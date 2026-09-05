@@ -466,6 +466,17 @@ if (cd "$BAD" && "$BIN" check-manifest >/dev/null 2>&1); then
   echo "symlink target escaped the package root" >&2
   exit 1
 fi
+printf '%s\n' '{"schema-version":1,"package":{"name":"bad","version":"1.0.0"},"targets":[{"name":"bad","kind":"bin","entry":"src"}],"dependencies":{}}' > "$BAD/elisapkg.json"
+if (cd "$BAD" && "$BIN" check-manifest >/dev/null 2>&1); then
+  echo "directory target entry was accepted" >&2
+  exit 1
+fi
+ln -s src/main.elisa "$BAD/linked-main"
+printf '%s\n' '{"schema-version":1,"package":{"name":"bad","version":"1.0.0"},"targets":[{"name":"bad","kind":"bin","entry":"linked-main"}],"dependencies":{}}' > "$BAD/elisapkg.json"
+if (cd "$BAD" && "$BIN" check-manifest >/dev/null 2>&1); then
+  echo "symlink target entry was accepted" >&2
+  exit 1
+fi
 
 printf '%s\n' '{"schema-version":1,"targets":[{"name":"target","kind":"bin","entry":"src/main.elisa"}],"package":{"name":"good","version":"1.0.0"},"dependencies":{}}' > "$BAD/elisapkg.json"
 (cd "$BAD" && "$BIN" check-manifest >/dev/null)
