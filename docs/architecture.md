@@ -13,6 +13,7 @@ The current source units are:
 | `Archive` | Shared safe relative-entry policy | Path-segment checks | Future archive extraction and packaging must use the same traversal guard. |
 | `Manifest` | Manifest entry-path policy | Schema/path policy marker | Target paths are checked through `Archive`; parser state remains private to validation. |
 | `SemVer` | Version precedence and initial range matching | Requirement parser helpers and grammar constants | Resolver code receives parsed bounds instead of interpreting range text itself. |
+| `Integrity` | SHA-256 bytes and hexadecimal encoding | Compression/hash implementation details | Digests are content claims; `Trust` still decides whether authenticated metadata authorizes them. |
 | `Cli` | `run(argc, argv)` | None | The public command surface delegates to private command helpers. |
 
 The current compiler backend requires foreign declarations at compilation-unit scope, so `Platform` wraps those declarations rather than placing them inside the module body. This keeps the exception local and documented. Callers use qualified names such as `Platform::pkg_fopen`, `Model::Version`, and `Security::remote_fetch_status`; `using` imports are deliberately avoided.
@@ -25,5 +26,6 @@ Future implementation modules should follow the same pattern:
 - `Archive` owns deterministic writing and bounded safe extraction; expose verified staging operations, never arbitrary destination paths.
 - `Cache` owns content-addressed storage and locking; expose immutable verified handles, never “verified” booleans detached from bytes.
 - `Build` owns target planning and subprocess execution; expose sanitized build results and keep environment construction private.
+- `Integrity` owns digest calculation and known-answer vectors; expose bytes or encoded digests, never mutable hash state.
 
 Each module must have one owner for its invariants, explicit public data contracts, and a `private:` section for parsing cursors, filesystem paths, mutable caches, and other implementation details. Cross-module calls should use qualified names so a future member cannot silently shadow a security-sensitive helper.

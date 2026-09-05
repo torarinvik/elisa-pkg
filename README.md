@@ -2,7 +2,7 @@
 
 `elisapkg` is the Elisa Packaging System, implemented in Elisa. The repository currently contains the first local vertical slice: strict manifest checks, deterministic lockfiles, frozen builds, local project scaffolding, toolchain invocation, and fail-closed remote-source policy.
 
-The source uses explicit Elisa modules. `Cli::run` is the public command boundary; `Platform` wraps the minimal FFI seam; `Model` contains value contracts; `Trust` defines signed-metadata verification results and the fail-closed production policy; and `Security` owns remote-operation decisions. See [`docs/architecture.md`](docs/architecture.md) for the visibility and namespace rules.
+The source uses explicit Elisa modules. `Cli::run` is the public command boundary; `Platform` wraps the minimal FFI seam; `Model` contains value contracts; `Integrity` computes SHA-256 digests; `Trust` defines signed-metadata verification results and the fail-closed production policy; and `Security` owns remote-operation decisions. See [`docs/architecture.md`](docs/architecture.md) for the visibility and namespace rules.
 
 ## Bootstrap
 
@@ -27,7 +27,7 @@ build/elisapkg init path/to/app
 
 The manifest and lockfile are JSON schema-versioned. `resolve --frozen` verifies the existing lockfile byte-for-byte and refuses to edit it. `--offline`, `--locked`, and `--frozen` are accepted by the CLI; remote acquisition remains disabled until signed registry metadata and publisher authorization are configured.
 
-Commands that inspect or build a project accept `--manifest-path PATH`; PATH may name the project directory or its `elisapkg.json`. `clean` removes only the known `.elisapkg/build/app` output and empty build directories. Registry dependency declarations are syntax-checked locally, including exact, caret, tilde, and comparison SemVer ranges, but resolution remains fail-closed until a verified registry provider exists.
+Commands that inspect or build a project accept `--manifest-path PATH`; PATH may name the project directory or its `elisapkg.json`. Local path resolution walks the dependency graph transitively, sorts package records by canonical name, normalizes relative paths, and rejects conflicting duplicate package identities. Target paths are resolved with `realpath` and must remain below their package root, including when a symlink is present. `clean` removes only the known `.elisapkg/build/app` output and empty build directories. Registry dependency declarations are syntax-checked locally, including exact, caret, tilde, and comparison SemVer ranges, but resolution remains fail-closed until a verified registry provider exists.
 
 ## Security posture
 

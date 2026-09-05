@@ -815,96 +815,6 @@ def bytes_less(left: darray[u8]&, right: darray[u8]&) -> bool:
         return false if left[index] > right[index]
     return left.count < right.count
 
-def field_append(fields: mutable darray[u8]&, value: darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
-    for index in 0..<value.count |fields, value|:
-        fields.push(value[index])
-    fields.push(0)
-
-def field_count(fields: darray[u8]&) -> usize:
-    count: mutable usize = 0.usize()
-    for index in 0..<fields.count |fields, count|:
-        count <- count + 1.usize() if fields[index] == 0
-    return count
-
-def field_copy_at(fields: darray[u8]&, wanted_index: usize, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
-    cursor: mutable usize = 0.usize()
-    current: mutable usize = 0.usize()
-    while cursor < fields.count |fields, cursor, current, out|:
-        end: mutable usize = cursor
-        while end < fields.count and fields[end] != 0 |fields, end|:
-            end <- end + 1.usize()
-        if current == wanted_index:
-            for index in cursor..<end |fields, out|:
-                out.push(fields[index])
-            return true
-        current <- current + 1.usize()
-        cursor <- end + 1.usize()
-    return false
-
-def field_seen(fields: darray[u8]&, wanted: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
-    total: usize = field_count(fields)
-    for index in 0..<total |fields, wanted|:
-        candidate: mutable darray[u8] = []
-        return true if field_copy_at(fields, index, &candidate) and bytes_equal(candidate, wanted)
-    return false
-
-def collect_sorted_local_fields(raw: darray[u8]&, names: mutable darray[u8]&, paths: mutable darray[u8]&, versions: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-    dependency_start: usize = json_key_value_offset(raw, "dependencies")
-    return true if dependency_start >= raw.count
-    dependency_end: usize = json_object_end(raw, dependency_start)
-    return false if dependency_end <= dependency_start or raw[dependency_start] != 123
-    in_string: mutable bool = false
-    escaped: mutable bool = false
-    string_start: mutable usize = 0.usize()
-    braces: mutable i64 = 1
-    brackets: mutable i64 = 0
-    for index in (dependency_start + 1.usize())..<dependency_end |raw, names, paths, versions, in_string, escaped, string_start, braces, brackets|:
-        byte: u8 = raw[index]
-        if not in_string:
-            if byte == 34:
-                in_string <- true
-                string_start <- index + 1.usize()
-            elif byte == 123:
-                braces <- braces + 1
-            elif byte == 125:
-                braces <- braces - 1
-            elif byte == 91:
-                brackets <- brackets + 1
-            elif byte == 93:
-                brackets <- brackets - 1
-        elif escaped:
-            escaped <- false
-        elif byte == 92:
-            escaped <- true
-        elif byte == 34:
-            after: mutable usize = index + 1.usize()
-            while after < dependency_end and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
-                after <- after + 1.usize()
-            direct_key: bool = braces == 1 and brackets == 0 and after < dependency_end and raw[after] == 58
-            if direct_key:
-                alias: mutable darray[u8] = []
-                for key_index in string_start..<index |alias, raw|:
-                    alias.push(raw[key_index])
-                return false if not valid_package_name(alias)
-                after <- after + 1.usize()
-                while after < dependency_end and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
-                    after <- after + 1.usize()
-                return false if after >= dependency_end or raw[after] != 123
-                dep_end: usize = json_object_end(raw, after)
-                return false if dep_end > dependency_end
-                dep_path: mutable darray[u8] = []
-                return false if not object_string_value(raw, after, dep_end, "path", &dep_path)
-                return false if not valid_dependency_path(dep_path)
-                dep_name: mutable darray[u8] = []
-                dep_version: mutable darray[u8] = []
-                return false if not load_package_at(&dep_path, &dep_name, &dep_version)
-                return false if not bytes_equal(alias, dep_name)
-                field_append(&names, alias)
-                field_append(&paths, dep_path)
-                field_append(&versions, dep_version)
-            in_string <- false
-    return true
-
 def slice_equals_array(raw: darray[u8]&, start: usize, end: usize, wanted: darray[u8]&) -> bool:
     return false if end < start or end - start != wanted.count
     for index in 0..<wanted.count |raw, wanted|:
@@ -965,94 +875,175 @@ def direct_dependency_count(raw: darray[u8]&, dependency_start: usize, dependenc
             in_string <- false
     return count
 
-def canonical_sorted_local_lock(name: darray[u8]&, version: darray[u8]&, raw: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+def queue_append_field(queue: mutable darray[u8]&, value: darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
+    for index in 0..<value.count |queue, value|:
+        queue.push(value[index])
+    queue.push(0)
+
+def queue_append_record(queue: mutable darray[u8]&, path: darray[u8]&, name: darray[u8]&, version: darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
+    queue_append_field(queue, path)
+    queue_append_field(queue, name)
+    queue_append_field(queue, version)
+
+def queue_field_at(queue: darray[u8]&, record: usize, field: usize, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+    cursor: mutable usize = 0.usize()
+    current_record: mutable usize = 0.usize()
+    while cursor < queue.count |queue, cursor, current_record, out|:
+        for current_field in 0..<3 |queue, cursor, current_record, current_field, out|:
+            end: mutable usize = cursor
+            while end < queue.count and queue[end] != 0 |queue, end|:
+                end <- end + 1.usize()
+            if current_record == record and current_field == field:
+                for index in cursor..<end |queue, out|:
+                    out.push(queue[index])
+                return true
+            cursor <- end + 1.usize()
+        current_record <- current_record + 1.usize()
+    return false
+
+def queue_name_record(queue: darray[u8]&, total: usize, wanted: darray[u8]&) -> usize can[Memory.Allocate, Abort.Panic]:
+    for record in 0..<total |queue, wanted|:
+        candidate: mutable darray[u8] = []
+        return record if queue_field_at(queue, record, 1, &candidate) and bytes_equal(candidate, wanted)
+    return total
+
+def append_local_dependency_records(raw: darray[u8]&, package_root: darray[u8]&, queue: mutable darray[u8]&, total: mutable usize&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    dependency_start: usize = json_key_value_offset(raw, "dependencies")
+    return true if dependency_start >= raw.count
+    dependency_end: usize = json_object_end(raw, dependency_start)
+    return false if dependency_end <= dependency_start or raw[dependency_start] != 123
+    in_string: mutable bool = false
+    escaped: mutable bool = false
+    string_start: mutable usize = 0.usize()
+    braces: mutable i64 = 1
+    brackets: mutable i64 = 0
+    for index in (dependency_start + 1.usize())..<dependency_end |raw, package_root, queue, total, in_string, escaped, string_start, braces, brackets|:
+        byte: u8 = raw[index]
+        if not in_string:
+            if byte == 34:
+                in_string <- true
+                string_start <- index + 1.usize()
+            elif byte == 123:
+                braces <- braces + 1
+            elif byte == 125:
+                braces <- braces - 1
+            elif byte == 91:
+                brackets <- brackets + 1
+            elif byte == 93:
+                brackets <- brackets - 1
+        elif escaped:
+            escaped <- false
+        elif byte == 92:
+            escaped <- true
+        elif byte == 34:
+            after: mutable usize = index + 1.usize()
+            while after < dependency_end and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
+                after <- after + 1.usize()
+            if braces == 1 and brackets == 0 and after < dependency_end and raw[after] == 58:
+                alias: mutable darray[u8] = []
+                for key_index in string_start..<index |alias, raw|:
+                    alias.push(raw[key_index])
+                return false if not valid_package_name(alias)
+                object_start: mutable usize = after + 1.usize()
+                while object_start < dependency_end and (raw[object_start] == 32 or raw[object_start] == 9 or raw[object_start] == 10 or raw[object_start] == 13) |raw, object_start|:
+                    object_start <- object_start + 1.usize()
+                object_end: usize = json_object_end(raw, object_start)
+                return false if object_start >= dependency_end or object_end <= object_start or raw[object_start] != 123 or object_end > dependency_end
+                dep_path: mutable darray[u8] = []
+                return false if not object_string_value(raw, object_start, object_end, "path", &dep_path)
+                return false if not valid_dependency_path(dep_path)
+                parent_root: mutable darray[u8] = []
+                if package_root.count > 0.usize() and not (package_root.count == 1.usize() and package_root[0] == 46):
+                    for root_index in 0..<package_root.count |parent_root, package_root|:
+                        parent_root.push(package_root[root_index])
+                dep_path_c: mutable darray[u8] = []
+                path_with_nul_into(&dep_path, &dep_path_c)
+                dep_path_name: cstr = (&dep_path_c[0]).cast[cstr] can Unsafe.PointerCast
+                child_root_raw: mutable darray[u8] = []
+                path_join_into(&parent_root, dep_path_name, &child_root_raw)
+                child_root: mutable darray[u8] = []
+                return false if not normalize_relative_path(&child_root_raw, &child_root)
+                child_name: mutable darray[u8] = []
+                child_version: mutable darray[u8] = []
+                return false if not load_package_at(&child_root, &child_name, &child_version)
+                return false if not bytes_equal(alias, child_name)
+                existing: usize = queue_name_record(queue, total, child_name)
+                if existing < total:
+                    existing_path: mutable darray[u8] = []
+                    existing_version: mutable darray[u8] = []
+                    return false if not queue_field_at(queue, existing, 0, &existing_path) or not queue_field_at(queue, existing, 2, &existing_version)
+                    return false if not bytes_equal(existing_path, child_root) or not bytes_equal(existing_version, child_version)
+                    in_string <- false
+                    continue
+                queue_append_record(queue, &child_root, child_name, child_version)
+                total <- total + 1.usize()
+            in_string <- false
+    return true
+
+def canonical_transitive_local_lock(name: darray[u8]&, version: darray[u8]&, raw: darray[u8]&, root: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
     out: mutable darray[u8] = []
     bytes_push_view(&out, "{\n  \"lock-version\": 2,\n  \"resolver\": \"elisapkg-v2\",\n  \"package\": {\n    \"name\": \"")
     bytes_push_array(&out, name)
     bytes_push_view(&out, "\",\n    \"version\": \"")
     bytes_push_array(&out, version)
     bytes_push_view(&out, "\"\n  },\n  \"packages\": [")
-    dependency_start: usize = json_key_value_offset(raw, "dependencies")
-    return out if dependency_start >= raw.count
-    dependency_end: usize = json_object_end(raw, dependency_start)
-    return [] if dependency_end <= dependency_start or raw[dependency_start] != 123
-    total: usize = direct_dependency_count(raw, dependency_start, dependency_end)
+    queue: mutable darray[u8] = []
+    total: mutable usize = 0.usize()
+    return [] if not append_local_dependency_records(raw, root, &queue, &total)
+    processed: mutable usize = 0.usize()
+    while processed < total |queue, processed, total, root|:
+        package_root: mutable darray[u8] = []
+        return [] if not queue_field_at(queue, processed, 0, &package_root)
+        manifest_path: mutable darray[u8] = []
+        path_join_into(&package_root, "elisapkg.json", &manifest_path)
+        child_raw: mutable darray[u8] = []
+        return [] if not read_file_into(&manifest_path, &child_raw)
+        child_name: mutable darray[u8] = []
+        child_version: mutable darray[u8] = []
+        return [] if not validate_manifest_at(child_raw, &package_root, &child_name, &child_version)
+        queued_name: mutable darray[u8] = []
+        queued_version: mutable darray[u8] = []
+        return [] if not queue_field_at(queue, processed, 1, &queued_name) or not queue_field_at(queue, processed, 2, &queued_version)
+        return [] if not bytes_equal(queued_name, child_name) or not bytes_equal(queued_version, child_version)
+        return [] if not append_local_dependency_records(child_raw, &package_root, &queue, &total)
+        processed <- processed + 1.usize()
     emitted: mutable darray[u8] = []
     first: mutable bool = true
-    for _step in 0..<total |raw, emitted, out, first|:
+    for _step in 0..<total |queue, emitted, out, first|:
         found: mutable bool = false
-        selected_start: mutable usize = 0.usize()
-        selected_end: mutable usize = 0.usize()
-        selected_object_start: mutable usize = 0.usize()
-        selected_object_end: mutable usize = 0.usize()
-        in_string: mutable bool = false
-        escaped: mutable bool = false
-        string_start: mutable usize = 0.usize()
-        braces: mutable i64 = 1
-        brackets: mutable i64 = 0
-        for index in (dependency_start + 1.usize())..<dependency_end |raw, emitted, found, selected_start, selected_end, selected_object_start, selected_object_end, in_string, escaped, string_start, braces, brackets|:
-            byte: u8 = raw[index]
-            if not in_string:
-                if byte == 34:
-                    in_string <- true
-                    string_start <- index + 1.usize()
-                elif byte == 123:
-                    braces <- braces + 1
-                elif byte == 125:
-                    braces <- braces - 1
-                elif byte == 91:
-                    brackets <- brackets + 1
-                elif byte == 93:
-                    brackets <- brackets - 1
-            elif escaped:
-                escaped <- false
-            elif byte == 92:
-                escaped <- true
-            elif byte == 34:
-                after: mutable usize = index + 1.usize()
-                while after < dependency_end and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
-                    after <- after + 1.usize()
-                if braces == 1 and brackets == 0 and after < dependency_end and raw[after] == 58:
-                    object_start: mutable usize = after + 1.usize()
-                    while object_start < dependency_end and (raw[object_start] == 32 or raw[object_start] == 9 or raw[object_start] == 10 or raw[object_start] == 13) |raw, object_start|:
-                        object_start <- object_start + 1.usize()
-                    object_end: usize = json_object_end(raw, object_start)
-                    candidate_seen: bool = emitted_contains_slice(emitted, raw, string_start, index)
-                    candidate_valid: bool = object_start < dependency_end and object_end > object_start and raw[object_start] == 123 and object_end <= dependency_end
-                    if candidate_valid and not candidate_seen and (not found or slice_less_slice(raw, string_start, index, selected_start, selected_end)):
-                        found <- true
-                        selected_start <- string_start
-                        selected_end <- index
-                        selected_object_start <- object_start
-                        selected_object_end <- object_end
-                in_string <- false
+        selected: mutable usize = total
+        selected_name: mutable darray[u8] = []
+        for candidate in 0..<total |queue, emitted, found, selected, selected_name|:
+            candidate_name: mutable darray[u8] = []
+            continue if not queue_field_at(queue, candidate, 1, &candidate_name)
+            continue if emitted_contains_slice(emitted, candidate_name, 0, candidate_name.count)
+            if not found or bytes_less(candidate_name, selected_name):
+                selected <- candidate
+                selected_name.resize(0)
+                for index in 0..<candidate_name.count |selected_name, candidate_name|:
+                    selected_name.push(candidate_name[index])
+                found <- true
         break if not found
         selected_path: mutable darray[u8] = []
         selected_version: mutable darray[u8] = []
-        return [] if not object_string_value(raw, selected_object_start, selected_object_end, "path", &selected_path)
-        return [] if not valid_dependency_path(selected_path)
-        dep_name: mutable darray[u8] = []
-        return [] if not load_package_at(&selected_path, &dep_name, &selected_version)
-        return [] if not slice_equals_array(raw, selected_start, selected_end, dep_name)
-        return [] if slice_equals_array(raw, selected_start, selected_end, name)
+        return [] if not queue_field_at(queue, selected, 0, &selected_path) or not queue_field_at(queue, selected, 2, &selected_version)
         out.push(44) if not first
         bytes_push_view(&out, "\n    {\"name\":\"")
-        for index in selected_start..<selected_end |out, raw|:
-            out.push(raw[index])
+        bytes_push_array(&out, selected_name)
         bytes_push_view(&out, "\",\"version\":\"")
         bytes_push_array(&out, selected_version)
         bytes_push_view(&out, "\",\"source\":{\"type\":\"path\",\"path\":\"")
         bytes_push_array(&out, selected_path)
         bytes_push_view(&out, "\"}}")
-        for index in selected_start..<selected_end |emitted, raw|:
-            emitted.push(raw[index])
+        for index in 0..<selected_name.count |emitted, selected_name|:
+            emitted.push(selected_name[index])
         emitted.push(0)
         first <- false
     bytes_push_view(&out, "\n  ]\n}\n")
     return out
 
 def canonical_lock_for_manifest(name: darray[u8]&, version: darray[u8]&, raw: darray[u8]&, root: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-    canonical: darray[u8] = canonical_sorted_local_lock(name, version, raw)
+    canonical: darray[u8] = canonical_transitive_local_lock(name, version, raw, root)
     return canonical if canonical.count > 0.usize()
     out: mutable darray[u8] = []
     bytes_push_view(&out, "{\n  \"lock-version\": 2,\n  \"resolver\": \"elisapkg-v2\",\n  \"package\": {\n    \"name\": \"")
@@ -1143,6 +1134,40 @@ def valid_dependency_path(path: darray[u8]&) -> bool:
         return false if byte == 0 or byte < 32 or byte == 34 or byte == 92
     return false if bytes_count(path, "//") > 0.usize()
     return true
+
+def normalize_relative_path(path: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+    out.resize(0)
+    segment_start: mutable usize = 0.usize()
+    index: mutable usize = 0.usize()
+    while index <= path.count |path, out, segment_start, index|:
+        at_end: bool = index == path.count
+        if at_end or path[index] == 47:
+            segment_length: usize = index - segment_start
+            if segment_length > 0.usize() and not (segment_length == 1.usize() and path[segment_start] == 46):
+                is_parent: bool = segment_length == 2.usize() and path[segment_start] == 46 and path[segment_start + 1.usize()] == 46
+                if is_parent:
+                    if out.count > 0.usize():
+                        last: mutable usize = out.count
+                        while last > 0.usize() and out[last - 1.usize()] != 47 |out, last|:
+                            last <- last - 1.usize()
+                        previous_parent: bool = out.count - last == 2.usize() and out[last] == 46 and out[last + 1.usize()] == 46
+                        if previous_parent:
+                            out.push(47)
+                            out.push(46)
+                            out.push(46)
+                        else:
+                            out.resize(last)
+                    else:
+                        out.push(46)
+                        out.push(46)
+                else:
+                    if out.count > 0.usize():
+                        out.push(47)
+                    for part in segment_start..<index |path, out|:
+                        out.push(path[part])
+            segment_start <- index + 1.usize()
+        index <- index + 1.usize()
+    return out.count > 0.usize()
 
 def object_has_direct_key(raw: darray[u8]&, object_start: usize, object_end: usize, wanted: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
     return false if object_start >= object_end or raw[object_start] != 123

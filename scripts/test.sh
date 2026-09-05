@@ -84,12 +84,15 @@ mkdir -p "$CASE"
   cd "$CASE"
   "$BIN" init . >/dev/null
   "$BIN" check-manifest --manifest-path "$CASE/elisapkg.json" >/dev/null
-  mkdir -p local-util/src
+  mkdir -p local-util/src nested-util/src
   printf '%s\n' 'def main() -> i64:' '    return 0' > local-util/src/main.elisa
-  printf '%s\n' '{"schema-version":1,"package":{"name":"local-util","version":"1.2.3"},"targets":[{"name":"local-util","kind":"lib","entry":"src/main.elisa"}],"dependencies":{}}' > local-util/elisapkg.json
+  printf '%s\n' 'def main() -> i64:' '    return 0' > nested-util/src/main.elisa
+  printf '%s\n' '{"schema-version":1,"package":{"name":"nested-util","version":"0.4.0"},"targets":[{"name":"nested-util","kind":"lib","entry":"src/main.elisa"}],"dependencies":{}}' > nested-util/elisapkg.json
+  printf '%s\n' '{"schema-version":1,"package":{"name":"local-util","version":"1.2.3"},"targets":[{"name":"local-util","kind":"lib","entry":"src/main.elisa"}],"dependencies":{"nested-util":{"path":"../nested-util"}}}' > local-util/elisapkg.json
   "$BIN" add local-util --path local-util >/dev/null
   "$BIN" check-manifest >/dev/null
   "$BIN" resolve >/dev/null
+  grep -F '"name":"nested-util"' elisapkg.lock >/dev/null
   "$BIN" resolve --frozen >/dev/null
   cp elisapkg.lock elisapkg.lock.good
   printf '%s\n' '{}' > elisapkg.lock
