@@ -2011,7 +2011,7 @@ def run_build(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Con
     bytes_push_cstr(&receipt, runtime_obj)
     bytes_push_view(&receipt, "\nallow-stale:")
     bytes_push_cstr(&receipt, allow_stale)
-    bytes_push_view(&receipt, "\nsemantic-gate:1\n")
+    bytes_push_view(&receipt, "\nsemantic-gate:1")
     artifact_c: mutable darray[u8] = []
     receipt_c: mutable darray[u8] = []
     path_with_nul_into(&artifact, &artifact_c)
@@ -2019,11 +2019,20 @@ def run_build(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Con
     artifact_name: cstr = (&artifact_c[0]).cast[cstr] can Unsafe.PointerCast
     receipt_name: cstr = (&receipt_c[0]).cast[cstr] can Unsafe.PointerCast
     if file_exists(&artifact) and file_exists(&receipt_path):
+        existing_artifact: mutable darray[u8] = []
         existing_receipt: mutable darray[u8] = []
         existing_receipt.resize(4096)
-        if read_cstr_into(receipt_name, &existing_receipt) and bytes_equal(existing_receipt, receipt):
-            write_ok("built .elisapkg/build/app (cached)\n")
-            return EXIT_OK
+        if read_file_into(&artifact, &existing_artifact) and read_cstr_into(receipt_name, &existing_receipt):
+            existing_artifact_digest_bytes: mutable darray[u8] = []
+            existing_artifact_digest: mutable darray[u8] = []
+            if Integrity::sha256(existing_artifact, &existing_artifact_digest_bytes) == Integrity::DigestCode.Ok and Integrity::hex_digest(existing_artifact_digest_bytes, &existing_artifact_digest):
+                expected_receipt: mutable darray[u8] = bytes_copy(receipt)
+                bytes_push_view(&expected_receipt, "\nartifact-digest:sha256:")
+                bytes_push_array(&expected_receipt, existing_artifact_digest)
+                bytes_push_view(&expected_receipt, "\n")
+                if bytes_equal(existing_receipt, expected_receipt):
+                    write_ok("built .elisapkg/build/app (cached)\n")
+                    return EXIT_OK
     # mkstemp keeps the compiler output path exclusive for the whole child
     # process, preventing a predictable temporary symlink from redirecting the
     # output. The final rename is the only point at which app becomes visible.
@@ -2087,6 +2096,15 @@ def run_build(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Con
     if Platform::pkg_rename(temp_name, artifact_name) != 0:
         _ = Platform::pkg_unlink(temp_name)
         return EXIT_BUILD
+    artifact_content: mutable darray[u8] = []
+    artifact_digest_bytes: mutable darray[u8] = []
+    artifact_digest: mutable darray[u8] = []
+    return EXIT_BUILD if not read_file_into(&artifact, &artifact_content)
+    return EXIT_BUILD if Integrity::sha256(artifact_content, &artifact_digest_bytes) != Integrity::DigestCode.Ok
+    return EXIT_BUILD if not Integrity::hex_digest(artifact_digest_bytes, &artifact_digest)
+    bytes_push_view(&receipt, "\nartifact-digest:sha256:")
+    bytes_push_array(&receipt, artifact_digest)
+    bytes_push_view(&receipt, "\n")
     return EXIT_BUILD if not write_cstr_file(receipt_name, &receipt)
     write_ok("built .elisapkg/build/app\n")
     _ = options

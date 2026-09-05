@@ -30,8 +30,8 @@ The manifest and lockfile are JSON schema-versioned. `resolve --frozen` verifies
 `cache verify` performs the same canonical-lock and local manifest-digest check
 before reporting that no shared remote cache is configured. Successful builds
 publish an exclusive compiler output by atomic rename and retain a receipt of
-the target source digest and selected compiler inputs; unchanged builds reuse
-that receipt.
+the target source and artifact digests plus selected compiler inputs; unchanged
+builds reuse that receipt only after rechecking the executable bytes.
 
 Commands that inspect or build a project accept `--manifest-path PATH`; PATH may name the project directory or its `elisapkg.json`. Local path resolution walks the dependency graph transitively, sorts package records by canonical name, normalizes relative paths, records a SHA-256 manifest digest, and rejects conflicting duplicate package identities. Target paths are resolved with `realpath` and must remain below their package root, including when a symlink is present. `clean` removes only the known `.elisapkg/build/app` output and empty build directories. Registry dependency declarations are syntax-checked locally, including exact, caret, tilde, and comparison SemVer ranges, but resolution remains fail-closed until a verified registry provider exists.
 

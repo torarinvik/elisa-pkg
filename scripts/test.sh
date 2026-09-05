@@ -133,6 +133,20 @@ mkdir -p "$CASE"
   mv elisapkg.root.good elisapkg.json
   "$BIN" build >/dev/null
   "$BIN" build --frozen >/dev/null
+  python3 - <<'PY'
+path = ".elisapkg/build/app"
+with open(path, "r+b") as handle:
+    value = handle.read(1)
+    handle.seek(0)
+    handle.write(bytes([value[0] ^ 1]))
+PY
+  rebuild_output="$("$BIN" build)"
+  case "$rebuild_output" in
+    *"(cached)"*)
+      echo "tampered artifact was accepted from the cache" >&2
+      exit 1
+      ;;
+  esac
   cp src/main.elisa src/main.size.good
   python3 - <<'PY'
 with open("src/main.elisa", "wb") as handle:
