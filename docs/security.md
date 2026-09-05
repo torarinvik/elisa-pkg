@@ -61,9 +61,11 @@ use descriptor-relative no-follow opens for all components, including absolute
 paths anchored at `/`; they detect I/O errors and reject special files.
 Archive validation
 also checks zero data padding and file/directory conflicts. Frozen resolution
-performs no lockfile replacement. Build receipt v2 reuses only when the target,
-manifest, compiler settings, and artifact digest all match; included sources
-and complete toolchain contents remain outside the current key.
+performs no lockfile replacement. Build receipt v4 reuses only when the target,
+manifest, compiler settings, compiler/stage1/runtime content identities, and
+artifact digest all match; included non-target sources remain outside the
+current key. An unavailable toolchain identity disables reuse rather than
+silently trusting a stale artifact.
 
 These changes do not supply the planned remote verifier or execution sandbox.
 Project mutation and installation still assume a trusted, user-owned directory;

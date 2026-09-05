@@ -202,6 +202,34 @@ def read_cstr_into(path_name: cstr, out: mutable darray[u8]&) -> bool can[Memory
         return not failed and not oversized
     return false
 
+def external_identity_label(path_name: cstr, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    out.resize(0)
+    if Platform::pkg_strlen(path_name) == 0.usize():
+        bytes_push_view(&out, "none")
+        return true
+    resolved_buffer: mutable darray[u8] = []
+    resolved_buffer.resize(4096)
+    resolved_raw: mutable u8& = (&resolved_buffer[0]).cast[mutable u8&] can Unsafe.PointerCast
+    resolved_name: mutable cstr = ""
+    if Platform::pkg_realpath(path_name, resolved_raw) is resolved:
+        resolved_name <- resolved
+    else:
+        bytes_push_view(&out, "unavailable")
+        return false
+    content: mutable darray[u8] = []
+    content.resize(67108865)
+    if not read_cstr_into(resolved_name, &content):
+        bytes_push_view(&out, "unavailable")
+        return false
+    digest_bytes: mutable darray[u8] = []
+    digest: mutable darray[u8] = []
+    if Integrity::sha256(content, &digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(digest_bytes, &digest):
+        bytes_push_view(&out, "unavailable")
+        return false
+    bytes_push_view(&out, "sha256:")
+    bytes_push_array(&out, digest)
+    return true
+
 def write_fd_all(fd: i64, value: darray[u8]&) -> bool can[Unsafe.PointerCast, Console.Write]:
     offset: mutable usize = 0.usize()
     while offset < value.count |value, offset|:
@@ -2573,8 +2601,15 @@ def run_build(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Con
         runtime_obj <- configured_runtime.cast[cstr]
     if Platform::pkg_getenv("ELISA_ALLOW_STALE_STAGE1") is configured_stale:
         allow_stale <- configured_stale.cast[cstr]
+    compiler_identity: mutable darray[u8] = []
+    stage1_identity: mutable darray[u8] = []
+    runtime_identity: mutable darray[u8] = []
+    compiler_identity_ok: bool = external_identity_label(compiler, &compiler_identity)
+    stage1_identity_ok: bool = external_identity_label(stage1_bin, &stage1_identity)
+    runtime_identity_ok: bool = external_identity_label(runtime_obj, &runtime_identity)
+    toolchain_identity_ok: bool = compiler_identity_ok and stage1_identity_ok and runtime_identity_ok
     receipt: mutable darray[u8] = []
-    bytes_push_view(&receipt, "elisapkg-build-receipt:3\nentry:")
+    bytes_push_view(&receipt, "elisapkg-build-receipt:4\nentry:")
     bytes_push_array(&receipt, target_entry)
     bytes_push_view(&receipt, "\nsource-digest:sha256:")
     bytes_push_array(&receipt, source_digest)
@@ -2588,6 +2623,12 @@ def run_build(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Con
     bytes_push_cstr(&receipt, stage1_bin)
     bytes_push_view(&receipt, "\nruntime-object:")
     bytes_push_cstr(&receipt, runtime_obj)
+    bytes_push_view(&receipt, "\ncompiler-identity:")
+    bytes_push_array(&receipt, compiler_identity)
+    bytes_push_view(&receipt, "\nstage1-identity:")
+    bytes_push_array(&receipt, stage1_identity)
+    bytes_push_view(&receipt, "\nruntime-identity:")
+    bytes_push_array(&receipt, runtime_identity)
     bytes_push_view(&receipt, "\nallow-stale:")
     bytes_push_cstr(&receipt, allow_stale)
     bytes_push_view(&receipt, "\nsemantic-gate:1")
@@ -2597,7 +2638,7 @@ def run_build(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Con
     path_with_nul_into(&receipt_path, &receipt_c)
     artifact_name: cstr = (&artifact_c[0]).cast[cstr] can Unsafe.PointerCast
     receipt_name: cstr = (&receipt_c[0]).cast[cstr] can Unsafe.PointerCast
-    if cstr_file_exists(artifact_name) and cstr_file_exists(receipt_name) and Platform::pkg_access(artifact_name, 1) == 0:
+    if toolchain_identity_ok and cstr_file_exists(artifact_name) and cstr_file_exists(receipt_name) and Platform::pkg_access(artifact_name, 1) == 0:
         cached_artifact: mutable darray[u8] = []
         cached_receipt: mutable darray[u8] = []
         cached_receipt.resize(4096)

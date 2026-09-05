@@ -257,6 +257,32 @@ mkdir -p "$CASE"
   mv elisapkg.root.good elisapkg.json
   "$BIN" build >/dev/null
   "$BIN" build --frozen >/dev/null
+  TOOLCHAIN_WRAPPER="$CASE/compiler-wrapper.sh"
+  printf '%s\n' '#!/bin/sh' "exec '$ELISA_COMPILER_ROOT/scripts/elisac_stage1.sh' \"\$@\"" > "$TOOLCHAIN_WRAPPER"
+  chmod +x "$TOOLCHAIN_WRAPPER"
+  wrapper_build_output="$(ELISAPKG_COMPILER="$TOOLCHAIN_WRAPPER" "$BIN" build)"
+  case "$wrapper_build_output" in
+    *"(cached)"*)
+      echo "changed compiler path was accepted from the cache" >&2
+      exit 1
+      ;;
+  esac
+  wrapper_cached_output="$(ELISAPKG_COMPILER="$TOOLCHAIN_WRAPPER" "$BIN" build)"
+  case "$wrapper_cached_output" in
+    *"(cached)"*) ;;
+    *)
+      echo "unchanged compiler wrapper was not reused" >&2
+      exit 1
+      ;;
+  esac
+  printf '%s\n' '# content mutation must invalidate the receipt' >> "$TOOLCHAIN_WRAPPER"
+  wrapper_mutated_output="$(ELISAPKG_COMPILER="$TOOLCHAIN_WRAPPER" "$BIN" build)"
+  case "$wrapper_mutated_output" in
+    *"(cached)"*)
+      echo "mutated compiler wrapper was accepted from the cache" >&2
+      exit 1
+      ;;
+  esac
   cp local-util/src/main.elisa local-util/src/main.elisa.good
   printf '%s\n' 'def main() -> i64:' '    return 1' > local-util/src/main.elisa
   dependency_rebuild_output="$("$BIN" build)"
