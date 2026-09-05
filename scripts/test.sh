@@ -276,6 +276,11 @@ if (cd "$BAD" && "$BIN" check-manifest >/dev/null 2>&1); then
   echo "traversal target entry was accepted" >&2
   exit 1
 fi
+printf '%s\n' '{"schema-version":1,"package":{"name":"good","version":"1.0.0"},"targets":[{"name":"target","kind":"bin","entry":"./src/main.elisa"}],"dependencies":{}}' > "$BAD/elisapkg.json"
+if (cd "$BAD" && "$BIN" check-manifest >/dev/null 2>&1); then
+  echo "dot-prefixed target entry was accepted" >&2
+  exit 1
+fi
 printf '%s\n' '{"schema-version":1,"package":{"name":"good","version":"1.0.0"},"targets":[{"name":"target","kind":"bin","entry":"src/main.elisa"}],"dependencies":{}}' > "$BAD/elisapkg.json"
 cp "$BAD/elisapkg.json" "$BAD/manifest.json"
 if (cd "$BAD" && "$BIN" check-manifest >/dev/null 2>&1); then
