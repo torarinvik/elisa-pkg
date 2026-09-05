@@ -15,9 +15,11 @@ namespace, and algorithm policy. They are deliberately not signature
 verification; the production policy still rejects every remote operation until
 the reviewed provider and trust-state persistence are implemented.
 
-State-directory creation uses descriptor-anchored `mkdirat`/`openat`
-traversal and rejects symlinked `.elisapkg`, build, install, and receipt
-directories, including intermediate parent links.
+State-directory creation and atomic file publication use descriptor-anchored
+`mkdirat`/`openat`/`renameat`/`linkat` traversal. Reads, temporary files,
+access checks, cleanup, and directory changes reject symlinked `.elisapkg`,
+build, install, and receipt paths, including intermediate parent links and
+`..` traversal.
 
 Archive extraction is a separate boundary. The accepted subset is regular files and directories only, with bounded compressed and expanded sizes, no links/devices/special modes, no absolute or traversal paths, no duplicate or case-colliding names, private staging, and atomic publication into a verified content store. Cache pathnames and receipts are never treated as proof of verification.
 
@@ -58,7 +60,8 @@ recheck them before unlinking immutable entries.
 
 Review corrections: archive, manifest, lockfile, receipt, and artifact reads
 use descriptor-relative no-follow opens for all components, including absolute
-paths anchored at `/`; they detect I/O errors and reject special files.
+paths anchored at `/`; atomic writes and cleanup use the same parent-handle
+boundary, detect I/O errors, and reject special files.
 Archive validation
 also checks zero data padding and file/directory conflicts. Frozen resolution
 performs no lockfile replacement. Build receipt v4 reuses only when the target,

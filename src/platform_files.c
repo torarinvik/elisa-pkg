@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -30,6 +31,9 @@ struct walk_state {
 };
 
 static _Thread_local struct walk_state *active_state;
+static unsigned long temp_counter;
+
+static int open_directory_path(const char *path);
 
 static const char *relative_path(const char *path) {
     if (path[0] == '.' && path[1] == '/') {
@@ -196,6 +200,11 @@ static int open_package_file(const char *path) {
             free(copy);
             return -EINVAL;
         }
+        if (strcmp(part, "..") == 0) {
+            close(directory);
+            free(copy);
+            return -EINVAL;
+        }
         if (strcmp(part, ".") == 0) {
             if (slash == NULL) {
                 close(directory);
@@ -227,7 +236,38 @@ static int open_package_file(const char *path) {
  * mode semantics and are already protected by O_EXCL in the caller. */
 FILE *elisapkg_fopen(const char *path, const char *mode) {
     if (path == NULL || mode == NULL) return NULL;
-    if (strcmp(mode, "rb") != 0) return fopen(path, mode);
+    if (strcmp(mode, "wxb") == 0) {
+        char *copy = strdup(path);
+        if (copy == NULL) return NULL;
+        char *slash = strrchr(copy, '/');
+        char *leaf = copy;
+        char *parent = ".";
+        if (slash != NULL) {
+            leaf = slash + 1;
+            if (*leaf == '\0') { free(copy); return NULL; }
+            if (slash == copy) {
+                slash[1] = '\0';
+                parent = copy;
+            } else {
+                *slash = '\0';
+                parent = copy;
+            }
+        }
+        if (strcmp(leaf, ".") == 0 || strcmp(leaf, "..") == 0 || strchr(leaf, '/') != NULL) {
+            free(copy);
+            return NULL;
+        }
+        int directory = open_directory_path(parent);
+        if (directory < 0) { free(copy); return NULL; }
+        int file = openat(directory, leaf, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+        close(directory);
+        free(copy);
+        if (file < 0) return NULL;
+        FILE *stream = fdopen(file, "wb");
+        if (stream == NULL) close(file);
+        return stream;
+    }
+    if (strcmp(mode, "rb") != 0) return NULL;
     int file = open_package_file(path);
     if (file < 0) return NULL;
     FILE *stream = fdopen(file, "rb");
@@ -310,6 +350,11 @@ long long elisapkg_mkdir(const char *path, unsigned short mode) {
         free(copy);
         return directory;
     }
+    if (strcmp(leaf, ".") == 0 || strcmp(leaf, "..") == 0 || strchr(leaf, '/') != NULL) {
+        close(directory);
+        free(copy);
+        return -EINVAL;
+    }
     const int result = mkdirat(directory, leaf, (mode_t)mode) == 0 ? 0 : -errno;
     close(directory);
     free(copy);
@@ -343,4 +388,218 @@ long long elisapkg_read_package_file(const char *path, unsigned char *output, si
     }
     close(file);
     return used == capacity ? -EFBIG : (long long)used;
+}
+
+static int split_parent_leaf(const char *path, char **copy_out, char **parent_out, char **leaf_out) {
+    if (path == NULL || path[0] == '\0' || strlen(path) > 4096) return -EINVAL;
+    char *copy = strdup(path);
+    if (copy == NULL) return -ENOMEM;
+    char *slash = strrchr(copy, '/');
+    char *leaf = copy;
+    char *parent = ".";
+    if (slash != NULL) {
+        leaf = slash + 1;
+        if (*leaf == '\0') { free(copy); return -EINVAL; }
+        if (slash == copy) {
+            slash[1] = '\0';
+            parent = copy;
+        } else {
+            *slash = '\0';
+            parent = copy;
+        }
+    }
+    if (*leaf == '\0' || strcmp(leaf, ".") == 0 || strcmp(leaf, "..") == 0 || strchr(leaf, '/') != NULL) {
+        free(copy);
+        return -EINVAL;
+    }
+    *copy_out = copy;
+    *parent_out = parent;
+    *leaf_out = leaf;
+    return 0;
+}
+
+long long elisapkg_mkstemp(char *template_path) {
+    char *copy = NULL;
+    char *parent = NULL;
+    char *leaf = NULL;
+    const int split = split_parent_leaf(template_path, &copy, &parent, &leaf);
+    if (split != 0) return split;
+    const size_t leaf_length = strlen(leaf);
+    if (leaf_length < 6 || memcmp(leaf + leaf_length - 6, "XXXXXX", 6) != 0) {
+        free(copy);
+        return -EINVAL;
+    }
+    int directory = open_directory_path(parent);
+    if (directory < 0) { free(copy); return directory; }
+    static const char alphabet[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    const size_t template_offset = (size_t)(leaf - copy);
+    for (unsigned int attempt = 0; attempt < 256; attempt++) {
+        uint64_t value = ((uint64_t)getpid() << 32) ^ (uint64_t)(uintptr_t)template_path ^
+                         (uint64_t)__sync_fetch_and_add(&temp_counter, 1) ^ (uint64_t)attempt * 0x9e3779b97f4a7c15ULL;
+        for (size_t index = 0; index < 6; index++) {
+            leaf[leaf_length - 6 + index] = alphabet[value % (sizeof(alphabet) - 1)];
+            value = value / (sizeof(alphabet) - 1) + 0x9e3779b97f4a7c15ULL;
+        }
+        int file = openat(directory, leaf, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+        if (file >= 0) {
+            memcpy(template_path + template_offset, leaf, leaf_length + 1);
+            close(directory);
+            free(copy);
+            return file;
+        }
+        if (errno != EEXIST) {
+            const int error = errno;
+            close(directory);
+            free(copy);
+            return error == 0 ? -EIO : -error;
+        }
+    }
+    close(directory);
+    free(copy);
+    return -EEXIST;
+}
+
+long long elisapkg_access(const char *path, int mode) {
+    if (mode != 0 && mode != 1) return -EINVAL;
+    int file = open_package_file(path);
+    if (file < 0) return file;
+    struct stat info;
+    const int status = fstat(file, &info);
+    close(file);
+    if (status != 0) return -errno;
+    if (mode == 1 && (info.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)) == 0) return -EACCES;
+    return 0;
+}
+
+long long elisapkg_chdir(const char *path) {
+    int directory = open_directory_path(path);
+    if (directory < 0) return directory;
+    const int result = fchdir(directory) == 0 ? 0 : -errno;
+    close(directory);
+    return result;
+}
+
+long long elisapkg_unlink(const char *path) {
+    char *copy = NULL;
+    char *parent = NULL;
+    char *leaf = NULL;
+    const int split = split_parent_leaf(path, &copy, &parent, &leaf);
+    if (split != 0) return split;
+    int directory = open_directory_path(parent);
+    if (directory < 0) { free(copy); return directory; }
+    const int result = unlinkat(directory, leaf, 0) == 0 ? 0 : -errno;
+    close(directory);
+    free(copy);
+    return result;
+}
+
+long long elisapkg_rmdir(const char *path) {
+    char *copy = NULL;
+    char *parent = NULL;
+    char *leaf = NULL;
+    const int split = split_parent_leaf(path, &copy, &parent, &leaf);
+    if (split != 0) return split;
+    int directory = open_directory_path(parent);
+    if (directory < 0) { free(copy); return directory; }
+    const int result = unlinkat(directory, leaf, AT_REMOVEDIR) == 0 ? 0 : -errno;
+    close(directory);
+    free(copy);
+    return result;
+}
+
+long long elisapkg_chmod(const char *path, unsigned short mode) {
+    char *copy = NULL;
+    char *parent = NULL;
+    char *leaf = NULL;
+    const int split = split_parent_leaf(path, &copy, &parent, &leaf);
+    if (split != 0) return split;
+    int directory = open_directory_path(parent);
+    if (directory < 0) { free(copy); return directory; }
+    int file = openat(directory, leaf, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    const int opened_errno = errno;
+    if (file < 0) {
+        close(directory);
+        free(copy);
+        return opened_errno == 0 ? -EIO : -opened_errno;
+    }
+    const int result = fchmod(file, (mode_t)mode) == 0 ? 0 : -errno;
+    close(file);
+    close(directory);
+    free(copy);
+    return result;
+}
+
+long long elisapkg_link(const char *old_path, const char *new_path) {
+    char *old_copy = NULL;
+    char *old_parent = NULL;
+    char *old_leaf = NULL;
+    char *new_copy = NULL;
+    char *new_parent = NULL;
+    char *new_leaf = NULL;
+    int split = split_parent_leaf(old_path, &old_copy, &old_parent, &old_leaf);
+    if (split != 0) return split;
+    split = split_parent_leaf(new_path, &new_copy, &new_parent, &new_leaf);
+    if (split != 0) { free(old_copy); return split; }
+    int old_directory = open_directory_path(old_parent);
+    int new_directory = open_directory_path(new_parent);
+    if (old_directory < 0 || new_directory < 0) {
+        if (old_directory >= 0) close(old_directory);
+        if (new_directory >= 0) close(new_directory);
+        free(old_copy); free(new_copy);
+        return old_directory < 0 ? old_directory : new_directory;
+    }
+    struct stat source_info;
+    struct stat destination_info;
+    const int source_status = fstatat(old_directory, old_leaf, &source_info, AT_SYMLINK_NOFOLLOW);
+    const int source_errno = errno;
+    const int destination_status = fstatat(new_directory, new_leaf, &destination_info, AT_SYMLINK_NOFOLLOW);
+    const int destination_errno = errno;
+    int result = 0;
+    if (source_status != 0 || !S_ISREG(source_info.st_mode) || (destination_status == 0)) {
+        result = source_status != 0 ? -source_errno : (destination_status == 0 ? -EEXIST : -destination_errno);
+    } else if (linkat(old_directory, old_leaf, new_directory, new_leaf, 0) != 0) {
+        result = -errno;
+    }
+    close(old_directory); close(new_directory);
+    free(old_copy); free(new_copy);
+    return result;
+}
+
+long long elisapkg_rename(const char *old_path, const char *new_path) {
+    char *old_copy = NULL;
+    char *old_parent = NULL;
+    char *old_leaf = NULL;
+    char *new_copy = NULL;
+    char *new_parent = NULL;
+    char *new_leaf = NULL;
+    int split = split_parent_leaf(old_path, &old_copy, &old_parent, &old_leaf);
+    if (split != 0) return split;
+    split = split_parent_leaf(new_path, &new_copy, &new_parent, &new_leaf);
+    if (split != 0) { free(old_copy); return split; }
+    int old_directory = open_directory_path(old_parent);
+    int new_directory = open_directory_path(new_parent);
+    if (old_directory < 0 || new_directory < 0) {
+        if (old_directory >= 0) close(old_directory);
+        if (new_directory >= 0) close(new_directory);
+        free(old_copy); free(new_copy);
+        return old_directory < 0 ? old_directory : new_directory;
+    }
+    struct stat source_info;
+    struct stat destination_info;
+    const int source_status = fstatat(old_directory, old_leaf, &source_info, AT_SYMLINK_NOFOLLOW);
+    const int source_errno = errno;
+    const int destination_status = fstatat(new_directory, new_leaf, &destination_info, AT_SYMLINK_NOFOLLOW);
+    int result = 0;
+    if (source_status != 0 || !S_ISREG(source_info.st_mode)) {
+        result = source_status != 0 ? -source_errno : -EINVAL;
+    } else if (destination_status == 0 && S_ISLNK(destination_info.st_mode)) {
+        result = -ELOOP;
+    } else if (destination_status == 0 && !S_ISREG(destination_info.st_mode)) {
+        result = -EISDIR;
+    } else if (renameat(old_directory, old_leaf, new_directory, new_leaf) != 0) {
+        result = -errno;
+    }
+    close(old_directory); close(new_directory);
+    free(old_copy); free(new_copy);
+    return result;
 }

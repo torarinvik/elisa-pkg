@@ -229,6 +229,21 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
     mkdir_secure = native.elisapkg_mkdir
     mkdir_secure.argtypes = [ctypes.c_char_p, ctypes.c_ushort]
     mkdir_secure.restype = ctypes.c_longlong
+    access_secure = native.elisapkg_access
+    access_secure.argtypes = [ctypes.c_char_p, ctypes.c_int]
+    access_secure.restype = ctypes.c_longlong
+    mkstemp_secure = native.elisapkg_mkstemp
+    mkstemp_secure.argtypes = [ctypes.c_char_p]
+    mkstemp_secure.restype = ctypes.c_longlong
+    rename_secure = native.elisapkg_rename
+    rename_secure.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+    rename_secure.restype = ctypes.c_longlong
+    unlink_secure = native.elisapkg_unlink
+    unlink_secure.argtypes = [ctypes.c_char_p]
+    unlink_secure.restype = ctypes.c_longlong
+    chdir_secure = native.elisapkg_chdir
+    chdir_secure.argtypes = [ctypes.c_char_p]
+    chdir_secure.restype = ctypes.c_longlong
     buffer = ctypes.create_string_buffer(128)
     previous = Path.cwd()
     try:
@@ -246,6 +261,23 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
         assert is_directory(b'nested/created') == 1
         assert mkdir_secure(b'nested/alias/blocked', 0o755) < 0
         assert read(b'alias/main.elisa', buffer, 128) < 0
+        assert read(b'../src/main.elisa', buffer, 128) < 0
+        assert access_secure(b'alias/main.elisa', 0) < 0
+        assert chdir_secure(b'alias') < 0
+        temp_template = ctypes.create_string_buffer(b'nested/temporary.XXXXXX')
+        temp_fd = mkstemp_secure(temp_template)
+        assert temp_fd >= 0
+        os.close(temp_fd)
+        temporary_name = Path(temp_template.value.decode())
+        assert temporary_name.is_file()
+        assert unlink_secure(str(temporary_name).encode()) == 0
+        linked_parent_template = ctypes.create_string_buffer(b'nested/alias/temporary.XXXXXX')
+        assert mkstemp_secure(linked_parent_template) < 0
+        Path('rename-source').write_bytes(b'source')
+        Path('rename-destination').symlink_to('src/main.elisa')
+        assert rename_secure(b'rename-source', b'rename-destination') < 0
+        Path('rename-destination').unlink()
+        Path('rename-source').unlink()
         Path('linked').symlink_to('src/main.elisa')
         assert read(b'linked', buffer, 128) < 0
         assert read(str((project / 'src/main.elisa').resolve()).encode(), buffer, 128) > 0
