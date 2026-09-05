@@ -215,31 +215,36 @@ if (cd "$BAD" && "$BIN" check-manifest >/dev/null 2>&1); then
   exit 1
 fi
 
-printf '%s\n' '{"schema-version":1,"targets":[{"name":"target","entry":"src/main.elisa"}],"package":{"name":"good","version":"1.0.0"},"dependencies":{}}' > "$BAD/elisapkg.json"
+printf '%s\n' '{"schema-version":1,"targets":[{"name":"target","kind":"bin","entry":"src/main.elisa"}],"package":{"name":"good","version":"1.0.0"},"dependencies":{}}' > "$BAD/elisapkg.json"
 (cd "$BAD" && "$BIN" check-manifest >/dev/null)
-printf '%s\n' '{"schema-version":1,"package":{"name":"good","version":"1.0.0"},"targets":[{"name":"target","entry":"src/main.elisa"}],"dependencies":{"foo":{"version":"^1.0.0","registry":"primary"}}}' > "$BAD/elisapkg.json"
+printf '%s\n' '{"schema-version":1,"package":{"name":"good","version":"1.0.0"},"targets":[{"name":"target","kind":"plugin","entry":"src/main.elisa"}],"dependencies":{}}' > "$BAD/elisapkg.json"
+if (cd "$BAD" && "$BIN" check-manifest >/dev/null 2>&1); then
+  echo "unsupported target kind was accepted" >&2
+  exit 1
+fi
+printf '%s\n' '{"schema-version":1,"package":{"name":"good","version":"1.0.0"},"targets":[{"name":"target","kind":"bin","entry":"src/main.elisa"}],"dependencies":{"foo":{"version":"^1.0.0","registry":"primary"}}}' > "$BAD/elisapkg.json"
 (cd "$BAD" && "$BIN" check-manifest >/dev/null)
-printf '%s\n' '{"schema-version":1,"package":{"name":"good","version":"1.0.0"},"targets":[{"name":"target","entry":"src/main.elisa"}],"dependencies":{"foo":{"version":"1.01.0","registry":"primary"}}}' > "$BAD/elisapkg.json"
+printf '%s\n' '{"schema-version":1,"package":{"name":"good","version":"1.0.0"},"targets":[{"name":"target","kind":"bin","entry":"src/main.elisa"}],"dependencies":{"foo":{"version":"1.01.0","registry":"primary"}}}' > "$BAD/elisapkg.json"
 if (cd "$BAD" && "$BIN" check-manifest >/dev/null 2>&1); then
   echo "invalid dependency requirement was accepted" >&2
   exit 1
 fi
-printf '%s\n' '{"schema-version":1,"package":{"name":"good","version":"1.0.0"},"targets":[{"name":"target","entry":"src/main.elisa"}],"dependencies":{"foo":{"path":"local","registry":"primary","version":"^1.0.0"}}}' > "$BAD/elisapkg.json"
+printf '%s\n' '{"schema-version":1,"package":{"name":"good","version":"1.0.0"},"targets":[{"name":"target","kind":"bin","entry":"src/main.elisa"}],"dependencies":{"foo":{"path":"local","registry":"primary","version":"^1.0.0"}}}' > "$BAD/elisapkg.json"
 if (cd "$BAD" && "$BIN" check-manifest >/dev/null 2>&1); then
   echo "dependency with contradictory sources was accepted" >&2
   exit 1
 fi
-printf '%s\n' '{"schema-version":1,"package":{"name":"good","version":"1.0.0"},"targets":[{"name":"target","entry":"src/main.elisa"}],"dependencies":{"foo":{"version":"^1.0.0","registry":"primary"},"foo":{"version":"^1.0.0","registry":"primary"}}}' > "$BAD/elisapkg.json"
+printf '%s\n' '{"schema-version":1,"package":{"name":"good","version":"1.0.0"},"targets":[{"name":"target","kind":"bin","entry":"src/main.elisa"}],"dependencies":{"foo":{"version":"^1.0.0","registry":"primary"},"foo":{"version":"^1.0.0","registry":"primary"}}}' > "$BAD/elisapkg.json"
 if (cd "$BAD" && "$BIN" check-manifest >/dev/null 2>&1); then
   echo "duplicate dependency alias was accepted" >&2
   exit 1
 fi
-printf '%s\n' '{"schema-version":1,"package":{"name":"good","version":"1.0.0"},"targets":[{"name":"target","entry":"../outside.elisa"}],"dependencies":{}}' > "$BAD/elisapkg.json"
+printf '%s\n' '{"schema-version":1,"package":{"name":"good","version":"1.0.0"},"targets":[{"name":"target","kind":"bin","entry":"../outside.elisa"}],"dependencies":{}}' > "$BAD/elisapkg.json"
 if (cd "$BAD" && "$BIN" check-manifest >/dev/null 2>&1); then
   echo "traversal target entry was accepted" >&2
   exit 1
 fi
-printf '%s\n' '{"schema-version":1,"package":{"name":"good","version":"1.0.0"},"targets":[{"name":"target","entry":"src/main.elisa"}],"dependencies":{}}' > "$BAD/elisapkg.json"
+printf '%s\n' '{"schema-version":1,"package":{"name":"good","version":"1.0.0"},"targets":[{"name":"target","kind":"bin","entry":"src/main.elisa"}],"dependencies":{}}' > "$BAD/elisapkg.json"
 cp "$BAD/elisapkg.json" "$BAD/manifest.json"
 if (cd "$BAD" && "$BIN" check-manifest >/dev/null 2>&1); then
   echo "ambiguous manifest pair was accepted" >&2
