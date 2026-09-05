@@ -1875,10 +1875,13 @@ def run_clean() -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.P
     state: mutable darray[u8] = []
     build_dir: mutable darray[u8] = []
     artifact: mutable darray[u8] = []
+    receipt: mutable darray[u8] = []
     path_join_into(root, ".elisapkg", &state)
     path_join_into(state, "build", &build_dir)
     path_join_into(build_dir, "app", &artifact)
+    path_join_into(build_dir, "receipt", &receipt)
     return EXIT_BUILD if not remove_known_file(&artifact)
+    return EXIT_BUILD if not remove_known_file(&receipt)
     return EXIT_BUILD if not remove_empty_directory(&build_dir)
     # `.elisapkg` is removed only when it is empty; cache/state files are never
     # traversed or recursively deleted by clean.
@@ -1951,8 +1954,18 @@ def run_build(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Con
     if options.locked or options.frozen:
         lock_status: i64 = run_resolve(start, options)
         return lock_status if lock_status != EXIT_OK
+    target_source: mutable darray[u8] = []
+    return EXIT_BUILD if not read_file_into(&target_entry, &target_source)
+    source_digest_bytes: mutable darray[u8] = []
+    source_digest: mutable darray[u8] = []
+    return EXIT_BUILD if Integrity::sha256(target_source, &source_digest_bytes) != Integrity::DigestCode.Ok
+    return EXIT_BUILD if not Integrity::hex_digest(source_digest_bytes, &source_digest)
     build_dir: mutable darray[u8] = []
+    artifact: mutable darray[u8] = []
+    receipt_path: mutable darray[u8] = []
     path_join_into(start, ".elisapkg/build", &build_dir)
+    path_join_into(build_dir, "app", &artifact)
+    path_join_into(build_dir, "receipt", &receipt_path)
     _ = make_directory(&build_dir)
     compiler: mutable cstr = "elisac-stage1"
     if Platform::pkg_getenv("ELISAPKG_COMPILER") is configured:
@@ -1969,6 +1982,47 @@ def run_build(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Con
         runtime_obj <- configured_runtime.cast[cstr]
     if Platform::pkg_getenv("ELISA_ALLOW_STALE_STAGE1") is configured_stale:
         allow_stale <- configured_stale.cast[cstr]
+    receipt: mutable darray[u8] = []
+    bytes_push_view(&receipt, "elisapkg-build-receipt:1\nentry:")
+    bytes_push_array(&receipt, target_entry)
+    bytes_push_view(&receipt, "\nsource-digest:sha256:")
+    bytes_push_array(&receipt, source_digest)
+    bytes_push_view(&receipt, "\ncompiler:")
+    bytes_push_cstr(&receipt, compiler)
+    bytes_push_view(&receipt, "\nstage1-bin:")
+    bytes_push_cstr(&receipt, stage1_bin)
+    bytes_push_view(&receipt, "\nruntime-object:")
+    bytes_push_cstr(&receipt, runtime_obj)
+    bytes_push_view(&receipt, "\nallow-stale:")
+    bytes_push_cstr(&receipt, allow_stale)
+    bytes_push_view(&receipt, "\nsemantic-gate:1\n")
+    artifact_c: mutable darray[u8] = []
+    receipt_c: mutable darray[u8] = []
+    path_with_nul_into(&artifact, &artifact_c)
+    path_with_nul_into(&receipt_path, &receipt_c)
+    artifact_name: cstr = (&artifact_c[0]).cast[cstr] can Unsafe.PointerCast
+    receipt_name: cstr = (&receipt_c[0]).cast[cstr] can Unsafe.PointerCast
+    if file_exists(&artifact) and file_exists(&receipt_path):
+        existing_receipt: mutable darray[u8] = []
+        existing_receipt.resize(4096)
+        if read_cstr_into(receipt_name, &existing_receipt) and bytes_equal(existing_receipt, receipt):
+            write_ok("built .elisapkg/build/app (cached)\n")
+            return EXIT_OK
+    # mkstemp keeps the compiler output path exclusive for the whole child
+    # process, preventing a predictable temporary symlink from redirecting the
+    # output. The final rename is the only point at which app becomes visible.
+    temp_template: mutable darray[u8] = []
+    for index in 0..<build_dir.count |temp_template, build_dir|:
+        temp_template.push(build_dir[index])
+    if temp_template.count == 0.usize() or temp_template[temp_template.count - 1.usize()] != 47:
+        temp_template.push(47)
+    bytes_push_view(&temp_template, "app.tmp.XXXXXX")
+    temp_template.push(0)
+    temp_raw: mutable u8& = (&temp_template[0]).cast[mutable u8&] can Unsafe.PointerCast
+    temp_fd: i64 = Platform::pkg_mkstemp(temp_raw)
+    return EXIT_BUILD if temp_fd < 0
+    _ = Platform::pkg_close(temp_fd)
+    temp_name: cstr = (&temp_template[0]).cast[cstr] can Unsafe.PointerCast
     # An explicit compiler is required for reproducible builds. PATH lookup is
     # delegated to execvp only after the user has selected the executable.
     stage1_env: mutable darray[u8] = []
@@ -1998,7 +2052,7 @@ def run_build(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Con
     args.push("-emit")
     args.push("exe")
     args.push("-o")
-    args.push(".elisapkg/build/app")
+    args.push(temp_name)
     args.push(target_entry_name)
     args.push(null)
     child_argv: mutable cstr&& = (&args[0]).cast[mutable cstr&&] can Unsafe.PointerCast
@@ -2006,10 +2060,18 @@ def run_build(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Con
     if pid == 0:
         _ = Platform::pkg_execvp("/usr/bin/env", child_argv)
         Platform::pkg_process_exit(127)
-    return EXIT_BUILD if pid < 0
+    if pid < 0:
+        _ = Platform::pkg_unlink(temp_name)
+        return EXIT_BUILD
     status: mutable i64 = 0
     waited: i64 = Platform::pkg_waitpid(pid, &status, 0)
-    return EXIT_BUILD if waited < 0 or status != 0
+    if waited < 0 or status != 0:
+        _ = Platform::pkg_unlink(temp_name)
+        return EXIT_BUILD
+    if Platform::pkg_rename(temp_name, artifact_name) != 0:
+        _ = Platform::pkg_unlink(temp_name)
+        return EXIT_BUILD
+    return EXIT_BUILD if not write_cstr_file(receipt_name, &receipt)
     write_ok("built .elisapkg/build/app\n")
     _ = options
     return EXIT_OK

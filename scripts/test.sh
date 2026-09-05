@@ -146,6 +146,7 @@ mkdir -p "$CASE"
   else
     test "$?" -eq 6
   fi
+  test -x .elisapkg/build/app
   mv src/main.elisa.good src/main.elisa
   "$BIN" run -- >/dev/null
   "$BIN" package --list >/dev/null
