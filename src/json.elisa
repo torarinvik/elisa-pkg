@@ -38,13 +38,14 @@ module Json:
         def unique_object_keys(raw: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
             object_ids: mutable darray[usize] = []
             seen_object_ids: mutable darray[usize] = []
+            seen_hashes: mutable darray[u32] = []
             seen_starts: mutable darray[usize] = []
             seen_ends: mutable darray[usize] = []
             next_object_id: mutable usize = 0.usize()
             in_string: mutable bool = false
             escaped: mutable bool = false
             string_start: mutable usize = 0.usize()
-            for index in 0..<raw.count |raw, object_ids, seen_object_ids, seen_starts, seen_ends, next_object_id, in_string, escaped, string_start|:
+            for index in 0..<raw.count |raw, object_ids, seen_object_ids, seen_hashes, seen_starts, seen_ends, next_object_id, in_string, escaped, string_start|:
                 byte: u8 = raw[index]
                 if in_string:
                     if escaped:
@@ -57,9 +58,10 @@ module Json:
                             after <- after + 1.usize()
                         if after < raw.count and raw[after] == 58 and object_ids.count > 0.usize():
                             current_id: usize = object_ids[object_ids.count - 1.usize()]
-                            return false if duplicate_key(raw, string_start, index, current_id, seen_object_ids, seen_starts, seen_ends)
-                            return false if seen_object_ids.count >= 65536.usize()
+                            return false if duplicate_key(raw, string_start, index, current_id, seen_object_ids, seen_hashes, seen_starts, seen_ends)
+                            return false if seen_object_ids.count >= 4096.usize()
                             seen_object_ids.push(current_id)
+                            seen_hashes.push(key_hash(raw, string_start, index))
                             seen_starts.push(string_start)
                             seen_ends.push(index)
                         in_string <- false
@@ -68,7 +70,7 @@ module Json:
                     in_string <- true
                     string_start <- index + 1.usize()
                 elif byte == 123:
-                    return false if object_ids.count >= 65536.usize()
+                    return false if object_ids.count >= 4096.usize()
                     object_ids.push(next_object_id)
                     next_object_id <- next_object_id + 1.usize()
                 elif byte == 125:
@@ -81,13 +83,21 @@ module Json:
         def is_continuation(byte: u8) -> bool:
             return byte >= 128 and byte <= 191
 
+        def key_hash(raw: darray[u8]&, start: usize, end: usize) -> u32:
+            hash: mutable u32 = 2166136261.u32()
+            for index in start..<end |raw, hash|:
+                hash <- (hash ^ raw[index].u32()) * 16777619.u32()
+            return hash
+
         def is_space(byte: u8) -> bool:
             return byte == 32 or byte == 9 or byte == 10 or byte == 13
 
-        def duplicate_key(raw: darray[u8]&, start: usize, end: usize, object_id: usize, seen_object_ids: darray[usize]&, seen_starts: darray[usize]&, seen_ends: darray[usize]&) -> bool:
+        def duplicate_key(raw: darray[u8]&, start: usize, end: usize, object_id: usize, seen_object_ids: darray[usize]&, seen_hashes: darray[u32]&, seen_starts: darray[usize]&, seen_ends: darray[usize]&) -> bool:
             return false if end < start
-            for item in 0..<seen_object_ids.count |raw, seen_object_ids, seen_starts, seen_ends, start, end, object_id|:
+            current_hash: u32 = key_hash(raw, start, end)
+            for item in 0..<seen_object_ids.count |raw, seen_object_ids, seen_hashes, seen_starts, seen_ends, start, end, object_id, current_hash|:
                 continue if seen_object_ids[item] != object_id
+                continue if seen_hashes[item] != current_hash
                 prior_start: usize = seen_starts[item]
                 prior_end: usize = seen_ends[item]
                 continue if prior_end - prior_start != end - start
