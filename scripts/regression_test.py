@@ -27,7 +27,9 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
              f'include "{ROOT}/src/solver.elisa"', 'def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:']
     lines.extend([
         '    platform_buffer: mutable darray[u8] = []',
-        '    platform_buffer.resize(128)',
+        '    platform_size: i64 = Platform::pkg_package_file_size("src/main.elisa")',
+        '    return 803 if platform_size <= 0 or platform_size > 1048576',
+        '    platform_buffer.resize(platform_size.usize() + 1.usize())',
         '    platform_raw: mutable u8& = (&platform_buffer[0]).cast[mutable u8&] can Unsafe.PointerCast',
         '    return 800 if Platform::pkg_is_directory(".") != 1',
         '    return 801 if Platform::pkg_is_directory("src") != 1',

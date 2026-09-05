@@ -10,6 +10,7 @@ if [[ -n "${ELISA_COMPILER_ROOT:-}" ]]; then
   export ELISAPKG_COMPILER="${ELISAPKG_COMPILER:-$ELISA_COMPILER_ROOT/scripts/elisac_stage1.sh}"
   export ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_COMPILER_ROOT/build/runtime/elisacore_runtime.o}"
 fi
+export ELISA_ALLOW_STALE_STAGE1="${ELISA_ALLOW_STALE_STAGE1:-0}"
 "$BIN" --version | grep -F 'elisapkg 0.1.0' >/dev/null
 "$BIN" doctor | grep -F 'remote metadata signatures: unavailable' >/dev/null
 

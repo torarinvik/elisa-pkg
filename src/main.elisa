@@ -182,7 +182,9 @@ def read_package_file_into(path: darray[u8]&, out: mutable darray[u8]&) -> bool 
     path_c: mutable darray[u8] = []
     path_with_nul_into(path, &path_c)
     path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
-    out.resize(67108865)
+    file_size: i64 = Platform::pkg_package_file_size(path_name)
+    return false if file_size < 0 or file_size > 67108864
+    out.resize(file_size.usize() + 1.usize())
     out_raw: mutable u8& = (&out[0]).cast[mutable u8&] can Unsafe.PointerCast
     read_size: i64 = Platform::pkg_read_package_file(path_name, out_raw, out.count)
     return false if read_size < 0
@@ -337,7 +339,7 @@ def remove_empty_directory(path: darray[u8]&) -> bool can[Memory.Allocate, Abort
     path_c: mutable darray[u8] = []
     path_with_nul_into(path, &path_c)
     path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
-    return true if Platform::pkg_access(path_name, 0) != 0
+    return true if Platform::pkg_is_directory(path_name) != 1
     return Platform::pkg_rmdir(path_name) == 0
 
 def remove_cstr_file(path_name: cstr) -> bool:
@@ -2295,8 +2297,9 @@ def run_clean() -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.P
     return EXIT_BUILD if not remove_known_file(&package_receipt)
     return EXIT_BUILD if not remove_empty_directory(&build_dir)
     # `.elisapkg` is removed only when it is empty; cache/state files are never
-    # traversed or recursively deleted by clean.
-    return EXIT_BUILD if not remove_empty_directory(&state)
+    # traversed or recursively deleted by clean. A retained cache makes this
+    # directory intentionally non-empty, which is a successful clean result.
+    _ = remove_empty_directory(&state)
     write_ok("cleaned known .elisapkg outputs\n")
     return EXIT_OK
 
@@ -2461,8 +2464,10 @@ def package_archive_bytes(raw: darray[u8]&, target: darray[u8]&, out: mutable da
         content: mutable darray[u8] = []
         entry_c: mutable darray[u8] = []
         path_with_nul_into(entry, &entry_c)
-        content.resize(67108865)
         entry_name: cstr = (&entry_c[0]).cast[cstr] can Unsafe.PointerCast
+        entry_size: i64 = Platform::pkg_package_file_size(entry_name)
+        return false if entry_size < 0 or entry_size > 67108864
+        content.resize(entry_size.usize() + 1.usize())
         content_raw: mutable u8& = (&content[0]).cast[mutable u8&] can Unsafe.PointerCast
         read_size: i64 = Platform::pkg_read_package_file(entry_name, content_raw, content.count)
         return false if read_size < 0
@@ -2538,9 +2543,11 @@ def run_package(argc: i64, slots: mutable cstr&&, start: darray[u8]&) -> i64 can
     path_with_nul_into(&archive_path, &archive_c)
     archive_name: cstr = (&archive_c[0]).cast[cstr] can Unsafe.PointerCast
     return 7 if not write_cstr_file(archive_name, &archive)
+    persisted_archive: mutable darray[u8] = []
+    return 7 if not read_package_file_into(&archive_path, &persisted_archive)
     digest_bytes: mutable darray[u8] = []
     digest: mutable darray[u8] = []
-    return 7 if Integrity::sha256(archive, &digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(digest_bytes, &digest)
+    return 7 if Integrity::sha256(persisted_archive, &digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(digest_bytes, &digest)
     blob_path: mutable darray[u8] = []
     return 7 if not Cache::blob_path(digest, &blob_path)
     cache_parent: mutable darray[u8] = []
@@ -2625,11 +2632,13 @@ def run_build(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Con
     return EXIT_BUILD if Integrity::sha256(lock_raw, &lock_digest_bytes) != Integrity::DigestCode.Ok
     return EXIT_BUILD if not Integrity::hex_digest(lock_digest_bytes, &lock_digest)
     target_source: mutable darray[u8] = []
-    target_source.resize(67108865)
+    target_source_size: i64 = Platform::pkg_package_file_size(target_entry_raw)
+    return EXIT_BUILD if target_source_size < 0 or target_source_size > 67108864
+    target_source.resize(target_source_size.usize() + 1.usize())
     target_source_raw: mutable u8& = (&target_source[0]).cast[mutable u8&] can Unsafe.PointerCast
-    target_source_size: i64 = Platform::pkg_read_package_file(target_entry_raw, target_source_raw, target_source.count)
-    return EXIT_BUILD if target_source_size < 0
-    target_source.resize(target_source_size.usize())
+    target_source_read: i64 = Platform::pkg_read_package_file(target_entry_raw, target_source_raw, target_source.count)
+    return EXIT_BUILD if target_source_read < 0 or target_source_read != target_source_size
+    target_source.resize(target_source_read.usize())
     source_digest_bytes: mutable darray[u8] = []
     source_digest: mutable darray[u8] = []
     return EXIT_BUILD if Integrity::sha256(target_source, &source_digest_bytes) != Integrity::DigestCode.Ok
@@ -2664,7 +2673,6 @@ def run_build(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Con
         bytes_push_view(&compiler_identity, "none")
     else:
         compiler_content: mutable darray[u8] = []
-        compiler_content.resize(67108865)
         compiler_path: mutable darray[u8] = []
         bytes_push_cstr(&compiler_path, compiler)
         if not read_package_file_into(&compiler_path, &compiler_content):
@@ -2684,7 +2692,6 @@ def run_build(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Con
         bytes_push_view(&stage1_identity, "none")
     else:
         stage1_content: mutable darray[u8] = []
-        stage1_content.resize(67108865)
         stage1_path: mutable darray[u8] = []
         bytes_push_cstr(&stage1_path, stage1_bin)
         if not read_package_file_into(&stage1_path, &stage1_content):
@@ -2704,7 +2711,6 @@ def run_build(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Con
         bytes_push_view(&runtime_identity, "none")
     else:
         runtime_content: mutable darray[u8] = []
-        runtime_content.resize(67108865)
         runtime_path: mutable darray[u8] = []
         bytes_push_cstr(&runtime_path, runtime_obj)
         if not read_package_file_into(&runtime_path, &runtime_content):

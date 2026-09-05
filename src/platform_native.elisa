@@ -12,6 +12,8 @@ extern native_openat(directory: i64, path: cstr, flags: i64, ...) -> i64
 extern native_mkdirat(directory: i64, path: cstr, mode: i64) -> i64
 @link_name("unlinkat")
 extern native_unlinkat(directory: i64, path: cstr, flags: i64) -> i64
+@link_name("rmdir")
+extern native_rmdir(path: cstr) -> i64
 @link_name("renameat")
 extern native_renameat(old_directory: i64, old_path: cstr, new_directory: i64, new_path: cstr) -> i64
 @link_name("linkat")
@@ -49,7 +51,7 @@ extern native_free(value: void&)
 @link_name("getpid")
 extern native_getpid() -> i64
 @link_name("__error")
-extern native_errno() -> mutable i64&
+extern native_errno() -> mutable i32&
 @link_name("fopen")
 extern native_fopen(path: cstr, mode: cstr) -> mutable heap void&?
 @link_name("fdopen")
@@ -211,7 +213,7 @@ module PlatformNative:
             directory: i64 = open_directory_path(parent_name)
             return directory if directory < 0
             result: i64 = native_mkdirat(directory, leaf_name, mode.i64())
-            errno_value: i64 = native_errno()
+            errno_value: i64 = current_errno()
             _ = native_close(directory)
             return 0 if result == 0 else -errno_value
 
@@ -224,13 +226,18 @@ module PlatformNative:
                 stat.resize(144)
                 raw: mutable void& = (&stat[0]).cast[mutable void&] can Unsafe.PointerCast
                 if native_fstat(fd, raw) != 0:
-                    errno_value: i64 = native_errno()
+                    errno_value: i64 = current_errno()
                     _ = native_close(fd)
                     return -errno_value
                 mode_bits: u64 = read_u16(stat, 4)
+                if (mode_bits & 61440.u64()) != regular_mode:
+                    _ = native_close(fd)
+                    return -21
+                if (mode_bits & 73.u64()) == 0:
+                    _ = native_close(fd)
+                    return -13
                 _ = native_close(fd)
-                return -21 if (mode_bits & 61440.u64()) != regular_mode
-                return -13 if (mode_bits & 73.u64()) == 0
+                return 0
             _ = native_close(fd)
             return 0
 
@@ -243,12 +250,12 @@ module PlatformNative:
             directory: i64 = open_directory_path(parent_name)
             return directory if directory < 0
             fd: i64 = native_openat(directory, leaf_name, flags_read_no_follow())
-            open_error: i64 = native_errno()
+            open_error: i64 = current_errno()
             if fd < 0:
                 _ = native_close(directory)
                 return -open_error
             result: i64 = native_fchmod(fd, mode.i64())
-            errno_value: i64 = native_errno()
+            errno_value: i64 = current_errno()
             _ = native_close(fd)
             _ = native_close(directory)
             return 0 if result == 0 else -errno_value
@@ -257,19 +264,19 @@ module PlatformNative:
             return unlink_kind(path, 0)
 
         def rmdir(path: cstr) -> i64:
-            return unlink_kind(path, 2)
+            return rmdir_secure(path)
 
         def link(old_path: cstr, new_path: cstr) -> i64:
             return link_or_rename(old_path, new_path, false)
 
         def rename(old_path: cstr, new_path: cstr) -> i64:
-            return link_or_rename(old_path, new_path, true)
+            return rename_secure(old_path, new_path)
 
         def chdir(path: cstr) -> i64:
             directory: i64 = open_directory_path(path)
             return directory if directory < 0
             result: i64 = native_fchdir(directory)
-            errno_value: i64 = native_errno()
+            errno_value: i64 = current_errno()
             _ = native_close(directory)
             return 0 if result == 0 else -errno_value
 
@@ -348,7 +355,7 @@ module PlatformNative:
                         template_path[start + index] <- leaf[index]
                     _ = native_close(directory)
                     return fd
-                return negative_errno() if native_errno() != 17
+                return negative_errno() if current_errno() != 17
             _ = native_close(directory)
             return -17
 
@@ -396,14 +403,14 @@ module PlatformNative:
                 if waited == pid:
                     return 0
                 if waited < 0:
-                    continue if native_errno() == 4
+                    continue if current_errno() == 4
                     return negative_errno()
                 now: i64 = monotonic_milliseconds()
                 return -5 if now < 0
                 if now >= deadline:
                     _ = native_kill(-pid, 9)
                     _ = native_kill(pid, 9)
-                    while native_waitpid(pid, status, 0) < 0 and native_errno() == 4 |pid, status|:
+                    while native_waitpid(pid, status, 0) < 0 and current_errno() == 4 |pid, status|:
                         _ = 0
                     return -110
                 pause: mutable darray[u8] = timespec_bytes(0, 10000000)
@@ -458,6 +465,68 @@ module PlatformNative:
             return native_fwrite(buffer, size, count, stream)
 
     private:
+        def rmdir_secure(path: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            parent: mutable darray[u8] = []
+            leaf: mutable darray[u8] = []
+            return -22 if not split_parent_leaf(path, &parent, &leaf)
+            parent_name: cstr = (&parent[0]).cast[cstr] can Unsafe.PointerCast
+            leaf_name: cstr = (&leaf[0]).cast[cstr] can Unsafe.PointerCast
+            parent_directory: i64 = open_directory_path(parent_name)
+            return parent_directory if parent_directory < 0
+            original_directory: i64 = native_open(".", flags_directory())
+            if original_directory < 0:
+                errno_value: i64 = error_code()
+                _ = native_close(parent_directory)
+                return -errno_value
+            changed: i64 = native_fchdir(parent_directory)
+            if changed != 0:
+                errno_value: i64 = error_code()
+                _ = native_close(parent_directory)
+                _ = native_close(original_directory)
+                return -errno_value
+            removed: i64 = native_rmdir(leaf_name)
+            remove_errno: i64 = error_code()
+            restored: i64 = native_fchdir(original_directory)
+            restore_errno: i64 = error_code()
+            _ = native_close(parent_directory)
+            _ = native_close(original_directory)
+            return 0 if removed == 0 and restored == 0
+            return -remove_errno if removed != 0 else -restore_errno
+
+        def rename_secure(old_path: cstr, new_path: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            old_parent: mutable darray[u8] = []
+            old_leaf: mutable darray[u8] = []
+            new_parent: mutable darray[u8] = []
+            new_leaf: mutable darray[u8] = []
+            return -22 if not split_parent_leaf(old_path, &old_parent, &old_leaf) or not split_parent_leaf(new_path, &new_parent, &new_leaf)
+            old_name: cstr = (&old_parent[0]).cast[cstr] can Unsafe.PointerCast
+            old_leaf_name: cstr = (&old_leaf[0]).cast[cstr] can Unsafe.PointerCast
+            new_name: cstr = (&new_parent[0]).cast[cstr] can Unsafe.PointerCast
+            new_leaf_name: cstr = (&new_leaf[0]).cast[cstr] can Unsafe.PointerCast
+            old_directory: i64 = open_directory_path(old_name)
+            return old_directory if old_directory < 0
+            new_directory: i64 = open_directory_path(new_name)
+            return close_two_error(old_directory, new_directory, new_directory) if new_directory < 0
+            source_fd: i64 = native_openat(old_directory, old_leaf_name, flags_read_no_follow())
+            source_errno: i64 = current_errno()
+            return close_two_error(old_directory, new_directory, -source_errno) if source_fd < 0
+            source_regular: bool = regular_fd(source_fd)
+            _ = native_close(source_fd)
+            return close_two_error(old_directory, new_directory, -21) if not source_regular
+            destination_fd: i64 = native_openat(new_directory, new_leaf_name, flags_read_no_follow())
+            destination_errno: i64 = error_code()
+            if destination_fd >= 0:
+                destination_regular: bool = regular_fd(destination_fd)
+                _ = native_close(destination_fd)
+                return close_two_error(old_directory, new_directory, -21) if not destination_regular
+            if destination_fd < 0 and destination_errno != 2:
+                return close_two_error(old_directory, new_directory, -destination_errno)
+            result: i64 = native_renameat(old_directory, old_leaf_name, new_directory, new_leaf_name)
+            result_errno: i64 = error_code()
+            _ = native_close(old_directory)
+            _ = native_close(new_directory)
+            return 0 if result == 0 else -result_errno
+
         def directory_empty(directory: i64) -> bool can[Unsafe.PointerCast]:
             duplicate: i64 = native_dup(directory)
             return false if duplicate < 0
@@ -571,8 +640,8 @@ module PlatformNative:
                 copy_out[finish] <- 0
                 part: cstr = (&copy_out[start]).cast[cstr] can Unsafe.PointerCast
                 next: mutable i64 = native_openat(directory, part, flags_directory() + flag_no_follow)
-                if next < 0 and native_errno() == 2:
-                    if native_mkdirat(directory, part, 493) != 0 and native_errno() != 17:
+                if next < 0 and current_errno() == 2:
+                    if native_mkdirat(directory, part, 493) != 0 and current_errno() != 17:
                         return close_error(directory, negative_errno())
                     next <- native_openat(directory, part, flags_directory() + flag_no_follow)
                 return close_error(directory, negative_errno()) if next < 0
@@ -635,12 +704,15 @@ module PlatformNative:
             return flag_write_only + flag_create + flag_exclusive + flag_no_follow + flag_close_on_exec
 
         def error_code() -> i64:
-            value: i64 = native_errno()
+            value: i64 = current_errno()
             return value if value > 0 else 5
 
         def negative_errno() -> i64:
-            value: i64 = native_errno()
+            value: i64 = current_errno()
             return -value if value > 0 else -5
+
+        def current_errno() -> i64:
+            return native_errno()[0].i64()
 
         def cstr_equal(left: cstr, right: cstr) -> bool:
             left_length: usize = native_strlen(left)
@@ -723,7 +795,13 @@ module PlatformNative:
                 had_slash: bool = finish < length
                 path_copy[finish] <- 0
                 part: cstr = (&path_copy[start]).cast[cstr] can Unsafe.PointerCast
-                return close_error(directory, -22) if cstr_equal(part, "") or cstr_equal(part, "..")
+                # Package manifests may intentionally reference a local
+                # dependency outside the current project (for example,
+                # "../shared"), so this resolver accepts parent components.
+                # Every component is still opened descriptor-relatively with
+                # no-follow semantics; callers validate the resulting path
+                # against their package-root policy before using it.
+                return close_error(directory, -22) if cstr_equal(part, "")
                 flags: i64 = flags_file_read() + (flag_directory if had_slash else 0)
                 next: i64 = native_openat(directory, part, flags)
                 return close_error(directory, -error_code()) if next < 0
@@ -774,24 +852,29 @@ module PlatformNative:
             return old_directory if old_directory < 0
             new_directory: i64 = open_directory_path(new_name)
             return close_two_error(old_directory, new_directory, new_directory) if new_directory < 0
-            old_stat: mutable darray[u8] = []
-            return close_two_error(old_directory, new_directory, -5) if stat_mode(old_directory, old_leaf_name, &old_stat) != 0
-            old_mode: u64 = read_u16(old_stat, 4)
-            return close_two_error(old_directory, new_directory, -22) if (old_mode & 61440.u64()) != regular_mode
+            source_fd: i64 = native_openat(old_directory, old_leaf_name, flags_read_no_follow())
+            source_errno: i64 = current_errno()
+            return close_two_error(old_directory, new_directory, -source_errno) if source_fd < 0
+            source_regular: bool = regular_fd(source_fd)
+            _ = native_close(source_fd)
+            return close_two_error(old_directory, new_directory, -21) if not source_regular
             new_stat: mutable darray[u8] = []
-            new_result: i64 = stat_mode(new_directory, new_leaf_name, &new_stat)
+            new_stat.resize(144)
+            new_stat_raw: mutable void& = (&new_stat[0]).cast[mutable void&] can Unsafe.PointerCast
+            new_result: i64 = native_fstatat(new_directory, new_leaf_name, new_stat_raw, at_no_follow)
+            new_errno: i64 = error_code()
             result: mutable i64 = 0
             if is_move:
                 if new_result == 0:
                     new_mode: u64 = read_u16(new_stat, 4)
                     return close_two_error(old_directory, new_directory, -40) if (new_mode & 61440.u64()) == symlink_mode
                     return close_two_error(old_directory, new_directory, -21) if (new_mode & 61440.u64()) != regular_mode
-                elif new_result != -2:
-                    return close_two_error(old_directory, new_directory, new_result)
+                if new_result != 0 and new_errno != 2:
+                    return close_two_error(old_directory, new_directory, -new_errno)
                 result <- native_renameat(old_directory, old_leaf_name, new_directory, new_leaf_name)
             else:
                 return close_two_error(old_directory, new_directory, -17) if new_result == 0
-                return close_two_error(old_directory, new_directory, new_result) if new_result != -2
+                return close_two_error(old_directory, new_directory, -new_errno) if new_result != 0 and new_errno != 2
                 result <- native_linkat(old_directory, old_leaf_name, new_directory, new_leaf_name, 0)
             errno_value: i64 = error_code()
             _ = native_close(old_directory)
@@ -860,7 +943,7 @@ module PlatformNative:
                         raw: mutable u8& = record.cast[mutable u8&] can Unsafe.PointerCast
                         name_length: usize = raw[18].usize() + raw[19].usize() * 256.usize()
                         continue if name_length == 0 or name_length > 255.usize()
-                        continue if (raw[20] == 4) or (raw[20] == 8 and forbidden_file_name(raw, 21, name_length))
+                        continue if raw[20] == 8 and forbidden_file_name(raw, 21, name_length)
                         continue if name_is_dot(raw, 21, name_length)
                         child: mutable darray[u8] = []
                         if not cstr_equal(path, "."):
@@ -873,17 +956,20 @@ module PlatformNative:
                         child_name: cstr = (&child[0]).cast[cstr] can Unsafe.PointerCast
                         child_length: usize = path_length(child_name)
                         return false if child_length == 0 or child_length > 4096.usize()
-                        if raw[20] == 4:
+                        directory_probe: i64 = open_directory_path(child_name)
+                        if directory_probe >= 0:
+                            _ = native_close(directory_probe)
                             continue if skip_directory(child_name)
-                            continue if not collect_directory(child_name, out, depth + 1.usize())
-                        elif raw[20] == 8:
+                            return false if not collect_directory(child_name, out, depth + 1.usize())
+                        else:
+                            file_probe: i64 = open_package_file(child_name)
+                            continue if file_probe < 0
+                            _ = native_close(file_probe)
                             continue if skip_file(child_name)
                             return false if out.count + child_length + 1.usize() > 16777216.usize()
                             for index in 0..<child_length |out, child_name|:
                                 out.push(child_name[index].u8())
                             out.push(0)
-                        else:
-                            break
                     else:
                         break
                 _ = native_closedir(stream)
@@ -908,7 +994,7 @@ module PlatformNative:
             return raw[offset] == 46 and length >= 4 and raw[offset + 1] == 101 and raw[offset + 2] == 110 and raw[offset + 3] == 118
 
         def skip_directory(path: cstr) -> bool:
-            return path_has_component(path, ".git") or path_has_component(path, ".hg") or path_has_component(path, ".svn") or path_has_component(path, ".elisapkg") or path_has_component(path, "build") or path_has_component(path, "target")
+            return path_has_component(path, ".git") or path_has_component(path, ".hg") or path_has_component(path, ".svn") or path_has_component(path, ".elisapkg") or path_has_component(path, ".env") or path_has_component(path, "build") or path_has_component(path, "target")
 
         def skip_file(path: cstr) -> bool:
             length: usize = native_strlen(path)
@@ -935,7 +1021,10 @@ module PlatformNative:
                 finish: mutable usize = start
                 while finish < length and path[finish].u8() != 47:
                     finish <- finish + 1.usize()
-                segment: cstr = (&path[start]).cast[cstr] can Unsafe.PointerCast
-                return true if finish - start == wanted_length and cstr_equal(segment, wanted)
+                if finish - start == wanted_length:
+                    matches: mutable bool = true
+                    for index in 0..<wanted_length |path, wanted, start, matches|:
+                        matches <- false if path[start + index].u8() != wanted[index].u8()
+                    return true if matches
                 start <- finish + 1.usize()
             return false
