@@ -295,4 +295,19 @@ if (cd "$BAD" && "$BIN" check-manifest >/dev/null 2>&1); then
   exit 1
 fi
 
+CYCLE="$ROOT/build/cycle-package-$$"
+mkdir -p "$CYCLE/a/src" "$CYCLE/b/src" "$CYCLE/src"
+printf '%s\n' 'def main() -> i64:' '    return 0' > "$CYCLE/src/main.elisa"
+cp "$CYCLE/src/main.elisa" "$CYCLE/a/src/main.elisa"
+cp "$CYCLE/src/main.elisa" "$CYCLE/b/src/main.elisa"
+printf '%s\n' '{"schema-version":1,"package":{"name":"a","version":"1.0.0"},"targets":[{"name":"a","kind":"lib","entry":"src/main.elisa"}],"dependencies":{"b":{"path":"../b"}}}' > "$CYCLE/a/elisapkg.json"
+printf '%s\n' '{"schema-version":1,"package":{"name":"b","version":"1.0.0"},"targets":[{"name":"b","kind":"lib","entry":"src/main.elisa"}],"dependencies":{"a":{"path":"../a"}}}' > "$CYCLE/b/elisapkg.json"
+printf '%s\n' '{"schema-version":1,"package":{"name":"root","version":"1.0.0"},"targets":[{"name":"root","kind":"bin","entry":"src/main.elisa"}],"dependencies":{"a":{"path":"a"}}}' > "$CYCLE/elisapkg.json"
+if (cd "$CYCLE" && "$BIN" resolve >/dev/null 2>&1); then
+  echo "dependency cycle was accepted" >&2
+  exit 1
+else
+  test "$?" -eq 3
+fi
+
 echo "elisapkg smoke tests passed"

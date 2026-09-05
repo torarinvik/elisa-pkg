@@ -23,6 +23,8 @@ unfinished transaction and removes the journal after a completed one.
 Registry entries will add the registry identity, exact version, immutable source descriptor, archive size and SHA-256 digest, authenticated metadata version, signer/delegation identity, and normalized dependency edges. Absolute paths, credentials, host-specific temporary locations, and mutable branch names do not belong in a published lockfile.
 
 Local path resolution walks reachable local dependencies transitively. Paths are normalized relative to the project root (`a/../b` is recorded as `b`), duplicate package names must resolve to the same path and version, and package records are sorted by canonical package name before serialization.
+The active parent chain is tracked separately from the queue, so a cycle is a
+resolution error while a shared diamond dependency remains valid.
 
 Each local record also carries `manifest-digest`, a SHA-256 digest of the exact
 validated manifest bytes. It detects manifest drift in frozen resolution; source
