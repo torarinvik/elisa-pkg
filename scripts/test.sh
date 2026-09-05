@@ -165,6 +165,14 @@ mkdir -p "$CASE"
   "$BIN" check-manifest >/dev/null
   cmp recovered.manifest elisapkg.json >/dev/null
   test ! -e .elisapkg/transaction.state
+  printf '%s\n' 'unrecognized-state' > .elisapkg/transaction.state
+  if "$BIN" check-manifest >/dev/null 2>&1; then
+    echo "unrecognized transaction state was accepted" >&2
+    exit 1
+  else
+    test "$?" -eq 5
+  fi
+  python3 -c 'import os; os.unlink(".elisapkg/transaction.state")'
 )
 
 BAD="$ROOT/build/invalid-package"
