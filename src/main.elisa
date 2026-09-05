@@ -1375,23 +1375,16 @@ def valid_dependency_object(raw: darray[u8]&, object_start: usize, object_end: u
     has_version: bool = object_has_direct_key(raw, object_start, object_end, version_key)
     has_git: bool = object_has_direct_key(raw, object_start, object_end, git_key)
     has_rev: bool = object_has_direct_key(raw, object_start, object_end, rev_key)
-    # Git sources are intentionally not accepted by the local resolver yet.
-    # Rejecting their fields avoids treating an ambiguous future declaration as
-    # a valid path or registry dependency.
-    return false if has_git or has_rev
+    # Git and registry sources are intentionally not accepted by the local
+    # resolver yet. Rejecting their fields avoids treating an unsupported
+    # remote declaration as a successfully resolved empty graph.
+    return false if has_git or has_rev or has_registry or has_version
     return false if has_path and (has_registry or has_version)
     if has_path:
         path: mutable darray[u8] = []
         return false if not object_string_value(raw, object_start, object_end, "path", &path)
         return valid_dependency_path(path)
-    return false if not has_registry or not has_version
-    registry: mutable darray[u8] = []
-    return false if not object_string_value(raw, object_start, object_end, "registry", &registry)
-    return false if registry.count == 0.usize() or registry.count > 128.usize()
-    requirement: mutable darray[u8] = []
-    return false if not object_string_value(raw, object_start, object_end, "version", &requirement)
-    parsed: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
-    return SemVer::parse_requirement(requirement, &parsed)
+    return false
 
 def valid_optional_package_strings(raw: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
     package_start: usize = json_key_value_offset(raw, "package")
@@ -1874,6 +1867,15 @@ def run_doctor() -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.
     write_ok("child environment: scrubbed; only compiler bootstrap variables are retained\n")
     write_ok("compiler: set ELISAPKG_COMPILER to an audited compiler adapter\n")
     return EXIT_OK
+
+def run_test(argc: i64, slots: mutable cstr&&, start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    # The current single-artifact planner uses the first declared target as the
+    # executable under test. Reusing the normal build path keeps dependency,
+    # lock, and compiler-environment checks identical while multi-target
+    # planning is completed.
+    status: i64 = run_build(start, options)
+    return status if status != EXIT_OK
+    return run_program(argc, slots)
 
 def run_fetch(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
     _ = start
@@ -2635,8 +2637,7 @@ def cli_main(argc: i64, argv: mutable void&) -> i64 can[Console.Write, Memory.Al
             build_status: i64 = run_build(&start, options)
             return build_status if build_status != EXIT_OK
             return run_program(argc, slots)
-        write_error("error: `run` and `test` require a built target; use `elisapkg build` first\n")
-        return EXIT_BUILD
+        return run_test(argc, slots, &start, options)
     write_error("error: unknown command; run `elisapkg --help`\n")
     return EXIT_USAGE
 

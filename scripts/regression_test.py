@@ -126,7 +126,8 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
 
     manifest = project / 'elisapkg.json'
     valid = manifest.read_text()
-    for invalid in [valid.replace('"schema-version": 1,', '"schema-version": 1'), valid + '{}']:
+    unsupported_registry = valid.replace('"dependencies": {}', '"dependencies":{"remote":{"registry":"default","version":"^1.0.0"}}')
+    for invalid in [valid.replace('"schema-version": 1,', '"schema-version": 1'), valid + '{}', unsupported_registry]:
         manifest.write_text(invalid)
         result = subprocess.run([BIN, 'check-manifest'], cwd=project, capture_output=True, timeout=120)
         assert result.returncode != 0
