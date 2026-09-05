@@ -90,6 +90,29 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
     lines.append('    solver_candidates[0].yanked <- true')
     lines.append('    solver_result <- Solver::solve(solver_candidates, solver_roots, &solver_selected)')
     check('solver_result == Solver::SolveCode.Unsatisfiable')
+    lines.extend([
+        '    solver_a_name: mutable darray[u8] = [97]',
+        '    solver_b_name: mutable darray[u8] = [98]',
+        '    solver_a_req_one: mutable darray[u8] = [94,49,46,48,46,48]',
+        '    solver_a_req_two: mutable darray[u8] = [94,50,46,48,46,48]',
+        '    solver_b_root_req: mutable darray[u8] = [62,61,49,46,48,46,48,32,60,51,46,48,46,48]',
+        '    solver_roots_two: mutable darray[Solver::Constraint] = []',
+        '    solver_roots_two.push(Solver::Constraint{package: solver_a_name, requirement: solver_a_req_one})',
+        '    solver_roots_two.push(Solver::Constraint{package: solver_b_name, requirement: solver_b_root_req})',
+        '    solver_b_deps_one: mutable darray[Solver::Constraint] = []',
+        '    solver_b_deps_two: mutable darray[Solver::Constraint] = []',
+        '    solver_b_deps_one.push(Solver::Constraint{package: solver_a_name, requirement: solver_a_req_one})',
+        '    solver_b_deps_two.push(Solver::Constraint{package: solver_a_name, requirement: solver_a_req_two})',
+        '    solver_candidates_two: mutable darray[Solver::Candidate] = []',
+        '    solver_candidates_two.push(Solver::Candidate{package: solver_a_name, version: Model::Version{major: 1, minor: 0, patch: 0, prerelease: false}, dependencies: solver_dependencies, yanked: false})',
+        '    solver_candidates_two.push(Solver::Candidate{package: solver_a_name, version: Model::Version{major: 2, minor: 0, patch: 0, prerelease: false}, dependencies: solver_dependencies, yanked: false})',
+        '    solver_candidates_two.push(Solver::Candidate{package: solver_b_name, version: Model::Version{major: 1, minor: 0, patch: 0, prerelease: false}, dependencies: solver_b_deps_one, yanked: false})',
+        '    solver_candidates_two.push(Solver::Candidate{package: solver_b_name, version: Model::Version{major: 2, minor: 0, patch: 0, prerelease: false}, dependencies: solver_b_deps_two, yanked: false})',
+        '    solver_selected_two: mutable darray[usize] = []',
+        '    solver_result <- Solver::solve(solver_candidates_two, solver_roots_two, &solver_selected_two)',
+    ])
+    check('solver_result == Solver::SolveCode.Solved')
+    check('solver_selected_two.count == 2.usize() and solver_selected_two[0] == 0.usize() and solver_selected_two[1] == 2.usize()')
     lines.append('    return 0')
     source = work / 'probe.elisa'
     source.write_text('\n'.join(lines) + '\n')
