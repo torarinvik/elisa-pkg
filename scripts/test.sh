@@ -149,6 +149,12 @@ mkdir -p "$CASE"
   "$BIN" tree | grep -F 'app 0.1.0' >/dev/null
   "$BIN" tree | grep -F 'local-util 1.2.3' >/dev/null
   "$BIN" why local-util | grep -F 'app -> local-util' >/dev/null
+  if "$BIN" package >/dev/null 2>&1; then
+    echo "archive creation unexpectedly bypassed its release gate" >&2
+    exit 1
+  else
+    test "$?" -eq 7
+  fi
   "$BIN" update local-util >/dev/null
   if "$BIN" add local-util --path local-util >/dev/null 2>&1; then
     echo "duplicate dependency was accepted" >&2

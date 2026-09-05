@@ -29,6 +29,10 @@ The manifest and lockfile are JSON schema-versioned. `resolve --frozen` verifies
 
 Commands that inspect or build a project accept `--manifest-path PATH`; PATH may name the project directory or its `elisapkg.json`. Local path resolution walks the dependency graph transitively, sorts package records by canonical name, normalizes relative paths, records a SHA-256 manifest digest, and rejects conflicting duplicate package identities. Target paths are resolved with `realpath` and must remain below their package root, including when a symlink is present. `clean` removes only the known `.elisapkg/build/app` output and empty build directories. Registry dependency declarations are syntax-checked locally, including exact, caret, tilde, and comparison SemVer ranges, but resolution remains fail-closed until a verified registry provider exists.
 
+`package --list` previews the validated file set. Archive creation itself is
+explicitly gated until the deterministic tar/gzip writer and signed release
+workflow are enabled; invoking `package` without `--list` returns an error.
+
 ## Security posture
 
 Remote packages are not accepted unsigned. `fetch` currently exits with the security status and explains that no trusted source provider is configured. This is deliberate: checksums, TLS, and a registry URL alone do not authenticate a publisher. The implementation plan requires a reviewed signed-metadata protocol, trusted-root bootstrap, publisher delegation, expiry and rollback protection, safe archive extraction, credential redaction, key rotation/revocation, adversarial fixtures, and independent security review before remote support is enabled.
