@@ -165,6 +165,12 @@ mkdir -p "$CASE"
   "$BIN" check-manifest >/dev/null
   cmp recovered.manifest elisapkg.json >/dev/null
   test ! -e .elisapkg/transaction.state
+  cp recovered.manifest .elisapkg/transaction.manifest
+  printf '%s\n' 'manifest-replaced' > .elisapkg/transaction.state
+  printf '%s\n' '{}' > elisapkg.json
+  "$BIN" check-manifest >/dev/null
+  cmp recovered.manifest elisapkg.json >/dev/null
+  test ! -e .elisapkg/transaction.state
   printf '%s\n' 'unrecognized-state' > .elisapkg/transaction.state
   if "$BIN" check-manifest >/dev/null 2>&1; then
     echo "unrecognized transaction state was accepted" >&2
