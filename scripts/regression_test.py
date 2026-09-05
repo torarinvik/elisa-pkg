@@ -128,6 +128,9 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
     for command in [['resolve', 'unexpected'], ['check-manifest', 'unexpected']]:
         result = subprocess.run([BIN, *command], cwd=project, capture_output=True, timeout=120)
         assert result.returncode == 2, (command, result)
+    for command in [['resolve', '--list'], ['build', '--dry-run'], ['build', '--version']]:
+        result = subprocess.run([BIN, *command], cwd=project, capture_output=True, timeout=120)
+        assert result.returncode == 2, (command, result)
     result = subprocess.run([BIN, 'update', 'missing'], cwd=project, capture_output=True, timeout=120)
     assert result.returncode == 3, result
     result = subprocess.run([BIN, 'test'], cwd=project, capture_output=True, timeout=120)
