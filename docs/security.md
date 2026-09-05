@@ -15,6 +15,10 @@ namespace, and algorithm policy. They are deliberately not signature
 verification; the production policy still rejects every remote operation until
 the reviewed provider and trust-state persistence are implemented.
 
+State-directory creation uses descriptor-anchored `mkdirat`/`openat`
+traversal and rejects symlinked `.elisapkg`, build, install, and receipt
+directories, including intermediate parent links.
+
 Archive extraction is a separate boundary. The accepted subset is regular files and directories only, with bounded compressed and expanded sizes, no links/devices/special modes, no absolute or traversal paths, no duplicate or case-colliding names, private staging, and atomic publication into a verified content store. Cache pathnames and receipts are never treated as proof of verification.
 
 Manifest bytes must be valid UTF-8 before field interpretation. The local
