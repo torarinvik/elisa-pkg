@@ -108,6 +108,17 @@ def main() -> i64:
     return 5 if Trust::precheck_algorithm("ed25519") != Trust::VerificationCode.Valid
     return 6 if Trust::precheck_namespace(package, namespace) != Trust::VerificationCode.Valid
     return 7 if Trust::precheck_namespace(package, other) != Trust::VerificationCode.UnauthorizedNamespace
+    registry: mutable darray[u8] = [112, 114, 105, 109, 97, 114, 121]
+    mirror: mutable darray[u8] = [109, 105, 114, 114, 111, 114]
+    version: mutable darray[u8] = [49, 46, 48, 46, 48]
+    digest: mutable darray[u8] = [100, 105, 103, 101, 115, 116]
+    return 8 if Trust::precheck_binding(registry, registry, package, package, version, version, digest, digest, 3, 3) != Trust::VerificationCode.Valid
+    return 9 if Trust::precheck_binding(mirror, registry, package, package, version, version, digest, digest, 3, 3) != Trust::VerificationCode.WrongRegistry
+    return 10 if Trust::precheck_binding(registry, registry, package, package, version, version, digest, digest, 2, 3) != Trust::VerificationCode.ArchiveSizeMismatch
+    return 11 if Trust::precheck_publisher_attestation(false) != Trust::VerificationCode.MissingPublisherAttestation
+    return 12 if Trust::precheck_threshold(1, 2) != Trust::VerificationCode.ThresholdInsufficient
+    return 13 if Trust::precheck_revocation(true) != Trust::VerificationCode.RevokedKey
+    return 14 if Trust::precheck_clock(9, 8) != Trust::VerificationCode.ClockRollback
     return 0
 EOF
 ELISA_STAGE1_BIN="${ELISA_STAGE1_BIN:-$ELISA_COMPILER_ROOT/bin/elisac-stage1}" \

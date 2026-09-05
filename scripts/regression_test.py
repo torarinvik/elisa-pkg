@@ -69,6 +69,17 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
     check('not Archive::verify_ustar_archive(archive)')
     namespace, package = data('acme'), data('acme/../evil')
     check(f'Trust::precheck_namespace({package}, {namespace}) == Trust::VerificationCode.UnauthorizedNamespace')
+    registry, expected_registry = data('primary'), data('primary')
+    package_name, expected_package = data('acme/app'), data('acme/app')
+    version, expected_version = data('1.2.3'), data('1.2.3')
+    archive_digest, expected_digest = data('digest'), data('digest')
+    check(f'Trust::precheck_binding({registry}, {expected_registry}, {package_name}, {expected_package}, {version}, {expected_version}, {archive_digest}, {expected_digest}, 42, 42) == Trust::VerificationCode.Valid')
+    check(f'Trust::precheck_binding({data("mirror")}, {expected_registry}, {package_name}, {expected_package}, {version}, {expected_version}, {archive_digest}, {expected_digest}, 42, 42) == Trust::VerificationCode.WrongRegistry')
+    check(f'Trust::precheck_binding({registry}, {expected_registry}, {package_name}, {expected_package}, {version}, {expected_version}, {archive_digest}, {expected_digest}, 41, 42) == Trust::VerificationCode.ArchiveSizeMismatch')
+    check('Trust::precheck_publisher_attestation(false) == Trust::VerificationCode.MissingPublisherAttestation')
+    check('Trust::precheck_threshold(1, 2) == Trust::VerificationCode.ThresholdInsufficient')
+    check('Trust::precheck_revocation(true) == Trust::VerificationCode.RevokedKey')
+    check('Trust::precheck_clock(9, 8) == Trust::VerificationCode.ClockRollback')
     lines.extend([
         '    solver_name: mutable darray[u8] = [97]',
         '    solver_requirement: mutable darray[u8] = [94,49,46,48,46,48]',
