@@ -27,7 +27,7 @@ build/elisapkg init path/to/app
 (cd path/to/app && ELISAPKG_INSTALL_PREFIX="$HOME/.local" ../../build/elisapkg install --local)
 ```
 
-The manifest and lockfile are JSON schema-versioned. `resolve --frozen` verifies the existing lockfile byte-for-byte and refuses to edit it. Dependency edits journal the original manifest/lock pair and recover it after an interrupted process. `tree` and `why NAME` read the verified lock and show the selected local graph. `--offline`, `--locked`, and `--frozen` are accepted by the CLI; remote acquisition remains disabled until signed registry metadata and publisher authorization are configured.
+The manifest and lockfile are JSON schema-versioned. `resolve --frozen` verifies the existing lockfile byte-for-byte and refuses to edit it. Dependency edits journal the original manifest/lock pair and recover it after an interrupted process. `tree` and `why NAME` read the verified lock and show the selected local graph. `--offline`, `--locked`, and `--frozen` are accepted by the CLI. `fetch` verifies local path sources against the committed lockfile without network access; remote acquisition remains disabled until signed registry metadata and publisher authorization are configured.
 
 `cache verify` performs the same canonical-lock and local manifest-digest check
 before reporting that no shared remote cache is configured. Successful builds
@@ -88,4 +88,4 @@ Run the deterministic smoke suite with:
 scripts/test.sh
 ```
 
-The suite compiles the source, checks help/version/doctor, creates an isolated package, resolves and freezes its lockfile, builds and runs it, and verifies invalid-manifest and unsigned-fetch failures. Generated state is ignored by Git.
+The suite compiles the source, checks help/version/doctor, creates an isolated package, resolves and freezes its lockfile, builds and runs it, and verifies invalid-manifest, local-fetch, and unsigned-remote-operation failures. Generated state is ignored by Git.

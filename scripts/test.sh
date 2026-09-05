@@ -407,10 +407,10 @@ PY
   "$BIN" remove local-util >/dev/null
   "$BIN" check-manifest >/dev/null
   "$BIN" resolve --frozen >/dev/null
-  "$BIN" fetch >/dev/null 2>&1 && exit 1 || test "$?" -eq 5
+  "$BIN" fetch >/dev/null
   "$BIN" publish >/dev/null 2>&1 && exit 1 || test "$?" -eq 5
   "$BIN" install app >/dev/null 2>&1 && exit 1 || test "$?" -eq 5
-  "$BIN" fetch --offline >/dev/null 2>&1 && exit 1 || test "$?" -eq 5
+  "$BIN" fetch --offline >/dev/null
   test -f .elisapkg/build/app
   "$BIN" clean >/dev/null
   test ! -e .elisapkg/build/app

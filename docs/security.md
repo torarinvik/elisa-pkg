@@ -1,8 +1,9 @@
 # Security release gates
 
-Remote source acquisition is disabled in the current binary. `elisapkg fetch`,
-`publish`, and remote `install NAME` fail with security status 5 until a trusted
-source provider is configured. `install --local` is a separate, offline path
+Remote source acquisition is disabled in the current binary. `elisapkg fetch`
+verifies local path sources against the lockfile; remote fetches, `publish`, and
+remote `install NAME` fail with security status 5 until a trusted source provider
+is configured. `install --local` is a separate, offline path
 that only publishes the current package's verified build output under the
 user-selected prefix. This is an intentional fail-closed boundary, not a
 temporary insecure mode.
