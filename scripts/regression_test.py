@@ -278,6 +278,9 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
     timeout_error = native.elisapkg_timeout_error
     timeout_error.argtypes = []
     timeout_error.restype = ctypes.c_longlong
+    realpath_secure = native.elisapkg_realpath
+    realpath_secure.argtypes = [ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t]
+    realpath_secure.restype = ctypes.c_char_p
 
     def ustar(name, content, mode=0o644):
         header = bytearray(512)
@@ -306,6 +309,10 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
         assert is_directory(b'src') == 1
         assert read(b'src/main.elisa', buffer, 128) > 0
         assert read(b'../external/src/main.elisa', buffer, 128) > 0
+        resolved = ctypes.create_string_buffer(4096)
+        assert realpath_secure(b'src/main.elisa', resolved, len(resolved)) is not None
+        tiny_resolved = ctypes.create_string_buffer(1)
+        assert realpath_secure(b'src/main.elisa', tiny_resolved, len(tiny_resolved)) is None
         Path('alias').symlink_to('src', target_is_directory=True)
         assert is_directory(b'alias') == 0
         Path('nested').mkdir()

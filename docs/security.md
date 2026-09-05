@@ -23,6 +23,10 @@ Controlled local dependency reads may use normalized `..` path segments so
 sibling packages remain supported; target and state paths are validated before
 they reach this seam.
 
+Canonical target checks use a bounded platform `realpath` wrapper. It resolves
+into caller-provided storage only after checking the input and output limits;
+short buffers fail instead of receiving a truncated or overflowing path.
+
 Archive extraction is a separate boundary. The accepted subset is regular files
 with parent directories created by the extractor, bounded archive and file
 sizes, no links/devices/special modes, no absolute or traversal paths, no

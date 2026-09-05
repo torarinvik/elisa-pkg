@@ -744,6 +744,20 @@ long long elisapkg_access(const char *path, int mode) {
     return 0;
 }
 
+const char *elisapkg_realpath(const char *path, unsigned char *resolved, size_t capacity) {
+    if (path == NULL || resolved == NULL || capacity == 0 || strlen(path) > 4096) return NULL;
+    char *canonical = realpath(path, NULL);
+    if (canonical == NULL) return NULL;
+    const size_t length = strlen(canonical);
+    if (length + 1 > capacity) {
+        free(canonical);
+        return NULL;
+    }
+    memcpy(resolved, canonical, length + 1);
+    free(canonical);
+    return (const char *)resolved;
+}
+
 long long elisapkg_chdir(const char *path) {
     int directory = open_directory_path(path);
     if (directory < 0) return directory;
