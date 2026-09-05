@@ -231,9 +231,9 @@ static int open_package_file(const char *path) {
     return file;
 }
 
-/* Read-mode fopen is routed through the same descriptor-relative no-follow
- * walk as the byte-buffer helpers. Exclusive-create writes retain libc's
- * mode semantics and are already protected by O_EXCL in the caller. */
+/* Read-mode and exclusive-create streams are routed through the same
+ * descriptor-relative no-follow walk as the byte-buffer helpers. Other modes
+ * are rejected because this seam does not need an unbounded libc path API. */
 FILE *elisapkg_fopen(const char *path, const char *mode) {
     if (path == NULL || mode == NULL) return NULL;
     if (strcmp(mode, "wxb") == 0) {
