@@ -29,7 +29,10 @@ The package writer asks `Platform` for a sorted, regular-file-only directory
 walk, then applies manifest include patterns and the `Archive` path policy in
 Elisa before reading bytes. The native seam performs no archive selection or
 serialization, which keeps filesystem traversal separate from the public
-archive format and makes the byte stream suitable for later signing.
+archive format. `Archive::verify_ustar_archive` parses the resulting bytes
+again, so the file is only exposed after bounds, checksum, duplicate-entry,
+padding, and end-marker checks; the verified byte stream is suitable for later
+signing.
 
 Future implementation modules should follow the same pattern:
 

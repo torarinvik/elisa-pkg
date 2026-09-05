@@ -89,6 +89,44 @@ ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_COMPILER_ROOT/build/runtime/elisa
   "$ELISA_COMPILER_ROOT/scripts/elisac_stage1.sh" -emit exe -o "$HASH_BIN" "$HASH_PROBE"
 "$HASH_BIN"
 
+# Exercise the archive verifier against a valid record and two malformed
+# variants. The verifier is the gate used immediately before package output is
+# published, so checksum and type-field regressions must fail closed.
+ARCHIVE_PROBE="$ROOT/build/archive-probe-$$.elisa"
+ARCHIVE_BIN="$ROOT/build/archive-probe-$$"
+cat > "$ARCHIVE_PROBE" <<EOF
+include "$ROOT/src/archive.elisa"
+
+def append_bytes(out: mutable darray[u8]&, value: darray[u8]&) -> void:
+    for index in 0..<value.count |out, value|:
+        out.push(value[index])
+
+def append_zeroes(out: mutable darray[u8]&, count: usize) -> void:
+    for _index in 0..<count |out|:
+        out.push(0)
+
+def main() -> i64:
+    name: mutable darray[u8] = [115, 114, 99, 47, 109, 97, 105, 110, 46, 101, 108, 105, 115, 97]
+    header: darray[u8] = Archive::tar_file_header(name, 3)
+    return 1 if header.count != 512.usize()
+    valid: mutable darray[u8] = []
+    append_bytes(&valid, header)
+    valid.push(97)
+    valid.push(98)
+    valid.push(99)
+    append_zeroes(&valid, 509)
+    append_zeroes(&valid, 1024)
+    return 2 if not Archive::verify_ustar_archive(valid)
+    valid[156] <- 50
+    return 3 if Archive::verify_ustar_archive(valid)
+    return 0
+EOF
+ELISA_STAGE1_BIN="${ELISA_STAGE1_BIN:-$ELISA_COMPILER_ROOT/bin/elisac-stage1}" \
+ELISA_ALLOW_STALE_STAGE1="${ELISA_ALLOW_STALE_STAGE1:-0}" \
+ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_COMPILER_ROOT/build/runtime/elisacore_runtime.o}" \
+  "$ELISA_COMPILER_ROOT/scripts/elisac_stage1.sh" -emit exe -o "$ARCHIVE_BIN" "$ARCHIVE_PROBE"
+"$ARCHIVE_BIN"
+
 CASE="$ROOT/build/test-package-$(date +%s%N)"
 mkdir -p "$CASE"
 (

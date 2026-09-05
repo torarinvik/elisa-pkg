@@ -50,7 +50,99 @@ module Archive:
             header[155] <- 32
             return header
 
+        def verify_ustar_archive(archive: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            return false if archive.count < 1024.usize() or archive.count > 67108864.usize()
+            return false if archive.count % 512.usize() != 0.usize()
+            cursor: mutable usize = 0.usize()
+            entries: mutable usize = 0.usize()
+            seen: mutable darray[u8] = []
+            while cursor + 512.usize() <= archive.count:
+                if archive_block_zero(archive, cursor):
+                    return archive_block_zero(archive, cursor + 512.usize()) and cursor + 1024.usize() == archive.count and entries > 0.usize()
+                return false if cursor + 512.usize() > archive.count
+                return false if archive[cursor + 257.usize()] != 117 or archive[cursor + 258.usize()] != 115 or archive[cursor + 259.usize()] != 116 or archive[cursor + 260.usize()] != 97 or archive[cursor + 261.usize()] != 114 or archive[cursor + 262.usize()] != 0 or archive[cursor + 263.usize()] != 48 or archive[cursor + 264.usize()] != 48
+                name: mutable darray[u8] = []
+                name_end: mutable usize = 0.usize()
+                while name_end < 100.usize() and archive[cursor + name_end] != 0:
+                    name.push(archive[cursor + name_end])
+                    name_end <- name_end + 1.usize()
+                return false if name_end == 0.usize() or name_end == 100.usize() or not is_safe_entry(name)
+                return false if archive_seen(seen, name)
+                for index in 0..<name.count |seen, name|:
+                    seen.push(name[index])
+                seen.push(0)
+                mode: mutable usize = 0.usize()
+                uid: mutable usize = 0.usize()
+                gid: mutable usize = 0.usize()
+                size: mutable usize = 0.usize()
+                mtime: mutable usize = 0.usize()
+                stored_checksum: mutable usize = 0.usize()
+                return false if not parse_octal(archive, cursor + 100.usize(), 8.usize(), &mode) or mode != 420.usize()
+                return false if not parse_octal(archive, cursor + 108.usize(), 8.usize(), &uid) or uid != 0.usize()
+                return false if not parse_octal(archive, cursor + 116.usize(), 8.usize(), &gid) or gid != 0.usize()
+                return false if not parse_octal(archive, cursor + 124.usize(), 12.usize(), &size) or size > 67108864.usize() - 1024.usize()
+                return false if not parse_octal(archive, cursor + 136.usize(), 12.usize(), &mtime) or mtime != 0.usize()
+                return false if archive[cursor + 156.usize()] != 48
+                return false if not parse_octal(archive, cursor + 148.usize(), 8.usize(), &stored_checksum)
+                checksum: mutable usize = 0.usize()
+                for index in 0..<512.usize() |archive, cursor, checksum|:
+                    byte: usize = archive[cursor + index].usize()
+                    checksum <- checksum + 32.usize() if index >= 148.usize() and index < 156.usize()
+                    checksum <- checksum + byte if index < 148.usize() or index >= 156.usize()
+                return false if checksum != stored_checksum
+                data_start: usize = cursor + 512.usize()
+                return false if size > archive.count - data_start
+                data_end: usize = data_start + size
+                padding: usize = (512.usize() - (size % 512.usize())) % 512.usize()
+                return false if padding > archive.count - data_end
+                cursor <- data_end + padding
+                entries <- entries + 1.usize()
+                return false if entries > 4096.usize()
+            return false
+
     private:
+        def archive_block_zero(archive: darray[u8]&, start: usize) -> bool:
+            return false if start + 512.usize() > archive.count
+            for index in 0..<512.usize() |archive, start|:
+                return false if archive[start + index] != 0
+            return true
+
+        def archive_seen(seen: darray[u8]&, wanted: darray[u8]&) -> bool:
+            cursor: mutable usize = 0.usize()
+            while cursor < seen.count:
+                end: mutable usize = cursor
+                while end < seen.count and seen[end] != 0 |seen, end|:
+                    end <- end + 1.usize()
+                return true if end - cursor == wanted.count and slice_equal(seen, cursor, end, wanted)
+                cursor <- end + 1.usize()
+            return false
+
+        def slice_equal(value: darray[u8]&, start: usize, end: usize, wanted: darray[u8]&) -> bool:
+            return false if end < start or end - start != wanted.count
+            for index in 0..<wanted.count |value, start, wanted|:
+                return false if value[start + index] != wanted[index]
+            return true
+
+        def parse_octal(value: darray[u8]&, offset: usize, width: usize, out: mutable usize&) -> bool:
+            return false if width < 2.usize() or offset + width > value.count
+            cursor: mutable usize = offset
+            finish: usize = offset + width
+            parsed: mutable usize = 0.usize()
+            digits: mutable usize = 0.usize()
+            while cursor < finish and value[cursor] >= 48 and value[cursor] <= 55:
+                digit: usize = (value[cursor] - 48).usize()
+                return false if parsed > (18446744073709551615.usize() - digit) / 8.usize()
+                parsed <- parsed * 8.usize() + digit
+                digits <- digits + 1.usize()
+                cursor <- cursor + 1.usize()
+            return false if digits == 0.usize() or cursor >= finish or (value[cursor] != 0 and value[cursor] != 32)
+            cursor <- cursor + 1.usize()
+            while cursor < finish:
+                return false if value[cursor] != 0 and value[cursor] != 32
+                cursor <- cursor + 1.usize()
+            out <- parsed
+            return true
+
         def write_octal(header: mutable darray[u8]&, offset: usize, value: usize, width: usize) -> void:
             return if width == 0.usize()
             divisor: mutable usize = 1.usize()
