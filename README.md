@@ -35,8 +35,10 @@ publish an exclusive compiler output by atomic rename and retain a receipt of
 the target source, manifest, resolved-lock, and artifact digests plus selected
 compiler inputs. A matching receipt and artifact are reused; changing the
 root, dependency graph, or target source forces a fresh compiler invocation.
-Included non-target sources and compiler contents remain outside this receipt
-and require a future build-key expansion.
+Compiler, stage1, and runtime content identities are included in the receipt;
+if any identity cannot be captured, that build does not reuse an existing
+artifact. Included non-target sources remain outside this receipt and require
+a future build-key expansion.
 `cache gc --dry-run` is likewise read-only and reports that there is no shared
 cache to sweep; destructive garbage collection stays disabled until the
 content-addressed store, leases, and concurrent-reader rules are implemented.
