@@ -200,12 +200,17 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
     read = native.elisapkg_read_package_file
     read.argtypes = [ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t]
     read.restype = ctypes.c_longlong
+    is_directory = native.elisapkg_is_directory
+    is_directory.argtypes = [ctypes.c_char_p]
+    is_directory.restype = ctypes.c_longlong
     buffer = ctypes.create_string_buffer(128)
     previous = Path.cwd()
     try:
         os.chdir(project)
+        assert is_directory(b'src') == 1
         assert read(b'src/main.elisa', buffer, 128) > 0
         Path('alias').symlink_to('src', target_is_directory=True)
+        assert is_directory(b'alias') == 0
         assert read(b'alias/main.elisa', buffer, 128) < 0
         Path('linked').symlink_to('src/main.elisa')
         assert read(b'linked', buffer, 128) < 0
