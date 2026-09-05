@@ -133,6 +133,18 @@ mkdir -p "$CASE"
   mv elisapkg.root.good elisapkg.json
   "$BIN" build >/dev/null
   "$BIN" build --frozen >/dev/null
+  cp src/main.elisa src/main.size.good
+  python3 - <<'PY'
+with open("src/main.elisa", "wb") as handle:
+    handle.write(b" " * 1048577)
+PY
+  if "$BIN" build >/dev/null 2>&1; then
+    echo "oversized target source was accepted" >&2
+    exit 1
+  else
+    test "$?" -eq 6
+  fi
+  mv src/main.size.good src/main.elisa
   printf '%s\n' 'def main() -> i64:' '    return 0' > src/alternate.elisa
   cp elisapkg.json elisapkg.target.good
   sed 's#src/main.elisa#src/alternate.elisa#' elisapkg.target.good > elisapkg.json
