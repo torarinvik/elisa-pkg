@@ -151,6 +151,12 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
     assert result.returncode == 6, result
     assert artifact.read_bytes() == b'previous working output'
 
+    guard = project / '.elisapkg/transaction.guard'
+    guard.mkdir()
+    result = subprocess.run([BIN, 'check-manifest'], cwd=project, capture_output=True, timeout=120)
+    assert result.returncode == 5, result
+    guard.rmdir()
+
     # Directly exercise the native seam with a regular file and link traversal.
     library = work / 'platform.dylib'
     run([os.environ.get('CC', 'cc'), '-shared', '-fPIC', ROOT / 'src/platform_files.c', '-o', library])

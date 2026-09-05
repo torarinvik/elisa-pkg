@@ -69,3 +69,12 @@ with a scrubbed environment but does not claim an OS sandbox. Dependency build
 scripts, plugins, post-install hooks, and automatic native dependency
 installation are disabled. This remains a release limitation until an
 enforceable process-isolation adapter is proven.
+
+## D-009: project transaction ownership
+
+Manifest and lock edits acquire an exclusive `.elisapkg/transaction.guard`
+directory before journaling state. A guard with no recoverable state is treated
+as an active or interrupted transaction and blocks further commands; the client
+does not guess whether it is safe to delete another process's lock. Successful
+commit and rollback remove the guard, while stale guards require explicit
+operator recovery.

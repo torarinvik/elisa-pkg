@@ -328,7 +328,7 @@ def remove_empty_directory(path: darray[u8]&) -> bool can[Memory.Allocate, Abort
     path_c: mutable darray[u8] = []
     path_with_nul_into(path, &path_c)
     path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
-    return true if not cstr_file_exists(path_name)
+    return true if Platform::pkg_access(path_name, 0) != 0
     return Platform::pkg_rmdir(path_name) == 0
 
 def remove_cstr_file(path_name: cstr) -> bool:
@@ -339,10 +339,21 @@ def transaction_cleanup() -> bool:
     return false if not remove_cstr_file(".elisapkg/transaction.manifest")
     return false if not remove_cstr_file(".elisapkg/transaction.lock")
     return false if not remove_cstr_file(".elisapkg/transaction.state")
+    guard: mutable darray[u8] = []
+    bytes_push_view(&guard, ".elisapkg/transaction.guard")
+    return false if not remove_empty_directory(&guard)
     return true
 
 def transaction_begin(original_manifest: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
-    return false if cstr_file_exists(".elisapkg/transaction.state")
+    guard: mutable darray[u8] = []
+    bytes_push_view(&guard, ".elisapkg/transaction.guard")
+    guard_c: mutable darray[u8] = []
+    path_with_nul_into(&guard, &guard_c)
+    guard_name: cstr = (&guard_c[0]).cast[cstr] can Unsafe.PointerCast
+    return false if Platform::pkg_mkdir(guard_name, 448.u16()) != 0
+    if cstr_file_exists(".elisapkg/transaction.state"):
+        _ = remove_empty_directory(&guard)
+        return false
     return false if not write_cstr_file(".elisapkg/transaction.manifest", original_manifest)
     state: mutable darray[u8] = []
     if cstr_file_exists("elisapkg.lock"):
@@ -381,7 +392,14 @@ def transaction_restore() -> bool can[Memory.Allocate, Abort.Panic, Unsafe.Point
     return transaction_cleanup()
 
 def transaction_recover() -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
-    return true if not cstr_file_exists(".elisapkg/transaction.state")
+    if not cstr_file_exists(".elisapkg/transaction.state"):
+        guard: mutable darray[u8] = []
+        bytes_push_view(&guard, ".elisapkg/transaction.guard")
+        guard_c: mutable darray[u8] = []
+        path_with_nul_into(&guard, &guard_c)
+        guard_name: cstr = (&guard_c[0]).cast[cstr] can Unsafe.PointerCast
+        return false if Platform::pkg_access(guard_name, 0) == 0
+        return true
     state: mutable darray[u8] = []
     state.resize(128)
     return false if not read_cstr_into(".elisapkg/transaction.state", &state)
