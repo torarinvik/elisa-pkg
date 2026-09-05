@@ -459,6 +459,31 @@ def valid_target_kinds(raw: darray[u8]&) -> bool can[Memory.Allocate, Abort.Pani
             in_string <- false
     return found > 0.usize()
 
+def valid_target_objects(raw: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+    targets_start: usize = json_key_value_offset(raw, "targets")
+    return false if targets_start >= raw.count or raw[targets_start] != 91
+    targets_end: usize = json_array_end(raw, targets_start)
+    return false if targets_end <= targets_start
+    seen: mutable darray[u8] = []
+    found: mutable usize = 0.usize()
+    index: mutable usize = targets_start + 1.usize()
+    while index < targets_end |raw, seen, found, index|:
+        if raw[index] == 123:
+            object_end: usize = json_object_end(raw, index)
+            return false if object_end <= index or object_end > targets_end
+            target_name: mutable darray[u8] = []
+            return false if not object_string_value(raw, index, object_end, "name", &target_name)
+            return false if not valid_package_name(target_name)
+            return false if dependency_alias_seen(seen, target_name)
+            seen.push(0) if seen.count > 0.usize()
+            for name_index in 0..<target_name.count |seen, target_name|:
+                seen.push(target_name[name_index])
+            seen.push(0)
+            found <- found + 1.usize()
+            index <- object_end
+        index <- index + 1.usize()
+    return found > 0.usize()
+
 # ---------- semantic versions ---------------------------------------------------------
 
 def parse_version(value: darray[u8]&, out: mutable Model::Version&) -> bool:
@@ -596,6 +621,30 @@ def json_object_end(raw: darray[u8]&, object_start: usize) -> usize:
         elif byte == 123:
             depth <- depth + 1
         elif byte == 125:
+            depth <- depth - 1
+            return index if depth == 0
+            return raw.count if depth < 0
+    return raw.count
+
+def json_array_end(raw: darray[u8]&, array_start: usize) -> usize:
+    return raw.count if array_start >= raw.count or raw[array_start] != 91
+    depth: mutable i64 = 0
+    in_string: mutable bool = false
+    escaped: mutable bool = false
+    for index in array_start..<raw.count |raw, depth, in_string, escaped|:
+        byte: u8 = raw[index]
+        if in_string:
+            if escaped:
+                escaped <- false
+            elif byte == 92:
+                escaped <- true
+            elif byte == 34:
+                in_string <- false
+        elif byte == 34:
+            in_string <- true
+        elif byte == 91:
+            depth <- depth + 1
+        elif byte == 93:
             depth <- depth - 1
             return index if depth == 0
             return raw.count if depth < 0
@@ -874,6 +923,7 @@ def validate_manifest_at(raw: darray[u8]&, root: darray[u8]&, name_out: mutable 
     return false if json_key_count(raw, "entry") < 1.usize()
     return false if not valid_target_entries(raw, root)
     return false if not valid_target_kinds(raw)
+    return false if not valid_target_objects(raw)
     return false if json_top_key_count(raw, "dependencies") > 1.usize()
     return false if json_top_key_count(raw, "dev-dependencies") > 1.usize()
     return false if not valid_dependency_map(raw, "dependencies")
