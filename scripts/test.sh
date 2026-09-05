@@ -336,6 +336,16 @@ if (cd "$BAD" && "$BIN" check-manifest >/dev/null 2>&1); then
   echo "non-string package metadata was accepted" >&2
   exit 1
 fi
+printf '%s\n' '{"schema-version":1,"package":{"name":"bad","version":"1.0.0"},"targets":[{"name":"bad","kind":"bin","entry":"src/main.elisa"}],"include":{},"dependencies":{}}' > "$BAD/elisapkg.json"
+if (cd "$BAD" && "$BIN" check-manifest >/dev/null 2>&1); then
+  echo "non-array include field was accepted" >&2
+  exit 1
+fi
+printf '%s\n' '{"schema-version":1,"package":{"name":"bad","version":"1.0.0"},"targets":[{"name":"bad","kind":"bin","entry":"src/main.elisa"}],"include":["src/**",],"dependencies":{}}' > "$BAD/elisapkg.json"
+if (cd "$BAD" && "$BIN" check-manifest >/dev/null 2>&1); then
+  echo "trailing include comma was accepted" >&2
+  exit 1
+fi
 
 printf '%s' '{"schema-version":1,"package":{"name":"bad","version":"1.0.0"},"targets":[{"entry":"src/main.elisa"}],"dependencies":{}}' > "$BAD/elisapkg.json"
 head -c 1049000 /dev/zero | tr '\0' ' ' >> "$BAD/elisapkg.json"
