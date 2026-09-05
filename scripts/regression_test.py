@@ -230,6 +230,7 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
     previous = Path.cwd()
     try:
         os.chdir(project)
+        assert is_directory(b'') == 0
         assert is_directory(b'src') == 1
         assert read(b'src/main.elisa', buffer, 128) > 0
         Path('alias').symlink_to('src', target_is_directory=True)

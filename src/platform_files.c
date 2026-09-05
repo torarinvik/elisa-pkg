@@ -233,7 +233,7 @@ long long elisapkg_package_file_size(const char *path) {
 }
 
 static int open_directory_path(const char *path) {
-    if (path == NULL || strlen(path) > 4096) return -EINVAL;
+    if (path == NULL || path[0] == '\0' || strlen(path) > 4096) return -EINVAL;
     char *copy = strdup(path);
     if (copy == NULL) return -ENOMEM;
     const int absolute = path[0] == '/';
