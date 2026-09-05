@@ -234,6 +234,9 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
         assert read(b'src/main.elisa', buffer, 128) > 0
         Path('alias').symlink_to('src', target_is_directory=True)
         assert is_directory(b'alias') == 0
+        Path('nested').mkdir()
+        Path('nested/alias').symlink_to('../src', target_is_directory=True)
+        assert is_directory(b'nested/alias') == 0
         assert read(b'alias/main.elisa', buffer, 128) < 0
         Path('linked').symlink_to('src/main.elisa')
         assert read(b'linked', buffer, 128) < 0

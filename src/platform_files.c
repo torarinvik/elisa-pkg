@@ -232,11 +232,44 @@ long long elisapkg_package_file_size(const char *path) {
     return (long long)info.st_size;
 }
 
+static int open_directory_path(const char *path) {
+    if (path == NULL || strlen(path) > 4096) return -EINVAL;
+    char *copy = strdup(path);
+    if (copy == NULL) return -ENOMEM;
+    const int absolute = path[0] == '/';
+    int directory = open(absolute ? "/" : ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (directory < 0) { free(copy); return -errno; }
+    char *part = copy;
+    while (absolute && *part == '/') part++;
+    while (*part != '\0') {
+        char *slash = strchr(part, '/');
+        if (slash != NULL) *slash = '\0';
+        if (*part != '\0' && strcmp(part, ".") != 0) {
+            int next = openat(directory, part, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            if (next < 0) {
+                const int error = errno;
+                close(directory);
+                free(copy);
+                return error == 0 ? -EIO : -error;
+            }
+            close(directory);
+            directory = next;
+        }
+        if (slash == NULL) break;
+        part = slash + 1;
+        while (*part == '/') part++;
+    }
+    free(copy);
+    return directory;
+}
+
 long long elisapkg_is_directory(const char *path) {
-    if (path == NULL) return 0;
+    int directory = open_directory_path(path);
+    if (directory < 0) return 0;
     struct stat info;
-    if (lstat(path, &info) != 0) return 0;
-    return S_ISDIR(info.st_mode) && !S_ISLNK(info.st_mode) ? 1 : 0;
+    const int result = fstat(directory, &info) == 0 && S_ISDIR(info.st_mode) ? 1 : 0;
+    close(directory);
+    return result;
 }
 
 long long elisapkg_read_package_file(const char *path, unsigned char *output, size_t capacity) {
