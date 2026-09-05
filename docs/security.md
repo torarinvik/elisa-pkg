@@ -51,6 +51,13 @@ and a timeout kills the group before the temporary artifact is removed. This
 limits hangs and descendant-process leaks, but it does not replace a sandbox or
 prevent a trusted child from consuming resources until the deadline.
 
+Before `exec`, the child also applies a platform resource profile: compiler
+children receive 600 seconds of CPU time and a 128 MiB file-size limit, while
+run/test children receive 120 seconds of CPU time and a 64 MiB file-size limit;
+core dumps are disabled. If the operating system refuses the profile, the child
+exits before running user-selected code. These limits are host-specific
+guardrails and do not provide filesystem or network isolation.
+
 Every package build additionally sets `ELISA_STAGE1_SEMANTIC_GATE=1` in the
 controlled child environment. A semantic diagnostic therefore stops the build
 before an artifact can be reported as successful.

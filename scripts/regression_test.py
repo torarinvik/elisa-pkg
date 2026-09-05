@@ -286,6 +286,9 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
     timeout_error = native.elisapkg_timeout_error
     timeout_error.argtypes = []
     timeout_error.restype = ctypes.c_longlong
+    set_limits = native.elisapkg_set_process_limits
+    set_limits.argtypes = [ctypes.c_longlong]
+    set_limits.restype = ctypes.c_longlong
     realpath_secure = native.elisapkg_realpath
     realpath_secure.argtypes = [ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t]
     realpath_secure.restype = ctypes.c_char_p
@@ -389,4 +392,10 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
         pass
     else:
         raise AssertionError('timed-out child still exists')
+    for profile in (1, 2):
+        limited = os.fork()
+        if limited == 0:
+            os._exit(0 if set_limits(profile) == 0 else 1)
+        _, limited_status = os.waitpid(limited, 0)
+        assert os.WIFEXITED(limited_status) and os.WEXITSTATUS(limited_status) == 0
 print('review regressions passed')

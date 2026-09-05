@@ -14,6 +14,7 @@
 #include <signal.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
 #include <time.h>
 #include <sys/wait.h>
 
@@ -777,6 +778,24 @@ long long elisapkg_chdir(const char *path) {
 
 long long elisapkg_set_process_group(void) {
     return setpgid(0, 0) == 0 ? 0 : -errno;
+}
+
+long long elisapkg_set_process_limits(long long profile) {
+    struct rlimit cpu = {0};
+    struct rlimit file_size = {0};
+    const rlim_t cpu_seconds = profile == 1 ? 600 : (profile == 2 ? 120 : 0);
+    const rlim_t file_bytes = profile == 1 ? 134217728 : (profile == 2 ? 67108864 : 0);
+    if (cpu_seconds == 0 || file_bytes == 0) return -EINVAL;
+    cpu.rlim_cur = cpu_seconds;
+    cpu.rlim_max = cpu_seconds;
+    file_size.rlim_cur = file_bytes;
+    file_size.rlim_max = file_bytes;
+    if (setrlimit(RLIMIT_CPU, &cpu) != 0 || setrlimit(RLIMIT_FSIZE, &file_size) != 0) return -errno;
+#ifdef RLIMIT_CORE
+    struct rlimit core = {0, 0};
+    if (setrlimit(RLIMIT_CORE, &core) != 0) return -errno;
+#endif
+    return 0;
 }
 
 static long long monotonic_milliseconds(void) {
