@@ -32,3 +32,7 @@ publication for both the binary and its receipt. It refuses pre-existing
 destinations, records the artifact SHA-256 digest, and only uninstalls when the
 receipt, package name, path, and current bytes all match. A changed executable
 or receipt is left in place for manual recovery.
+
+`cache gc --dry-run` does not delete anything. Actual cache collection remains
+disabled until it can mark live lock, lease, and installation references and
+recheck them before unlinking immutable entries.

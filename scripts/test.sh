@@ -105,6 +105,13 @@ mkdir -p "$CASE"
   "$BIN" resolve >/dev/null
   grep -F '"name":"nested-util"' elisapkg.lock >/dev/null
   "$BIN" cache verify | grep -F 'manifest digests verified' >/dev/null
+  "$BIN" cache gc --dry-run | grep -F 'nothing would be collected' >/dev/null
+  if "$BIN" cache gc >/dev/null 2>&1; then
+    echo "disabled cache GC unexpectedly succeeded" >&2
+    exit 1
+  else
+    test "$?" -eq 7
+  fi
   "$BIN" resolve --frozen >/dev/null
   cp local-util/elisapkg.json local-util/elisapkg.json.good
   sed 's/1.2.3/1.2.4/' local-util/elisapkg.json.good > local-util/elisapkg.json
