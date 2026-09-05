@@ -25,7 +25,7 @@ build/elisapkg init path/to/app
 (cd path/to/app && ../../build/elisapkg run --)
 ```
 
-The manifest and lockfile are JSON schema-versioned. `resolve --frozen` verifies the existing lockfile byte-for-byte and refuses to edit it. `--offline`, `--locked`, and `--frozen` are accepted by the CLI; remote acquisition remains disabled until signed registry metadata and publisher authorization are configured.
+The manifest and lockfile are JSON schema-versioned. `resolve --frozen` verifies the existing lockfile byte-for-byte and refuses to edit it. `tree` and `why NAME` read the verified lock and show the selected local graph. `--offline`, `--locked`, and `--frozen` are accepted by the CLI; remote acquisition remains disabled until signed registry metadata and publisher authorization are configured.
 
 Commands that inspect or build a project accept `--manifest-path PATH`; PATH may name the project directory or its `elisapkg.json`. Local path resolution walks the dependency graph transitively, sorts package records by canonical name, normalizes relative paths, records a SHA-256 manifest digest, and rejects conflicting duplicate package identities. Target paths are resolved with `realpath` and must remain below their package root, including when a symlink is present. `clean` removes only the known `.elisapkg/build/app` output and empty build directories. Registry dependency declarations are syntax-checked locally, including exact, caret, tilde, and comparison SemVer ranges, but resolution remains fail-closed until a verified registry provider exists.
 

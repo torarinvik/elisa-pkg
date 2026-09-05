@@ -1581,6 +1581,55 @@ def run_check(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Con
     write_ok("\n")
     return EXIT_OK
 
+def print_lock_packages(raw: darray[u8]&) -> bool can[Console.Write, Memory.Allocate, Abort.Panic]:
+    found: mutable usize = 0.usize()
+    for index in 0..<raw.count |raw, found|:
+        continue if raw[index] != 123
+        object_end: usize = json_object_end(raw, index)
+        continue if object_end <= index
+        package_name: mutable darray[u8] = []
+        package_version: mutable darray[u8] = []
+        if object_string_value(raw, index, object_end, "name", &package_name) and object_string_value(raw, index, object_end, "version", &package_version):
+            write_bytes(1, &package_name)
+            write_ok(" ")
+            write_bytes(1, &package_version)
+            write_ok("\n")
+            found <- found + 1.usize()
+    return found > 0.usize()
+
+def lock_contains_package(raw: darray[u8]&, wanted: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+    for index in 0..<raw.count |raw, wanted|:
+        continue if raw[index] != 123
+        object_end: usize = json_object_end(raw, index)
+        continue if object_end <= index
+        package_name: mutable darray[u8] = []
+        return true if object_string_value(raw, index, object_end, "name", &package_name) and bytes_equal(package_name, wanted)
+    return false
+
+def run_why(argc: i64, slots: mutable cstr&&, start: darray[u8]&) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    return EXIT_USAGE if argc < 3
+    wanted: mutable darray[u8] = []
+    bytes_push_cstr(&wanted, slots[2].cast[cstr])
+    return EXIT_USAGE if not valid_package_name(wanted)
+    raw: mutable darray[u8] = []
+    raw.resize(1048577)
+    return EXIT_RESOLVE if not read_cstr_into("elisapkg.json", &raw)
+    root_name: mutable darray[u8] = []
+    root_version: mutable darray[u8] = []
+    return EXIT_RESOLVE if not validate_manifest_at(raw, start, &root_name, &root_version)
+    return EXIT_RESOLVE if not cstr_file_exists("elisapkg.lock")
+    lock: mutable darray[u8] = []
+    lock.resize(1048577)
+    return EXIT_RESOLVE if not read_cstr_into("elisapkg.lock", &lock)
+    expected: darray[u8] = canonical_lock_for_manifest(root_name, root_version, raw, start)
+    return EXIT_RESOLVE if expected.count == 0.usize() or not bytes_equal(expected, lock)
+    return EXIT_RESOLVE if not lock_contains_package(lock, wanted)
+    write_bytes(1, &root_name)
+    write_ok(" -> ")
+    write_bytes(1, &wanted)
+    write_ok("\n")
+    return EXIT_OK
+
 def run_resolve(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
     if not project_manifest_exists():
         write_error("error: could not find elisapkg.json in the current directory\n")
@@ -1621,10 +1670,13 @@ def run_tree(start: darray[u8]&) -> i64 can[Console.Write, Memory.Allocate, Abor
     name: mutable darray[u8] = []
     version: mutable darray[u8] = []
     return EXIT_RESOLVE if not validate_manifest(raw, &name, &version)
-    write_bytes(1, &name)
-    write_ok(" ")
-    write_bytes(1, &version)
-    write_ok("\n")
+    return EXIT_RESOLVE if not cstr_file_exists("elisapkg.lock")
+    lock: mutable darray[u8] = []
+    lock.resize(1048577)
+    return EXIT_RESOLVE if not read_cstr_into("elisapkg.lock", &lock)
+    expected: darray[u8] = canonical_lock_for_manifest(name, version, raw, start)
+    return EXIT_RESOLVE if expected.count == 0.usize() or not bytes_equal(expected, lock)
+    return EXIT_RESOLVE if not print_lock_packages(lock)
     return EXIT_OK
 
 def run_metadata(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -1931,8 +1983,10 @@ def cli_main(argc: i64, argv: mutable void&) -> i64 can[Console.Write, Memory.Al
         return run_check(&start, options)
     if command == "resolve":
         return run_resolve(&start, options)
-    if command == "tree" or command == "why":
+    if command == "tree":
         return run_tree(&start)
+    if command == "why":
+        return run_why(argc, slots, &start)
     if command == "metadata":
         return run_metadata(&start, options)
     if command == "doctor":

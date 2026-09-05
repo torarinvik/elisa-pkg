@@ -138,6 +138,8 @@ mkdir -p "$CASE"
   printf '%s\n' 'def main() -> i64:' '    return 0' > src/main.elisa
   "$BIN" metadata --json | grep -F '"schema-version":1' >/dev/null
   "$BIN" tree | grep -F 'app 0.1.0' >/dev/null
+  "$BIN" tree | grep -F 'local-util 1.2.3' >/dev/null
+  "$BIN" why local-util | grep -F 'app -> local-util' >/dev/null
   "$BIN" update local-util >/dev/null
   if "$BIN" add local-util --path local-util >/dev/null 2>&1; then
     echo "duplicate dependency was accepted" >&2
