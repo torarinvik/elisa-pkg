@@ -32,10 +32,11 @@ The manifest and lockfile are JSON schema-versioned. `resolve --frozen` verifies
 `cache verify` performs the same canonical-lock and local manifest-digest check
 before reporting that no shared remote cache is configured. Successful builds
 publish an exclusive compiler output by atomic rename and retain a receipt of
-the target source, manifest, and artifact digests plus selected compiler
-inputs. A matching receipt and artifact are reused; changing either digest
-forces a fresh compiler invocation. Included non-target sources and compiler
-contents remain outside receipt v2 and require a future build-key expansion.
+the target source, manifest, resolved-lock, and artifact digests plus selected
+compiler inputs. A matching receipt and artifact are reused; changing the
+root, dependency graph, or target source forces a fresh compiler invocation.
+Included non-target sources and compiler contents remain outside this receipt
+and require a future build-key expansion.
 `cache gc --dry-run` is likewise read-only and reports that there is no shared
 cache to sweep; destructive garbage collection stays disabled until the
 content-addressed store, leases, and concurrent-reader rules are implemented.

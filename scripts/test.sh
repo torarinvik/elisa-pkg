@@ -257,6 +257,16 @@ mkdir -p "$CASE"
   mv elisapkg.root.good elisapkg.json
   "$BIN" build >/dev/null
   "$BIN" build --frozen >/dev/null
+  cp local-util/src/main.elisa local-util/src/main.elisa.good
+  printf '%s\n' 'def main() -> i64:' '    return 1' > local-util/src/main.elisa
+  dependency_rebuild_output="$("$BIN" build)"
+  case "$dependency_rebuild_output" in
+    *"(cached)"*)
+      echo "changed dependency source was accepted from the cache" >&2
+      exit 1
+      ;;
+  esac
+  mv local-util/src/main.elisa.good local-util/src/main.elisa
   python3 - <<'PY'
 path = ".elisapkg/build/app"
 with open(path, "r+b") as handle:

@@ -55,11 +55,12 @@ in `scripts/regression_test.py`.
 
 ## D-007: build reuse
 
-Receipt version 2 fingerprints the selected target source, manifest bytes,
-compiler configuration, and output artifact. A matching receipt and verified
-artifact may be reused; included non-target sources and complete compiler
-contents remain outside the key and require a future expansion. A failed child
-or invalid output never replaces the last known-good artifact. Fixture:
+Receipt version 3 fingerprints the selected target source, manifest bytes,
+resolved-lock bytes, compiler configuration, and output artifact. A matching
+receipt and verified artifact may be reused; included non-target sources and
+complete compiler contents remain outside the key and require a future
+expansion. A failed child or invalid output never replaces the last known-good
+artifact. Fixture:
 compiler-failure and artifact-preservation cases in the regression suite.
 
 ## D-008: trusted-source execution

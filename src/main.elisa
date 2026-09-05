@@ -2513,6 +2513,13 @@ def run_build(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Con
         return EXIT_BUILD
     lock_status: i64 = run_resolve(start, options)
     return lock_status if lock_status != EXIT_OK
+    lock_raw: mutable darray[u8] = []
+    lock_raw.resize(1048577)
+    return EXIT_BUILD if not read_cstr_into("elisapkg.lock", &lock_raw)
+    lock_digest_bytes: mutable darray[u8] = []
+    lock_digest: mutable darray[u8] = []
+    return EXIT_BUILD if Integrity::sha256(lock_raw, &lock_digest_bytes) != Integrity::DigestCode.Ok
+    return EXIT_BUILD if not Integrity::hex_digest(lock_digest_bytes, &lock_digest)
     target_source: mutable darray[u8] = []
     target_source.resize(67108865)
     target_source_raw: mutable u8& = (&target_source[0]).cast[mutable u8&] can Unsafe.PointerCast
@@ -2546,12 +2553,14 @@ def run_build(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Con
     if Platform::pkg_getenv("ELISA_ALLOW_STALE_STAGE1") is configured_stale:
         allow_stale <- configured_stale.cast[cstr]
     receipt: mutable darray[u8] = []
-    bytes_push_view(&receipt, "elisapkg-build-receipt:2\nentry:")
+    bytes_push_view(&receipt, "elisapkg-build-receipt:3\nentry:")
     bytes_push_array(&receipt, target_entry)
     bytes_push_view(&receipt, "\nsource-digest:sha256:")
     bytes_push_array(&receipt, source_digest)
     bytes_push_view(&receipt, "\nmanifest-digest:sha256:")
     bytes_push_array(&receipt, manifest_digest)
+    bytes_push_view(&receipt, "\nlock-digest:sha256:")
+    bytes_push_array(&receipt, lock_digest)
     bytes_push_view(&receipt, "\ncompiler:")
     bytes_push_cstr(&receipt, compiler)
     bytes_push_view(&receipt, "\nstage1-bin:")
@@ -2584,8 +2593,9 @@ def run_build(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Con
                     write_ok("built .elisapkg/build/app (cached)\n")
                     _ = options
                     return EXIT_OK
-    # Receipt v2 still omits included sources and compiler contents. Recompile until
-    # every effective input can be fingerprinted without accepting stale code.
+    # The lock digest includes every resolved local dependency identity and
+    # source digest. Recompile whenever that graph changes instead of reusing a
+    # root-only artifact.
     # mkstemp keeps the compiler output path exclusive for the whole child
     # process, preventing a predictable temporary symlink from redirecting the
     # output. The final rename is the only point at which app becomes visible.
