@@ -534,6 +534,7 @@ def valid_target_objects(raw: darray[u8]&) -> bool can[Memory.Allocate, Abort.Pa
         if raw[index] == 123:
             object_end: usize = json_object_end(raw, index)
             return false if object_end <= index or object_end > targets_end
+            return false if not valid_direct_field_set(raw, index, object_end, 2)
             target_name: mutable darray[u8] = []
             return false if not object_string_value(raw, index, object_end, "name", &target_name)
             return false if not valid_package_name(target_name)
@@ -978,6 +979,48 @@ def object_string_value(raw: darray[u8]&, object_start: usize, object_end: usize
             in_string <- false
     return false
 
+def valid_direct_field_set(raw: darray[u8]&, object_start: usize, object_end: usize, set_kind: i64) -> bool can[Memory.Allocate, Abort.Panic]:
+    return false if object_start >= object_end or raw[object_start] != 123
+    in_string: mutable bool = false
+    escaped: mutable bool = false
+    string_start: mutable usize = 0.usize()
+    braces: mutable i64 = 1
+    brackets: mutable i64 = 0
+    for index in (object_start + 1.usize())..<object_end |raw, in_string, escaped, string_start, braces, brackets|:
+        byte: u8 = raw[index]
+        if not in_string:
+            if byte == 34:
+                in_string <- true
+                string_start <- index + 1.usize()
+            elif byte == 123:
+                braces <- braces + 1
+            elif byte == 125:
+                braces <- braces - 1
+            elif byte == 91:
+                brackets <- brackets + 1
+            elif byte == 93:
+                brackets <- brackets - 1
+        elif escaped:
+            escaped <- false
+        elif byte == 92:
+            escaped <- true
+        elif byte == 34:
+            after: mutable usize = index + 1.usize()
+            while after < object_end and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
+                after <- after + 1.usize()
+            if braces == 1 and brackets == 0 and after < object_end and raw[after] == 58:
+                key: mutable darray[u8] = []
+                for key_index in string_start..<index |key, raw|:
+                    key.push(raw[key_index])
+                allowed: bool = false
+                if set_kind == 1:
+                    allowed <- bytes_equal_view(key, "name") or bytes_equal_view(key, "version") or bytes_equal_view(key, "description") or bytes_equal_view(key, "license") or bytes_equal_view(key, "elisa")
+                else:
+                    allowed <- bytes_equal_view(key, "name") or bytes_equal_view(key, "kind") or bytes_equal_view(key, "entry")
+                return false if not allowed
+            in_string <- false
+    return true
+
 def bytes_less(left: darray[u8]&, right: darray[u8]&) -> bool:
     limit: usize = left.count if left.count < right.count else right.count
     for index in 0..<limit |left, right|:
@@ -1400,6 +1443,7 @@ def valid_optional_package_strings(raw: darray[u8]&) -> bool can[Memory.Allocate
     package_start: usize = json_key_value_offset(raw, "package")
     package_end: usize = json_object_end(raw, package_start)
     return false if package_start >= raw.count or package_end <= package_start
+    return false if not valid_direct_field_set(raw, package_start, package_end, 1)
     description_key: mutable darray[u8] = [100, 101, 115, 99, 114, 105, 112, 116, 105, 111, 110]
     license_key: mutable darray[u8] = [108, 105, 99, 101, 110, 115, 101]
     elisa_key: mutable darray[u8] = [101, 108, 105, 115, 97]

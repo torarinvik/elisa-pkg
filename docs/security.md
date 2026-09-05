@@ -54,8 +54,9 @@ recheck them before unlinking immutable entries.
 Review corrections: archive reads use descriptor-relative no-follow opens for
 all components, detect I/O errors, and reject special files. Archive validation
 also checks zero data padding and file/directory conflicts. Frozen resolution
-performs no lockfile replacement. Build receipt reuse is disabled until included
-sources and toolchain contents are fully fingerprinted.
+performs no lockfile replacement. Build receipt v2 reuses only when the target,
+manifest, compiler settings, and artifact digest all match; included sources
+and complete toolchain contents remain outside the current key.
 
 These changes do not supply the planned remote verifier or execution sandbox.
 Project mutation and installation still assume a trusted, user-owned directory;

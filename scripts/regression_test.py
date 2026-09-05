@@ -131,7 +131,9 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
     valid = manifest.read_text()
     unsupported_registry = valid.replace('"dependencies": {}', '"dependencies":{"remote":{"registry":"default","version":"^1.0.0"}}')
     misplaced_identity = valid.replace('"targets":', '"name":"shadow","targets":')
-    for invalid in [valid.replace('"schema-version": 1,', '"schema-version": 1'), valid + '{}', unsupported_registry, misplaced_identity]:
+    misplaced_package_field = valid.replace('"version": "0.1.0"', '"version": "0.1.0", "entry":"src/main.elisa"', 1)
+    misplaced_target_field = valid.replace('"kind": "bin"', '"kind": "bin", "license":"MIT"', 1)
+    for invalid in [valid.replace('"schema-version": 1,', '"schema-version": 1'), valid + '{}', unsupported_registry, misplaced_identity, misplaced_package_field, misplaced_target_field]:
         manifest.write_text(invalid)
         result = subprocess.run([BIN, 'check-manifest'], cwd=project, capture_output=True, timeout=120)
         assert result.returncode != 0
