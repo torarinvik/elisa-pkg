@@ -23,6 +23,7 @@ build/elisapkg init path/to/app
 (cd path/to/app && ../../build/elisapkg resolve)
 (cd path/to/app && ../../build/elisapkg build)
 (cd path/to/app && ../../build/elisapkg run --)
+(cd path/to/app && ../../build/elisapkg test)
 (cd path/to/app && ELISAPKG_INSTALL_PREFIX="$HOME/.local" ../../build/elisapkg install --local)
 ```
 
