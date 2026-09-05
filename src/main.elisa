@@ -81,6 +81,19 @@ def bytes_count(haystack: darray[u8]&, needle: cstr) -> usize:
             start <- start + 1.usize()
     return total
 
+def bytes_starts_with(value: darray[u8]&, prefix: darray[u8]&) -> bool:
+    return false if prefix.count > value.count
+    for index in 0..<prefix.count |value, prefix|:
+        return false if value[index] != prefix[index]
+    return true
+
+def bytes_ends_with(value: darray[u8]&, suffix: darray[u8]&) -> bool:
+    return false if suffix.count > value.count
+    offset: usize = value.count - suffix.count
+    for index in 0..<suffix.count |value, suffix, offset|:
+        return false if value[offset + index] != suffix[index]
+    return true
+
 def write_bytes(fd: i64, value: darray[u8]&) -> void can[Console.Write, Unsafe.PointerCast]:
     can Console.Write:
         return if value.count == 0.usize()
@@ -198,6 +211,27 @@ def write_cstr_file(path_name: cstr, value: darray[u8]&) -> bool can[Memory.Allo
         _ = Platform::pkg_unlink(temp_name)
         return false
     return true
+
+def write_cstr_file_noclobber(path_name: cstr, value: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+    # Link the fsynced temporary into place so an existing destination can
+    # never be replaced by a rename race. The temporary is removed after the
+    # link, leaving one durable directory entry for the caller to own.
+    template: mutable darray[u8] = []
+    bytes_push_cstr(&template, path_name)
+    bytes_push_view(&template, ".tmp.XXXXXX")
+    template.push(0)
+    template_raw: mutable u8& = (&template[0]).cast[mutable u8&] can Unsafe.PointerCast
+    fd: i64 = Platform::pkg_mkstemp(template_raw)
+    return false if fd < 0
+    temp_name: cstr = (&template[0]).cast[cstr] can Unsafe.PointerCast
+    if not write_fd_all(fd, value) or Platform::pkg_fsync(fd) != 0:
+        _ = Platform::pkg_close(fd)
+        _ = Platform::pkg_unlink(temp_name)
+        return false
+    _ = Platform::pkg_close(fd)
+    linked: bool = Platform::pkg_link(temp_name, path_name) == 0
+    _ = Platform::pkg_unlink(temp_name)
+    return linked
 
 def cstr_file_exists(path_name: cstr) -> bool:
     return Platform::pkg_access(path_name, 0) == 0
@@ -1580,8 +1614,8 @@ def project_manifest_exists() -> bool:
     return legacy
 
 def usage() -> void can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-    write_ok("elisapkg — Elisa Packaging System\n\nUsage: elisapkg <command> [options]\n\nCommands:\n  init [PATH]                 create a package\n  check-manifest              validate elisapkg.json\n  add NAME --path PATH        add a verified local path dependency\n  remove NAME                 remove a declared local dependency\n  update [NAME]               recompute the local dependency lock\n  resolve [--locked|--offline]\n                              validate and write elisapkg.lock\n  tree                        show the resolved package graph\n  metadata --json             print normalized package metadata\n  doctor                      report toolchain and trust capabilities\n  build                       compile the package entry point\n  run -- ARGS                 build and run\n  test                        test targets (requires test harness)\n  clean                       remove build outputs (gated in this foundation)\n  fetch                       verify locked sources\n  cache verify                inspect cached verification records\n  package --list              preview publish files\n\nModes: --locked  --offline  --frozen  --json  --verbose\n")
-    write_ok("publish/install/uninstall are trust-gated and disabled until signed sources are configured\n")
+    write_ok("elisapkg — Elisa Packaging System\n\nUsage: elisapkg <command> [options]\n\nCommands:\n  init [PATH]                 create a package\n  check-manifest              validate elisapkg.json\n  add NAME --path PATH        add a verified local path dependency\n  remove NAME                 remove a declared local dependency\n  update [NAME]               recompute the local dependency lock\n  resolve [--locked|--offline]\n                              validate and write elisapkg.lock\n  tree                        show the resolved package graph\n  metadata --json             print normalized package metadata\n  doctor                      report toolchain and trust capabilities\n  build                       compile the package entry point\n  run -- ARGS                 build and run\n  test                        test targets (requires test harness)\n  clean                       remove build outputs (gated in this foundation)\n  fetch                       verify locked sources\n  cache verify                inspect cached verification records\n  package --list              preview publish files\n  install --local             install the current built binary into the user prefix\n  uninstall --local NAME      remove a receipt-owned local binary\n\nModes: --locked  --offline  --frozen  --json  --verbose\n")
+    write_ok("remote publish/install/uninstall are trust-gated; use install --local for a receipt-backed local binary\n")
 
 def current_directory_into(out: mutable darray[u8]&) -> void can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
     buffer: mutable darray[u8] = []
@@ -1850,11 +1884,182 @@ def run_publish() -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe
     write_error(Security::publish_message())
     return Security::publish_status()
 
-def run_install() -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+def valid_install_prefix(path: darray[u8]&) -> bool:
+    return false if path.count == 0.usize() or path.count > 4096.usize() or path[0] != 47
+    for index in 0..<path.count |path|:
+        return false if path[index] < 32 or path[index] == 127
+    return true
+
+def local_install_prefix(out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    if Platform::pkg_getenv("ELISAPKG_INSTALL_PREFIX") is configured_prefix:
+        prefix_name: cstr = configured_prefix.cast[cstr]
+        length: usize = Platform::pkg_strlen(prefix_name)
+        for index in 0..<length |out, prefix_name|:
+            out.push(prefix_name[index].u8())
+    elif Platform::pkg_getenv("HOME") is configured_home:
+        bytes_push_cstr(&out, configured_home.cast[cstr])
+        bytes_push_view(&out, "/.local")
+    return valid_install_prefix(out)
+
+def run_install_local(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    prefix: mutable darray[u8] = []
+    return EXIT_USAGE if not local_install_prefix(&prefix)
+    root: mutable darray[u8] = [46]
+    resolved: i64 = run_resolve(&root, options)
+    return resolved if resolved != EXIT_OK
+    name: mutable darray[u8] = []
+    version: mutable darray[u8] = []
+    return EXIT_USAGE if not load_package_at(&root, &name, &version)
+    return EXIT_BUILD if run_build(start, options) != EXIT_OK
+    artifact: mutable darray[u8] = []
+    path_join_into(start, ".elisapkg/build/app", &artifact)
+    artifact_bytes: mutable darray[u8] = []
+    return 7 if not read_file_into(&artifact, &artifact_bytes)
+    digest_bytes: mutable darray[u8] = []
+    digest: mutable darray[u8] = []
+    return 7 if Integrity::sha256(artifact_bytes, &digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(digest_bytes, &digest)
+    bin_dir: mutable darray[u8] = []
+    receipt_dir: mutable darray[u8] = []
+    path_join_into(prefix, "bin", &bin_dir)
+    path_join_into(prefix, "share/elisapkg/receipts", &receipt_dir)
+    _ = make_directory(&bin_dir)
+    _ = make_directory(&receipt_dir)
+    name_c: mutable darray[u8] = []
+    path_with_nul_into(&name, &name_c)
+    name_raw: cstr = (&name_c[0]).cast[cstr] can Unsafe.PointerCast
+    destination: mutable darray[u8] = []
+    receipt_path: mutable darray[u8] = []
+    path_join_into(bin_dir, name_raw, &destination)
+    path_join_into(receipt_dir, name_raw, &receipt_path)
+    destination_c: mutable darray[u8] = []
+    receipt_c: mutable darray[u8] = []
+    path_with_nul_into(&destination, &destination_c)
+    path_with_nul_into(&receipt_path, &receipt_c)
+    destination_name: cstr = (&destination_c[0]).cast[cstr] can Unsafe.PointerCast
+    receipt_name: cstr = (&receipt_c[0]).cast[cstr] can Unsafe.PointerCast
+    lock_path: mutable darray[u8] = []
+    path_join_into(prefix, ".elisapkg-install.lock", &lock_path)
+    lock_c: mutable darray[u8] = []
+    path_with_nul_into(&lock_path, &lock_c)
+    lock_name: cstr = (&lock_c[0]).cast[cstr] can Unsafe.PointerCast
+    return 7 if Platform::pkg_mkdir(lock_name, 448.u16()) != 0
+    if file_exists(&destination) or file_exists(&receipt_path):
+        _ = Platform::pkg_rmdir(lock_name)
+        write_error("error: install destination or receipt already exists; refusing to overwrite\n")
+        return 7
+    if not write_cstr_file_noclobber(destination_name, &artifact_bytes) or Platform::pkg_chmod(destination_name, 493.u16()) != 0:
+        _ = remove_known_file(&destination)
+        _ = Platform::pkg_rmdir(lock_name)
+        return 7
+    receipt: mutable darray[u8] = []
+    bytes_push_view(&receipt, "elisapkg-install-receipt:1\nname:")
+    bytes_push_array(&receipt, name)
+    bytes_push_view(&receipt, "\nversion:")
+    bytes_push_array(&receipt, version)
+    bytes_push_view(&receipt, "\npath:")
+    bytes_push_array(&receipt, destination)
+    bytes_push_view(&receipt, "\nartifact-digest:sha256:")
+    bytes_push_array(&receipt, digest)
+    bytes_push_view(&receipt, "\n")
+    if not write_cstr_file_noclobber(receipt_name, &receipt):
+        _ = remove_known_file(&destination)
+        _ = Platform::pkg_rmdir(lock_name)
+        return 7
+    _ = Platform::pkg_rmdir(lock_name)
+    write_ok("installed ")
+    write_bytes(1, &name)
+    write_ok(" to ")
+    write_bytes(1, &destination)
+    write_ok("\n")
+    return EXIT_OK
+
+def run_install(argc: i64, slots: mutable cstr&&, start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    if argc == 3 and slots[2].cast[cstr] == "--local":
+        return run_install_local(start, options)
     write_error(Security::install_message())
     return Security::install_status()
 
-def run_uninstall() -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+def run_uninstall_local(name_raw_input: cstr) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    name: mutable darray[u8] = []
+    bytes_push_cstr(&name, name_raw_input)
+    prefix: mutable darray[u8] = []
+    return EXIT_USAGE if not local_install_prefix(&prefix)
+    bin_dir: mutable darray[u8] = []
+    receipt_dir: mutable darray[u8] = []
+    path_join_into(prefix, "bin", &bin_dir)
+    path_join_into(prefix, "share/elisapkg/receipts", &receipt_dir)
+    name_c: mutable darray[u8] = []
+    path_with_nul_into(&name, &name_c)
+    name_raw: cstr = (&name_c[0]).cast[cstr] can Unsafe.PointerCast
+    destination: mutable darray[u8] = []
+    receipt_path: mutable darray[u8] = []
+    path_join_into(bin_dir, name_raw, &destination)
+    path_join_into(receipt_dir, name_raw, &receipt_path)
+    destination_c: mutable darray[u8] = []
+    receipt_c: mutable darray[u8] = []
+    path_with_nul_into(&destination, &destination_c)
+    path_with_nul_into(&receipt_path, &receipt_c)
+    destination_name: cstr = (&destination_c[0]).cast[cstr] can Unsafe.PointerCast
+    receipt_name: cstr = (&receipt_c[0]).cast[cstr] can Unsafe.PointerCast
+    lock_path: mutable darray[u8] = []
+    path_join_into(prefix, ".elisapkg-install.lock", &lock_path)
+    lock_c: mutable darray[u8] = []
+    path_with_nul_into(&lock_path, &lock_c)
+    lock_name: cstr = (&lock_c[0]).cast[cstr] can Unsafe.PointerCast
+    return 7 if Platform::pkg_mkdir(lock_name, 448.u16()) != 0
+    if not file_exists(&destination) or not file_exists(&receipt_path):
+        _ = Platform::pkg_rmdir(lock_name)
+        write_error("error: no matching local installation receipt is available\n")
+        return 7
+    artifact_bytes: mutable darray[u8] = []
+    receipt: mutable darray[u8] = []
+    receipt.resize(4096)
+    if not read_file_into(&destination, &artifact_bytes) or not read_cstr_into(receipt_name, &receipt):
+        _ = Platform::pkg_rmdir(lock_name)
+        return 7
+    digest_bytes: mutable darray[u8] = []
+    digest: mutable darray[u8] = []
+    if Integrity::sha256(artifact_bytes, &digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(digest_bytes, &digest):
+        _ = Platform::pkg_rmdir(lock_name)
+        return 7
+    expected_prefix: mutable darray[u8] = []
+    expected_suffix: mutable darray[u8] = []
+    bytes_push_view(&expected_prefix, "elisapkg-install-receipt:1\nname:")
+    bytes_push_array(&expected_prefix, name)
+    bytes_push_view(&expected_prefix, "\nversion:")
+    bytes_push_view(&expected_suffix, "\npath:")
+    bytes_push_array(&expected_suffix, destination)
+    bytes_push_view(&expected_suffix, "\nartifact-digest:sha256:")
+    bytes_push_array(&expected_suffix, digest)
+    bytes_push_view(&expected_suffix, "\n")
+    version_bytes: mutable darray[u8] = []
+    version_end: usize = receipt.count - expected_suffix.count if receipt.count >= expected_suffix.count else 0.usize()
+    if not bytes_starts_with(receipt, expected_prefix) or not bytes_ends_with(receipt, expected_suffix) or version_end <= expected_prefix.count:
+        _ = Platform::pkg_rmdir(lock_name)
+        write_error("error: installation receipt does not match the current file; refusing removal\n")
+        return 7
+    for index in expected_prefix.count..<version_end |receipt, version_bytes|:
+        version_bytes.push(receipt[index])
+    parsed_version: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
+    if not parse_version(version_bytes, &parsed_version):
+        _ = Platform::pkg_rmdir(lock_name)
+        write_error("error: installation receipt does not match the current file; refusing removal\n")
+        return 7
+    if not remove_known_file(&destination) or not remove_known_file(&receipt_path):
+        _ = Platform::pkg_rmdir(lock_name)
+        return 7
+    _ = Platform::pkg_rmdir(lock_name)
+    write_ok("uninstalled ")
+    write_bytes(1, &name)
+    write_ok("\n")
+    return EXIT_OK
+
+def run_uninstall(argc: i64, slots: mutable cstr&&) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    if argc == 4 and slots[2].cast[cstr] == "--local":
+        name: mutable darray[u8] = []
+        bytes_push_cstr(&name, slots[3].cast[cstr])
+        return EXIT_USAGE if not valid_package_name(name)
+        return run_uninstall_local(slots[3].cast[cstr])
     write_error("error: no installation receipt is available\n")
     return 7
 
@@ -2228,7 +2433,7 @@ def cli_main(argc: i64, argv: mutable void&) -> i64 can[Console.Write, Memory.Al
         options.frozen <- true if flag == "--frozen"
         options.json <- true if flag == "--json"
         options.verbose <- true if flag == "--verbose"
-        recognized: bool = flag[0].u8() != 45 or flag == "--locked" or flag == "--offline" or flag == "--frozen" or flag == "--json" or flag == "--verbose" or flag == "--manifest-path" or flag == "--list" or flag == "--dry-run" or flag == "--version" or flag == "--"
+        recognized: bool = flag[0].u8() != 45 or flag == "--locked" or flag == "--offline" or flag == "--frozen" or flag == "--json" or flag == "--verbose" or flag == "--manifest-path" or flag == "--list" or flag == "--dry-run" or flag == "--version" or flag == "--" or (command == "install" and flag == "--local") or (command == "uninstall" and flag == "--local")
         flags_ok <- false if not recognized
     if not flags_ok:
         write_error("error: unknown option; run `elisapkg --help`\n")
@@ -2250,9 +2455,9 @@ def cli_main(argc: i64, argv: mutable void&) -> i64 can[Console.Write, Memory.Al
     if command == "publish":
         return run_publish()
     if command == "install":
-        return run_install()
+        return run_install(argc, slots, &start, options)
     if command == "uninstall":
-        return run_uninstall()
+        return run_uninstall(argc, slots)
     if command == "clean":
         return run_clean()
     if command == "cache" and argc > 2 and slots[2].cast[cstr] == "verify":

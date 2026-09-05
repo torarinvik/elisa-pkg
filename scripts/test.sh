@@ -176,6 +176,37 @@ PY
   mv src/main.elisa.good src/main.elisa
   "$BIN" run -- >/dev/null
   "$BIN" package --list >/dev/null
+  PREFIX="$CASE/local-prefix"
+  ELISAPKG_INSTALL_PREFIX="$PREFIX" "$BIN" install --local >/dev/null
+  test -x "$PREFIX/bin/app"
+  ELISAPKG_INSTALL_PREFIX="$PREFIX" "$PREFIX/bin/app"
+  if ELISAPKG_INSTALL_PREFIX="$PREFIX" "$BIN" install --local >/dev/null 2>&1; then
+    echo "local install overwrote an existing destination" >&2
+    exit 1
+  else
+    test "$?" -eq 7
+  fi
+  cp "$PREFIX/bin/app" "$PREFIX/bin/app.good"
+  printf '%s' x >> "$PREFIX/bin/app"
+  if ELISAPKG_INSTALL_PREFIX="$PREFIX" "$BIN" uninstall --local app >/dev/null 2>&1; then
+    echo "local uninstall removed a modified binary" >&2
+    exit 1
+  else
+    test "$?" -eq 7
+  fi
+  cp "$PREFIX/bin/app.good" "$PREFIX/bin/app"
+  rm "$PREFIX/bin/app.good"
+  cp "$PREFIX/share/elisapkg/receipts/app" "$PREFIX/share/elisapkg/receipts/app.good"
+  printf '%s' junk >> "$PREFIX/share/elisapkg/receipts/app"
+  if ELISAPKG_INSTALL_PREFIX="$PREFIX" "$BIN" uninstall --local app >/dev/null 2>&1; then
+    echo "local uninstall accepted a malformed receipt" >&2
+    exit 1
+  else
+    test "$?" -eq 7
+  fi
+  mv "$PREFIX/share/elisapkg/receipts/app.good" "$PREFIX/share/elisapkg/receipts/app"
+  ELISAPKG_INSTALL_PREFIX="$PREFIX" "$BIN" uninstall --local app >/dev/null
+  test ! -e "$PREFIX/bin/app"
   PROBE="$CASE/compiler-env-probe.sh"
   DUMP="$CASE/compiler-env.dump"
   printf '%s\n' '#!/bin/sh' "/usr/bin/env > '$DUMP'" 'exit 127' > "$PROBE"

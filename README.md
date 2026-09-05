@@ -23,6 +23,7 @@ build/elisapkg init path/to/app
 (cd path/to/app && ../../build/elisapkg resolve)
 (cd path/to/app && ../../build/elisapkg build)
 (cd path/to/app && ../../build/elisapkg run --)
+(cd path/to/app && ELISAPKG_INSTALL_PREFIX="$HOME/.local" ../../build/elisapkg install --local)
 ```
 
 The manifest and lockfile are JSON schema-versioned. `resolve --frozen` verifies the existing lockfile byte-for-byte and refuses to edit it. Dependency edits journal the original manifest/lock pair and recover it after an interrupted process. `tree` and `why NAME` read the verified lock and show the selected local graph. `--offline`, `--locked`, and `--frozen` are accepted by the CLI; remote acquisition remains disabled until signed registry metadata and publisher authorization are configured.
@@ -39,9 +40,27 @@ Commands that inspect or build a project accept `--manifest-path PATH`; PATH may
 explicitly gated until the deterministic tar/gzip writer and signed release
 workflow are enabled; invoking `package` without `--list` returns an error.
 
+`install --local` is the deliberately narrow local deployment path. It resolves
+the local graph, builds the current binary, and writes it to
+`$ELISAPKG_INSTALL_PREFIX/bin/<package-name>` (or `$HOME/.local/bin` when the
+override is absent). The destination and its receipt are created through an
+exclusive hard-link publication, so an existing file cannot be replaced. A
+receipt under `share/elisapkg/receipts` binds the package name, destination, and
+SHA-256 artifact digest. `uninstall --local NAME` removes only a matching,
+unchanged receipt-owned binary; modified files and malformed receipts are
+refused. Remote `install NAME` remains trust-gated with the other network
+operations.
+
 ## Security posture
 
-Remote packages are not accepted unsigned. `fetch` currently exits with the security status and explains that no trusted source provider is configured. This is deliberate: checksums, TLS, and a registry URL alone do not authenticate a publisher. The implementation plan requires a reviewed signed-metadata protocol, trusted-root bootstrap, publisher delegation, expiry and rollback protection, safe archive extraction, credential redaction, key rotation/revocation, adversarial fixtures, and independent security review before remote support is enabled.
+Remote packages are not accepted unsigned. `fetch` and remote `install NAME`
+currently exit with the security status and explain that no trusted source
+provider is configured. This is deliberate: checksums, TLS, and a registry URL
+alone do not authenticate a publisher. The implementation plan requires a
+reviewed signed-metadata protocol, trusted-root bootstrap, publisher
+delegation, expiry and rollback protection, safe archive extraction, credential
+redaction, key rotation/revocation, adversarial fixtures, and independent
+security review before remote support is enabled.
 
 Builds execute trusted Elisa source under the selected compiler. Dependency build sandboxing, arbitrary build scripts, plugins, and native dependency installation are not enabled. `doctor` reports these limits instead of implying isolation.
 

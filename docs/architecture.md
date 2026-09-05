@@ -19,6 +19,12 @@ The current source units are:
 
 The current compiler backend requires foreign declarations at compilation-unit scope, so `Platform` wraps those declarations rather than placing them inside the module body. This keeps the exception local and documented. Callers use qualified names such as `Platform::pkg_fopen`, `Model::Version`, and `Security::remote_fetch_status`; `using` imports are deliberately avoided.
 
+The current CLI also has a local deployment path. `install --local` stays in
+the command layer, but delegates digesting and filesystem publication to the
+same platform and integrity primitives used by builds. Its receipt is treated
+as an ownership claim only after the executable bytes, package name, and exact
+destination match; remote installation remains behind `Security` and `Trust`.
+
 Future implementation modules should follow the same pattern:
 
 - `Manifest` owns parsing and validation; expose normalized package records and keep token scanners private.

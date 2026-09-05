@@ -1,6 +1,11 @@
 # Security release gates
 
-Remote source acquisition is disabled in the current binary. `elisapkg fetch`, `publish`, and `install` fail with security status 5 until a trusted source provider is configured. This is an intentional fail-closed boundary, not a temporary insecure mode.
+Remote source acquisition is disabled in the current binary. `elisapkg fetch`,
+`publish`, and remote `install NAME` fail with security status 5 until a trusted
+source provider is configured. `install --local` is a separate, offline path
+that only publishes the current package's verified build output under the
+user-selected prefix. This is an intentional fail-closed boundary, not a
+temporary insecure mode.
 
 Before enabling remote packages, the implementation must use an established signed-metadata protocol and an audited cryptographic provider. The client must bootstrap a trusted root out of band, validate threshold-signed role metadata and namespace delegation, bind identity/version/registry/archive digest together, enforce expiry and monotonic rollback protection, and persist trusted metadata versions atomically. Publisher authorization must cover the exact deterministic archive bytes. Unknown algorithms, missing thresholds, stale or replayed metadata, invalid signatures, revoked keys, and unauthorized namespaces are hard failures.
 
@@ -21,3 +26,9 @@ The local executor starts compiler and application children through `/usr/bin/en
 Every package build additionally sets `ELISA_STAGE1_SEMANTIC_GATE=1` in the
 controlled child environment. A semantic diagnostic therefore stops the build
 before an artifact can be reported as successful.
+
+Local installation uses a per-prefix mkdir lock and exclusive hard-link
+publication for both the binary and its receipt. It refuses pre-existing
+destinations, records the artifact SHA-256 digest, and only uninstalls when the
+receipt, package name, path, and current bytes all match. A changed executable
+or receipt is left in place for manual recovery.

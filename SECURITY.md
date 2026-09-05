@@ -1,6 +1,6 @@
 # Security policy
 
-`elisapkg` treats package metadata, source archives, manifests, lockfiles, and registry responses as hostile input. The current implementation has no enabled remote source provider. `fetch` fails closed with exit status 5, and `publish`/`install` are not enabled. This prevents an unsigned network path from becoming an accidental default while the trust protocol is reviewed.
+`elisapkg` treats package metadata, source archives, manifests, lockfiles, and registry responses as hostile input. The current implementation has no enabled remote source provider. `fetch` fails closed with exit status 5, and `publish`/remote `install NAME` are not enabled. `install --local` remains an offline, receipt-backed deployment of the current build and does not consume registry data. This prevents an unsigned network path from becoming an accidental default while the trust protocol is reviewed.
 
 The supported trust design is described in `IMPLEMENTATION_PLAN.md` (ignored local roadmap) and will be extracted into tracked protocol documentation before remote support is enabled. It requires an established signed-metadata protocol with an out-of-band trusted root, offline root keys, threshold recovery, namespace delegation, authenticated exact archive digests, expiry and rollback protection, key rotation and revocation, and publisher authorization bound to the exact packaged bytes. A checksum or TLS connection by itself is not treated as publisher authentication.
 
