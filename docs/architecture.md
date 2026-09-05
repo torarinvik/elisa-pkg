@@ -15,6 +15,7 @@ The current source units are:
 | `Json` | Bounded duplicate-key rejection for JSON objects | Lexical cursors and seen-key tables | It rejects ambiguity at the byte boundary; callers still own schema and type validation. |
 | `SemVer` | Version precedence and initial range matching | Requirement parser helpers and grammar constants | Resolver code receives parsed bounds instead of interpreting range text itself. |
 | `Resolve` | Bounded in-memory candidate selection | Catalog cursors and duplicate tracking | Selection is pure and deterministic; providers must authenticate metadata before constructing a catalog. |
+| `Solver` | Bounded backtracking over authenticated candidates | Candidate ordering, trails, and decision limits | It accepts metadata records only; source acquisition, signature checks, and filesystem effects remain outside the solver. |
 | `Integrity` | SHA-256 bytes and hexadecimal encoding | Compression/hash implementation details | Digests are content claims; `Trust` still decides whether authenticated metadata authorizes them. |
 | `Cli` | `run(argc, argv)` | None | The public command surface delegates to private command helpers. |
 

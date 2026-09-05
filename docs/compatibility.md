@@ -35,6 +35,7 @@ explicitly present and executable.
 | semantic checking | mandatory stage1 gate | invalid-source fixture | Supported toolchain must still be pinned for release |
 | SHA-256 | in-language implementation | FIPS known-answer fixture | Digest is not publisher authentication |
 | JSON grammar | bounded iterative validator | manifest and regression fixtures | No decoded value tree or source locations |
+| deterministic graph solver | bounded in-memory backtracking module | solver fixture in `scripts/regression_test.py` | CLI still resolves local paths through its existing graph walker |
 | TLS, registry transport | disabled | fail-closed command tests | Requires reviewed transport adapter |
 | signed metadata | disabled | fail-closed trust policy | Requires protocol/provider review and trust-state persistence |
 | archive extraction | disabled | writer/verifier only | Safe staging primitives are still a milestone |
