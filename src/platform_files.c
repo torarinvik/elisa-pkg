@@ -88,7 +88,7 @@ static int archive_entry_safe(const unsigned char *name, size_t length) {
     for (size_t index = 0; index <= length; index++) {
         if (index < length && name[index] != '/') {
             unsigned char byte = name[index];
-            if (byte < 32 || byte == 127 || byte == '\\') return 0;
+            if (byte < 32 || byte == 127 || byte == '\\' || byte == ':') return 0;
             continue;
         }
         size_t segment_length = index - segment_start;
