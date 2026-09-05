@@ -244,6 +244,11 @@ static int open_directory_path(const char *path) {
     while (*part != '\0') {
         char *slash = strchr(part, '/');
         if (slash != NULL) *slash = '\0';
+        if (strcmp(part, "..") == 0) {
+            close(directory);
+            free(copy);
+            return -EINVAL;
+        }
         if (*part != '\0' && strcmp(part, ".") != 0) {
             int next = openat(directory, part, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
             if (next < 0) {
