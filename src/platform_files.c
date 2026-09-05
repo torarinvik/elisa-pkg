@@ -284,6 +284,38 @@ static int open_directory_path(const char *path) {
     return directory;
 }
 
+long long elisapkg_mkdir(const char *path, unsigned short mode) {
+    if (path == NULL || path[0] == '\0' || strlen(path) > 4096) return -EINVAL;
+    char *copy = strdup(path);
+    if (copy == NULL) return -ENOMEM;
+    char *slash = strrchr(copy, '/');
+    char *leaf = copy;
+    char *parent = ".";
+    if (slash != NULL) {
+        leaf = slash + 1;
+        if (*leaf == '\0') {
+            free(copy);
+            return -EINVAL;
+        }
+        if (slash == copy) {
+            slash[1] = '\0';
+            parent = copy;
+        } else {
+            *slash = '\0';
+            parent = copy;
+        }
+    }
+    int directory = open_directory_path(parent);
+    if (directory < 0) {
+        free(copy);
+        return directory;
+    }
+    const int result = mkdirat(directory, leaf, (mode_t)mode) == 0 ? 0 : -errno;
+    close(directory);
+    free(copy);
+    return result;
+}
+
 long long elisapkg_is_directory(const char *path) {
     int directory = open_directory_path(path);
     if (directory < 0) return 0;

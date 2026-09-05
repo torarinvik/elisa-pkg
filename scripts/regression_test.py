@@ -226,6 +226,9 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
     is_directory = native.elisapkg_is_directory
     is_directory.argtypes = [ctypes.c_char_p]
     is_directory.restype = ctypes.c_longlong
+    mkdir_secure = native.elisapkg_mkdir
+    mkdir_secure.argtypes = [ctypes.c_char_p, ctypes.c_ushort]
+    mkdir_secure.restype = ctypes.c_longlong
     buffer = ctypes.create_string_buffer(128)
     previous = Path.cwd()
     try:
@@ -239,6 +242,9 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
         Path('nested').mkdir()
         Path('nested/alias').symlink_to('../src', target_is_directory=True)
         assert is_directory(b'nested/alias') == 0
+        assert mkdir_secure(b'nested/created', 0o755) == 0
+        assert is_directory(b'nested/created') == 1
+        assert mkdir_secure(b'nested/alias/blocked', 0o755) < 0
         assert read(b'alias/main.elisa', buffer, 128) < 0
         Path('linked').symlink_to('src/main.elisa')
         assert read(b'linked', buffer, 128) < 0
