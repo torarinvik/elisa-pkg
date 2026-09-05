@@ -322,6 +322,12 @@ for name in ("src/.env", "src/private.pem"):
     Path(name).unlink()
 PY
   PREFIX="$CASE/local-prefix"
+  if ELISAPKG_INSTALL_PREFIX="$CASE/local-prefix/../escape" "$BIN" install --local >/dev/null 2>&1; then
+    echo "path traversal install prefix was accepted" >&2
+    exit 1
+  else
+    test "$?" -eq 2
+  fi
   ELISAPKG_INSTALL_PREFIX="$PREFIX" "$BIN" install --local >/dev/null
   test -x "$PREFIX/bin/app"
   ELISAPKG_INSTALL_PREFIX="$PREFIX" "$PREFIX/bin/app"
