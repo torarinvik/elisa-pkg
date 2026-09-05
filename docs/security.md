@@ -69,7 +69,10 @@ an all-or-nothing pair. The receipt records the package identity, manifest
 digest, lock digest, and deterministic archive digest; verification re-reads the
 archive through the no-follow platform seam and recomputes every digest. A
 missing pair member, changed archive, changed lock, or changed manifest is a
-security failure rather than a cache miss.
+security failure rather than a cache miss. The archive is also retained as a
+local content-addressed hard-link under `.elisapkg/cache/sha256/<prefix>/`; the
+same digest is recomputed from that blob, so a corrupted cache object cannot be
+consumed as a normal miss.
 
 `cache gc --dry-run` does not delete anything. Actual cache collection remains
 disabled until it can mark live lock, lease, and installation references and

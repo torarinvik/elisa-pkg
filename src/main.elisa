@@ -2294,6 +2294,25 @@ def run_clean() -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.P
     write_ok("cleaned known .elisapkg outputs\n")
     return EXIT_OK
 
+def package_cache_blob_path(digest: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+    return false if digest.count != 64.usize()
+    bytes_push_view(out, ".elisapkg/cache/sha256/")
+    out.push(digest[0])
+    out.push(digest[1])
+    out.push(47)
+    bytes_push_array(out, digest)
+    return true
+
+def verify_package_cache_blob(digest: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    blob_path: mutable darray[u8] = []
+    return false if not package_cache_blob_path(digest, &blob_path)
+    blob_bytes: mutable darray[u8] = []
+    return false if not read_package_file_into(&blob_path, &blob_bytes)
+    digest_bytes: mutable darray[u8] = []
+    actual: mutable darray[u8] = []
+    return false if Integrity::sha256(blob_bytes, &digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(digest_bytes, &actual)
+    return bytes_equal(actual, digest)
+
 def run_cache_verify(start: darray[u8]&) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
     raw: mutable darray[u8] = []
     raw.resize(1048577)
@@ -2328,6 +2347,7 @@ def run_cache_verify(start: darray[u8]&) -> i64 can[Console.Write, Memory.Alloca
         return EXIT_SECURITY if not read_cstr_into(".elisapkg/package.receipt", &receipt)
         expected_receipt: darray[u8] = Archive::package_receipt_bytes(name, version, manifest_digest, lock_digest, archive_digest)
         return EXIT_SECURITY if not bytes_equal(receipt, expected_receipt)
+        return EXIT_SECURITY if not verify_package_cache_blob(archive_digest)
     write_ok("cache: local lock and manifest digests verified\n")
     if archive_present:
         write_ok("cache: deterministic package archive and receipt verified\n")
@@ -2534,6 +2554,23 @@ def run_package(argc: i64, slots: mutable cstr&&, start: darray[u8]&) -> i64 can
     digest_bytes: mutable darray[u8] = []
     digest: mutable darray[u8] = []
     return 7 if Integrity::sha256(archive, &digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(digest_bytes, &digest)
+    blob_path: mutable darray[u8] = []
+    return 7 if not package_cache_blob_path(digest, &blob_path)
+    cache_parent: mutable darray[u8] = []
+    bytes_push_view(&cache_parent, ".elisapkg/cache/sha256/")
+    cache_parent.push(digest[0])
+    cache_parent.push(digest[1])
+    return 7 if not make_directory(&cache_parent)
+    blob_name_c: mutable darray[u8] = []
+    archive_source_c: mutable darray[u8] = []
+    path_with_nul_into(&blob_path, &blob_name_c)
+    path_with_nul_into(&archive_path, &archive_source_c)
+    blob_name: cstr = (&blob_name_c[0]).cast[cstr] can Unsafe.PointerCast
+    archive_source_name: cstr = (&archive_source_c[0]).cast[cstr] can Unsafe.PointerCast
+    if cstr_file_exists(blob_name):
+        return 7 if not verify_package_cache_blob(digest)
+    elif Platform::pkg_link(archive_source_name, blob_name) != 0:
+        return 7 if not cstr_file_exists(blob_name) or not verify_package_cache_blob(digest)
     receipt: darray[u8] = Archive::package_receipt_bytes(package_name, package_version, manifest_digest, lock_digest, digest)
     receipt_c: mutable darray[u8] = []
     path_with_nul_into(&receipt_path, &receipt_c)

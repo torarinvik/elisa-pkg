@@ -33,7 +33,9 @@ The manifest and lockfile are JSON schema-versioned. `resolve --frozen` verifies
 and, when a package archive exists, verifies its deterministic archive receipt.
 The receipt binds the archive bytes to the exact manifest and lockfile digests,
 and a partial archive/receipt pair is rejected. It then reports that no shared
-remote cache is configured. Successful builds
+remote cache is configured. Package archives also receive a local
+content-addressed hard-link under `.elisapkg/cache/sha256/`; verification
+rehashes that blob and rejects corruption. Successful builds
 publish an exclusive compiler output by atomic rename and retain a receipt of
 the target source, manifest, resolved-lock, and artifact digests plus selected
 compiler inputs. A matching receipt and artifact are reused; changing the
@@ -43,8 +45,9 @@ if any identity cannot be captured, that build does not reuse an existing
 artifact. Included non-target sources remain outside this receipt and require
 a future build-key expansion.
 `cache gc --dry-run` is likewise read-only and reports that there is no shared
-cache to sweep; destructive garbage collection stays disabled until the
-content-addressed store, leases, and concurrent-reader rules are implemented.
+cache to sweep; destructive garbage collection stays disabled until leases,
+quarantine, and concurrent-reader rules are implemented for the local blob
+store.
 
 Commands that inspect or build a project accept `--manifest-path PATH`; PATH may name the project directory or its `elisapkg.json`. Local path resolution walks the dependency graph transitively, sorts package records by canonical name, normalizes relative paths, records SHA-256 manifest and first-target source digests, and rejects conflicting duplicate package identities. Target paths are resolved with `realpath` and must remain below their package root, including when a symlink is present. `clean` removes only the known `.elisapkg/build/app`, `.elisapkg/package.tar`, and `.elisapkg/package.receipt` outputs plus empty build directories. Registry dependency declarations are syntax-checked locally, including exact, caret, tilde, and comparison SemVer ranges; the pure `Resolve` selector is covered by in-memory fixtures, while CLI resolution remains fail-closed until a verified registry provider exists.
 

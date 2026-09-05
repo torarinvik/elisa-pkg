@@ -352,6 +352,17 @@ PY
   cp .elisapkg/package.receipt package.receipt.good
   test -s .elisapkg/package.receipt
   "$BIN" cache verify | grep -F 'package archive and receipt verified' >/dev/null
+  PACKAGE_BLOB="$(find .elisapkg/cache/sha256 -type f | head -n 1)"
+  test -n "$PACKAGE_BLOB"
+  printf '%s' junk >> "$PACKAGE_BLOB"
+  if "$BIN" cache verify >/dev/null 2>&1; then
+    echo "cache verification accepted a corrupted content-addressed blob" >&2
+    exit 1
+  fi
+  python3 - <<PY
+from pathlib import Path
+Path("$PACKAGE_BLOB").unlink()
+PY
   "$BIN" package >/dev/null
   cmp package.tar.good .elisapkg/package.tar >/dev/null
   cmp package.receipt.good .elisapkg/package.receipt >/dev/null

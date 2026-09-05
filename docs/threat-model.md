@@ -12,7 +12,7 @@ Git data, cache records, and compiler diagnostics as hostile input.
 | project manifest/lock pair | crash or concurrent editor | recoverable consistent mutation | journaled local edits | bounded mutation lock and kill-point matrix |
 | credentials | malicious package/compiler/log path | scoped storage and redaction | scrubbed compiler environment; remote disabled | credential-store adapter and redirect tests |
 | build output | failed or malicious compiler child | failed builds preserve known-good output | exclusive temp, pre-rename validation | sandbox/resource policy |
-| cache entries | writable pathname or stale receipt | immutable verified bytes | no shared remote cache | content-addressed store, leases, GC |
+| cache entries | writable pathname or stale receipt | immutable verified bytes | local digest-addressed hard-link and receipt revalidation; no shared remote cache | leases, GC, and quarantine policy |
 | installation prefix | unrelated executable or race | ownership and atomic replacement | receipt and hard-link publication | platform lock and upgrade fault tests |
 | compiler/runtime | bootstrap compromise | pinned provenance and semantic gate | explicit seed/runtime inputs | signed release provenance |
 
