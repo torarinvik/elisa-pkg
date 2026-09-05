@@ -301,9 +301,9 @@ PY
   "$BIN" run -- >/dev/null
   "$BIN" package --list >/dev/null
   "$BIN" package >/dev/null
-  cp .elisapkg/package.tar .elisapkg/package.tar.good
+  cp .elisapkg/package.tar package.tar.good
   "$BIN" package >/dev/null
-  cmp .elisapkg/package.tar.good .elisapkg/package.tar >/dev/null
+  cmp package.tar.good .elisapkg/package.tar >/dev/null
   tar -tf .elisapkg/package.tar | grep -F 'elisapkg.json' >/dev/null
   if tar -tf .elisapkg/package.tar | grep -E 'IMPLEMENTATION_PLAN|\.elisapkg/|\.env|\.pem|\.key' >/dev/null; then
     echo "package archive included a forbidden path" >&2
@@ -374,6 +374,7 @@ PY
     test "$?" -eq 7
   fi
   printf '%s\n' 'def main() -> i64:' '    return 0' > src/main.elisa
+  "$BIN" resolve >/dev/null
   "$BIN" metadata --json | grep -F '"schema-version":1' >/dev/null
   "$BIN" tree | grep -F 'app 0.1.0' >/dev/null
   "$BIN" tree | grep -F 'local-util 1.2.3' >/dev/null
@@ -579,4 +580,5 @@ else
   test "$?" -eq 3
 fi
 
+python3 "$ROOT/scripts/regression_test.py"
 echo "elisapkg smoke tests passed"

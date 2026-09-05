@@ -152,30 +152,43 @@ def read_file_into(path: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memo
         chunk.resize(8192)
         rounds: mutable usize = 0.usize()
         oversized: mutable bool = false
-        while rounds < 128.usize() |out, chunk, stream, rounds|:
+        while rounds < 8192.usize() |out, chunk, stream, rounds|:
             chunk_raw: mutable void& = (&chunk[0]).cast[mutable void&] can Unsafe.PointerCast
             got: usize = Platform::pkg_fread(chunk_raw, 1, 8192, open_stream)
             break if got == 0.usize()
             for index in 0..<got |out, chunk|:
                 out.push(chunk[index])
             rounds <- rounds + 1.usize()
-        if rounds == 128.usize():
+        if rounds == 8192.usize():
             chunk.resize(1)
             probe_raw: mutable void& = (&chunk[0]).cast[mutable void&] can Unsafe.PointerCast
             oversized <- Platform::pkg_fread(probe_raw, 1, 1, open_stream) > 0.usize()
+        failed: bool = Platform::pkg_ferror(open_stream) != 0
         _ = Platform::pkg_fclose(open_stream)
-        return false if oversized
+        return false if oversized or failed
         return true
     return false
+
+def read_package_file_into(path: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    path_c: mutable darray[u8] = []
+    path_with_nul_into(path, &path_c)
+    path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
+    out.resize(67108865)
+    out_raw: mutable u8& = (&out[0]).cast[mutable u8&] can Unsafe.PointerCast
+    read_size: i64 = Platform::pkg_read_package_file(path_name, out_raw, out.count)
+    return false if read_size < 0
+    out.resize(read_size.usize())
+    return true
 
 def read_cstr_into(path_name: cstr, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
     stream: mutable heap void&? = Platform::pkg_fopen(path_name, O_READ)
     if stream is open_stream:
         out_raw: mutable void& = (&out[0]).cast[mutable void&] can Unsafe.PointerCast
         got: usize = Platform::pkg_fread(out_raw, 1, out.count, open_stream)
+        failed: bool = Platform::pkg_ferror(open_stream) != 0
         out.resize(got)
         _ = Platform::pkg_fclose(open_stream)
-        return true
+        return not failed
     return false
 
 def write_fd_all(fd: i64, value: darray[u8]&) -> bool can[Unsafe.PointerCast, Console.Write]:
@@ -242,11 +255,13 @@ def write_file(path: darray[u8]&, value: darray[u8]&) -> bool can[Memory.Allocat
     path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
     stream: mutable heap void&? = Platform::pkg_fopen(path_name, O_CREATE_EXCLUSIVE)
     if stream is open_stream:
+        written: mutable usize = 0.usize()
         if value.count > 0.usize():
             value_raw: void& = (&value[0]).cast[void&] can Unsafe.PointerCast
-            _ = Platform::pkg_fwrite(value_raw, 1, value.count, open_stream)
+            written <- Platform::pkg_fwrite(value_raw, 1, value.count, open_stream)
+        failed: bool = Platform::pkg_ferror(open_stream) != 0
         _ = Platform::pkg_fclose(open_stream)
-        return true
+        return written == value.count and not failed
     return false
 
 def file_exists(path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -687,37 +702,6 @@ def valid_package_name(name: darray[u8]&) -> bool:
             previous_hyphen <- false
     return true
 
-def valid_json_shape(raw: darray[u8]&) -> bool:
-    in_string: mutable bool = false
-    escaped: mutable bool = false
-    braces: mutable i64 = 0
-    brackets: mutable i64 = 0
-    for index in 0..<raw.count |raw, in_string, escaped, braces, brackets|:
-        byte: u8 = raw[index]
-        if in_string:
-            if escaped:
-                escaped <- false
-            elif byte == 92:
-                escaped <- true
-            elif byte == 34:
-                in_string <- false
-            elif byte < 32:
-                return false
-        else:
-            if byte == 34:
-                in_string <- true
-            elif byte == 123:
-                braces <- braces + 1
-            elif byte == 125:
-                braces <- braces - 1
-                return false if braces < 0
-            elif byte == 91:
-                brackets <- brackets + 1
-            elif byte == 93:
-                brackets <- brackets - 1
-                return false if brackets < 0
-    return not in_string and not escaped and braces == 0 and brackets == 0
-
 def allowed_manifest_keys(raw: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
     # Scan only string tokens immediately followed by a colon. This keeps JSON
     # text inside descriptions from being mistaken for fields while rejecting
@@ -884,7 +868,7 @@ def json_key_value_is_one(raw: darray[u8]&, wanted: cstr) -> bool can[Memory.All
 def validate_manifest_at(raw: darray[u8]&, root: darray[u8]&, name_out: mutable darray[u8]&, version_out: mutable darray[u8]&) -> bool:
     return false if raw.count == 0.usize() or raw.count > 1048576.usize()
     return false if not Json::valid_utf8(raw)
-    return false if not valid_json_shape(raw)
+    return false if not Json::valid_document(raw)
     return false if not Json::unique_object_keys(raw)
     return false if not allowed_manifest_keys(raw)
     for index in 0..<raw.count |raw|:
@@ -1158,6 +1142,7 @@ def append_local_dependency_records(raw: darray[u8]&, package_root: darray[u8]&,
                     return false if not bytes_equal(existing_path, child_root) or not bytes_equal(existing_version, child_version)
                     in_string <- false
                     continue
+                return false if total >= 4096.usize()
                 queue_append_record(queue, &child_root, child_name, child_version)
                 parents.push(parent)
                 total <- total + 1.usize()
@@ -1178,7 +1163,7 @@ def canonical_transitive_local_lock(name: darray[u8]&, version: darray[u8]&, raw
     root_source_path: mutable darray[u8] = []
     path_join_into(root, root_entry_name, &root_source_path)
     root_source: mutable darray[u8] = []
-    return [] if not read_file_into(&root_source_path, &root_source)
+    return [] if not read_package_file_into(&root_source_path, &root_source)
     root_source_digest_bytes: mutable darray[u8] = []
     root_source_digest: mutable darray[u8] = []
     return [] if Integrity::sha256(root_source, &root_source_digest_bytes) != Integrity::DigestCode.Ok
@@ -1206,7 +1191,7 @@ def canonical_transitive_local_lock(name: darray[u8]&, version: darray[u8]&, raw
         manifest_path: mutable darray[u8] = []
         path_join_into(&package_root, "elisapkg.json", &manifest_path)
         child_raw: mutable darray[u8] = []
-        return [] if not read_file_into(&manifest_path, &child_raw)
+        return [] if not read_package_file_into(&manifest_path, &child_raw)
         child_name: mutable darray[u8] = []
         child_version: mutable darray[u8] = []
         return [] if not validate_manifest_at(child_raw, &package_root, &child_name, &child_version)
@@ -1239,7 +1224,7 @@ def canonical_transitive_local_lock(name: darray[u8]&, version: darray[u8]&, raw
         selected_manifest_path: mutable darray[u8] = []
         path_join_into(&selected_path, "elisapkg.json", &selected_manifest_path)
         selected_manifest: mutable darray[u8] = []
-        return [] if not read_file_into(&selected_manifest_path, &selected_manifest)
+        return [] if not read_package_file_into(&selected_manifest_path, &selected_manifest)
         selected_entry: mutable darray[u8] = []
         return [] if not first_target_entry(selected_manifest, &selected_entry)
         selected_entry_c: mutable darray[u8] = []
@@ -1248,7 +1233,7 @@ def canonical_transitive_local_lock(name: darray[u8]&, version: darray[u8]&, raw
         selected_source_path: mutable darray[u8] = []
         path_join_into(selected_path, selected_entry_name, &selected_source_path)
         selected_source: mutable darray[u8] = []
-        return [] if not read_file_into(&selected_source_path, &selected_source)
+        return [] if not read_package_file_into(&selected_source_path, &selected_source)
         selected_source_digest_bytes: mutable darray[u8] = []
         selected_source_digest: mutable darray[u8] = []
         return [] if Integrity::sha256(selected_source, &selected_source_digest_bytes) != Integrity::DigestCode.Ok
@@ -1818,7 +1803,7 @@ def run_resolve(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[C
         existing.resize(1048577)
         return EXIT_RESOLVE if not read_cstr_into("elisapkg.lock", &existing)
         return EXIT_RESOLVE if not bytes_equal(existing, lock)
-    return EXIT_RESOLVE if not write_cstr_file("elisapkg.lock", &lock)
+    return EXIT_RESOLVE if not (options.locked or options.frozen) and not write_cstr_file("elisapkg.lock", &lock)
     write_ok("resolved ")
     write_bytes(1, &name)
     write_ok(" ")
@@ -1914,7 +1899,7 @@ def run_install_local(start: darray[u8]&, options: Model::CommandOptions) -> i64
     artifact: mutable darray[u8] = []
     path_join_into(start, ".elisapkg/build/app", &artifact)
     artifact_bytes: mutable darray[u8] = []
-    return 7 if not read_file_into(&artifact, &artifact_bytes)
+    return 7 if not read_package_file_into(&artifact, &artifact_bytes)
     digest_bytes: mutable darray[u8] = []
     digest: mutable darray[u8] = []
     return 7 if Integrity::sha256(artifact_bytes, &digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(digest_bytes, &digest)
@@ -1947,7 +1932,10 @@ def run_install_local(start: darray[u8]&, options: Model::CommandOptions) -> i64
         _ = Platform::pkg_rmdir(lock_name)
         write_error("error: install destination or receipt already exists; refusing to overwrite\n")
         return 7
-    if not write_cstr_file_noclobber(destination_name, &artifact_bytes) or Platform::pkg_chmod(destination_name, 493.u16()) != 0:
+    if not write_cstr_file_noclobber(destination_name, &artifact_bytes):
+        _ = Platform::pkg_rmdir(lock_name)
+        return 7
+    if Platform::pkg_chmod(destination_name, 493.u16()) != 0:
         _ = remove_known_file(&destination)
         _ = Platform::pkg_rmdir(lock_name)
         return 7
@@ -2215,7 +2203,7 @@ def include_allows_path(raw: darray[u8]&, path: darray[u8]&) -> bool can[Memory.
     return false
 
 def publish_path_forbidden(path: darray[u8]&) -> bool:
-    return false if path.count == 0.usize() or not Archive::is_safe_entry(path)
+    return true if path.count == 0.usize() or not Archive::is_safe_entry(path)
     return true if bytes_equal_view(path, "IMPLEMENTATION_PLAN.md") or bytes_equal_view(path, ".netrc")
     return true if bytes_equal_view(path, "credentials") or bytes_equal_view(path, "credentials.json")
     return true if bytes_count(path, ".git/") > 0.usize() or bytes_count(path, ".hg/") > 0.usize() or bytes_count(path, ".svn/") > 0.usize() or bytes_count(path, ".elisapkg/") > 0.usize() or bytes_count(path, "build/") > 0.usize() or bytes_count(path, "target/") > 0.usize()
@@ -2267,7 +2255,14 @@ def package_archive_bytes(raw: darray[u8]&, target: darray[u8]&, out: mutable da
         return false if cursor >= paths.count
         cursor <- cursor + 1.usize()
         content: mutable darray[u8] = []
-        return false if not read_file_into(&entry, &content)
+        entry_c: mutable darray[u8] = []
+        path_with_nul_into(entry, &entry_c)
+        content.resize(67108865)
+        entry_name: cstr = (&entry_c[0]).cast[cstr] can Unsafe.PointerCast
+        content_raw: mutable u8& = (&content[0]).cast[mutable u8&] can Unsafe.PointerCast
+        read_size: i64 = Platform::pkg_read_package_file(entry_name, content_raw, content.count)
+        return false if read_size < 0
+        content.resize(read_size.usize())
         return false if content.count > 67108864.usize() - 1024.usize() - 512.usize() - 511.usize()
         return false if out.count > 67108864.usize() - 1024.usize() - 512.usize() - 511.usize() - content.count
         header: darray[u8] = Archive::tar_file_header(entry, content.count)
@@ -2357,13 +2352,14 @@ def run_build(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Con
         target_entry_name <- resolved_target
     else:
         return EXIT_BUILD
-    if options.locked or options.frozen:
-        lock_status: i64 = run_resolve(start, options)
-        return lock_status if lock_status != EXIT_OK
+    lock_status: i64 = run_resolve(start, options)
+    return lock_status if lock_status != EXIT_OK
     target_source: mutable darray[u8] = []
-    resolved_target_path: mutable darray[u8] = []
-    bytes_push_cstr(&resolved_target_path, target_entry_name)
-    return EXIT_BUILD if not read_file_into(&resolved_target_path, &target_source)
+    target_source.resize(67108865)
+    target_source_raw: mutable u8& = (&target_source[0]).cast[mutable u8&] can Unsafe.PointerCast
+    target_source_size: i64 = Platform::pkg_read_package_file(target_entry_raw, target_source_raw, target_source.count)
+    return EXIT_BUILD if target_source_size < 0
+    target_source.resize(target_source_size.usize())
     source_digest_bytes: mutable darray[u8] = []
     source_digest: mutable darray[u8] = []
     return EXIT_BUILD if Integrity::sha256(target_source, &source_digest_bytes) != Integrity::DigestCode.Ok
@@ -2410,21 +2406,8 @@ def run_build(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Con
     path_with_nul_into(&receipt_path, &receipt_c)
     artifact_name: cstr = (&artifact_c[0]).cast[cstr] can Unsafe.PointerCast
     receipt_name: cstr = (&receipt_c[0]).cast[cstr] can Unsafe.PointerCast
-    if file_exists(&artifact) and file_exists(&receipt_path):
-        existing_artifact: mutable darray[u8] = []
-        existing_receipt: mutable darray[u8] = []
-        existing_receipt.resize(4096)
-        if read_file_into(&artifact, &existing_artifact) and read_cstr_into(receipt_name, &existing_receipt):
-            existing_artifact_digest_bytes: mutable darray[u8] = []
-            existing_artifact_digest: mutable darray[u8] = []
-            if Integrity::sha256(existing_artifact, &existing_artifact_digest_bytes) == Integrity::DigestCode.Ok and Integrity::hex_digest(existing_artifact_digest_bytes, &existing_artifact_digest):
-                expected_receipt: mutable darray[u8] = bytes_copy(receipt)
-                bytes_push_view(&expected_receipt, "\nartifact-digest:sha256:")
-                bytes_push_array(&expected_receipt, existing_artifact_digest)
-                bytes_push_view(&expected_receipt, "\n")
-                if bytes_equal(existing_receipt, expected_receipt):
-                    write_ok("built .elisapkg/build/app (cached)\n")
-                    return EXIT_OK
+    # Receipt v1 omits included sources and compiler contents. Recompile until
+    # every effective input can be fingerprinted without accepting stale code.
     # mkstemp keeps the compiler output path exclusive for the whole child
     # process, preventing a predictable temporary symlink from redirecting the
     # output. The final rename is the only point at which app becomes visible.
@@ -2485,15 +2468,21 @@ def run_build(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Con
     if waited < 0 or status != 0:
         _ = Platform::pkg_unlink(temp_name)
         return EXIT_BUILD
-    if Platform::pkg_rename(temp_name, artifact_name) != 0:
+    temporary_size: i64 = Platform::pkg_package_file_size(temp_name)
+    if temporary_size <= 0 or Platform::pkg_access(temp_name, 1) != 0:
         _ = Platform::pkg_unlink(temp_name)
         return EXIT_BUILD
+    temporary_path: mutable darray[u8] = []
+    bytes_push_cstr(&temporary_path, temp_name)
     artifact_content: mutable darray[u8] = []
     artifact_digest_bytes: mutable darray[u8] = []
     artifact_digest: mutable darray[u8] = []
-    return EXIT_BUILD if not read_file_into(&artifact, &artifact_content)
+    return EXIT_BUILD if not read_package_file_into(&temporary_path, &artifact_content)
     return EXIT_BUILD if Integrity::sha256(artifact_content, &artifact_digest_bytes) != Integrity::DigestCode.Ok
     return EXIT_BUILD if not Integrity::hex_digest(artifact_digest_bytes, &artifact_digest)
+    if Platform::pkg_rename(temp_name, artifact_name) != 0:
+        _ = Platform::pkg_unlink(temp_name)
+        return EXIT_BUILD
     bytes_push_view(&receipt, "\nartifact-digest:sha256:")
     bytes_push_array(&receipt, artifact_digest)
     bytes_push_view(&receipt, "\n")
@@ -2585,6 +2574,7 @@ def cli_main(argc: i64, argv: mutable void&) -> i64 can[Console.Write, Memory.Al
     flags_ok: mutable bool = true
     for index in 2..<argc |slots, options, flags_ok|:
         flag: cstr = slots[index].cast[cstr]
+        break if flag == "--"
         options.locked <- true if flag == "--locked"
         options.offline <- true if flag == "--offline"
         options.frozen <- true if flag == "--frozen"

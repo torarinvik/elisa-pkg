@@ -6,6 +6,9 @@ module Archive:
     public:
         def is_safe_entry(entry: darray[u8]&) -> bool:
             return false if entry.count == 0.usize() or entry.count > 4096.usize()
+            return false if entry[entry.count - 1.usize()] == 47
+            for index in 0..<entry.count |entry|:
+                return false if entry[index] < 32 or entry[index] == 127
             return false if entry[0] == 47 or entry[0] == 92
             return false if entry.count >= 2.usize() and entry[1] == 58
             return false if entry.count == 1.usize() and entry[0] == 46
@@ -21,7 +24,7 @@ module Archive:
         # extensions are rejected until their canonical semantics have a
         # dedicated parser and test corpus.
         def tar_file_header(entry: darray[u8]&, size: usize) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
-            return [] if not is_safe_entry(entry) or entry.count > 100.usize()
+            return [] if not is_safe_entry(entry) or entry.count >= 100.usize() or size > 67108864.usize()
             header: mutable darray[u8] = []
             header.resize(512)
             for index in 0..<entry.count |header, entry|:
@@ -97,6 +100,7 @@ module Archive:
                 data_end: usize = data_start + size
                 padding: usize = (512.usize() - (size % 512.usize())) % 512.usize()
                 return false if padding > archive.count - data_end
+                return false if not archive_range_zero(archive, data_end, padding)
                 cursor <- data_end + padding
                 entries <- entries + 1.usize()
                 return false if entries > 4096.usize()
@@ -121,25 +125,20 @@ module Archive:
                 end: mutable usize = cursor
                 while end < seen.count and seen[end] != 0 |seen, end|:
                     end <- end + 1.usize()
-                return true if end - cursor == wanted.count and slice_equal_fold(seen, cursor, end, wanted)
+                common: usize = end - cursor if end - cursor < wanted.count else wanted.count
+                matches: mutable bool = true
+                for index in 0..<common |seen, cursor, wanted, matches|:
+                    left: mutable u8 = seen[cursor + index]
+                    right: mutable u8 = wanted[index]
+                    left <- left + 32 if left >= 65 and left <= 90
+                    right <- right + 32 if right >= 65 and right <= 90
+                    matches <- false if left != right
+                if matches:
+                    return true if end - cursor == wanted.count
+                    return true if common < wanted.count and wanted[common] == 47
+                    return true if common < end - cursor and seen[cursor + common] == 47
                 cursor <- end + 1.usize()
             return false
-
-        def slice_equal(value: darray[u8]&, start: usize, end: usize, wanted: darray[u8]&) -> bool:
-            return false if end < start or end - start != wanted.count
-            for index in 0..<wanted.count |value, start, wanted|:
-                return false if value[start + index] != wanted[index]
-            return true
-
-        def slice_equal_fold(value: darray[u8]&, start: usize, end: usize, wanted: darray[u8]&) -> bool:
-            return false if end < start or end - start != wanted.count
-            for index in 0..<wanted.count |value, start, wanted|:
-                left: u8 = value[start + index]
-                right: u8 = wanted[index]
-                left <- left + 32 if left >= 65 and left <= 90
-                right <- right + 32 if right >= 65 and right <= 90
-                return false if left != right
-            return true
 
         def parse_octal(value: darray[u8]&, offset: usize, width: usize, out: mutable usize&) -> bool:
             return false if width < 2.usize() or offset + width > value.count
@@ -178,7 +177,7 @@ module Archive:
 
         def contains_parent_segment(entry: darray[u8]&) -> bool:
             for index in 0..<entry.count |entry|:
-                return true if entry[index] == 46 and index + 1.usize() < entry.count and entry[index + 1.usize()] == 46
+                return true if entry[index] == 46 and index + 1.usize() < entry.count and entry[index + 1.usize()] == 46 and (index == 0.usize() or entry[index - 1.usize()] == 47) and (index + 2.usize() == entry.count or entry[index + 2.usize()] == 47)
             return false
 
         def contains_double_separator(entry: darray[u8]&) -> bool:

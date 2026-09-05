@@ -1,15 +1,18 @@
+#define _DARWIN_C_SOURCE
 #define _XOPEN_SOURCE 700
 
 #include <errno.h>
 #include <ftw.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 
 /*
- * This is deliberately only a filesystem enumeration seam. Selection,
- * archive policy, ordering, and serialization stay in Elisa. The walker never
+ * This is deliberately only a filesystem seam. Serialization and manifest selection stay in Elisa;
+ * this binding supplies traversal, sorting and conservative file exclusions. The walker never
  * follows links and refuses special files so an archive cannot turn a source
  * tree into an implicit device or link traversal primitive.
  */
@@ -25,7 +28,7 @@ struct walk_state {
     int error;
 };
 
-static struct walk_state *active_state;
+static _Thread_local struct walk_state *active_state;
 
 static const char *relative_path(const char *path) {
     if (path[0] == '.' && path[1] == '/') {
@@ -82,7 +85,8 @@ static int collect_entry(const char *path) {
         return 1;
     }
     const char *relative = relative_path(path);
-    if (relative[0] == '\0' || strlen(relative) > 4096 || forbidden_leaf(relative)) {
+    if (strlen(relative) > 4096) { active_state->error = ENAMETOOLONG; return 1; }
+    if (relative[0] == '\0' || forbidden_leaf(relative)) {
         return 0;
     }
     if (active_state->count == active_state->capacity) {
@@ -110,7 +114,7 @@ static int collect_entry(const char *path) {
 
 static int walk_callback(const char *path, const struct stat *st, int type, struct FTW *info) {
     (void)st;
-    (void)info;
+    if (info->level > 64) { active_state->error = EOVERFLOW; return 1; }
     if (skip_directory(path)) {
         return 0;
     }
@@ -133,7 +137,7 @@ static int compare_entries(const void *left, const void *right) {
 }
 
 long long elisapkg_collect_files(const char *root, unsigned char *output, size_t capacity) {
-    if (root == NULL || output == NULL || capacity == 0) {
+    if (root == NULL || strcmp(root, ".") != 0 || output == NULL || capacity == 0) {
         return -EINVAL;
     }
     struct walk_state state = {0};
@@ -169,4 +173,81 @@ long long elisapkg_collect_files(const char *root, unsigned char *output, size_t
     }
     free(state.entries);
     return (long long)used;
+}
+
+/* Open every component relative to an already opened directory. A rename or
+ * symlink swap cannot redirect the read outside this directory chain. */
+static int open_package_file(const char *path) {
+    if (path == NULL || path[0] == '/' || strlen(path) > 4096) return -EINVAL;
+    char *copy = strdup(path);
+    if (copy == NULL) return -ENOMEM;
+    int directory = open(".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (directory < 0) { free(copy); return -EIO; }
+    char *part = copy;
+    int file = -1;
+    while (1) {
+        char *slash = strchr(part, '/');
+        if (slash != NULL) *slash = '\0';
+        if (*part == '\0') {
+            close(directory);
+            free(copy);
+            return -EINVAL;
+        }
+        if (strcmp(part, ".") == 0) {
+            if (slash == NULL) {
+                close(directory);
+                free(copy);
+                return -EINVAL;
+            }
+            part = slash + 1;
+            continue;
+        }
+        int next = openat(directory, part, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK | (slash != NULL ? O_DIRECTORY : 0));
+        if (next < 0) {
+            const int error = errno;
+            close(directory);
+            free(copy);
+            return error == 0 ? -EIO : -error;
+        }
+        if (slash == NULL) { file = next; break; }
+        close(directory);
+        directory = next;
+        part = slash + 1;
+    }
+    close(directory);
+    free(copy);
+    return file;
+}
+
+long long elisapkg_package_file_size(const char *path) {
+    int file = open_package_file(path);
+    if (file < 0) return file;
+    struct stat info;
+    if (fstat(file, &info) != 0) {
+        close(file);
+        return -EIO;
+    }
+    close(file);
+    if (!S_ISREG(info.st_mode) || info.st_size < 0) return -EIO;
+    return (long long)info.st_size;
+}
+
+long long elisapkg_read_package_file(const char *path, unsigned char *output, size_t capacity) {
+    if (output == NULL || capacity == 0) return -EINVAL;
+    int file = open_package_file(path);
+    if (file < 0) return file;
+    struct stat info;
+    if (fstat(file, &info) != 0 || !S_ISREG(info.st_mode) || info.st_size < 0 || (unsigned long long)info.st_size >= capacity) {
+        close(file); return -EFBIG;
+    }
+    size_t used = 0;
+    while (used < capacity) {
+        ssize_t amount = read(file, output + used, capacity - used);
+        if (amount < 0 && errno == EINTR) continue;
+        if (amount < 0) { close(file); return -EIO; }
+        if (amount == 0) break;
+        used += (size_t)amount;
+    }
+    close(file);
+    return used == capacity ? -EFBIG : (long long)used;
 }

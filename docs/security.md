@@ -50,3 +50,14 @@ metadata and publisher authorization.
 `cache gc --dry-run` does not delete anything. Actual cache collection remains
 disabled until it can mark live lock, lease, and installation references and
 recheck them before unlinking immutable entries.
+
+Review corrections: archive reads use descriptor-relative no-follow opens for
+all components, detect I/O errors, and reject special files. Archive validation
+also checks zero data padding and file/directory conflicts. Frozen resolution
+performs no lockfile replacement. Build receipt reuse is disabled until included
+sources and toolchain contents are fully fingerprinted.
+
+These changes do not supply the planned remote verifier or execution sandbox.
+Project mutation and installation still assume a trusted, user-owned directory;
+concurrent malicious changes to state or installation directories require further
+handle-based filesystem work before hostile shared directories are supported.
