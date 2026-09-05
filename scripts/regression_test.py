@@ -161,6 +161,22 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
     run([BIN, 'resolve'], cwd=parent, stdout=subprocess.DEVNULL)
     assert '"name":"external"' in (parent / 'elisapkg.lock').read_text()
 
+    collision_root = work / 'collision-root'
+    collision_dep = work / 'collision-dep'
+    run([BIN, 'init', collision_root], stdout=subprocess.DEVNULL)
+    run([BIN, 'init', collision_dep], stdout=subprocess.DEVNULL)
+    collision_manifest = collision_root / 'elisapkg.json'
+    collision_manifest.write_text(
+        '{"schema-version":1,"package":{"name":"collision-root","version":"0.1.0"},'
+        '"targets":[{"name":"collision-root","kind":"bin","entry":"src/main.elisa"}],'
+        '"dependencies":{"collision":{"path":"../collision-dep"}}}\n')
+    (collision_dep / 'elisapkg.json').write_text(
+        '{"schema-version":1,"package":{"name":"collision-root","version":"0.2.0"},'
+        '"targets":[{"name":"collision-root","kind":"lib","entry":"src/main.elisa"}],'
+        '"dependencies":{}}\n')
+    result = subprocess.run([BIN, 'resolve'], cwd=collision_root, capture_output=True, timeout=120)
+    assert result.returncode == 3, result
+
     manifest = project / 'elisapkg.json'
     valid = manifest.read_text()
     unsupported_registry = valid.replace('"dependencies": {}', '"dependencies":{"remote":{"registry":"default","version":"^1.0.0"}}')
