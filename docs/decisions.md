@@ -82,3 +82,15 @@ as an active or interrupted transaction and blocks further commands; the client
 does not guess whether it is safe to delete another process's lock. Successful
 commit and rollback remove the guard, while stale guards require explicit
 operator recovery.
+
+## D-010: local archive cache identity
+
+Every successfully packaged archive is hard-linked into the local
+`.elisapkg/cache/sha256/<prefix>/<digest>` store after deterministic archive
+verification. `cache verify` rehashes both the visible archive and its receipt
+backing blob; a missing or corrupted blob is a security failure. A subsequent
+package operation moves a corrupted active blob to the quarantine directory
+before publishing a replacement. Shared leases, destructive garbage collection,
+and remote cache exchange remain disabled until their concurrency policy is
+implemented. Fixture: package receipt and corrupted-blob cases in
+`scripts/test.sh`.
