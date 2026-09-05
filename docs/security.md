@@ -6,7 +6,8 @@ Before enabling remote packages, the implementation must use an established sign
 
 Archive extraction is a separate boundary. The accepted subset is regular files and directories only, with bounded compressed and expanded sizes, no links/devices/special modes, no absolute or traversal paths, no duplicate or case-colliding names, private staging, and atomic publication into a verified content store. Cache pathnames and receipts are never treated as proof of verification.
 
-The local target validator rejects absolute, parent, dot-prefixed, and
+Manifest bytes must be valid UTF-8 before field interpretation. The local
+target validator rejects absolute, parent, dot-prefixed, and
 backslash path forms, then canonicalizes both the package root and each target
 entry with `realpath` and enforces a component boundary. This catches a
 lexically safe path that escapes through a symlink. `Integrity::sha256` is

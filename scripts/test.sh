@@ -346,6 +346,17 @@ if (cd "$BAD" && "$BIN" check-manifest >/dev/null 2>&1); then
   echo "trailing include comma was accepted" >&2
   exit 1
 fi
+python3 - "$BAD/elisapkg.json" <<'PY'
+import sys
+path = sys.argv[1]
+data = b'{"schema-version":1,"package":{"name":"bad","version":"1.0.0","description":"ok\xc0"},"targets":[{"name":"bad","kind":"bin","entry":"src/main.elisa"}],"dependencies":{}}\n'
+with open(path, "wb") as handle:
+    handle.write(data)
+PY
+if (cd "$BAD" && "$BIN" check-manifest >/dev/null 2>&1); then
+  echo "invalid UTF-8 manifest was accepted" >&2
+  exit 1
+fi
 
 printf '%s' '{"schema-version":1,"package":{"name":"bad","version":"1.0.0"},"targets":[{"entry":"src/main.elisa"}],"dependencies":{}}' > "$BAD/elisapkg.json"
 head -c 1049000 /dev/zero | tr '\0' ' ' >> "$BAD/elisapkg.json"
