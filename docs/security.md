@@ -37,9 +37,10 @@ The local package writer emits only regular files in sorted ustar order with
 zero timestamps and normalized ownership. It rejects unsafe or overlong names,
 state/VCS directories, and credential-like filenames before reading bytes;
 PAX/GNU extensions and compression are not accepted. Before the archive is
-written, a second parser verifies its magic, octal fields, checksum, duplicate
-names, data padding, and exactly two zero end blocks. Remote publication still
-requires signed metadata and publisher authorization.
+written, a second parser verifies its magic, octal fields, checksum, regular
+file mode, case-folded duplicate names, data padding, zeroed extension fields,
+and exactly two zero end blocks. Remote publication still requires signed
+metadata and publisher authorization.
 
 `cache gc --dry-run` does not delete anything. Actual cache collection remains
 disabled until it can mark live lock, lease, and installation references and

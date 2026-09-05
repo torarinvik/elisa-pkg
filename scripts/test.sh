@@ -156,6 +156,21 @@ def main() -> i64:
     return 2 if not Archive::verify_ustar_archive(valid)
     valid[156] <- 50
     return 3 if Archive::verify_ustar_archive(valid)
+    upper_name: mutable darray[u8] = [83, 82, 67, 47, 77, 65, 73, 78, 46, 69, 76, 73, 83, 65]
+    upper_header: darray[u8] = Archive::tar_file_header(upper_name, 3)
+    duplicate: mutable darray[u8] = []
+    append_bytes(&duplicate, header)
+    duplicate.push(97)
+    duplicate.push(98)
+    duplicate.push(99)
+    append_zeroes(&duplicate, 509)
+    append_bytes(&duplicate, upper_header)
+    duplicate.push(97)
+    duplicate.push(98)
+    duplicate.push(99)
+    append_zeroes(&duplicate, 509)
+    append_zeroes(&duplicate, 1024)
+    return 4 if Archive::verify_ustar_archive(duplicate)
     return 0
 EOF
 ELISA_STAGE1_BIN="${ELISA_STAGE1_BIN:-$ELISA_COMPILER_ROOT/bin/elisac-stage1}" \
