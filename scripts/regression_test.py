@@ -190,6 +190,13 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
         result = subprocess.run([BIN, 'check-manifest'], cwd=project, capture_output=True, timeout=120)
         assert result.returncode != 0
     manifest.write_text(valid)
+    legacy_only = project / 'manifest.json'
+    legacy_only.write_text(valid)
+    manifest.unlink()
+    result = subprocess.run([BIN, 'check-manifest'], cwd=project, capture_output=True, timeout=120)
+    assert result.returncode == 2, result
+    manifest.write_text(valid)
+    legacy_only.unlink()
     artifact = project / '.elisapkg/build/app'
     artifact.parent.mkdir(parents=True, exist_ok=True)
     artifact.write_bytes(b'previous working output')
