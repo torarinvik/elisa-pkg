@@ -357,6 +357,14 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
         archive_buffer = ctypes.create_string_buffer(archive)
         assert extract_ustar(archive_buffer, len(archive), str(extraction_root).encode()) == 0
         assert (extraction_root / 'src/main.elisa').read_bytes().startswith(b'def main')
+        partial_root = work / 'partial-extraction'
+        partial_root.mkdir()
+        malformed_second = bytearray(ustar('second', b'bad'))
+        malformed_second[257] = ord('x')
+        partial_archive = ustar('first', b'ok')[:-1024] + bytes(malformed_second)
+        partial_buffer = ctypes.create_string_buffer(partial_archive)
+        assert extract_ustar(partial_buffer, len(partial_archive), str(partial_root).encode()) < 0
+        assert not (partial_root / 'first').exists()
         traversal_root = work / 'traversal-extraction'
         traversal_root.mkdir()
         traversal = ustar('../escape', b'escape')

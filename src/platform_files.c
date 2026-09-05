@@ -612,14 +612,22 @@ long long elisapkg_extract_ustar(const unsigned char *archive, size_t archive_si
         for (size_t index = 0; index < padding; index++) {
             if (archive[data_end + index] != 0) goto extraction_failed;
         }
+        char *entry_copy = malloc(name_length + 1);
+        if (entry_copy == NULL) goto extraction_failed;
+        memcpy(entry_copy, header, name_length);
+        entry_copy[name_length] = '\0';
         char *copy = NULL;
         char *leaf = NULL;
         int parent = archive_open_parent(root, header, name_length, &copy, &leaf);
-        if (parent < 0) goto extraction_failed;
+        if (parent < 0) {
+            free(entry_copy);
+            goto extraction_failed;
+        }
         int file = openat(parent, leaf, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644);
         if (file < 0) {
             close(parent);
             free(copy);
+            free(entry_copy);
             goto extraction_failed;
         }
         size_t written = 0;
@@ -631,22 +639,23 @@ long long elisapkg_extract_ustar(const unsigned char *archive, size_t archive_si
                 (void)unlinkat(parent, leaf, 0);
                 close(parent);
                 free(copy);
+                free(entry_copy);
                 goto extraction_failed;
             }
             written += (size_t)amount;
         }
-        if (fsync(file) != 0 || close(file) != 0) {
+        const int sync_status = fsync(file);
+        const int close_status = close(file);
+        if (sync_status != 0 || close_status != 0) {
             (void)unlinkat(parent, leaf, 0);
             close(parent);
             free(copy);
+            free(entry_copy);
             goto extraction_failed;
         }
         close(parent);
         free(copy);
-        seen[seen_count] = malloc(name_length + 1);
-        if (seen[seen_count] == NULL) goto extraction_failed;
-        memcpy(seen[seen_count], header, name_length);
-        seen[seen_count][name_length] = '\0';
+        seen[seen_count] = entry_copy;
         seen_count++;
         entries++;
         if (entries > 4096) goto extraction_failed;
