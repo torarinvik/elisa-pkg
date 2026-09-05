@@ -470,7 +470,10 @@ if (cd "$BAD" && "$BIN" check-manifest >/dev/null 2>&1); then
   exit 1
 fi
 printf '%s\n' '{"schema-version":1,"package":{"name":"good","version":"1.0.0"},"targets":[{"name":"target","kind":"bin","entry":"src/main.elisa"}],"dependencies":{"foo":{"version":"^1.0.0","registry":"primary"}}}' > "$BAD/elisapkg.json"
-(cd "$BAD" && "$BIN" check-manifest >/dev/null)
+if (cd "$BAD" && "$BIN" check-manifest >/dev/null 2>&1); then
+  echo "unsupported registry dependency was accepted" >&2
+  exit 1
+fi
 printf '%s\n' '{"schema-version":1,"package":{"name":"good","version":"1.0.0"},"targets":[{"name":"target","kind":"bin","entry":"src/main.elisa"}],"dependencies":{"foo":{"version":"1.01.0","registry":"primary"}}}' > "$BAD/elisapkg.json"
 if (cd "$BAD" && "$BIN" check-manifest >/dev/null 2>&1); then
   echo "invalid dependency requirement was accepted" >&2
