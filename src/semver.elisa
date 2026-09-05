@@ -22,6 +22,12 @@ module SemVer:
             return 1 if right.prerelease and not left.prerelease
             return 0
 
+        def compare_text(left: darray[u8]&, right: darray[u8]&) -> i64:
+            left_parts: mutable ParsedToken = ParsedToken{major: 0, minor: 0, patch: 0, pre_start: 0, pre_end: 0, has_pre: false}
+            right_parts: mutable ParsedToken = ParsedToken{major: 0, minor: 0, patch: 0, pre_start: 0, pre_end: 0, has_pre: false}
+            return 2 if not parse_token_parts(left, &left_parts) or not parse_token_parts(right, &right_parts)
+            return compare_parts(left_parts, right_parts, left, right)
+
         # v1 requirement grammar: exact versions, ^, ~, and one comparison.
         # The resolver will reject a range it cannot parse; it never guesses.
         def parse_requirement(value: darray[u8]&, out: mutable Requirement&) -> bool:
@@ -118,6 +124,113 @@ module SemVer:
 
     private:
         const precedence_contract: cstr = "SemVer 2.0 precedence; build metadata excluded from ordering"
+
+        struct ParsedToken:
+            major: mutable u64
+            minor: mutable u64
+            patch: mutable u64
+            pre_start: mutable usize
+            pre_end: mutable usize
+            has_pre: mutable bool
+
+        def compare_parts(left: ParsedToken, right: ParsedToken, left_raw: darray[u8]&, right_raw: darray[u8]&) -> i64:
+            return -1 if left.major < right.major
+            return 1 if left.major > right.major
+            return -1 if left.minor < right.minor
+            return 1 if left.minor > right.minor
+            return -1 if left.patch < right.patch
+            return 1 if left.patch > right.patch
+            if left.has_pre != right.has_pre:
+                return -1 if left.has_pre else 1
+            return 0 if not left.has_pre
+            left_cursor: mutable usize = left.pre_start
+            right_cursor: mutable usize = right.pre_start
+            while left_cursor < left.pre_end or right_cursor < right.pre_end |left_raw, right_raw, left_cursor, right_cursor|:
+                return -1 if left_cursor >= left.pre_end
+                return 1 if right_cursor >= right.pre_end
+                left_end: mutable usize = left_cursor
+                right_end: mutable usize = right_cursor
+                while left_end < left.pre_end and left_raw[left_end] != 46 |left_raw, left_end|:
+                    left_end <- left_end + 1.usize()
+                while right_end < right.pre_end and right_raw[right_end] != 46 |right_raw, right_end|:
+                    right_end <- right_end + 1.usize()
+                left_numeric: mutable bool = true
+                right_numeric: mutable bool = true
+                index: mutable usize = left_cursor
+                while index < left_end |left_raw, left_numeric, index|:
+                    left_numeric <- false if left_raw[index] < 48 or left_raw[index] > 57
+                    index <- index + 1.usize()
+                index <- right_cursor
+                while index < right_end |right_raw, right_numeric, index|:
+                    right_numeric <- false if right_raw[index] < 48 or right_raw[index] > 57
+                    index <- index + 1.usize()
+                if left_numeric != right_numeric:
+                    return -1 if left_numeric else 1
+                if left_numeric:
+                    left_number: mutable u64 = 0
+                    right_number: mutable u64 = 0
+                    return 2 if not parse_u64(left_raw, left_cursor, left_end, &left_number) or not parse_u64(right_raw, right_cursor, right_end, &right_number)
+                    return -1 if left_number < right_number
+                    return 1 if left_number > right_number
+                else:
+                    limit: usize = left_end - left_cursor if left_end - left_cursor < right_end - right_cursor else right_end - right_cursor
+                    index <- 0
+                    while index < limit |left_raw, right_raw, left_cursor, right_cursor, index|:
+                        return -1 if left_raw[left_cursor + index] < right_raw[right_cursor + index]
+                        return 1 if left_raw[left_cursor + index] > right_raw[right_cursor + index]
+                        index <- index + 1.usize()
+                    return -1 if left_end - left_cursor < right_end - right_cursor
+                    return 1 if left_end - left_cursor > right_end - right_cursor
+                left_cursor <- left_end + 1.usize()
+                right_cursor <- right_end + 1.usize()
+            return 0
+
+        def parse_token_parts(value: darray[u8]&, out: mutable ParsedToken&) -> bool:
+            dot1: mutable usize = value.count
+            dot2: mutable usize = value.count
+            for index in 0..<value.count |value, dot1, dot2|:
+                if value[index] == 46:
+                    if dot1 == value.count:
+                        dot1 <- index
+                    elif dot2 == value.count:
+                        dot2 <- index
+                    else:
+                        return false
+            return false if dot1 == value.count or dot2 == value.count or dot1 == 0.usize() or dot2 == dot1 + 1.usize()
+            pre_start: mutable usize = value.count
+            for index in (dot2 + 1.usize())..<value.count |value, pre_start|:
+                if value[index] == 45:
+                    pre_start <- index
+                    break
+            patch_end: usize = pre_start
+            return false if patch_end == dot2 + 1.usize()
+            return false if not parse_u64(value, 0, dot1, &out.major) or not parse_u64(value, dot1 + 1.usize(), dot2, &out.minor) or not parse_u64(value, dot2 + 1.usize(), patch_end, &out.patch)
+            return false if dot1 > 1.usize() and value[0] == 48
+            return false if dot2 - dot1 > 2.usize() and value[dot1 + 1.usize()] == 48
+            return false if patch_end - dot2 > 2.usize() and value[dot2 + 1.usize()] == 48
+            return false if pre_start < value.count and pre_start + 1.usize() >= value.count
+            out.has_pre <- pre_start < value.count
+            out.pre_start <- pre_start + 1.usize() if out.has_pre else value.count
+            out.pre_end <- value.count
+            for index in 0..<value.count |value|:
+                return false if value[index] == 43
+            if out.has_pre:
+                segment_start: mutable usize = out.pre_start
+                numeric: mutable bool = true
+                index: mutable usize = out.pre_start
+                while index <= out.pre_end:
+                    at_end: bool = index == out.pre_end
+                    if at_end or value[index] == 46:
+                        return false if index == segment_start
+                        return false if numeric and index - segment_start > 1.usize() and value[segment_start] == 48
+                        segment_start <- index + 1.usize()
+                        numeric <- true
+                    else:
+                        byte: u8 = value[index]
+                        return false if not ((byte >= 48 and byte <= 57) or (byte >= 65 and byte <= 90) or (byte >= 97 and byte <= 122) or byte == 45)
+                        numeric <- false if byte < 48 or byte > 57
+                    index <- index + 1.usize()
+            return true
 
         def is_space(byte: u8) -> bool:
             return byte == 32 or byte == 9 or byte == 10 or byte == 13

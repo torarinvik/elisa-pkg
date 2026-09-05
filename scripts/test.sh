@@ -26,6 +26,9 @@ def main() -> i64:
     exact: mutable darray[u8] = [49, 46, 50, 46, 51]
     pair: mutable darray[u8] = [62, 61, 49, 46, 48, 46, 48, 32, 60, 50, 46, 48, 46, 48]
     bad: mutable darray[u8] = [49, 46, 48, 46, 48, 45, 48, 49]
+    alpha: mutable darray[u8] = [49, 46, 48, 46, 48, 45, 97, 108, 112, 104, 97]
+    beta: mutable darray[u8] = [49, 46, 48, 46, 48, 45, 98, 101, 116, 97]
+    stable: mutable darray[u8] = [49, 46, 48, 46, 48]
     blank: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
     return 1 if not SemVer::parse_requirement(caret, &blank)
     return 2 if not SemVer::matches(blank, Model::Version{major: 1, minor: 9, patch: 0, prerelease: false})
@@ -37,6 +40,10 @@ def main() -> i64:
     return 8 if not SemVer::matches(blank, Model::Version{major: 1, minor: 7, patch: 0, prerelease: false})
     return 9 if SemVer::matches(blank, Model::Version{major: 2, minor: 0, patch: 0, prerelease: false})
     return 10 if SemVer::parse_requirement(bad, &blank)
+    return 11 if SemVer::compare_text(alpha, beta) != -1
+    return 12 if SemVer::compare_text(alpha, stable) != -1
+    return 13 if SemVer::compare_text(beta, alpha) != 1
+    return 14 if SemVer::compare_text(stable, alpha) != 1
     return 0
 EOF
 ELISA_STAGE1_BIN="${ELISA_STAGE1_BIN:-$ELISA_COMPILER_ROOT/bin/elisac-stage1}" \
