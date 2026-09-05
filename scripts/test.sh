@@ -338,8 +338,12 @@ PY
   "$BIN" package --list >/dev/null
   "$BIN" package >/dev/null
   cp .elisapkg/package.tar package.tar.good
+  cp .elisapkg/package.receipt package.receipt.good
+  test -s .elisapkg/package.receipt
+  "$BIN" cache verify | grep -F 'package archive and receipt verified' >/dev/null
   "$BIN" package >/dev/null
   cmp package.tar.good .elisapkg/package.tar >/dev/null
+  cmp package.receipt.good .elisapkg/package.receipt >/dev/null
   tar -tf .elisapkg/package.tar | grep -F 'elisapkg.json' >/dev/null
   if tar -tf .elisapkg/package.tar | grep -E 'IMPLEMENTATION_PLAN|\.elisapkg/|\.env|\.pem|\.key' >/dev/null; then
     echo "package archive included a forbidden path" >&2
@@ -352,6 +356,18 @@ PY
     echo "package archive included a credential-like file" >&2
     exit 1
   fi
+  printf '%s' junk >> .elisapkg/package.receipt
+  if "$BIN" cache verify >/dev/null 2>&1; then
+    echo "cache verification accepted a tampered package receipt" >&2
+    exit 1
+  fi
+  "$BIN" package >/dev/null
+  mv .elisapkg/package.receipt .elisapkg/package.receipt.saved
+  if "$BIN" cache verify >/dev/null 2>&1; then
+    echo "cache verification accepted a package without its receipt" >&2
+    exit 1
+  fi
+  mv .elisapkg/package.receipt.saved .elisapkg/package.receipt
   python3 - <<'PY'
 from pathlib import Path
 for name in ("src/.env", "src/private.pem"):

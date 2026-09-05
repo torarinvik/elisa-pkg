@@ -96,9 +96,8 @@ def bytes_ends_with(value: darray[u8]&, suffix: darray[u8]&) -> bool:
     return true
 
 def write_bytes(fd: i64, value: darray[u8]&) -> void can[Console.Write, Unsafe.PointerCast]:
-    can Console.Write:
-        return if value.count == 0.usize()
-        raw: void& = (&value[0]).cast[void&] can Unsafe.PointerCast
+    return if value.count == 0.usize()
+    raw: void& = (&value[0]).cast[void&] can Unsafe.PointerCast
     _ = Platform::pkg_write(fd, raw, value.count) can Console.Write
 
 def write_text(fd: i64, value: cstr) -> void can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -2276,21 +2275,39 @@ def run_clean() -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.P
     artifact: mutable darray[u8] = []
     receipt: mutable darray[u8] = []
     package_archive: mutable darray[u8] = []
+    package_receipt: mutable darray[u8] = []
     path_join_into(root, ".elisapkg", &state)
     return EXIT_BUILD if not make_directory(&state)
     path_join_into(state, "build", &build_dir)
     path_join_into(build_dir, "app", &artifact)
     path_join_into(build_dir, "receipt", &receipt)
     path_join_into(state, "package.tar", &package_archive)
+    path_join_into(state, "package.receipt", &package_receipt)
     return EXIT_BUILD if not remove_known_file(&artifact)
     return EXIT_BUILD if not remove_known_file(&receipt)
     return EXIT_BUILD if not remove_known_file(&package_archive)
+    return EXIT_BUILD if not remove_known_file(&package_receipt)
     return EXIT_BUILD if not remove_empty_directory(&build_dir)
     # `.elisapkg` is removed only when it is empty; cache/state files are never
     # traversed or recursively deleted by clean.
     return EXIT_BUILD if not remove_empty_directory(&state)
     write_ok("cleaned known .elisapkg outputs\n")
     return EXIT_OK
+
+def package_receipt_bytes(name: darray[u8]&, version: darray[u8]&, manifest_digest: darray[u8]&, lock_digest: darray[u8]&, archive_digest: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
+    receipt: mutable darray[u8] = []
+    bytes_push_view(&receipt, "elisapkg-package-receipt:1\nname:")
+    bytes_push_array(&receipt, name)
+    bytes_push_view(&receipt, "\nversion:")
+    bytes_push_array(&receipt, version)
+    bytes_push_view(&receipt, "\nmanifest-digest:sha256:")
+    bytes_push_array(&receipt, manifest_digest)
+    bytes_push_view(&receipt, "\nlock-digest:sha256:")
+    bytes_push_array(&receipt, lock_digest)
+    bytes_push_view(&receipt, "\narchive-digest:sha256:")
+    bytes_push_array(&receipt, archive_digest)
+    bytes_push_view(&receipt, "\n")
+    return receipt
 
 def run_cache_verify(start: darray[u8]&) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
     raw: mutable darray[u8] = []
@@ -2304,7 +2321,31 @@ def run_cache_verify(start: darray[u8]&) -> i64 can[Console.Write, Memory.Alloca
     return EXIT_SECURITY if not read_cstr_into("elisapkg.lock", &lock)
     expected: darray[u8] = canonical_lock_for_manifest(name, version, raw, start)
     return EXIT_SECURITY if expected.count == 0.usize() or not bytes_equal(expected, lock)
+    archive_present: bool = cstr_file_exists(".elisapkg/package.tar")
+    receipt_present: bool = cstr_file_exists(".elisapkg/package.receipt")
+    return EXIT_SECURITY if archive_present != receipt_present
+    if archive_present:
+        manifest_digest_bytes: mutable darray[u8] = []
+        manifest_digest: mutable darray[u8] = []
+        lock_digest_bytes: mutable darray[u8] = []
+        lock_digest: mutable darray[u8] = []
+        return EXIT_SECURITY if Integrity::sha256(raw, &manifest_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(manifest_digest_bytes, &manifest_digest)
+        return EXIT_SECURITY if Integrity::sha256(lock, &lock_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(lock_digest_bytes, &lock_digest)
+        archive_path: mutable darray[u8] = []
+        bytes_push_view(&archive_path, ".elisapkg/package.tar")
+        archive_bytes: mutable darray[u8] = []
+        return EXIT_SECURITY if not read_package_file_into(&archive_path, &archive_bytes)
+        archive_digest_bytes: mutable darray[u8] = []
+        archive_digest: mutable darray[u8] = []
+        return EXIT_SECURITY if Integrity::sha256(archive_bytes, &archive_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(archive_digest_bytes, &archive_digest)
+        receipt: mutable darray[u8] = []
+        receipt.resize(8193)
+        return EXIT_SECURITY if not read_cstr_into(".elisapkg/package.receipt", &receipt)
+        expected_receipt: darray[u8] = package_receipt_bytes(name, version, manifest_digest, lock_digest, archive_digest)
+        return EXIT_SECURITY if not bytes_equal(receipt, expected_receipt)
     write_ok("cache: local lock and manifest digests verified\n")
+    if archive_present:
+        write_ok("cache: deterministic package archive and receipt verified\n")
     write_ok("cache: no shared remote cache configured\n")
     return EXIT_OK
 
@@ -2482,6 +2523,15 @@ def run_package(argc: i64, slots: mutable cstr&&, start: darray[u8]&) -> i64 can
         return EXIT_OK
     lock_options: Model::CommandOptions = Model::CommandOptions{locked: true, offline: true, frozen: true, json: false, verbose: false}
     return EXIT_RESOLVE if run_resolve(start, lock_options) != EXIT_OK
+    lock_raw: mutable darray[u8] = []
+    lock_raw.resize(1048577)
+    return EXIT_SECURITY if not read_cstr_into("elisapkg.lock", &lock_raw)
+    manifest_digest_bytes: mutable darray[u8] = []
+    manifest_digest: mutable darray[u8] = []
+    lock_digest_bytes: mutable darray[u8] = []
+    lock_digest: mutable darray[u8] = []
+    return EXIT_SECURITY if Integrity::sha256(raw, &manifest_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(manifest_digest_bytes, &manifest_digest)
+    return EXIT_SECURITY if Integrity::sha256(lock_raw, &lock_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(lock_digest_bytes, &lock_digest)
     state_root: mutable darray[u8] = []
     bytes_push_view(&state_root, ".elisapkg")
     return 7 if not make_directory(&state_root)
@@ -2490,6 +2540,8 @@ def run_package(argc: i64, slots: mutable cstr&&, start: darray[u8]&) -> i64 can
     return 7 if not Archive::verify_ustar_archive(archive)
     archive_path: mutable darray[u8] = []
     path_join_into(start, ".elisapkg/package.tar", &archive_path)
+    receipt_path: mutable darray[u8] = []
+    path_join_into(start, ".elisapkg/package.receipt", &receipt_path)
     archive_c: mutable darray[u8] = []
     path_with_nul_into(&archive_path, &archive_c)
     archive_name: cstr = (&archive_c[0]).cast[cstr] can Unsafe.PointerCast
@@ -2497,6 +2549,11 @@ def run_package(argc: i64, slots: mutable cstr&&, start: darray[u8]&) -> i64 can
     digest_bytes: mutable darray[u8] = []
     digest: mutable darray[u8] = []
     return 7 if Integrity::sha256(archive, &digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(digest_bytes, &digest)
+    receipt: darray[u8] = package_receipt_bytes(package_name, package_version, manifest_digest, lock_digest, digest)
+    receipt_c: mutable darray[u8] = []
+    path_with_nul_into(&receipt_path, &receipt_c)
+    receipt_name: cstr = (&receipt_c[0]).cast[cstr] can Unsafe.PointerCast
+    return 7 if not write_cstr_file(receipt_name, receipt)
     write_ok("packaged ")
     write_bytes(1, &package_name)
     write_ok(" ")

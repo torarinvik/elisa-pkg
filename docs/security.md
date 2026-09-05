@@ -56,6 +56,13 @@ file mode, case-folded duplicate names, data padding, zeroed extension fields,
 and exactly two zero end blocks. Remote publication still requires signed
 metadata and publisher authorization.
 
+`cache verify` treats `.elisapkg/package.tar` and `.elisapkg/package.receipt` as
+an all-or-nothing pair. The receipt records the package identity, manifest
+digest, lock digest, and deterministic archive digest; verification re-reads the
+archive through the no-follow platform seam and recomputes every digest. A
+missing pair member, changed archive, changed lock, or changed manifest is a
+security failure rather than a cache miss.
+
 `cache gc --dry-run` does not delete anything. Actual cache collection remains
 disabled until it can mark live lock, lease, and installation references and
 recheck them before unlinking immutable entries.

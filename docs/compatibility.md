@@ -38,7 +38,7 @@ explicitly present and executable.
 | deterministic graph solver | bounded in-memory backtracking module | solver fixture in `scripts/regression_test.py` | CLI still resolves local paths through its existing graph walker |
 | TLS, registry transport | disabled | fail-closed command tests | Requires reviewed transport adapter |
 | signed metadata | disabled | fail-closed trust policy | Requires protocol/provider review and trust-state persistence |
-| archive extraction | disabled | writer/verifier only | Safe staging primitives are still a milestone |
+| archive extraction | disabled | deterministic writer/verifier and package receipts | Safe staging primitives are still a milestone |
 
 Unsupported hosts and missing capabilities must produce an actionable error;
 they must not silently fall back to an unreviewed shell or network path.
