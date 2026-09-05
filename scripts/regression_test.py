@@ -350,8 +350,15 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
         assert (nonempty_root / 'keep').read_text() == 'keep'
     finally:
         os.chdir(previous)
-    sleepy = subprocess.Popen(['/bin/sleep', '5'])
+    sleepy = os.fork()
+    if sleepy == 0:
+        os.execl('/bin/sleep', 'sleep', '5')
     child_status = ctypes.c_longlong()
-    assert wait_timeout(sleepy.pid, ctypes.byref(child_status), 50) == timeout_error()
-    assert sleepy.poll() is not None
+    assert wait_timeout(sleepy, ctypes.byref(child_status), 50) == timeout_error()
+    try:
+        os.kill(sleepy, 0)
+    except ProcessLookupError:
+        pass
+    else:
+        raise AssertionError('timed-out child still exists')
 print('review regressions passed')
