@@ -9,6 +9,11 @@ temporary insecure mode.
 
 Before enabling remote packages, the implementation must use an established signed-metadata protocol and an audited cryptographic provider. The client must bootstrap a trusted root out of band, validate threshold-signed role metadata and namespace delegation, bind identity/version/registry/archive digest together, enforce expiry and monotonic rollback protection, and persist trusted metadata versions atomically. Publisher authorization must cover the exact deterministic archive bytes. Unknown algorithms, missing thresholds, stale or replayed metadata, invalid signatures, revoked keys, and unauthorized namespaces are hard failures.
 
+The `Trust` module now exposes metadata prechecks for expiry, rollback,
+namespace, and algorithm policy. They are deliberately not signature
+verification; the production policy still rejects every remote operation until
+the reviewed provider and trust-state persistence are implemented.
+
 Archive extraction is a separate boundary. The accepted subset is regular files and directories only, with bounded compressed and expanded sizes, no links/devices/special modes, no absolute or traversal paths, no duplicate or case-colliding names, private staging, and atomic publication into a verified content store. Cache pathnames and receipts are never treated as proof of verification.
 
 Manifest bytes must be valid UTF-8 before field interpretation. The local

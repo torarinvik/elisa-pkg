@@ -8,7 +8,7 @@ The current source units are:
 | --- | --- | --- | --- |
 | `Platform` | Namespaced wrappers for the small libc/process seam | File modes and future platform policy | Only platform wrappers may refer to foreign declarations. |
 | `Model` | `Version` and `CommandOptions` value contracts | Schema-policy constants and future normalized records | No handles, credentials, or unverified source bytes cross the model API. |
-| `Trust` | Verification result codes, policy contract, and diagnostics | Protocol/provider selection | A valid digest or TLS session cannot bypass signed metadata and publisher authorization. |
+| `Trust` | Verification result codes, policy contract, diagnostics, and metadata prechecks | Protocol/provider selection and private comparison helpers | Prechecks cover expiry, rollback, namespace, and algorithm policy; only a reviewed provider may return authenticated trust. |
 | `Security` | Fail-closed statuses and user-facing denial messages | Trust-protocol selection state | Remote operations cannot become enabled by a URL, flag, or lockfile alone. |
 | `Archive` | Safe relative-entry policy and deterministic ustar headers | Path-segment checks and fixed tar metadata | Packaging and future extraction must use the same traversal guard; long-name extensions remain disabled. |
 | `Manifest` | Manifest entry-path policy | Schema/path policy marker | Target paths are checked through `Archive`; parser state remains private to validation. |

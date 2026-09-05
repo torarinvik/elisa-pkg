@@ -89,6 +89,33 @@ ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_COMPILER_ROOT/build/runtime/elisa
   "$ELISA_COMPILER_ROOT/scripts/elisac_stage1.sh" -emit exe -o "$RESOLVE_BIN" "$RESOLVE_PROBE"
 "$RESOLVE_BIN"
 
+# Trust policy prechecks are distinct from cryptographic verification. Exercise
+# their expiry, rollback, namespace, and algorithm failures while the production
+# remote provider remains disabled.
+TRUST_PROBE="$ROOT/build/trust-probe-$$.elisa"
+TRUST_BIN="$ROOT/build/trust-probe-$$"
+cat > "$TRUST_PROBE" <<EOF
+include "$ROOT/src/trust.elisa"
+
+def main() -> i64:
+    package: mutable darray[u8] = [97, 99, 109, 101, 47, 97, 112, 112]
+    namespace: mutable darray[u8] = [97, 99, 109, 101]
+    other: mutable darray[u8] = [101, 118, 105, 108]
+    return 1 if Trust::precheck_metadata(4, 3, 100, 200) != Trust::VerificationCode.RollbackDetected
+    return 2 if Trust::precheck_metadata(4, 4, 200, 200) != Trust::VerificationCode.ExpiredMetadata
+    return 3 if Trust::precheck_metadata(4, 5, 100, 200) != Trust::VerificationCode.Valid
+    return 4 if Trust::precheck_algorithm("rsa") != Trust::VerificationCode.UnknownAlgorithm
+    return 5 if Trust::precheck_algorithm("ed25519") != Trust::VerificationCode.Valid
+    return 6 if Trust::precheck_namespace(package, namespace) != Trust::VerificationCode.Valid
+    return 7 if Trust::precheck_namespace(package, other) != Trust::VerificationCode.UnauthorizedNamespace
+    return 0
+EOF
+ELISA_STAGE1_BIN="${ELISA_STAGE1_BIN:-$ELISA_COMPILER_ROOT/bin/elisac-stage1}" \
+ELISA_ALLOW_STALE_STAGE1="${ELISA_ALLOW_STALE_STAGE1:-0}" \
+ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_COMPILER_ROOT/build/runtime/elisacore_runtime.o}" \
+  "$ELISA_COMPILER_ROOT/scripts/elisac_stage1.sh" -emit exe -o "$TRUST_BIN" "$TRUST_PROBE"
+"$TRUST_BIN"
+
 # Verify the in-language SHA-256 implementation against the two canonical
 # FIPS vectors used by the package-integrity path.
 HASH_PROBE="$ROOT/build/hash-probe-$$.elisa"
