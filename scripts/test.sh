@@ -97,6 +97,7 @@ mkdir -p "$CASE"
   "$BIN" check-manifest >/dev/null
   "$BIN" resolve >/dev/null
   grep -F '"name":"nested-util"' elisapkg.lock >/dev/null
+  "$BIN" cache verify | grep -F 'manifest digests verified' >/dev/null
   "$BIN" resolve --frozen >/dev/null
   cp local-util/elisapkg.json local-util/elisapkg.json.good
   sed 's/1.2.3/1.2.4/' local-util/elisapkg.json.good > local-util/elisapkg.json
