@@ -8,7 +8,7 @@ The first local release emits:
 {
   "lock-version": 2,
   "resolver": "elisapkg-v2",
-  "package": {"name": "elisapkg", "version": "0.1.0"},
+  "package": {"name": "elisapkg", "version": "0.1.0", "manifest-digest": "sha256:<hex>"},
   "packages": []
 }
 ```
@@ -26,9 +26,9 @@ Local path resolution walks reachable local dependencies transitively. Paths are
 The active parent chain is tracked separately from the queue, so a cycle is a
 resolution error while a shared diamond dependency remains valid.
 
-Each local record also carries `manifest-digest`, a SHA-256 digest of the exact
-validated manifest bytes. It detects manifest drift in frozen resolution; source
-file/archive digests remain a separate release gate and are not implied by this
-field.
+The root package record and each local record carry `manifest-digest`, a SHA-256
+digest of the exact validated manifest bytes. They detect root and dependency
+manifest drift in frozen resolution; source file/archive digests remain a
+separate release gate and are not implied by this field.
 
 Canonical bytes are UTF-8, two-space indentation, LF endings, deterministic member ordering, sorted package and edge arrays, and exactly one terminal newline. The resolver version is part of the format so changing candidate ordering or trust policy cannot silently reuse an old result.

@@ -122,6 +122,15 @@ mkdir -p "$CASE"
     exit 1
   fi
   mv elisapkg.lock.good elisapkg.lock
+  cp elisapkg.json elisapkg.root.good
+  sed 's/An Elisa application/Changed description/' elisapkg.root.good > elisapkg.json
+  if "$BIN" resolve --frozen >/dev/null 2>&1; then
+    echo "frozen mode accepted a changed root manifest" >&2
+    exit 1
+  else
+    test "$?" -eq 3
+  fi
+  mv elisapkg.root.good elisapkg.json
   "$BIN" build >/dev/null
   "$BIN" build --frozen >/dev/null
   printf '%s\n' 'def main() -> i64:' '    return 0' > src/alternate.elisa
