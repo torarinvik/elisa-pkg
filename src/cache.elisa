@@ -1,0 +1,63 @@
+# Local content-addressed cache policy.
+#
+# The cache module owns digest-shaped blob paths and revalidation. Publication
+# orchestration remains in the CLI so it can combine the cache with the package
+# transaction and quarantine policy without exposing mutable filesystem handles.
+
+include "./platform.elisa"
+include "./integrity.elisa"
+
+module Cache:
+    public:
+        def blob_path(digest: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            return false if not cache_valid_digest(digest)
+            cache_push_text(&out, ".elisapkg/cache/sha256/")
+            out.push(digest[0])
+            out.push(digest[1])
+            out.push(47)
+            cache_push_array(&out, digest)
+            return true
+
+        def verify_blob(digest: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            path: mutable darray[u8] = []
+            return false if not blob_path(digest, &path)
+            path_c: mutable darray[u8] = []
+            cache_push_array(&path_c, path)
+            path_c.push(0)
+            content: mutable darray[u8] = []
+            content.resize(67108865)
+            content_raw: mutable u8& = (&content[0]).cast[mutable u8&] can Unsafe.PointerCast
+            path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
+            read_size: i64 = Platform::pkg_read_package_file(path_name, content_raw, content.count)
+            return false if read_size < 0
+            content.resize(read_size.usize())
+            digest_bytes: mutable darray[u8] = []
+            actual: mutable darray[u8] = []
+            return false if Integrity::sha256(content, &digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(digest_bytes, &actual)
+            return cache_equal(actual, digest)
+
+    private:
+        def cache_valid_digest(digest: darray[u8]&) -> bool:
+            return false if digest.count != 64.usize()
+            for index in 0..<digest.count |digest|:
+                byte: u8 = digest[index]
+                return false if (byte < 48 or byte > 57) and (byte < 97 or byte > 102)
+            return true
+
+        def cache_equal(left: darray[u8]&, right: darray[u8]&) -> bool:
+            return false if left.count != right.count
+            for index in 0..<left.count |left, right|:
+                return false if left[index] != right[index]
+            return true
+
+        def cache_push_text(out: mutable darray[u8]&, value: cstr) -> void can[Memory.Allocate, Abort.Panic]:
+            index: mutable usize = 0.usize()
+            while index < 1048576.usize() |out, value, index|:
+                byte: u8 = value[index].u8()
+                return if byte == 0
+                out.push(byte)
+                index <- index + 1.usize()
+
+        def cache_push_array(out: mutable darray[u8]&, value: darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
+            for index in 0..<value.count |out, value|:
+                out.push(value[index])

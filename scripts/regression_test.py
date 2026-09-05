@@ -21,6 +21,7 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
              f'include "{ROOT}/src/semver.elisa"',
              f'include "{ROOT}/src/json.elisa"',
              f'include "{ROOT}/src/archive.elisa"',
+             f'include "{ROOT}/src/cache.elisa"',
              f'include "{ROOT}/src/resolve.elisa"',
              f'include "{ROOT}/src/trust.elisa"',
              f'include "{ROOT}/src/solver.elisa"', 'def main() -> i64:']
@@ -80,6 +81,14 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
     check('Trust::precheck_threshold(1, 2) == Trust::VerificationCode.ThresholdInsufficient')
     check('Trust::precheck_revocation(true) == Trust::VerificationCode.RevokedKey')
     check('Trust::precheck_clock(9, 8) == Trust::VerificationCode.ClockRollback')
+    cache_digest = data('a' * 64)
+    cache_path: str = 'cache_path'
+    lines.append(f'    {cache_path}: mutable darray[u8] = []')
+    check(f'Cache::blob_path({cache_digest}, &{cache_path})')
+    check(f'{cache_path}.count > 0.usize()')
+    invalid_cache_digest = data('not-a-digest')
+    lines.append('    invalid_cache_path: mutable darray[u8] = []')
+    check(f'not Cache::blob_path({invalid_cache_digest}, &invalid_cache_path)')
     lines.extend([
         '    solver_name: mutable darray[u8] = [97]',
         '    solver_requirement: mutable darray[u8] = [94,49,46,48,46,48]',

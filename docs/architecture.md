@@ -17,6 +17,7 @@ The current source units are:
 | `Resolve` | Bounded in-memory candidate selection | Catalog cursors and duplicate tracking | Selection is pure and deterministic; providers must authenticate metadata before constructing a catalog. |
 | `Solver` | Bounded backtracking over authenticated candidates | Candidate ordering, trails, and decision limits | It accepts metadata records only; source acquisition, signature checks, and filesystem effects remain outside the solver. |
 | `Integrity` | SHA-256 bytes and hexadecimal encoding | Compression/hash implementation details | Digests are content claims; `Trust` still decides whether authenticated metadata authorizes them. |
+| `Cache` | Digest-addressed blob paths and byte revalidation | Digest grammar and no-follow blob reads | A pathname is never accepted as proof; callers must publish and quarantine through the CLI transaction. |
 | `Cli` | `run(argc, argv)` | None | The public command surface delegates to private command helpers. |
 
 The current compiler backend requires foreign declarations at compilation-unit scope, so `Platform` wraps those declarations rather than placing them inside the module body. This keeps the exception local and documented. Callers use qualified names such as `Platform::pkg_fopen`, `Model::Version`, and `Security::remote_fetch_status`; `using` imports are deliberately avoided.
