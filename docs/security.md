@@ -52,8 +52,10 @@ metadata and publisher authorization.
 disabled until it can mark live lock, lease, and installation references and
 recheck them before unlinking immutable entries.
 
-Review corrections: archive reads use descriptor-relative no-follow opens for
-all components, detect I/O errors, and reject special files. Archive validation
+Review corrections: archive, manifest, lockfile, receipt, and artifact reads
+use descriptor-relative no-follow opens for all components, including absolute
+paths anchored at `/`; they detect I/O errors and reject special files.
+Archive validation
 also checks zero data padding and file/directory conflicts. Frozen resolution
 performs no lockfile replacement. Build receipt v2 reuses only when the target,
 manifest, compiler settings, and artifact digest all match; included sources

@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include <stddef.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
 
@@ -178,12 +179,14 @@ long long elisapkg_collect_files(const char *root, unsigned char *output, size_t
 /* Open every component relative to an already opened directory. A rename or
  * symlink swap cannot redirect the read outside this directory chain. */
 static int open_package_file(const char *path) {
-    if (path == NULL || path[0] == '/' || strlen(path) > 4096) return -EINVAL;
+    if (path == NULL || strlen(path) > 4096) return -EINVAL;
     char *copy = strdup(path);
     if (copy == NULL) return -ENOMEM;
-    int directory = open(".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    const int absolute = path[0] == '/';
+    int directory = open(absolute ? "/" : ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (directory < 0) { free(copy); return -EIO; }
     char *part = copy;
+    while (absolute && *part == '/') part++;
     int file = -1;
     while (1) {
         char *slash = strchr(part, '/');
@@ -217,6 +220,19 @@ static int open_package_file(const char *path) {
     close(directory);
     free(copy);
     return file;
+}
+
+/* Read-mode fopen is routed through the same descriptor-relative no-follow
+ * walk as the byte-buffer helpers. Exclusive-create writes retain libc's
+ * mode semantics and are already protected by O_EXCL in the caller. */
+FILE *elisapkg_fopen(const char *path, const char *mode) {
+    if (path == NULL || mode == NULL) return NULL;
+    if (strcmp(mode, "rb") != 0) return fopen(path, mode);
+    int file = open_package_file(path);
+    if (file < 0) return NULL;
+    FILE *stream = fdopen(file, "rb");
+    if (stream == NULL) close(file);
+    return stream;
 }
 
 long long elisapkg_package_file_size(const char *path) {

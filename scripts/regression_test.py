@@ -242,7 +242,9 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
         assert read(b'alias/main.elisa', buffer, 128) < 0
         Path('linked').symlink_to('src/main.elisa')
         assert read(b'linked', buffer, 128) < 0
-        assert read(str((project / 'src/main.elisa').resolve()).encode(), buffer, 128) < 0
+        assert read(str((project / 'src/main.elisa').resolve()).encode(), buffer, 128) > 0
+        Path('absolute-linked').symlink_to((project / 'src/main.elisa').resolve())
+        assert read(str(project / 'absolute-linked').encode(), buffer, 128) < 0
     finally:
         os.chdir(previous)
 print('review regressions passed')
