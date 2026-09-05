@@ -41,6 +41,12 @@ Build subprocesses receive no credentials and no arbitrary dependency scripts. C
 
 The local executor starts compiler and application children through `/usr/bin/env -i` with a fixed PATH. It retains only the three compiler bootstrap variables needed by the self-hosting wrapper and never forwards the parent environment wholesale. This is credential minimization, not a sandbox: the selected compiler and trusted source still have the operating-system privileges of the invoking user.
 
+Compiler children have a ten-minute monotonic deadline; `run` and `test`
+children have a two-minute deadline. Each child enters a private process group,
+and a timeout kills the group before the temporary artifact is removed. This
+limits hangs and descendant-process leaks, but it does not replace a sandbox or
+prevent a trusted child from consuming resources until the deadline.
+
 Every package build additionally sets `ELISA_STAGE1_SEMANTIC_GATE=1` in the
 controlled child environment. A semantic diagnostic therefore stops the build
 before an artifact can be reported as successful.

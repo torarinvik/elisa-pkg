@@ -267,6 +267,12 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
     extract_ustar = native.elisapkg_extract_ustar
     extract_ustar.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p]
     extract_ustar.restype = ctypes.c_longlong
+    wait_timeout = native.elisapkg_waitpid_timeout
+    wait_timeout.argtypes = [ctypes.c_longlong, ctypes.POINTER(ctypes.c_longlong), ctypes.c_longlong]
+    wait_timeout.restype = ctypes.c_longlong
+    timeout_error = native.elisapkg_timeout_error
+    timeout_error.argtypes = []
+    timeout_error.restype = ctypes.c_longlong
 
     def ustar(name, content, mode=0o644):
         header = bytearray(512)
@@ -344,4 +350,8 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
         assert (nonempty_root / 'keep').read_text() == 'keep'
     finally:
         os.chdir(previous)
+    sleepy = subprocess.Popen(['/bin/sleep', '5'])
+    child_status = ctypes.c_longlong()
+    assert wait_timeout(sleepy.pid, ctypes.byref(child_status), 50) == timeout_error()
+    assert sleepy.poll() is not None
 print('review regressions passed')

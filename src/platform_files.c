@@ -5,13 +5,17 @@
 #include <dirent.h>
 #include <ftw.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <unistd.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <signal.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
+#include <sys/wait.h>
 
 /*
  * This is deliberately only a filesystem seam. Serialization and manifest selection stay in Elisa;
@@ -746,6 +750,56 @@ long long elisapkg_chdir(const char *path) {
     const int result = fchdir(directory) == 0 ? 0 : -errno;
     close(directory);
     return result;
+}
+
+long long elisapkg_set_process_group(void) {
+    return setpgid(0, 0) == 0 ? 0 : -errno;
+}
+
+static long long monotonic_milliseconds(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return -1;
+    if (now.tv_sec > (time_t)(LLONG_MAX / 1000)) return LLONG_MAX;
+    const long long seconds = (long long)now.tv_sec * 1000;
+    return seconds + (long long)(now.tv_nsec / 1000000);
+}
+
+long long elisapkg_waitpid_timeout(long long pid, long long *status, long long timeout_ms) {
+    if (pid <= 0 || status == NULL || timeout_ms <= 0) return -EINVAL;
+    const long long started = monotonic_milliseconds();
+    if (started < 0) return -EIO;
+    const long long deadline = started > LLONG_MAX - timeout_ms ? LLONG_MAX : started + timeout_ms;
+    for (;;) {
+        int native_status = 0;
+        const pid_t waited = waitpid((pid_t)pid, &native_status, WNOHANG);
+        if (waited == (pid_t)pid) {
+            *status = (long long)native_status;
+            return 0;
+        }
+        if (waited < 0) {
+            if (errno == EINTR) continue;
+            return errno == 0 ? -EIO : -errno;
+        }
+        const long long now = monotonic_milliseconds();
+        if (now < 0) return -EIO;
+        if (now >= deadline) {
+            if (kill(-(pid_t)pid, SIGKILL) != 0 && errno != ESRCH) {
+                (void)kill((pid_t)pid, SIGKILL);
+            }
+            int discarded_status = 0;
+            while (waitpid((pid_t)pid, &discarded_status, 0) < 0 && errno == EINTR) {
+            }
+            *status = (long long)discarded_status;
+            return -ETIMEDOUT;
+        }
+        struct timespec pause = {0, 10000000L};
+        while (nanosleep(&pause, &pause) != 0 && errno == EINTR) {
+        }
+    }
+}
+
+long long elisapkg_timeout_error(void) {
+    return -ETIMEDOUT;
 }
 
 long long elisapkg_unlink(const char *path) {

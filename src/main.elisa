@@ -23,6 +23,8 @@ const EXIT_SOURCE: i64 = 4
 const EXIT_SECURITY: i64 = 5
 const EXIT_BUILD: i64 = 6
 const EXIT_CANCEL: i64 = 130
+const BUILD_TIMEOUT_MS: i64 = 600000
+const PROGRAM_TIMEOUT_MS: i64 = 120000
 
 const O_READ: cstr = "rb"
 const O_WRITE: cstr = "wb"
@@ -2810,13 +2812,18 @@ def run_build(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Con
     child_argv: mutable cstr&& = (&args[0]).cast[mutable cstr&&] can Unsafe.PointerCast
     pid: i64 = Platform::pkg_fork()
     if pid == 0:
+        _ = Platform::pkg_set_process_group()
         _ = Platform::pkg_execvp("/usr/bin/env", child_argv)
         Platform::pkg_process_exit(127)
     if pid < 0:
         _ = Platform::pkg_unlink(temp_name)
         return EXIT_BUILD
     status: mutable i64 = 0
-    waited: i64 = Platform::pkg_waitpid(pid, &status, 0)
+    waited: i64 = Platform::pkg_waitpid_timeout(pid, &status, BUILD_TIMEOUT_MS)
+    if waited == Platform::pkg_timeout_error():
+        _ = Platform::pkg_unlink(temp_name)
+        write_error("error: compiler exceeded the 10-minute execution limit\n")
+        return EXIT_CANCEL
     if waited < 0 or status != 0:
         _ = Platform::pkg_unlink(temp_name)
         return EXIT_BUILD
@@ -2860,11 +2867,13 @@ def run_program(argc: i64, slots: mutable cstr&&) -> i64 can[Console.Write, Memo
     child_argv: mutable cstr&& = (&args[0]).cast[mutable cstr&&] can Unsafe.PointerCast
     pid: i64 = Platform::pkg_fork()
     if pid == 0:
+        _ = Platform::pkg_set_process_group()
         _ = Platform::pkg_execvp("/usr/bin/env", child_argv)
         Platform::pkg_process_exit(127)
     return EXIT_BUILD if pid < 0
     status: mutable i64 = 0
-    waited: i64 = Platform::pkg_waitpid(pid, &status, 0)
+    waited: i64 = Platform::pkg_waitpid_timeout(pid, &status, PROGRAM_TIMEOUT_MS)
+    return EXIT_CANCEL if waited == Platform::pkg_timeout_error()
     return EXIT_BUILD if waited < 0
     # waitpid returns the platform wait status. Preserve a normal child's exit
     # code for `run`, and map signal termination to the documented cancellation
