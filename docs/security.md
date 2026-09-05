@@ -18,8 +18,10 @@ the reviewed provider and trust-state persistence are implemented.
 State-directory creation and atomic file publication use descriptor-anchored
 `mkdirat`/`openat`/`renameat`/`linkat` traversal. Reads, temporary files,
 access checks, cleanup, and directory changes reject symlinked `.elisapkg`,
-build, install, and receipt paths, including intermediate parent links and
-`..` traversal.
+build, install, and receipt paths, including intermediate parent links.
+Controlled local dependency reads may use normalized `..` path segments so
+sibling packages remain supported; target and state paths are validated before
+they reach this seam.
 
 Archive extraction is a separate boundary. The accepted subset is regular files and directories only, with bounded compressed and expanded sizes, no links/devices/special modes, no absolute or traversal paths, no duplicate or case-colliding names, private staging, and atomic publication into a verified content store. Cache pathnames and receipts are never treated as proof of verification.
 

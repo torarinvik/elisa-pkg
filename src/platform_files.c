@@ -200,11 +200,6 @@ static int open_package_file(const char *path) {
             free(copy);
             return -EINVAL;
         }
-        if (strcmp(part, "..") == 0) {
-            close(directory);
-            free(copy);
-            return -EINVAL;
-        }
         if (strcmp(part, ".") == 0) {
             if (slash == NULL) {
                 close(directory);

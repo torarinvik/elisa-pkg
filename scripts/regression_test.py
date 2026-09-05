@@ -252,6 +252,7 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
         assert is_directory(b'../') == 0
         assert is_directory(b'src') == 1
         assert read(b'src/main.elisa', buffer, 128) > 0
+        assert read(b'../external/src/main.elisa', buffer, 128) > 0
         Path('alias').symlink_to('src', target_is_directory=True)
         assert is_directory(b'alias') == 0
         Path('nested').mkdir()
@@ -261,7 +262,6 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
         assert is_directory(b'nested/created') == 1
         assert mkdir_secure(b'nested/alias/blocked', 0o755) < 0
         assert read(b'alias/main.elisa', buffer, 128) < 0
-        assert read(b'../src/main.elisa', buffer, 128) < 0
         assert access_secure(b'alias/main.elisa', 0) < 0
         assert chdir_secure(b'alias') < 0
         temp_template = ctypes.create_string_buffer(b'nested/temporary.XXXXXX')
