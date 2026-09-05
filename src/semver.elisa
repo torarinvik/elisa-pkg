@@ -1,0 +1,185 @@
+# Semantic-version policy. Parsing and matching are pure and carry no filesystem,
+# network, or trust state across the module boundary.
+
+module SemVer:
+    public:
+        struct Requirement:
+            lower: mutable Model::Version
+            upper: mutable Model::Version
+            has_lower: mutable bool
+            has_upper: mutable bool
+            include_lower: mutable bool
+            include_upper: mutable bool
+
+        def compare(left: Model::Version, right: Model::Version) -> i64:
+            return -1 if left.major < right.major
+            return 1 if left.major > right.major
+            return -1 if left.minor < right.minor
+            return 1 if left.minor > right.minor
+            return -1 if left.patch < right.patch
+            return 1 if left.patch > right.patch
+            return -1 if left.prerelease and not right.prerelease
+            return 1 if right.prerelease and not left.prerelease
+            return 0
+
+        # v1 requirement grammar: exact versions, ^, ~, and one comparison.
+        # The resolver will reject a range it cannot parse; it never guesses.
+        def parse_requirement(value: darray[u8]&, out: mutable Requirement&) -> bool:
+            start: mutable usize = 0.usize()
+            finish: mutable usize = value.count
+            while start < finish and is_space(value[start]):
+                start <- start + 1.usize()
+            while finish > start and is_space(value[finish - 1.usize()]):
+                finish <- finish - 1.usize()
+            return false if start >= finish
+
+            operator: mutable u8 = 0
+            operator_length: mutable usize = 0.usize()
+            if value[start] == 94 or value[start] == 126:
+                operator <- value[start]
+                operator_length <- 1.usize()
+            elif value[start] == 60 or value[start] == 62:
+                operator <- value[start]
+                operator_length <- 1.usize()
+                if start + 1.usize() < finish and value[start + 1.usize()] == 61:
+                    operator_length <- 2.usize()
+
+            version_start: mutable usize = start + operator_length
+            while version_start < finish and is_space(value[version_start]):
+                version_start <- version_start + 1.usize()
+            version_end: mutable usize = version_start
+            while version_end < finish and not is_space(value[version_end]):
+                version_end <- version_end + 1.usize()
+            return false if version_start >= version_end
+            parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
+            return false if not parse_version_token(value, version_start, version_end, &parsed)
+
+            has_second: bool = version_end < finish
+            if has_second:
+                return false if operator != 60 and operator != 62
+                cursor: mutable usize = version_end
+                while cursor < finish and is_space(value[cursor]):
+                    cursor <- cursor + 1.usize()
+                return false if cursor >= finish or (value[cursor] != 60 and value[cursor] != 62)
+                second_operator: u8 = value[cursor]
+                second_length: mutable usize = 1.usize()
+                if cursor + 1.usize() < finish and value[cursor + 1.usize()] == 61:
+                    second_length <- 2.usize()
+                second_start: mutable usize = cursor + second_length
+                while second_start < finish and is_space(value[second_start]):
+                    second_start <- second_start + 1.usize()
+                second_end: mutable usize = second_start
+                while second_end < finish and not is_space(value[second_end]):
+                    second_end <- second_end + 1.usize()
+                return false if second_start >= second_end or second_end != finish
+                second: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
+                return false if not parse_version_token(value, second_start, second_end, &second)
+                out.lower <- parsed if operator == 62
+                out.include_lower <- operator == 62 and operator_length == 2.usize()
+                out.has_lower <- operator == 62
+                out.upper <- parsed if operator == 60
+                out.include_upper <- operator == 60 and operator_length == 2.usize()
+                out.has_upper <- operator == 60
+                out.lower <- second if second_operator == 62
+                out.include_lower <- second_operator == 62 and second_length == 2.usize()
+                out.has_lower <- second_operator == 62
+                out.upper <- second if second_operator == 60
+                out.include_upper <- second_operator == 60 and second_length == 2.usize()
+                out.has_upper <- second_operator == 60
+                return true
+            return false if version_end != finish
+
+            out.lower <- parsed
+            out.upper <- parsed
+            out.has_lower <- true
+            out.has_upper <- true
+            out.include_lower <- true
+            out.include_upper <- true
+            if operator == 94:
+                out.upper <- caret_upper(parsed)
+                out.include_upper <- false
+            elif operator == 126:
+                out.upper <- Model::Version{major: parsed.major, minor: parsed.minor + 1, patch: 0, prerelease: false}
+                out.include_upper <- false
+            elif operator == 60:
+                out.has_lower <- false
+                out.include_upper <- operator_length == 2.usize()
+            elif operator == 62:
+                out.has_upper <- false
+                out.include_lower <- operator_length == 2.usize()
+            return true
+
+        def matches(requirement: Requirement, candidate: Model::Version) -> bool:
+            lower_cmp: i64 = compare(candidate, requirement.lower)
+            return false if requirement.has_lower and (lower_cmp < 0 or (lower_cmp == 0 and not requirement.include_lower))
+            upper_cmp: i64 = compare(candidate, requirement.upper)
+            return false if requirement.has_upper and (upper_cmp > 0 or (upper_cmp == 0 and not requirement.include_upper))
+            return true
+
+    private:
+        const precedence_contract: cstr = "SemVer 2.0 precedence; build metadata excluded from ordering"
+
+        def is_space(byte: u8) -> bool:
+            return byte == 32 or byte == 9 or byte == 10 or byte == 13
+
+        def parse_u64(value: darray[u8]&, start: usize, end: usize, out: mutable u64&) -> bool:
+            return false if start >= end
+            number: mutable u64 = 0
+            for index in start..<end |value, number|:
+                return false if value[index] < 48 or value[index] > 57
+                digit: u64 = (value[index] - 48).u64()
+                return false if number > 1844674407370955161 or (number == 1844674407370955161 and digit > 5)
+                number <- number * 10 + digit
+            out <- number
+            return true
+
+        def parse_version_token(value: darray[u8]&, start: usize, end: usize, out: mutable Model::Version&) -> bool:
+            first_dot: mutable usize = end
+            second_dot: mutable usize = end
+            for index in start..<end |value, first_dot, second_dot|:
+                if value[index] == 46:
+                    if first_dot == end:
+                        first_dot <- index
+                    elif second_dot == end:
+                        second_dot <- index
+                    else:
+                        return false
+            return false if first_dot == end or second_dot == end or first_dot == start or second_dot == first_dot + 1.usize() or second_dot + 1.usize() >= end
+            return false if first_dot - start > 1.usize() and value[start] == 48
+            return false if second_dot - first_dot > 2.usize() and value[first_dot + 1.usize()] == 48
+            major: mutable u64 = 0
+            minor: mutable u64 = 0
+            patch: mutable u64 = 0
+            return false if not parse_u64(value, start, first_dot, &major)
+            return false if not parse_u64(value, first_dot + 1.usize(), second_dot, &minor)
+            prerelease_start: usize = second_dot + 1.usize()
+            prerelease_end: mutable usize = end
+            for index in prerelease_start..<end |value, prerelease_end|:
+                prerelease_end <- index if value[index] == 45
+            return false if prerelease_end - prerelease_start > 1.usize() and value[prerelease_start] == 48
+            return false if not parse_u64(value, prerelease_start, prerelease_end, &patch)
+            if prerelease_end < end:
+                pre_start: mutable usize = prerelease_end + 1.usize()
+                return false if pre_start >= end
+                segment_start: mutable usize = pre_start
+                segment_digits: mutable bool = true
+                while pre_start < end:
+                    byte: u8 = value[pre_start]
+                    if byte == 46:
+                        return false if pre_start == segment_start
+                        return false if segment_digits and pre_start - segment_start > 1.usize() and value[segment_start] == 48
+                        segment_start <- pre_start + 1.usize()
+                        segment_digits <- true
+                    else:
+                        return false if not ((byte >= 48 and byte <= 57) or (byte >= 65 and byte <= 90) or (byte >= 97 and byte <= 122) or byte == 45)
+                        segment_digits <- false if byte < 48 or byte > 57
+                    pre_start <- pre_start + 1.usize()
+                return false if pre_start == segment_start
+                return false if segment_digits and pre_start - segment_start > 1.usize() and value[segment_start] == 48
+            out <- Model::Version{major: major, minor: minor, patch: patch, prerelease: prerelease_end < end}
+            return true
+
+        def caret_upper(value: Model::Version) -> Model::Version:
+            return Model::Version{major: value.major + 1, minor: 0, patch: 0, prerelease: false} if value.major > 0
+            return Model::Version{major: 0, minor: value.minor + 1, patch: 0, prerelease: false} if value.minor > 0
+            return Model::Version{major: 0, minor: 0, patch: value.patch + 1, prerelease: false}

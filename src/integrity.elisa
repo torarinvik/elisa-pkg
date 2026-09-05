@@ -1,0 +1,146 @@
+# Content integrity primitives.
+#
+# This module is deliberately self-contained and exposes only a digest API. It
+# does not decide whether a digest is trusted; Trust owns that policy. Remote
+# acquisition remains disabled until signed metadata and an audited provider
+# are configured.
+
+module Integrity:
+    public:
+        const enum DigestCode of u8:
+            Ok
+            InputTooLarge
+            OutputFailure
+
+        const max_input: usize = 67108864
+
+        # Compute the FIPS 180-4 SHA-256 digest. The output is exactly 32 bytes.
+        def sha256(value: darray[u8]&, out: mutable darray[u8]&) -> DigestCode can[Memory.Allocate, Abort.Panic]:
+            return DigestCode.InputTooLarge if value.count > max_input
+            padded_size: usize = ((value.count + 9.usize() + 63.usize()) / 64.usize()) * 64.usize()
+            padded: mutable darray[u8] = []
+            padded.resize(padded_size)
+            for index in 0..<value.count |padded, value|:
+                padded[index] <- value[index]
+            padded[value.count] <- 128
+            bit_length: u64 = value.count.u64() * 8.u64()
+            length_offset: usize = padded_size - 8.usize()
+            padded[length_offset] <- (bit_length >> 56).u8()
+            padded[length_offset + 1.usize()] <- (bit_length >> 48).u8()
+            padded[length_offset + 2.usize()] <- (bit_length >> 40).u8()
+            padded[length_offset + 3.usize()] <- (bit_length >> 32).u8()
+            padded[length_offset + 4.usize()] <- (bit_length >> 24).u8()
+            padded[length_offset + 5.usize()] <- (bit_length >> 16).u8()
+            padded[length_offset + 6.usize()] <- (bit_length >> 8).u8()
+            padded[length_offset + 7.usize()] <- bit_length.u8()
+
+            state: mutable darray[u32] = []
+            state.push(0x6a09e667.u32())
+            state.push(0xbb67ae85.u32())
+            state.push(0x3c6ef372.u32())
+            state.push(0xa54ff53a.u32())
+            state.push(0x510e527f.u32())
+            state.push(0x9b05688c.u32())
+            state.push(0x1f83d9ab.u32())
+            state.push(0x5be0cd19.u32())
+            block: mutable usize = 0.usize()
+            while block < padded_size |padded, state, block|:
+                words: mutable darray[u32] = []
+                words.resize(64)
+                for index in 0..<16 |words, padded, block|:
+                    offset: usize = block + index * 4.usize()
+                    words[index] <- (padded[offset].u32() << 24) | (padded[offset + 1.usize()].u32() << 16) | (padded[offset + 2.usize()].u32() << 8) | padded[offset + 3.usize()].u32()
+                for index in 16..<64 |words|:
+                    words[index] <- small_sigma1(words[index - 2.usize()]) + words[index - 7.usize()] + small_sigma0(words[index - 15.usize()]) + words[index - 16.usize()]
+                a: mutable u32 = state[0]
+                b: mutable u32 = state[1]
+                c: mutable u32 = state[2]
+                d: mutable u32 = state[3]
+                e: mutable u32 = state[4]
+                f: mutable u32 = state[5]
+                g: mutable u32 = state[6]
+                h: mutable u32 = state[7]
+                for index in 0..<64 |words, a, b, c, d, e, f, g, h|:
+                    temp1: u32 = h + big_sigma1(e) + choose(e, f, g) + round_constant(index) + words[index]
+                    temp2: u32 = big_sigma0(a) + majority(a, b, c)
+                    h <- g
+                    g <- f
+                    f <- e
+                    e <- d + temp1
+                    d <- c
+                    c <- b
+                    b <- a
+                    a <- temp1 + temp2
+                state[0] <- state[0] + a
+                state[1] <- state[1] + b
+                state[2] <- state[2] + c
+                state[3] <- state[3] + d
+                state[4] <- state[4] + e
+                state[5] <- state[5] + f
+                state[6] <- state[6] + g
+                state[7] <- state[7] + h
+                block <- block + 64.usize()
+            out.resize(0)
+            for index in 0..<8 |out, state|:
+                word: u32 = state[index]
+                out.push((word >> 24).u8())
+                out.push((word >> 16).u8())
+                out.push((word >> 8).u8())
+                out.push(word.u8())
+            return DigestCode.Ok
+
+        def hex_digest(digest: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            return false if digest.count != 32.usize()
+            out.resize(0)
+            for index in 0..<digest.count |digest, out|:
+                high: u32 = (digest[index].u32() >> 4) & 15.u32()
+                low: u32 = digest[index].u32() & 15.u32()
+                out.push(hex_digit(high))
+                out.push(hex_digit(low))
+            return true
+
+    private:
+        def rotate_right(value: u32, amount: u32) -> u32:
+            return (value >> amount) | (value << (32.u32() - amount))
+
+        def choose(x: u32, y: u32, z: u32) -> u32:
+            return (x & y) ^ ((~x) & z)
+
+        def majority(x: u32, y: u32, z: u32) -> u32:
+            return (x & y) ^ (x & z) ^ (y & z)
+
+        def big_sigma0(value: u32) -> u32:
+            return rotate_right(value, 2) ^ rotate_right(value, 13) ^ rotate_right(value, 22)
+
+        def big_sigma1(value: u32) -> u32:
+            return rotate_right(value, 6) ^ rotate_right(value, 11) ^ rotate_right(value, 25)
+
+        def small_sigma0(value: u32) -> u32:
+            return rotate_right(value, 7) ^ rotate_right(value, 18) ^ (value >> 3)
+
+        def small_sigma1(value: u32) -> u32:
+            return rotate_right(value, 17) ^ rotate_right(value, 19) ^ (value >> 10)
+
+        def round_constant(index: usize) -> u32:
+            constants: darray[u32] = [
+                0x428a2f98.u32(), 0x71374491.u32(), 0xb5c0fbcf.u32(), 0xe9b5dba5.u32(),
+                0x3956c25b.u32(), 0x59f111f1.u32(), 0x923f82a4.u32(), 0xab1c5ed5.u32(),
+                0xd807aa98.u32(), 0x12835b01.u32(), 0x243185be.u32(), 0x550c7dc3.u32(),
+                0x72be5d74.u32(), 0x80deb1fe.u32(), 0x9bdc06a7.u32(), 0xc19bf174.u32(),
+                0xe49b69c1.u32(), 0xefbe4786.u32(), 0x0fc19dc6.u32(), 0x240ca1cc.u32(),
+                0x2de92c6f.u32(), 0x4a7484aa.u32(), 0x5cb0a9dc.u32(), 0x76f988da.u32(),
+                0x983e5152.u32(), 0xa831c66d.u32(), 0xb00327c8.u32(), 0xbf597fc7.u32(),
+                0xc6e00bf3.u32(), 0xd5a79147.u32(), 0x06ca6351.u32(), 0x14292967.u32(),
+                0x27b70a85.u32(), 0x2e1b2138.u32(), 0x4d2c6dfc.u32(), 0x53380d13.u32(),
+                0x650a7354.u32(), 0x766a0abb.u32(), 0x81c2c92e.u32(), 0x92722c85.u32(),
+                0xa2bfe8a1.u32(), 0xa81a664b.u32(), 0xc24b8b70.u32(), 0xc76c51a3.u32(),
+                0xd192e819.u32(), 0xd6990624.u32(), 0xf40e3585.u32(), 0x106aa070.u32(),
+                0x19a4c116.u32(), 0x1e376c08.u32(), 0x2748774c.u32(), 0x34b0bcb5.u32(),
+                0x391c0cb3.u32(), 0x4ed8aa4a.u32(), 0x5b9cca4f.u32(), 0x682e6ff3.u32(),
+                0x748f82ee.u32(), 0x78a5636f.u32(), 0x84c87814.u32(), 0x8cc70208.u32(),
+                0x90befffa.u32(), 0xa4506ceb.u32(), 0xbef9a3f7.u32(), 0xc67178f2.u32()
+            ]
+            return constants[index]
+
+        def hex_digit(value: u32) -> u8:
+            return (48.u32() + value).u8() if value < 10.u32() else (87.u32() + value).u8()

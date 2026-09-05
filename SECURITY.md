@@ -1,0 +1,11 @@
+# Security policy
+
+`elisapkg` treats package metadata, source archives, manifests, lockfiles, and registry responses as hostile input. The current implementation has no enabled remote source provider. `fetch` fails closed with exit status 5, and `publish`/`install` are not enabled. This prevents an unsigned network path from becoming an accidental default while the trust protocol is reviewed.
+
+The supported trust design is described in `IMPLEMENTATION_PLAN.md` (ignored local roadmap) and will be extracted into tracked protocol documentation before remote support is enabled. It requires an established signed-metadata protocol with an out-of-band trusted root, offline root keys, threshold recovery, namespace delegation, authenticated exact archive digests, expiry and rollback protection, key rotation and revocation, and publisher authorization bound to the exact packaged bytes. A checksum or TLS connection by itself is not treated as publisher authentication.
+
+The client must never execute registry-provided shell commands, build scripts, plugins, or post-install hooks. Compiler builds receive no publication credentials. Archive extraction must reject path traversal, links, devices, duplicate/case-colliding paths, malformed metadata, and resource-limit violations before any final cache path is touched.
+
+The Elisa implementation keeps these decisions behind `Trust` and `Security` modules. `Trust::VerificationCode` distinguishes missing, invalid, unauthorized, expired, rollback, and digest failures; the current production policy returns a hard failure for every remote operation because no reviewed verifier is enabled. A status code or lockfile entry never acts as proof of authenticity.
+
+Report suspected vulnerabilities privately to the project maintainers. Include the affected version, command, platform, and a minimal reproduction without publishing credentials or malicious payloads. Do not claim that signatures make package code harmless: an authorized publisher can still publish malicious source, so source trust and execution isolation remain separate controls.

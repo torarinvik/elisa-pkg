@@ -1,0 +1,1873 @@
+# Elisa Packaging System (`elisapkg`).
+#
+# The package manager keeps policy and algorithms in Elisa. Platform seams are
+# small libc bindings with `pkg_` names so they cannot collide with the compiler
+# runtime's declarations. Remote transport, archive extraction, and signing are
+# separate capabilities and are refused until their trust configuration is
+# present; no command silently falls back to an insecure mode.
+
+include "./platform.elisa"
+include "./model.elisa"
+include "./trust.elisa"
+include "./security.elisa"
+include "./manifest.elisa"
+include "./semver.elisa"
+include "./integrity.elisa"
+
+const EXIT_OK: i64 = 0
+const EXIT_USAGE: i64 = 2
+const EXIT_RESOLVE: i64 = 3
+const EXIT_SOURCE: i64 = 4
+const EXIT_SECURITY: i64 = 5
+const EXIT_BUILD: i64 = 6
+
+const O_READ: cstr = "rb"
+const O_WRITE: cstr = "wb"
+
+# ---------- byte and output helpers ---------------------------------------------------
+
+def bytes_push_view(out: mutable darray[u8]&, value: cstr) -> void can[Memory.Allocate, Abort.Panic]:
+    length: usize = Platform::pkg_strlen(value)
+    for index in 0..<length |out, value|:
+        byte: u8 = value[index].u8()
+        out.push(byte)
+
+def bytes_push_cstr(out: mutable darray[u8]&, value: cstr) -> void can[Memory.Allocate, Abort.Panic]:
+    index: mutable usize = 0.usize()
+    while index < 1048576.usize() |out, value, index|:
+        byte: u8 = value[index].u8()
+        break if byte == 0
+        out.push(byte)
+        index <- index + 1.usize()
+
+def bytes_equal(left: darray[u8]&, right: darray[u8]&) -> bool:
+    false return if left.count != right.count
+    for index in 0..<left.count |left, right|:
+        false return if left[index] != right[index]
+    return true
+
+def bytes_copy(value: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
+    out: mutable darray[u8] = []
+    for index in 0..<value.count |out, value|:
+        out.push(value[index])
+    return out
+
+def bytes_equal_view(left: darray[u8]&, right: cstr) -> bool:
+    length: usize = Platform::pkg_strlen(right)
+    false return if left.count != length
+    for index in 0..<left.count |left, right|:
+        right_byte: u8 = right[index].u8()
+        false return if left[index] != right_byte
+    return true
+
+def bytes_count(haystack: darray[u8]&, needle: cstr) -> usize:
+    needle_length: usize = Platform::pkg_strlen(needle)
+    total: mutable usize = 0.usize()
+    return total if needle_length == 0.usize() or needle_length > haystack.count
+    start: mutable usize = 0.usize()
+    while start + needle_length <= haystack.count |haystack, needle, total, start, needle_length|:
+        matched: mutable bool = true
+        for offset in 0..<needle_length |haystack, needle, start, matched|:
+            needle_byte: u8 = needle[offset].u8()
+            if haystack[start + offset] != needle_byte:
+                matched <- false
+                break
+        if matched:
+            total <- total + 1.usize()
+            start <- start + needle_length
+        else:
+            start <- start + 1.usize()
+    return total
+
+def write_bytes(fd: i64, value: darray[u8]&) -> void can[Console.Write, Unsafe.PointerCast]:
+    can Console.Write:
+        return if value.count == 0.usize()
+        raw: void& = (&value[0]).cast[void&] can Unsafe.PointerCast
+    _ = Platform::pkg_write(fd, raw, value.count) can Console.Write
+
+def write_text(fd: i64, value: cstr) -> void can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    buffer: mutable darray[u8] = []
+    bytes_push_view(&buffer, value)
+    write_bytes(fd, &buffer)
+
+def write_error(value: cstr) -> void can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    write_text(2, value)
+
+def write_ok(value: cstr) -> void can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    write_text(1, value)
+
+# ---------- path and file primitives --------------------------------------------------
+
+def path_join_into(left: darray[u8]&, right: cstr, out: mutable darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
+    if left.count > 0.usize():
+        for index in 0..<left.count |out, left|:
+            out.push(left[index])
+    if out.count > 0.usize() and out[out.count - 1.usize()] != 47:
+        out.push(47)
+    length: usize = Platform::pkg_strlen(right)
+    for index in 0..<length |out, right|:
+        byte: u8 = right[index].u8()
+        out.push(byte)
+def path_with_nul_into(path: darray[u8]&, out: mutable darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
+    for index in 0..<path.count |out, path|:
+        out.push(path[index])
+    out.push(0)
+
+def make_directory(path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    return true if path.count == 0.usize()
+    work: mutable darray[u8] = []
+    path_with_nul_into(path, &work)
+    for index in 1..<work.count |work, path|:
+        continue if work[index] != 47
+        work[index] <- 0
+        prefix: cstr = (&work[0]).cast[cstr] can Unsafe.PointerCast
+        _ = Platform::pkg_mkdir(prefix, 493.u16())
+        work[index] <- 47
+    final_path: cstr = (&work[0]).cast[cstr] can Unsafe.PointerCast
+    _ = Platform::pkg_mkdir(final_path, 493.u16())
+    return true
+
+def read_file_into(path: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+    path_c: mutable darray[u8] = []
+    path_with_nul_into(path, &path_c)
+    path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
+    stream: mutable heap void&? = Platform::pkg_fopen(path_name, O_READ)
+    if stream is open_stream:
+        chunk: mutable darray[u8] = []
+        chunk.resize(8192)
+        rounds: mutable usize = 0.usize()
+        while rounds < 128.usize() |out, chunk, stream, rounds|:
+            chunk_raw: mutable void& = (&chunk[0]).cast[mutable void&] can Unsafe.PointerCast
+            got: usize = Platform::pkg_fread(chunk_raw, 1, 8192, open_stream)
+            break if got == 0.usize()
+            for index in 0..<got |out, chunk|:
+                out.push(chunk[index])
+            rounds <- rounds + 1.usize()
+        _ = Platform::pkg_fclose(open_stream)
+        return true
+    return false
+
+def read_cstr_into(path_name: cstr, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    stream: mutable heap void&? = Platform::pkg_fopen(path_name, O_READ)
+    if stream is open_stream:
+        out_raw: mutable void& = (&out[0]).cast[mutable void&] can Unsafe.PointerCast
+        got: usize = Platform::pkg_fread(out_raw, 1, out.count, open_stream)
+        out.resize(got)
+        _ = Platform::pkg_fclose(open_stream)
+        return true
+    return false
+
+def write_fd_all(fd: i64, value: darray[u8]&) -> bool can[Unsafe.PointerCast, Console.Write]:
+    offset: mutable usize = 0.usize()
+    while offset < value.count |value, offset|:
+        value_raw: void& = (&value[offset]).cast[void&] can Unsafe.PointerCast
+        wrote: i64 = Platform::pkg_write(fd, value_raw, value.count - offset) can Console.Write
+        return false if wrote <= 0
+        offset <- offset + wrote.usize()
+    return true
+
+def write_cstr_file(path_name: cstr, value: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+    # mkstemp provides an exclusive 0600 temporary file; fsync and rename make
+    # the lockfile transition atomic and prevent readers from seeing a prefix.
+    template: mutable darray[u8] = []
+    bytes_push_cstr(&template, path_name)
+    bytes_push_view(&template, ".tmp.XXXXXX")
+    template.push(0)
+    template_raw: mutable u8& = (&template[0]).cast[mutable u8&] can Unsafe.PointerCast
+    fd: i64 = Platform::pkg_mkstemp(template_raw)
+    return false if fd < 0
+    temp_name: cstr = (&template[0]).cast[cstr] can Unsafe.PointerCast
+    if not write_fd_all(fd, value):
+        _ = Platform::pkg_close(fd)
+        _ = Platform::pkg_unlink(temp_name)
+        return false
+    if Platform::pkg_fsync(fd) != 0:
+        _ = Platform::pkg_close(fd)
+        _ = Platform::pkg_unlink(temp_name)
+        return false
+    _ = Platform::pkg_close(fd)
+    if Platform::pkg_rename(temp_name, path_name) != 0:
+        _ = Platform::pkg_unlink(temp_name)
+        return false
+    return true
+
+def cstr_file_exists(path_name: cstr) -> bool:
+    return Platform::pkg_access(path_name, 0) == 0
+
+def write_file(path: darray[u8]&, value: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    path_c: mutable darray[u8] = []
+    path_with_nul_into(path, &path_c)
+    path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
+    stream: mutable heap void&? = Platform::pkg_fopen(path_name, O_WRITE)
+    if stream is open_stream:
+        if value.count > 0.usize():
+            value_raw: void& = (&value[0]).cast[void&] can Unsafe.PointerCast
+            _ = Platform::pkg_fwrite(value_raw, 1, value.count, open_stream)
+        _ = Platform::pkg_fclose(open_stream)
+        return true
+    return false
+
+def file_exists(path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    path_c: mutable darray[u8] = []
+    path_with_nul_into(path, &path_c)
+    path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
+    stream: mutable heap void&? = Platform::pkg_fopen(path_name, O_READ)
+    if stream is open_stream:
+        _ = Platform::pkg_fclose(open_stream)
+        return true
+    return false
+
+def canonical_entry_within_root(root: darray[u8]&, entry: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    root_path: mutable darray[u8] = []
+    entry_path: mutable darray[u8] = []
+    for index in 0..<root.count |root, root_path|:
+        root_path.push(root[index])
+    if root_path.count == 0.usize() or root_path[root_path.count - 1.usize()] != 47:
+        root_path.push(47)
+    for index in 0..<entry.count |entry, entry_path|:
+        entry_path.push(entry[index])
+    root_c: mutable darray[u8] = []
+    entry_c: mutable darray[u8] = []
+    path_with_nul_into(&root_path, &root_c)
+    path_with_nul_into(&entry_path, &entry_c)
+    root_resolved: mutable darray[u8] = []
+    entry_resolved: mutable darray[u8] = []
+    root_resolved.resize(4096)
+    entry_resolved.resize(4096)
+    root_name: cstr = (&root_c[0]).cast[cstr] can Unsafe.PointerCast
+    entry_name: cstr = (&entry_c[0]).cast[cstr] can Unsafe.PointerCast
+    root_real: mutable cstr = ""
+    entry_real: mutable cstr = ""
+    if Platform::pkg_realpath(root_name, (&root_resolved[0]).cast[mutable u8&] can Unsafe.PointerCast) is resolved_root:
+        root_real <- resolved_root
+    else:
+        return false
+    if Platform::pkg_realpath(entry_name, (&entry_resolved[0]).cast[mutable u8&] can Unsafe.PointerCast) is resolved_entry:
+        entry_real <- resolved_entry
+    else:
+        return false
+    root_length: usize = Platform::pkg_strlen(root_real)
+    entry_length: usize = Platform::pkg_strlen(entry_real)
+    return false if entry_length <= root_length
+    for index in 0..<root_length |root_real, entry_real|:
+        return false if root_real[index].u8() != entry_real[index].u8()
+    return entry_real[root_length].u8() == 47
+
+def remove_known_file(path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    path_c: mutable darray[u8] = []
+    path_with_nul_into(path, &path_c)
+    path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
+    return true if not cstr_file_exists(path_name)
+    return Platform::pkg_unlink(path_name) == 0
+
+def remove_empty_directory(path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    path_c: mutable darray[u8] = []
+    path_with_nul_into(path, &path_c)
+    path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
+    return true if not cstr_file_exists(path_name)
+    return Platform::pkg_rmdir(path_name) == 0
+
+def safe_relative_entry(entry: darray[u8]&) -> bool:
+    return Manifest::is_safe_relative_entry(entry)
+
+def valid_target_entries(raw: darray[u8]&, root: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    in_string: mutable bool = false
+    escaped: mutable bool = false
+    string_start: mutable usize = 0.usize()
+    found: mutable usize = 0.usize()
+    for index in 0..<raw.count |raw, in_string, escaped, string_start, found|:
+        byte: u8 = raw[index]
+        if not in_string:
+            if byte == 34:
+                in_string <- true
+                string_start <- index + 1.usize()
+        elif escaped:
+            escaped <- false
+        elif byte == 92:
+            escaped <- true
+        elif byte == 34:
+            after: mutable usize = index + 1.usize()
+            while after < raw.count and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
+                after <- after + 1.usize()
+            matched: mutable bool = after < raw.count and raw[after] == 58 and index - string_start == 5.usize()
+            if matched:
+                for key_index in 0..<5.usize() |raw, string_start, matched|:
+                    matched <- false if raw[string_start + key_index] != "entry"[key_index].u8()
+            if matched:
+                after <- after + 1.usize()
+                while after < raw.count and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
+                    after <- after + 1.usize()
+                return false if after >= raw.count or raw[after] != 34
+                after <- after + 1.usize()
+                entry: mutable darray[u8] = []
+                while after < raw.count and raw[after] != 34 |raw, after, entry|:
+                    return false if raw[after] == 92
+                    entry.push(raw[after])
+                    after <- after + 1.usize()
+                return false if not safe_relative_entry(entry)
+                entry_path: mutable darray[u8] = []
+                for root_index in 0..<root.count |entry_path, root|:
+                    entry_path.push(root[root_index])
+                if entry_path.count == 0.usize() or entry_path[entry_path.count - 1.usize()] != 47:
+                    entry_path.push(47)
+                for entry_index in 0..<entry.count |entry_path, entry|:
+                    entry_path.push(entry[entry_index])
+                return false if not canonical_entry_within_root(root, &entry_path)
+                return false if not file_exists(&entry_path)
+                found <- found + 1.usize()
+            in_string <- false
+    return found > 0.usize()
+
+# ---------- semantic versions ---------------------------------------------------------
+
+def parse_version(value: darray[u8]&, out: mutable Model::Version&) -> bool:
+    second: mutable usize = value.count
+    prerelease: mutable bool = false
+    for index in 0..<value.count |value, second, prerelease|:
+        if value[index] == 45:
+            second <- index
+            prerelease <- true
+            break
+    dot1: mutable usize = value.count
+    dot2: mutable usize = value.count
+    for index in 0..<second |value, dot1, dot2|:
+        if value[index] == 46 and dot1 == value.count:
+            dot1 <- index
+        elif value[index] == 46 and dot2 == value.count:
+            dot2 <- index
+    return false if dot1 == value.count or dot2 == value.count
+    return false if dot1 == 0.usize() or dot2 == dot1 + 1.usize()
+    major: mutable i64 = 0
+    minor: mutable i64 = 0
+    patch: mutable i64 = 0
+    index: mutable usize = 0.usize()
+    while index < dot1 |value, major, index|:
+        return false if value[index] < 48 or value[index] > 57
+        major <- major * 10 + value[index].i64() - 48
+        index <- index + 1.usize()
+    index <- dot1 + 1.usize()
+    while index < dot2 |value, minor, index|:
+        return false if value[index] < 48 or value[index] > 57
+        minor <- minor * 10 + value[index].i64() - 48
+        index <- index + 1.usize()
+    index <- dot2 + 1.usize()
+    return false if index >= second or second == dot2 + 1.usize()
+    # Numeric components are bounded before arithmetic so hostile input cannot
+    # wrap the signed accumulator. This is an explicit v1 resource policy.
+    return false if dot1 > 18.usize()
+    return false if dot2 - dot1 - 1.usize() > 18.usize()
+    return false if second - dot2 - 1.usize() > 18.usize()
+    while index < second |value, patch, index|:
+        return false if value[index] < 48 or value[index] > 57
+        patch <- patch * 10 + value[index].i64() - 48
+        index <- index + 1.usize()
+    if prerelease:
+        index <- second + 1.usize()
+        previous_dot: mutable bool = true
+        segment_start: mutable usize = second + 1.usize()
+        segment_numeric: mutable bool = true
+        while index < value.count |value, index, previous_dot, segment_start, segment_numeric|:
+            byte: u8 = value[index]
+            is_dot: bool = byte == 46
+            valid_char: bool = is_dot or (byte >= 48 and byte <= 57) or (byte >= 65 and byte <= 90) or (byte >= 97 and byte <= 122) or byte == 45
+            return false if not valid_char or (is_dot and previous_dot)
+            if is_dot:
+                return false if segment_numeric and index > segment_start + 1.usize() and value[segment_start] == 48
+                segment_start <- index + 1.usize()
+                segment_numeric <- true
+            else:
+                segment_numeric <- false if byte < 48 or byte > 57
+            previous_dot <- is_dot
+            index <- index + 1.usize()
+        return false if previous_dot
+        return false if segment_numeric and value.count > segment_start + 1.usize() and value[segment_start] == 48
+    return false if dot1 > 1.usize() and value[0] == 48
+    return false if dot2 > dot1 + 2.usize() and value[dot1 + 1.usize()] == 48
+    return false if second > dot2 + 2.usize() and value[dot2 + 1.usize()] == 48
+    out.major <- major.u64()
+    out.minor <- minor.u64()
+    out.patch <- patch.u64()
+    out.prerelease <- prerelease
+    return true
+
+def version_compare(left: Model::Version, right: Model::Version) -> i64:
+    return SemVer::compare(left, right)
+
+# ---------- manifest and lock ---------------------------------------------------------
+
+def json_key_value_offset(raw: darray[u8]&, wanted: cstr) -> usize can[Memory.Allocate, Abort.Panic]:
+    in_string: mutable bool = false
+    escaped: mutable bool = false
+    string_start: mutable usize = 0.usize()
+    braces: mutable i64 = 0
+    brackets: mutable i64 = 0
+    wanted_length: usize = Platform::pkg_strlen(wanted)
+    for index in 0..<raw.count |raw, in_string, escaped, string_start, braces, brackets|:
+        byte: u8 = raw[index]
+        if not in_string:
+            if byte == 34:
+                in_string <- true
+                string_start <- index + 1.usize()
+            elif byte == 123:
+                braces <- braces + 1
+            elif byte == 125:
+                braces <- braces - 1
+            elif byte == 91:
+                brackets <- brackets + 1
+            elif byte == 93:
+                brackets <- brackets - 1
+        elif escaped:
+            escaped <- false
+        elif byte == 92:
+            escaped <- true
+        elif byte == 34:
+            after: mutable usize = index + 1.usize()
+            while after < raw.count and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
+                after <- after + 1.usize()
+            matched: mutable bool = after < raw.count and raw[after] == 58 and braces == 1 and brackets == 0 and index - string_start == wanted_length
+            if matched:
+                for key_index in 0..<wanted_length |raw, wanted, string_start, matched|:
+                    matched <- false if raw[string_start + key_index] != wanted[key_index].u8()
+            if matched:
+                after <- after + 1.usize()
+                while after < raw.count and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
+                    after <- after + 1.usize()
+                return after
+            in_string <- false
+    return raw.count
+
+def json_object_end(raw: darray[u8]&, object_start: usize) -> usize:
+    return raw.count if object_start >= raw.count or raw[object_start] != 123
+    depth: mutable i64 = 0
+    in_string: mutable bool = false
+    escaped: mutable bool = false
+    for index in object_start..<raw.count |raw, depth, in_string, escaped|:
+        byte: u8 = raw[index]
+        if in_string:
+            if escaped:
+                escaped <- false
+            elif byte == 92:
+                escaped <- true
+            elif byte == 34:
+                in_string <- false
+        elif byte == 34:
+            in_string <- true
+        elif byte == 123:
+            depth <- depth + 1
+        elif byte == 125:
+            depth <- depth - 1
+            return index if depth == 0
+            return raw.count if depth < 0
+    return raw.count
+
+def key_value(raw: darray[u8]&, key: cstr, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+    # Restrict package identity fields to the actual `package` object. A target
+    # named `name` that appears earlier in the document cannot change the package
+    # identity used in the lockfile.
+    package_start: usize = json_key_value_offset(raw, "package")
+    package_end: usize = json_object_end(raw, package_start)
+    return false if package_start >= raw.count or package_end <= package_start
+    in_string: mutable bool = false
+    escaped: mutable bool = false
+    string_start: mutable usize = 0.usize()
+    key_length: usize = Platform::pkg_strlen(key)
+    for index in (package_start + 1.usize())..<package_end |raw, in_string, escaped, string_start|:
+        byte: u8 = raw[index]
+        if not in_string:
+            if byte == 34:
+                in_string <- true
+                string_start <- index + 1.usize()
+        elif escaped:
+            escaped <- false
+        elif byte == 92:
+            escaped <- true
+        elif byte == 34:
+            after: mutable usize = index + 1.usize()
+            while after < package_end and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
+                after <- after + 1.usize()
+            matched: mutable bool = after < package_end and raw[after] == 58 and index - string_start == key_length
+            if matched:
+                for key_index in 0..<key_length |raw, key, string_start, matched|:
+                    matched <- false if raw[string_start + key_index] != key[key_index].u8()
+            if matched:
+                after <- after + 1.usize()
+                while after < package_end and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
+                    after <- after + 1.usize()
+                return false if after >= package_end or raw[after] != 34
+                after <- after + 1.usize()
+                while after < package_end and raw[after] != 34 |raw, after, out|:
+                    return false if raw[after] == 92
+                    out.push(raw[after])
+                    after <- after + 1.usize()
+                return after < package_end
+            in_string <- false
+    return false
+
+def valid_package_name(name: darray[u8]&) -> bool:
+    return false if name.count == 0.usize() or name.count > 64.usize()
+    return false if name[0] < 97 or name[0] > 122
+    previous_hyphen: mutable bool = false
+    for index in 0..<name.count |name, previous_hyphen|:
+        byte: u8 = name[index]
+        if byte == 45:
+            return false if index == 0.usize() or index + 1.usize() == name.count or previous_hyphen
+            previous_hyphen <- true
+        else:
+            return false if (byte < 97 or byte > 122) and (byte < 48 or byte > 57)
+            previous_hyphen <- false
+    return true
+
+def valid_json_shape(raw: darray[u8]&) -> bool:
+    in_string: mutable bool = false
+    escaped: mutable bool = false
+    braces: mutable i64 = 0
+    brackets: mutable i64 = 0
+    for index in 0..<raw.count |raw, in_string, escaped, braces, brackets|:
+        byte: u8 = raw[index]
+        if in_string:
+            if escaped:
+                escaped <- false
+            elif byte == 92:
+                escaped <- true
+            elif byte == 34:
+                in_string <- false
+            elif byte < 32:
+                return false
+        else:
+            if byte == 34:
+                in_string <- true
+            elif byte == 123:
+                braces <- braces + 1
+            elif byte == 125:
+                braces <- braces - 1
+                return false if braces < 0
+            elif byte == 91:
+                brackets <- brackets + 1
+            elif byte == 93:
+                brackets <- brackets - 1
+                return false if brackets < 0
+    return not in_string and not escaped and braces == 0 and brackets == 0
+
+def allowed_manifest_keys(raw: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+    # Scan only string tokens immediately followed by a colon. This keeps JSON
+    # text inside descriptions from being mistaken for fields while rejecting
+    # extension keys that the validator would otherwise silently ignore.
+    in_string: mutable bool = false
+    escaped: mutable bool = false
+    string_start: mutable usize = 0.usize()
+    braces: mutable i64 = 0
+    brackets: mutable i64 = 0
+    dependency_depth: mutable i64 = 0
+    pending_dependency_object: mutable bool = false
+    for index in 0..<raw.count |raw, in_string, escaped, string_start, braces, brackets, dependency_depth, pending_dependency_object|:
+        byte: u8 = raw[index]
+        if not in_string:
+            if byte == 34:
+                in_string <- true
+                string_start <- index + 1.usize()
+            elif byte == 123:
+                braces <- braces + 1
+                dependency_depth <- braces if pending_dependency_object
+                pending_dependency_object <- false
+            elif byte == 125:
+                dependency_depth <- 0 if dependency_depth == braces
+                braces <- braces - 1
+            elif byte == 91:
+                brackets <- brackets + 1
+            elif byte == 93:
+                brackets <- brackets - 1
+            elif pending_dependency_object:
+                pending_dependency_object <- false if byte != 32 and byte != 9 and byte != 10 and byte != 13 and byte != 58
+        elif escaped:
+            escaped <- false
+        elif byte == 92:
+            escaped <- true
+        elif byte == 34:
+            after: mutable usize = index + 1.usize()
+            while after < raw.count and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
+                after <- after + 1.usize()
+            if after < raw.count and raw[after] == 58:
+                key: mutable darray[u8] = []
+                for key_index in string_start..<index |key, raw|:
+                    key.push(raw[key_index])
+                known: bool = bytes_equal_view(key, "schema-version") or bytes_equal_view(key, "package") or bytes_equal_view(key, "targets") or bytes_equal_view(key, "dependencies") or bytes_equal_view(key, "dev-dependencies") or bytes_equal_view(key, "include") or bytes_equal_view(key, "name") or bytes_equal_view(key, "version") or bytes_equal_view(key, "description") or bytes_equal_view(key, "license") or bytes_equal_view(key, "elisa") or bytes_equal_view(key, "kind") or bytes_equal_view(key, "entry") or bytes_equal_view(key, "registry") or bytes_equal_view(key, "path") or bytes_equal_view(key, "git") or bytes_equal_view(key, "rev")
+                known <- true if dependency_depth > 0 and braces == dependency_depth and valid_package_name(key)
+                return false if not known
+                if braces == 1 and (bytes_equal_view(key, "dependencies") or bytes_equal_view(key, "dev-dependencies")):
+                    probe: mutable usize = after + 1.usize()
+                    while probe < raw.count and (raw[probe] == 32 or raw[probe] == 9 or raw[probe] == 10 or raw[probe] == 13) |raw, probe|:
+                        probe <- probe + 1.usize()
+                    pending_dependency_object <- probe < raw.count and raw[probe] == 123
+            in_string <- false
+    return true
+
+def json_key_count(raw: darray[u8]&, wanted: cstr) -> usize can[Memory.Allocate, Abort.Panic]:
+    in_string: mutable bool = false
+    escaped: mutable bool = false
+    string_start: mutable usize = 0.usize()
+    total: mutable usize = 0.usize()
+    wanted_length: usize = Platform::pkg_strlen(wanted)
+    for index in 0..<raw.count |raw, in_string, escaped, string_start, total|:
+        byte: u8 = raw[index]
+        if not in_string:
+            if byte == 34:
+                in_string <- true
+                string_start <- index + 1.usize()
+        elif escaped:
+            escaped <- false
+        elif byte == 92:
+            escaped <- true
+        elif byte == 34:
+            after: mutable usize = index + 1.usize()
+            while after < raw.count and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
+                after <- after + 1.usize()
+            if after < raw.count and raw[after] == 58 and index - string_start == wanted_length:
+                matched: mutable bool = true
+                for key_index in 0..<wanted_length |raw, wanted, string_start, matched|:
+                    matched <- false if raw[string_start + key_index] != wanted[key_index].u8()
+                total <- total + 1.usize() if matched
+            in_string <- false
+    return total
+
+def json_top_key_count(raw: darray[u8]&, wanted: cstr) -> usize can[Memory.Allocate, Abort.Panic]:
+    in_string: mutable bool = false
+    escaped: mutable bool = false
+    string_start: mutable usize = 0.usize()
+    braces: mutable i64 = 0
+    brackets: mutable i64 = 0
+    total: mutable usize = 0.usize()
+    wanted_length: usize = Platform::pkg_strlen(wanted)
+    for index in 0..<raw.count |raw, in_string, escaped, string_start, braces, brackets, total|:
+        byte: u8 = raw[index]
+        if not in_string:
+            if byte == 34:
+                in_string <- true
+                string_start <- index + 1.usize()
+            elif byte == 123:
+                braces <- braces + 1
+            elif byte == 125:
+                braces <- braces - 1
+            elif byte == 91:
+                brackets <- brackets + 1
+            elif byte == 93:
+                brackets <- brackets - 1
+        elif escaped:
+            escaped <- false
+        elif byte == 92:
+            escaped <- true
+        elif byte == 34:
+            after: mutable usize = index + 1.usize()
+            while after < raw.count and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
+                after <- after + 1.usize()
+            if after < raw.count and raw[after] == 58 and braces == 1 and brackets == 0 and index - string_start == wanted_length:
+                matched: mutable bool = true
+                for key_index in 0..<wanted_length |raw, wanted, string_start, matched|:
+                    matched <- false if raw[string_start + key_index] != wanted[key_index].u8()
+                total <- total + 1.usize() if matched
+            in_string <- false
+    return total
+
+def json_key_value_is_one(raw: darray[u8]&, wanted: cstr) -> bool can[Memory.Allocate, Abort.Panic]:
+    in_string: mutable bool = false
+    escaped: mutable bool = false
+    string_start: mutable usize = 0.usize()
+    braces: mutable i64 = 0
+    brackets: mutable i64 = 0
+    wanted_length: usize = Platform::pkg_strlen(wanted)
+    for index in 0..<raw.count |raw, in_string, escaped, string_start, braces, brackets|:
+        byte: u8 = raw[index]
+        if not in_string:
+            if byte == 34:
+                in_string <- true
+                string_start <- index + 1.usize()
+            elif byte == 123:
+                braces <- braces + 1
+            elif byte == 125:
+                braces <- braces - 1
+            elif byte == 91:
+                brackets <- brackets + 1
+            elif byte == 93:
+                brackets <- brackets - 1
+        elif escaped:
+            escaped <- false
+        elif byte == 92:
+            escaped <- true
+        elif byte == 34:
+            after: mutable usize = index + 1.usize()
+            while after < raw.count and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
+                after <- after + 1.usize()
+            if after < raw.count and raw[after] == 58 and braces == 1 and brackets == 0 and index - string_start == wanted_length:
+                matched: mutable bool = true
+                for key_index in 0..<wanted_length |raw, wanted, string_start, matched|:
+                    matched <- false if raw[string_start + key_index] != wanted[key_index].u8()
+                if matched:
+                    after <- after + 1.usize()
+                    while after < raw.count and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
+                        after <- after + 1.usize()
+                    return false if after >= raw.count or raw[after] != 49
+                    after <- after + 1.usize()
+                    return false if after < raw.count and raw[after] != 32 and raw[after] != 9 and raw[after] != 10 and raw[after] != 13 and raw[after] != 44 and raw[after] != 125 and raw[after] != 93
+                    return true
+            in_string <- false
+    return false
+
+def validate_manifest_at(raw: darray[u8]&, root: darray[u8]&, name_out: mutable darray[u8]&, version_out: mutable darray[u8]&) -> bool:
+    return false if raw.count == 0.usize() or raw.count > 1048576.usize()
+    return false if not valid_json_shape(raw)
+    return false if not allowed_manifest_keys(raw)
+    for index in 0..<raw.count |raw|:
+        return false if raw[index] == 0
+    first: mutable usize = 0.usize()
+    last: mutable usize = raw.count
+    while first < raw.count and (raw[first] == 32 or raw[first] == 9 or raw[first] == 10 or raw[first] == 13) |raw, first|:
+        first <- first + 1.usize()
+    while last > first and (raw[last - 1.usize()] == 32 or raw[last - 1.usize()] == 9 or raw[last - 1.usize()] == 10 or raw[last - 1.usize()] == 13) |raw, last, first|:
+        last <- last - 1.usize()
+    return false if first >= last or raw[first] != 123 or raw[last - 1.usize()] != 125
+    return false if json_object_end(raw, first) != last - 1.usize()
+    return false if json_top_key_count(raw, "schema-version") != 1.usize()
+    return false if not json_key_value_is_one(raw, "schema-version")
+    return false if json_top_key_count(raw, "package") != 1.usize()
+    return false if json_key_count(raw, "name") < 1.usize()
+    return false if json_top_key_count(raw, "targets") != 1.usize()
+    return false if json_key_count(raw, "entry") < 1.usize()
+    return false if not valid_target_entries(raw, root)
+    return false if json_top_key_count(raw, "dependencies") > 1.usize()
+    return false if json_top_key_count(raw, "dev-dependencies") > 1.usize()
+    return false if not valid_dependency_map(raw, "dependencies")
+    return false if not valid_dependency_map(raw, "dev-dependencies")
+    name: mutable darray[u8] = []
+    version: mutable darray[u8] = []
+    return false if not key_value(raw, "name", &name) or not key_value(raw, "version", &version)
+    return false if not valid_package_name(name)
+    parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
+    return false if not parse_version(version, &parsed)
+    for index in 0..<name.count |name_out, name|:
+        name_out.push(name[index])
+    for index in 0..<version.count |version_out, version|:
+        version_out.push(version[index])
+    return true
+
+def validate_manifest(raw: darray[u8]&, name_out: mutable darray[u8]&, version_out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    root: mutable darray[u8] = [46]
+    return validate_manifest_at(raw, &root, name_out, version_out)
+
+def load_package_at(root: darray[u8]&, name_out: mutable darray[u8]&, version_out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    manifest_path: mutable darray[u8] = []
+    path_join_into(root, "elisapkg.json", &manifest_path)
+    path_c: mutable darray[u8] = []
+    path_with_nul_into(manifest_path, &path_c)
+    path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
+    return false if not cstr_file_exists(path_name)
+    raw: mutable darray[u8] = []
+    raw.resize(1048577)
+    return false if not read_cstr_into(path_name, &raw)
+    return false if not validate_manifest_at(raw, root, name_out, version_out)
+    return true
+
+def object_string_value(raw: darray[u8]&, object_start: usize, object_end: usize, wanted: cstr, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+    return false if object_start >= object_end or raw[object_start] != 123
+    in_string: mutable bool = false
+    escaped: mutable bool = false
+    string_start: mutable usize = 0.usize()
+    braces: mutable i64 = 1
+    key_length: usize = Platform::pkg_strlen(wanted)
+    for index in (object_start + 1.usize())..<object_end |raw, in_string, escaped, string_start, braces|:
+        byte: u8 = raw[index]
+        if not in_string:
+            if byte == 34:
+                in_string <- true
+                string_start <- index + 1.usize()
+            elif byte == 123:
+                braces <- braces + 1
+            elif byte == 125:
+                braces <- braces - 1
+        elif escaped:
+            escaped <- false
+        elif byte == 92:
+            escaped <- true
+        elif byte == 34:
+            after: mutable usize = index + 1.usize()
+            while after < object_end and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
+                after <- after + 1.usize()
+            matched: mutable bool = braces == 1 and after < object_end and raw[after] == 58 and index - string_start == key_length
+            if matched:
+                for key_index in 0..<key_length |raw, wanted, string_start, matched|:
+                    matched <- false if raw[string_start + key_index] != wanted[key_index].u8()
+            if matched:
+                after <- after + 1.usize()
+                while after < object_end and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
+                    after <- after + 1.usize()
+                return false if after >= object_end or raw[after] != 34
+                after <- after + 1.usize()
+                while after < object_end and raw[after] != 34 |raw, after, out|:
+                    return false if raw[after] == 92
+                    out.push(raw[after])
+                    after <- after + 1.usize()
+                return after < object_end
+            in_string <- false
+    return false
+
+def bytes_less(left: darray[u8]&, right: darray[u8]&) -> bool:
+    limit: usize = left.count if left.count < right.count else right.count
+    for index in 0..<limit |left, right|:
+        return true if left[index] < right[index]
+        return false if left[index] > right[index]
+    return left.count < right.count
+
+def field_append(fields: mutable darray[u8]&, value: darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
+    for index in 0..<value.count |fields, value|:
+        fields.push(value[index])
+    fields.push(0)
+
+def field_count(fields: darray[u8]&) -> usize:
+    count: mutable usize = 0.usize()
+    for index in 0..<fields.count |fields, count|:
+        count <- count + 1.usize() if fields[index] == 0
+    return count
+
+def field_copy_at(fields: darray[u8]&, wanted_index: usize, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+    cursor: mutable usize = 0.usize()
+    current: mutable usize = 0.usize()
+    while cursor < fields.count |fields, cursor, current, out|:
+        end: mutable usize = cursor
+        while end < fields.count and fields[end] != 0 |fields, end|:
+            end <- end + 1.usize()
+        if current == wanted_index:
+            for index in cursor..<end |fields, out|:
+                out.push(fields[index])
+            return true
+        current <- current + 1.usize()
+        cursor <- end + 1.usize()
+    return false
+
+def field_seen(fields: darray[u8]&, wanted: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+    total: usize = field_count(fields)
+    for index in 0..<total |fields, wanted|:
+        candidate: mutable darray[u8] = []
+        return true if field_copy_at(fields, index, &candidate) and bytes_equal(candidate, wanted)
+    return false
+
+def collect_sorted_local_fields(raw: darray[u8]&, names: mutable darray[u8]&, paths: mutable darray[u8]&, versions: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    dependency_start: usize = json_key_value_offset(raw, "dependencies")
+    return true if dependency_start >= raw.count
+    dependency_end: usize = json_object_end(raw, dependency_start)
+    return false if dependency_end <= dependency_start or raw[dependency_start] != 123
+    in_string: mutable bool = false
+    escaped: mutable bool = false
+    string_start: mutable usize = 0.usize()
+    braces: mutable i64 = 1
+    brackets: mutable i64 = 0
+    for index in (dependency_start + 1.usize())..<dependency_end |raw, names, paths, versions, in_string, escaped, string_start, braces, brackets|:
+        byte: u8 = raw[index]
+        if not in_string:
+            if byte == 34:
+                in_string <- true
+                string_start <- index + 1.usize()
+            elif byte == 123:
+                braces <- braces + 1
+            elif byte == 125:
+                braces <- braces - 1
+            elif byte == 91:
+                brackets <- brackets + 1
+            elif byte == 93:
+                brackets <- brackets - 1
+        elif escaped:
+            escaped <- false
+        elif byte == 92:
+            escaped <- true
+        elif byte == 34:
+            after: mutable usize = index + 1.usize()
+            while after < dependency_end and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
+                after <- after + 1.usize()
+            direct_key: bool = braces == 1 and brackets == 0 and after < dependency_end and raw[after] == 58
+            if direct_key:
+                alias: mutable darray[u8] = []
+                for key_index in string_start..<index |alias, raw|:
+                    alias.push(raw[key_index])
+                return false if not valid_package_name(alias)
+                after <- after + 1.usize()
+                while after < dependency_end and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
+                    after <- after + 1.usize()
+                return false if after >= dependency_end or raw[after] != 123
+                dep_end: usize = json_object_end(raw, after)
+                return false if dep_end > dependency_end
+                dep_path: mutable darray[u8] = []
+                return false if not object_string_value(raw, after, dep_end, "path", &dep_path)
+                return false if not valid_dependency_path(dep_path)
+                dep_name: mutable darray[u8] = []
+                dep_version: mutable darray[u8] = []
+                return false if not load_package_at(&dep_path, &dep_name, &dep_version)
+                return false if not bytes_equal(alias, dep_name)
+                field_append(&names, alias)
+                field_append(&paths, dep_path)
+                field_append(&versions, dep_version)
+            in_string <- false
+    return true
+
+def slice_equals_array(raw: darray[u8]&, start: usize, end: usize, wanted: darray[u8]&) -> bool:
+    return false if end < start or end - start != wanted.count
+    for index in 0..<wanted.count |raw, wanted|:
+        return false if raw[start + index] != wanted[index]
+    return true
+
+def slice_less_slice(raw: darray[u8]&, left_start: usize, left_end: usize, right_start: usize, right_end: usize) -> bool:
+    left_count: usize = left_end - left_start
+    right_count: usize = right_end - right_start
+    limit: usize = left_count if left_count < right_count else right_count
+    for index in 0..<limit |raw|:
+        return true if raw[left_start + index] < raw[right_start + index]
+        return false if raw[left_start + index] > raw[right_start + index]
+    return left_count < right_count
+
+def emitted_contains_slice(emitted: darray[u8]&, raw: darray[u8]&, wanted_start: usize, wanted_end: usize) -> bool:
+    cursor: mutable usize = 0.usize()
+    while cursor < emitted.count:
+        end: mutable usize = cursor
+        while end < emitted.count and emitted[end] != 0 |emitted, end|:
+            end <- end + 1.usize()
+        if end - cursor == wanted_end - wanted_start:
+            equal: mutable bool = true
+            for index in 0..<(wanted_end - wanted_start) |emitted, raw, equal|:
+                equal <- false if emitted[cursor + index] != raw[wanted_start + index]
+            return true if equal
+        cursor <- end + 1.usize()
+    return false
+
+def direct_dependency_count(raw: darray[u8]&, dependency_start: usize, dependency_end: usize) -> usize:
+    count: mutable usize = 0.usize()
+    in_string: mutable bool = false
+    escaped: mutable bool = false
+    braces: mutable i64 = 1
+    brackets: mutable i64 = 0
+    for index in (dependency_start + 1.usize())..<dependency_end |raw, count, in_string, escaped, braces, brackets|:
+        byte: u8 = raw[index]
+        if not in_string:
+            if byte == 34:
+                in_string <- true
+            elif byte == 123:
+                braces <- braces + 1
+            elif byte == 125:
+                braces <- braces - 1
+            elif byte == 91:
+                brackets <- brackets + 1
+            elif byte == 93:
+                brackets <- brackets - 1
+        elif escaped:
+            escaped <- false
+        elif byte == 92:
+            escaped <- true
+        elif byte == 34:
+            after: mutable usize = index + 1.usize()
+            while after < dependency_end and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
+                after <- after + 1.usize()
+            count <- count + 1.usize() if braces == 1 and brackets == 0 and after < dependency_end and raw[after] == 58
+            in_string <- false
+    return count
+
+def canonical_sorted_local_lock(name: darray[u8]&, version: darray[u8]&, raw: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    out: mutable darray[u8] = []
+    bytes_push_view(&out, "{\n  \"lock-version\": 2,\n  \"resolver\": \"elisapkg-v2\",\n  \"package\": {\n    \"name\": \"")
+    bytes_push_array(&out, name)
+    bytes_push_view(&out, "\",\n    \"version\": \"")
+    bytes_push_array(&out, version)
+    bytes_push_view(&out, "\"\n  },\n  \"packages\": [")
+    dependency_start: usize = json_key_value_offset(raw, "dependencies")
+    return out if dependency_start >= raw.count
+    dependency_end: usize = json_object_end(raw, dependency_start)
+    return [] if dependency_end <= dependency_start or raw[dependency_start] != 123
+    total: usize = direct_dependency_count(raw, dependency_start, dependency_end)
+    emitted: mutable darray[u8] = []
+    first: mutable bool = true
+    for _step in 0..<total |raw, emitted, out, first|:
+        found: mutable bool = false
+        selected_start: mutable usize = 0.usize()
+        selected_end: mutable usize = 0.usize()
+        selected_object_start: mutable usize = 0.usize()
+        selected_object_end: mutable usize = 0.usize()
+        in_string: mutable bool = false
+        escaped: mutable bool = false
+        string_start: mutable usize = 0.usize()
+        braces: mutable i64 = 1
+        brackets: mutable i64 = 0
+        for index in (dependency_start + 1.usize())..<dependency_end |raw, emitted, found, selected_start, selected_end, selected_object_start, selected_object_end, in_string, escaped, string_start, braces, brackets|:
+            byte: u8 = raw[index]
+            if not in_string:
+                if byte == 34:
+                    in_string <- true
+                    string_start <- index + 1.usize()
+                elif byte == 123:
+                    braces <- braces + 1
+                elif byte == 125:
+                    braces <- braces - 1
+                elif byte == 91:
+                    brackets <- brackets + 1
+                elif byte == 93:
+                    brackets <- brackets - 1
+            elif escaped:
+                escaped <- false
+            elif byte == 92:
+                escaped <- true
+            elif byte == 34:
+                after: mutable usize = index + 1.usize()
+                while after < dependency_end and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
+                    after <- after + 1.usize()
+                if braces == 1 and brackets == 0 and after < dependency_end and raw[after] == 58:
+                    object_start: mutable usize = after + 1.usize()
+                    while object_start < dependency_end and (raw[object_start] == 32 or raw[object_start] == 9 or raw[object_start] == 10 or raw[object_start] == 13) |raw, object_start|:
+                        object_start <- object_start + 1.usize()
+                    object_end: usize = json_object_end(raw, object_start)
+                    candidate_seen: bool = emitted_contains_slice(emitted, raw, string_start, index)
+                    candidate_valid: bool = object_start < dependency_end and object_end > object_start and raw[object_start] == 123 and object_end <= dependency_end
+                    if candidate_valid and not candidate_seen and (not found or slice_less_slice(raw, string_start, index, selected_start, selected_end)):
+                        found <- true
+                        selected_start <- string_start
+                        selected_end <- index
+                        selected_object_start <- object_start
+                        selected_object_end <- object_end
+                in_string <- false
+        break if not found
+        selected_path: mutable darray[u8] = []
+        selected_version: mutable darray[u8] = []
+        return [] if not object_string_value(raw, selected_object_start, selected_object_end, "path", &selected_path)
+        return [] if not valid_dependency_path(selected_path)
+        dep_name: mutable darray[u8] = []
+        return [] if not load_package_at(&selected_path, &dep_name, &selected_version)
+        return [] if not slice_equals_array(raw, selected_start, selected_end, dep_name)
+        return [] if slice_equals_array(raw, selected_start, selected_end, name)
+        out.push(44) if not first
+        bytes_push_view(&out, "\n    {\"name\":\"")
+        for index in selected_start..<selected_end |out, raw|:
+            out.push(raw[index])
+        bytes_push_view(&out, "\",\"version\":\"")
+        bytes_push_array(&out, selected_version)
+        bytes_push_view(&out, "\",\"source\":{\"type\":\"path\",\"path\":\"")
+        bytes_push_array(&out, selected_path)
+        bytes_push_view(&out, "\"}}")
+        for index in selected_start..<selected_end |emitted, raw|:
+            emitted.push(raw[index])
+        emitted.push(0)
+        first <- false
+    bytes_push_view(&out, "\n  ]\n}\n")
+    return out
+
+def canonical_lock_for_manifest(name: darray[u8]&, version: darray[u8]&, raw: darray[u8]&, root: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    canonical: darray[u8] = canonical_sorted_local_lock(name, version, raw)
+    return canonical if canonical.count > 0.usize()
+    out: mutable darray[u8] = []
+    bytes_push_view(&out, "{\n  \"lock-version\": 2,\n  \"resolver\": \"elisapkg-v2\",\n  \"package\": {\n    \"name\": \"")
+    for index in 0..<name.count |out, name|:
+        out.push(name[index])
+    bytes_push_view(&out, "\",\n    \"version\": \"")
+    for index in 0..<version.count |out, version|:
+        out.push(version[index])
+    bytes_push_view(&out, "\"\n  },\n  \"packages\": [")
+    dependency_start: usize = json_key_value_offset(raw, "dependencies")
+    dependency_end: usize = json_object_end(raw, dependency_start)
+    return [] if dependency_start < raw.count and (dependency_end <= dependency_start or raw[dependency_start] != 123)
+    first_dependency: mutable bool = true
+    if dependency_start < raw.count and dependency_end > dependency_start + 1.usize():
+        in_string: mutable bool = false
+        escaped: mutable bool = false
+        string_start: mutable usize = 0.usize()
+        braces: mutable i64 = 1
+        brackets: mutable i64 = 0
+        for index in (dependency_start + 1.usize())..<dependency_end |raw, in_string, escaped, string_start, braces, brackets, first_dependency, out|:
+            byte: u8 = raw[index]
+            if not in_string:
+                if byte == 34:
+                    in_string <- true
+                    string_start <- index + 1.usize()
+                elif byte == 123:
+                    braces <- braces + 1
+                elif byte == 125:
+                    braces <- braces - 1
+                elif byte == 91:
+                    brackets <- brackets + 1
+                elif byte == 93:
+                    brackets <- brackets - 1
+            elif escaped:
+                escaped <- false
+            elif byte == 92:
+                escaped <- true
+            elif byte == 34:
+                after: mutable usize = index + 1.usize()
+                while after < dependency_end and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
+                    after <- after + 1.usize()
+                direct_key: mutable bool = braces == 1 and brackets == 0 and after < dependency_end and raw[after] == 58
+                if direct_key:
+                    alias: mutable darray[u8] = []
+                    for key_index in string_start..<index |alias, raw|:
+                        alias.push(raw[key_index])
+                    return [] if not valid_package_name(alias)
+                    after <- after + 1.usize()
+                    while after < dependency_end and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
+                        after <- after + 1.usize()
+                    return [] if after >= dependency_end or raw[after] != 123
+                    dep_end: usize = json_object_end(raw, after)
+                    return [] if dep_end > dependency_end
+                    dep_path: mutable darray[u8] = []
+                    return [] if not object_string_value(raw, after, dep_end, "path", &dep_path)
+                    return [] if not valid_dependency_path(dep_path)
+                    dep_name: mutable darray[u8] = []
+                    dep_version: mutable darray[u8] = []
+                    return [] if not load_package_at(&dep_path, &dep_name, &dep_version)
+                    return [] if not bytes_equal(alias, dep_name)
+                    return [] if bytes_equal(alias, name)
+                    if not first_dependency:
+                        out.push(44)
+                    bytes_push_view(&out, "\n    {\"name\":\"")
+                    for dep_index in 0..<dep_name.count |out, dep_name|:
+                        out.push(dep_name[dep_index])
+                    bytes_push_view(&out, "\",\"version\":\"")
+                    for dep_index in 0..<dep_version.count |out, dep_version|:
+                        out.push(dep_version[dep_index])
+                    bytes_push_view(&out, "\",\"source\":{\"type\":\"path\",\"path\":\"")
+                    for dep_index in 0..<dep_path.count |out, dep_path|:
+                        out.push(dep_path[dep_index])
+                    bytes_push_view(&out, "\"}}")
+                    first_dependency <- false
+                in_string <- false
+    bytes_push_view(&out, "\n  ]\n}\n")
+    return out
+
+def bytes_push_array(out: mutable darray[u8]&, value: darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
+    for index in 0..<value.count |out, value|:
+        out.push(value[index])
+
+def valid_dependency_path(path: darray[u8]&) -> bool:
+    return false if path.count == 0.usize() or path.count > 4096.usize()
+    return false if path[0] == 47 or path[0] == 92
+    for index in 0..<path.count |path|:
+        byte: u8 = path[index]
+        return false if byte == 0 or byte < 32 or byte == 34 or byte == 92
+    return false if bytes_count(path, "//") > 0.usize()
+    return true
+
+def object_has_direct_key(raw: darray[u8]&, object_start: usize, object_end: usize, wanted: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+    return false if object_start >= object_end or raw[object_start] != 123
+    in_string: mutable bool = false
+    escaped: mutable bool = false
+    string_start: mutable usize = 0.usize()
+    braces: mutable i64 = 1
+    brackets: mutable i64 = 0
+    for index in (object_start + 1.usize())..<object_end |raw, in_string, escaped, string_start, braces, brackets|:
+        byte: u8 = raw[index]
+        if not in_string:
+            if byte == 34:
+                in_string <- true
+                string_start <- index + 1.usize()
+            elif byte == 123:
+                braces <- braces + 1
+            elif byte == 125:
+                braces <- braces - 1
+            elif byte == 91:
+                brackets <- brackets + 1
+            elif byte == 93:
+                brackets <- brackets - 1
+        elif escaped:
+            escaped <- false
+        elif byte == 92:
+            escaped <- true
+        elif byte == 34:
+            after: mutable usize = index + 1.usize()
+            while after < object_end and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
+                after <- after + 1.usize()
+            if braces == 1 and brackets == 0 and after < object_end and raw[after] == 58 and index - string_start == wanted.count:
+                matched: mutable bool = true
+                for key_index in 0..<wanted.count |raw, wanted, string_start, matched|:
+                    matched <- false if raw[string_start + key_index] != wanted[key_index]
+                return true if matched
+            in_string <- false
+    return false
+
+def dependency_alias_seen(seen: darray[u8]&, alias: darray[u8]&) -> bool:
+    cursor: mutable usize = 0.usize()
+    while cursor < seen.count:
+        segment_end: mutable usize = cursor
+        while segment_end < seen.count and seen[segment_end] != 0:
+            segment_end <- segment_end + 1.usize()
+        return true if segment_end - cursor == alias.count and bytes_equal_range(seen, cursor, segment_end, alias)
+        cursor <- segment_end + 1.usize()
+    return false
+
+def bytes_equal_range(raw: darray[u8]&, start: usize, end: usize, wanted: darray[u8]&) -> bool:
+    return false if end - start != wanted.count
+    for index in 0..<wanted.count |raw, wanted|:
+        return false if raw[start + index] != wanted[index]
+    return true
+
+def valid_dependency_object(raw: darray[u8]&, object_start: usize, object_end: usize) -> bool can[Memory.Allocate, Abort.Panic]:
+    path_key: mutable darray[u8] = [112, 97, 116, 104]
+    registry_key: mutable darray[u8] = [114, 101, 103, 105, 115, 116, 114, 121]
+    version_key: mutable darray[u8] = [118, 101, 114, 115, 105, 111, 110]
+    has_path: bool = object_has_direct_key(raw, object_start, object_end, path_key)
+    has_registry: bool = object_has_direct_key(raw, object_start, object_end, registry_key)
+    has_version: bool = object_has_direct_key(raw, object_start, object_end, version_key)
+    return false if has_path and (has_registry or has_version)
+    if has_path:
+        path: mutable darray[u8] = []
+        return false if not object_string_value(raw, object_start, object_end, "path", &path)
+        return valid_dependency_path(path)
+    return false if not has_registry or not has_version
+    requirement: mutable darray[u8] = []
+    return false if not object_string_value(raw, object_start, object_end, "version", &requirement)
+    parsed: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
+    return SemVer::parse_requirement(requirement, &parsed)
+
+def valid_dependency_map(raw: darray[u8]&, wanted: cstr) -> bool can[Memory.Allocate, Abort.Panic]:
+    dependency_start: usize = json_key_value_offset(raw, wanted)
+    return true if dependency_start >= raw.count
+    dependency_end: usize = json_object_end(raw, dependency_start)
+    return false if dependency_end <= dependency_start or raw[dependency_start] != 123
+    seen: mutable darray[u8] = []
+    in_string: mutable bool = false
+    escaped: mutable bool = false
+    string_start: mutable usize = 0.usize()
+    braces: mutable i64 = 1
+    brackets: mutable i64 = 0
+    for index in (dependency_start + 1.usize())..<dependency_end |raw, seen, in_string, escaped, string_start, braces, brackets|:
+        byte: u8 = raw[index]
+        if not in_string:
+            if byte == 34:
+                in_string <- true
+                string_start <- index + 1.usize()
+            elif byte == 123:
+                braces <- braces + 1
+            elif byte == 125:
+                braces <- braces - 1
+            elif byte == 91:
+                brackets <- brackets + 1
+            elif byte == 93:
+                brackets <- brackets - 1
+        elif escaped:
+            escaped <- false
+        elif byte == 92:
+            escaped <- true
+        elif byte == 34:
+            after: mutable usize = index + 1.usize()
+            while after < dependency_end and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
+                after <- after + 1.usize()
+            direct_key: bool = braces == 1 and brackets == 0 and after < dependency_end and raw[after] == 58
+            if direct_key:
+                alias: mutable darray[u8] = []
+                for key_index in string_start..<index |alias, raw|:
+                    alias.push(raw[key_index])
+                return false if not valid_package_name(alias) or dependency_alias_seen(seen, alias)
+                seen.push(0) if seen.count > 0.usize()
+                for alias_index in 0..<alias.count |seen, alias|:
+                    seen.push(alias[alias_index])
+                seen.push(0)
+                after <- after + 1.usize()
+                while after < dependency_end and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
+                    after <- after + 1.usize()
+                return false if after >= dependency_end or raw[after] != 123
+                value_end: usize = json_object_end(raw, after)
+                return false if value_end > dependency_end
+                return false if not valid_dependency_object(raw, after, value_end)
+            in_string <- false
+    return true
+
+def append_local_dependency(raw: darray[u8]&, alias: darray[u8]&, path: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    out: mutable darray[u8] = []
+    dependency_start: usize = json_key_value_offset(raw, "dependencies")
+    dependency_end: usize = json_object_end(raw, dependency_start)
+    return [] if dependency_start >= raw.count or dependency_end <= dependency_start
+    return [] if object_has_direct_key(raw, dependency_start, dependency_end, alias)
+    has_existing: mutable bool = false
+    if dependency_end > dependency_start + 1.usize():
+        for index in (dependency_start + 1.usize())..<dependency_end |raw, has_existing|:
+            byte: u8 = raw[index]
+            if byte != 32 and byte != 9 and byte != 10 and byte != 13:
+                has_existing <- true
+                break
+    for index in 0..<dependency_end |out, raw|:
+        out.push(raw[index])
+    if has_existing:
+        out.push(44)
+        out.push(32)
+    out.push(34)
+    for alias_index in 0..<alias.count |out, alias|:
+        out.push(alias[alias_index])
+    bytes_push_view(&out, "\": {\"path\": \"")
+    for path_index in 0..<path.count |out, path|:
+        out.push(path[path_index])
+    bytes_push_view(&out, "\"}")
+    for index in dependency_end..<raw.count |out, raw|:
+        out.push(raw[index])
+    return out
+
+def find_dependency_span(raw: darray[u8]&, alias: darray[u8]&, start_out: mutable usize&, end_out: mutable usize&) -> bool can[Memory.Allocate, Abort.Panic]:
+    dependency_start: usize = json_key_value_offset(raw, "dependencies")
+    dependency_end: usize = json_object_end(raw, dependency_start)
+    return false if dependency_start >= raw.count or dependency_end <= dependency_start
+    in_string: mutable bool = false
+    escaped: mutable bool = false
+    string_start: mutable usize = 0.usize()
+    braces: mutable i64 = 1
+    brackets: mutable i64 = 0
+    for index in (dependency_start + 1.usize())..<dependency_end |raw, in_string, escaped, string_start, braces, brackets, start_out, end_out|:
+        byte: u8 = raw[index]
+        if not in_string:
+            if byte == 34:
+                in_string <- true
+                string_start <- index + 1.usize()
+            elif byte == 123:
+                braces <- braces + 1
+            elif byte == 125:
+                braces <- braces - 1
+            elif byte == 91:
+                brackets <- brackets + 1
+            elif byte == 93:
+                brackets <- brackets - 1
+        elif escaped:
+            escaped <- false
+        elif byte == 92:
+            escaped <- true
+        elif byte == 34:
+            after: mutable usize = index + 1.usize()
+            while after < dependency_end and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
+                after <- after + 1.usize()
+            direct: mutable bool = braces == 1 and brackets == 0 and after < dependency_end and raw[after] == 58 and index - string_start == alias.count
+            if direct:
+                matches: mutable bool = true
+                for alias_index in 0..<alias.count |raw, alias, string_start, matches|:
+                    matches <- false if raw[string_start + alias_index] != alias[alias_index]
+                if matches:
+                    after <- after + 1.usize()
+                    while after < dependency_end and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
+                        after <- after + 1.usize()
+                    return false if after >= dependency_end or raw[after] != 123
+                    value_end: usize = json_object_end(raw, after)
+                    return false if value_end >= dependency_end
+                    start_out <- string_start - 1.usize()
+                    end_out <- value_end + 1.usize()
+                    return true
+            in_string <- false
+    return false
+
+def remove_local_dependency(raw: darray[u8]&, alias: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
+    dependency_start: usize = json_key_value_offset(raw, "dependencies")
+    dependency_end: usize = json_object_end(raw, dependency_start)
+    start: mutable usize = 0.usize()
+    end: mutable usize = 0.usize()
+    return [] if not find_dependency_span(raw, alias, &start, &end)
+    probe: mutable usize = end
+    while probe < dependency_end and (raw[probe] == 32 or raw[probe] == 9 or raw[probe] == 10 or raw[probe] == 13) |raw, probe|:
+        probe <- probe + 1.usize()
+    if probe < dependency_end and raw[probe] == 44:
+        end <- probe + 1.usize()
+    else:
+        probe <- start
+        while probe > dependency_start + 1.usize() and (raw[probe - 1.usize()] == 32 or raw[probe - 1.usize()] == 9 or raw[probe - 1.usize()] == 10 or raw[probe - 1.usize()] == 13) |raw, probe|:
+            probe <- probe - 1.usize()
+        start <- probe - 1.usize() if probe > dependency_start and raw[probe - 1.usize()] == 44
+    out: mutable darray[u8] = []
+    for index in 0..<start |out, raw|:
+        out.push(raw[index])
+    for index in end..<raw.count |out, raw|:
+        out.push(raw[index])
+    return out
+
+# ---------- project discovery and commands -------------------------------------------
+
+def project_manifest_exists() -> bool:
+    current: bool = cstr_file_exists("elisapkg.json")
+    legacy: bool = cstr_file_exists("manifest.json")
+    # Two manifests would create an ambiguous authority boundary. Refuse both
+    # rather than silently preferring one based on filename order.
+    return false if current and legacy
+    return true if current
+    return legacy
+
+def usage() -> void can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    write_ok("elisapkg — Elisa Packaging System\n\nUsage: elisapkg <command> [options]\n\nCommands:\n  init [PATH]                 create a package\n  check-manifest              validate elisapkg.json\n  add NAME --path PATH        add a verified local path dependency\n  remove NAME                 remove a declared local dependency\n  update [NAME]               recompute the local dependency lock\n  resolve [--locked|--offline]\n                              validate and write elisapkg.lock\n  tree                        show the resolved package graph\n  metadata --json             print normalized package metadata\n  doctor                      report toolchain and trust capabilities\n  build                       compile the package entry point\n  run -- ARGS                 build and run\n  test                        test targets (requires test harness)\n  clean                       remove build outputs (gated in this foundation)\n  fetch                       verify locked sources\n  cache verify                inspect cached verification records\n  package --list              preview publish files\n\nModes: --locked  --offline  --frozen  --json  --verbose\n")
+    write_ok("publish/install/uninstall are trust-gated and disabled until signed sources are configured\n")
+
+def current_directory_into(out: mutable darray[u8]&) -> void can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    buffer: mutable darray[u8] = []
+    buffer.resize(4096)
+    raw: void& = (&buffer[0]).cast[void&] can Unsafe.PointerCast
+    _ = Platform::pkg_getcwd(raw, 4096)
+    for index in 0..<buffer.count |out, buffer|:
+        break if buffer[index] == 0
+        out.push(buffer[index])
+
+def change_directory(path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    path_c: mutable darray[u8] = []
+    path_with_nul_into(path, &path_c)
+    path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
+    return Platform::pkg_chdir(path_name) == 0
+
+def change_to_manifest_path(path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    return true if change_directory(path)
+    last_separator: mutable usize = path.count
+    for index in 0..<path.count |path, last_separator|:
+        last_separator <- index if path[index] == 47
+    parent: mutable darray[u8] = []
+    if last_separator == path.count:
+        parent.push(46)
+    elif last_separator == 0.usize():
+        parent.push(47)
+    else:
+        for index in 0..<last_separator |parent, path|:
+            parent.push(path[index])
+    return change_directory(&parent)
+
+def run_init(argc: i64, slots: mutable cstr&&) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    root: mutable darray[u8] = [46]
+    if argc > 2 and slots[2].cast[cstr] != "--help":
+        root <- []
+        bytes_push_cstr(&root, slots[2].cast[cstr])
+    return EXIT_USAGE if root.count == 0.usize()
+    manifest_path: mutable darray[u8] = []
+    path_join_into(root, "elisapkg.json", &manifest_path)
+    return EXIT_USAGE if file_exists(&manifest_path)
+    _ = make_directory(&root)
+    source: mutable darray[u8] = []
+    state: mutable darray[u8] = []
+    path_join_into(root, "src", &source)
+    path_join_into(root, ".elisapkg", &state)
+    _ = make_directory(&source)
+    _ = make_directory(&state)
+    manifest: mutable darray[u8] = []
+    bytes_push_view(&manifest, "{\n  \"schema-version\": 1,\n  \"package\": {\n    \"name\": \"app\",\n    \"version\": \"0.1.0\",\n    \"description\": \"An Elisa application\",\n    \"license\": \"MIT\",\n    \"elisa\": \">=0.1.0 <1.0.0\"\n  },\n  \"targets\": [{\"name\": \"app\", \"kind\": \"bin\", \"entry\": \"src/main.elisa\"}],\n  \"dependencies\": {},\n  \"dev-dependencies\": {},\n  \"include\": [\"src/**\", \"elisapkg.json\", \"LICENSE\", \"README.md\"]\n}\n")
+    entry: mutable darray[u8] = []
+    bytes_push_view(&entry, "def main() -> i64:\n    return 0\n")
+    entry_path: mutable darray[u8] = []
+    path_join_into(source, "main.elisa", &entry_path)
+    return EXIT_USAGE if file_exists(&entry_path)
+    return EXIT_SOURCE if not write_file(&manifest_path, &manifest)
+    return EXIT_SOURCE if not write_file(&entry_path, &entry)
+    write_ok("created package\n")
+    return EXIT_OK
+
+def run_add(argc: i64, slots: mutable cstr&&) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    return EXIT_USAGE if argc != 5 or slots[3].cast[cstr] != "--path"
+    alias: mutable darray[u8] = []
+    bytes_push_cstr(&alias, slots[2].cast[cstr])
+    return EXIT_USAGE if not valid_package_name(alias)
+    dependency_path: mutable darray[u8] = []
+    bytes_push_cstr(&dependency_path, slots[4].cast[cstr])
+    return EXIT_USAGE if not valid_dependency_path(dependency_path)
+    root: mutable darray[u8] = [46]
+    root_name: mutable darray[u8] = []
+    root_version: mutable darray[u8] = []
+    return EXIT_USAGE if not load_package_at(&root, &root_name, &root_version)
+    dependency_name: mutable darray[u8] = []
+    dependency_version: mutable darray[u8] = []
+    return EXIT_RESOLVE if not load_package_at(&dependency_path, &dependency_name, &dependency_version)
+    return EXIT_RESOLVE if not bytes_equal(alias, dependency_name) or bytes_equal(alias, root_name)
+    raw: mutable darray[u8] = []
+    raw.resize(1048577)
+    return EXIT_USAGE if not read_cstr_into("elisapkg.json", &raw)
+    return EXIT_USAGE if not validate_manifest_at(raw, &root, &root_name, &root_version)
+    updated: darray[u8] = append_local_dependency(raw, alias, dependency_path)
+    if updated.count == 0.usize():
+        write_error("error: dependency is already declared or the manifest has no dependency object\n")
+        return EXIT_RESOLVE
+    return EXIT_SOURCE if not write_cstr_file("elisapkg.json", &updated)
+    options: Model::CommandOptions = Model::CommandOptions{locked: false, offline: true, frozen: false, json: false, verbose: false}
+    resolved: i64 = run_resolve(&root, options)
+    if resolved != EXIT_OK:
+        restored: bool = write_cstr_file("elisapkg.json", &raw)
+        if not restored:
+            write_error("error: dependency edit failed and the original manifest could not be restored\n")
+            return EXIT_SECURITY
+        return resolved
+    write_ok("added local dependency ")
+    write_bytes(1, &alias)
+    write_ok(" from ")
+    write_bytes(1, &dependency_path)
+    write_ok("\n")
+    return EXIT_OK
+
+def load_package(start: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    exists: bool = project_manifest_exists()
+    _ = start
+    return false if not exists
+    raw: mutable darray[u8] = []
+    # One extra byte distinguishes an oversized document from a valid document
+    # that happens to end exactly at the policy limit.
+    raw.resize(1048577)
+    read_ok: mutable bool = read_cstr_into("elisapkg.json", &raw)
+    read_ok <- read_cstr_into("manifest.json", &raw) if not read_ok
+    return false if not read_ok
+    return false if raw.count == 0.usize()
+    name: mutable darray[u8] = []
+    version: mutable darray[u8] = []
+    valid: bool = validate_manifest(raw, &name, &version)
+    return false if not valid
+    return true
+
+def run_check(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    _ = options
+    if not load_package(start):
+        write_error("error: invalid or missing elisapkg.json (schema-version, package.name, package.version, and targets are required)\n")
+        return EXIT_USAGE
+    write_ok("manifest valid: ")
+    write_ok("elisapkg.json")
+    write_ok("\n")
+    return EXIT_OK
+
+def run_resolve(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    if not project_manifest_exists():
+        write_error("error: could not find elisapkg.json in the current directory\n")
+        return EXIT_USAGE
+    raw: mutable darray[u8] = []
+    # Read up to the manifest policy limit. A smaller buffer would silently
+    # validate only a prefix of an attacker-controlled document.
+    raw.resize(1048577)
+    read_ok: mutable bool = read_cstr_into("elisapkg.json", &raw)
+    read_ok <- read_cstr_into("manifest.json", &raw) if not read_ok
+    return EXIT_USAGE if not read_ok
+    name: mutable darray[u8] = []
+    version: mutable darray[u8] = []
+    return EXIT_USAGE if not validate_manifest(raw, &name, &version)
+    lock: darray[u8] = canonical_lock_for_manifest(name, version, raw, start)
+    return EXIT_RESOLVE if lock.count == 0.usize()
+    if options.locked or options.frozen:
+        return EXIT_RESOLVE if not cstr_file_exists("elisapkg.lock")
+        existing: mutable darray[u8] = []
+        existing.resize(1048577)
+        return EXIT_RESOLVE if not read_cstr_into("elisapkg.lock", &existing)
+        return EXIT_RESOLVE if not bytes_equal(existing, lock)
+    return EXIT_RESOLVE if not write_cstr_file("elisapkg.lock", &lock)
+    write_ok("resolved ")
+    write_bytes(1, &name)
+    write_ok(" ")
+    write_bytes(1, &version)
+    write_ok("\n")
+    return EXIT_OK
+
+def run_tree(start: darray[u8]&) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    if not project_manifest_exists():
+        write_error("error: could not find elisapkg.json in the current directory\n")
+        return EXIT_RESOLVE
+    raw: mutable darray[u8] = []
+    raw.resize(1048577)
+    return EXIT_RESOLVE if not read_cstr_into("elisapkg.json", &raw)
+    name: mutable darray[u8] = []
+    version: mutable darray[u8] = []
+    return EXIT_RESOLVE if not validate_manifest(raw, &name, &version)
+    write_bytes(1, &name)
+    write_ok(" ")
+    write_bytes(1, &version)
+    write_ok("\n")
+    return EXIT_OK
+
+def run_metadata(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    if not project_manifest_exists():
+        write_error("error: could not find elisapkg.json in the current directory\n")
+        return EXIT_USAGE
+    raw: mutable darray[u8] = []
+    raw.resize(1048577)
+    return EXIT_USAGE if not read_cstr_into("elisapkg.json", &raw)
+    name: mutable darray[u8] = []
+    version: mutable darray[u8] = []
+    return EXIT_USAGE if not validate_manifest(raw, &name, &version)
+    return EXIT_USAGE if not options.json
+    write_ok("{\"schema-version\":1,\"package\":{\"name\":\"")
+    write_bytes(1, &name)
+    write_ok("\",\"version\":\"")
+    write_bytes(1, &version)
+    write_ok("\"}}\n")
+    return EXIT_OK
+
+def run_doctor() -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    write_ok("elisapkg doctor\n")
+    write_ok("manifest: JSON schema v1\n")
+    write_ok("resolver: deterministic local v1\n")
+    write_ok("source integrity: local file verification\n")
+    write_ok("remote metadata signatures: unavailable until trust root is configured\n")
+    write_ok("build sandbox: not enabled; dependency builds are trusted-source execution\n")
+    write_ok("child environment: scrubbed; only compiler bootstrap variables are retained\n")
+    write_ok("compiler: set ELISAPKG_COMPILER to an audited compiler adapter\n")
+    return EXIT_OK
+
+def run_fetch(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    _ = start
+    _ = options
+    write_error(Security::remote_fetch_message())
+    return Security::remote_fetch_status()
+
+def run_publish() -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    write_error(Security::publish_message())
+    return Security::publish_status()
+
+def run_install() -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    write_error(Security::install_message())
+    return Security::install_status()
+
+def run_uninstall() -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    write_error("error: no installation receipt is available\n")
+    return 7
+
+def run_remove(argc: i64, slots: mutable cstr&&) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    return EXIT_USAGE if argc != 3
+    alias: mutable darray[u8] = []
+    bytes_push_cstr(&alias, slots[2].cast[cstr])
+    return EXIT_USAGE if not valid_package_name(alias)
+    root: mutable darray[u8] = [46]
+    root_name: mutable darray[u8] = []
+    root_version: mutable darray[u8] = []
+    return EXIT_USAGE if not load_package_at(&root, &root_name, &root_version)
+    raw: mutable darray[u8] = []
+    raw.resize(1048577)
+    return EXIT_USAGE if not read_cstr_into("elisapkg.json", &raw)
+    return EXIT_USAGE if not validate_manifest_at(raw, &root, &root_name, &root_version)
+    updated: darray[u8] = remove_local_dependency(raw, alias)
+    if updated.count == 0.usize():
+        write_error("error: dependency is not declared; no manifest or lockfile mutation was performed\n")
+        return EXIT_RESOLVE
+    return EXIT_SOURCE if not write_cstr_file("elisapkg.json", &updated)
+    options: Model::CommandOptions = Model::CommandOptions{locked: false, offline: true, frozen: false, json: false, verbose: false}
+    resolved: i64 = run_resolve(&root, options)
+    if resolved != EXIT_OK:
+        restored: bool = write_cstr_file("elisapkg.json", &raw)
+        if not restored:
+            write_error("error: dependency removal failed and the original manifest could not be restored\n")
+            return EXIT_SECURITY
+        return resolved
+    write_ok("removed local dependency ")
+    write_bytes(1, &alias)
+    write_ok("\n")
+    return EXIT_OK
+
+def run_update(argc: i64, slots: mutable cstr&&) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    return EXIT_USAGE if argc > 3
+    if argc == 3:
+        alias: mutable darray[u8] = []
+        bytes_push_cstr(&alias, slots[2].cast[cstr])
+        return EXIT_USAGE if not valid_package_name(alias)
+    root: mutable darray[u8] = [46]
+    options: Model::CommandOptions = Model::CommandOptions{locked: false, offline: true, frozen: false, json: false, verbose: false}
+    resolved: i64 = run_resolve(&root, options)
+    return resolved if resolved != EXIT_OK
+    write_ok("updated local dependency lock\n")
+    return EXIT_OK
+
+def run_clean() -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    root: mutable darray[u8] = [46]
+    state: mutable darray[u8] = []
+    build_dir: mutable darray[u8] = []
+    artifact: mutable darray[u8] = []
+    path_join_into(root, ".elisapkg", &state)
+    path_join_into(state, "build", &build_dir)
+    path_join_into(build_dir, "app", &artifact)
+    return EXIT_BUILD if not remove_known_file(&artifact)
+    return EXIT_BUILD if not remove_empty_directory(&build_dir)
+    # `.elisapkg` is removed only when it is empty; cache/state files are never
+    # traversed or recursively deleted by clean.
+    return EXIT_BUILD if not remove_empty_directory(&state)
+    write_ok("cleaned .elisapkg/build\n")
+    return EXIT_OK
+
+def run_cache_verify() -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    write_ok("cache: no shared remote cache configured\n")
+    return EXIT_OK
+
+def run_package(start: darray[u8]&) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    if not project_manifest_exists():
+        write_error("error: could not find elisapkg.json in the current directory\n")
+        return EXIT_USAGE
+    write_ok("package files:\n  elisapkg.json\n  src/main.elisa\n")
+    write_error("note: signing is required before publish; this command only previews files\n")
+    return EXIT_OK
+
+def run_build(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    return EXIT_BUILD if not load_package(start)
+    if options.locked or options.frozen:
+        lock_status: i64 = run_resolve(start, options)
+        return lock_status if lock_status != EXIT_OK
+    build_dir: mutable darray[u8] = []
+    path_join_into(start, ".elisapkg/build", &build_dir)
+    _ = make_directory(&build_dir)
+    compiler: mutable cstr = "elisac-stage1"
+    if Platform::pkg_getenv("ELISAPKG_COMPILER") is configured:
+        compiler <- configured.cast[cstr]
+    # Capture only the compiler settings needed by the wrapper. The child is
+    # started with a scrubbed environment so registry credentials and unrelated
+    # user variables cannot reach compile-time execution.
+    stage1_bin: mutable cstr = ""
+    runtime_obj: mutable cstr = ""
+    allow_stale: mutable cstr = ""
+    if Platform::pkg_getenv("ELISA_STAGE1_BIN") is configured_stage1:
+        stage1_bin <- configured_stage1.cast[cstr]
+    if Platform::pkg_getenv("ELISA_RUNTIME_OBJ") is configured_runtime:
+        runtime_obj <- configured_runtime.cast[cstr]
+    if Platform::pkg_getenv("ELISA_ALLOW_STALE_STAGE1") is configured_stale:
+        allow_stale <- configured_stale.cast[cstr]
+    # An explicit compiler is required for reproducible builds. PATH lookup is
+    # delegated to execvp only after the user has selected the executable.
+    stage1_env: mutable darray[u8] = []
+    runtime_env: mutable darray[u8] = []
+    stale_env: mutable darray[u8] = []
+    args: mutable darray[cstr] = []
+    args.push("/usr/bin/env")
+    args.push("-i")
+    args.push("PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin")
+    if stage1_bin != "":
+        bytes_push_view(&stage1_env, "ELISA_STAGE1_BIN=")
+        bytes_push_cstr(&stage1_env, stage1_bin)
+        stage1_env.push(0)
+        args.push((&stage1_env[0]).cast[cstr] can Unsafe.PointerCast)
+    if runtime_obj != "":
+        bytes_push_view(&runtime_env, "ELISA_RUNTIME_OBJ=")
+        bytes_push_cstr(&runtime_env, runtime_obj)
+        runtime_env.push(0)
+        args.push((&runtime_env[0]).cast[cstr] can Unsafe.PointerCast)
+    if allow_stale != "":
+        bytes_push_view(&stale_env, "ELISA_ALLOW_STALE_STAGE1=")
+        bytes_push_cstr(&stale_env, allow_stale)
+        stale_env.push(0)
+        args.push((&stale_env[0]).cast[cstr] can Unsafe.PointerCast)
+    args.push(compiler)
+    args.push("-emit")
+    args.push("exe")
+    args.push("-o")
+    args.push(".elisapkg/build/app")
+    args.push("src/main.elisa")
+    args.push(null)
+    child_argv: mutable cstr&& = (&args[0]).cast[mutable cstr&&] can Unsafe.PointerCast
+    pid: i64 = Platform::pkg_fork()
+    if pid == 0:
+        _ = Platform::pkg_execvp("/usr/bin/env", child_argv)
+        Platform::pkg_process_exit(127)
+    return EXIT_BUILD if pid < 0
+    status: mutable i64 = 0
+    waited: i64 = Platform::pkg_waitpid(pid, &status, 0)
+    return EXIT_BUILD if waited < 0 or status != 0
+    write_ok("built .elisapkg/build/app\n")
+    _ = options
+    return EXIT_OK
+
+def run_program(argc: i64, slots: mutable cstr&&) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    args: mutable darray[cstr] = []
+    args.push("/usr/bin/env")
+    args.push("-i")
+    args.push("PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin")
+    args.push(".elisapkg/build/app")
+    index: mutable i64 = 2
+    while index < argc and slots[index].cast[cstr] != "--" |slots, index|:
+        index <- index + 1
+    index <- index + 1 if index < argc and slots[index].cast[cstr] == "--"
+    while index < argc |args, slots, index|:
+        args.push(slots[index].cast[cstr])
+        index <- index + 1
+    args.push(null)
+    child_argv: mutable cstr&& = (&args[0]).cast[mutable cstr&&] can Unsafe.PointerCast
+    pid: i64 = Platform::pkg_fork()
+    if pid == 0:
+        _ = Platform::pkg_execvp("/usr/bin/env", child_argv)
+        Platform::pkg_process_exit(127)
+    return EXIT_BUILD if pid < 0
+    status: mutable i64 = 0
+    waited: i64 = Platform::pkg_waitpid(pid, &status, 0)
+    return EXIT_BUILD if waited < 0
+    # waitpid returns the platform wait status. Preserve a normal child's exit
+    # code for `run`; a signalled child is a package-manager build failure until
+    # a dedicated cancellation/signal policy is added.
+    return status / 256 if status % 256 == 0
+    return EXIT_BUILD
+
+# ---------- command line --------------------------------------------------------------
+
+module Cli:
+    public:
+        # The only public command surface. Platform, model, and trust-policy
+        # implementation details are intentionally absent from this contract.
+        def run(argc: i64, argv: mutable void&) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return cli_main(argc, argv)
+    private:
+        const command_contract_version: i64 = 1
+
+def cli_main(argc: i64, argv: mutable void&) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    slots: mutable cstr&& = argv.cast[mutable cstr&&]
+    if argc <= 1:
+        usage()
+        return EXIT_USAGE
+    command: cstr = slots[1].cast[cstr]
+    if command == "--help" or command == "-h":
+        usage()
+        return EXIT_OK
+    if command == "--version":
+        write_ok("elisapkg 0.1.0\n")
+        return EXIT_OK
+    if command == "init":
+        return run_init(argc, slots)
+    if command == "add":
+        return run_add(argc, slots)
+    if command == "remove":
+        return run_remove(argc, slots)
+    if command == "update":
+        return run_update(argc, slots)
+    manifest_path: mutable darray[u8] = []
+    has_manifest_path: mutable bool = false
+    scan_index: mutable i64 = 2
+    while scan_index < argc |slots, manifest_path, has_manifest_path, scan_index|:
+        scan_flag: cstr = slots[scan_index].cast[cstr]
+        break if scan_flag == "--"
+        if scan_flag == "--manifest-path":
+            return EXIT_USAGE if scan_index + 1 >= argc
+            bytes_push_cstr(&manifest_path, slots[scan_index + 1].cast[cstr])
+            has_manifest_path <- true
+            scan_index <- scan_index + 2
+        else:
+            scan_index <- scan_index + 1
+    if has_manifest_path:
+        return EXIT_USAGE if manifest_path.count == 0.usize() or not change_to_manifest_path(&manifest_path)
+    # `.` means the process working directory and keeps path operations on a
+    # non-empty, well-defined byte buffer.
+    start: mutable darray[u8] = [46]
+    options: mutable Model::CommandOptions = Model::CommandOptions{locked: false, offline: false, frozen: false, json: false, verbose: false}
+    flags_ok: mutable bool = true
+    for index in 2..<argc |slots, options, flags_ok|:
+        flag: cstr = slots[index].cast[cstr]
+        options.locked <- true if flag == "--locked"
+        options.offline <- true if flag == "--offline"
+        options.frozen <- true if flag == "--frozen"
+        options.json <- true if flag == "--json"
+        options.verbose <- true if flag == "--verbose"
+        recognized: bool = flag[0].u8() != 45 or flag == "--locked" or flag == "--offline" or flag == "--frozen" or flag == "--json" or flag == "--verbose" or flag == "--manifest-path" or flag == "--list" or flag == "--dry-run" or flag == "--version" or flag == "--"
+        flags_ok <- false if not recognized
+    if not flags_ok:
+        write_error("error: unknown option; run `elisapkg --help`\n")
+        return EXIT_USAGE
+    if command == "check-manifest":
+        return run_check(&start, options)
+    if command == "resolve":
+        return run_resolve(&start, options)
+    if command == "tree" or command == "why":
+        return run_tree(&start)
+    if command == "metadata":
+        return run_metadata(&start, options)
+    if command == "doctor":
+        return run_doctor()
+    if command == "fetch":
+        return run_fetch(&start, options)
+    if command == "publish":
+        return run_publish()
+    if command == "install":
+        return run_install()
+    if command == "uninstall":
+        return run_uninstall()
+    if command == "clean":
+        return run_clean()
+    if command == "cache" and argc > 2 and slots[2].cast[cstr] == "verify":
+        return run_cache_verify()
+    if command == "package":
+        return run_package(&start)
+    if command == "build" or command == "run" or command == "test":
+        return run_build(&start, options) if command == "build"
+        if command == "run":
+            build_status: i64 = run_build(&start, options)
+            return build_status if build_status != EXIT_OK
+            return run_program(argc, slots)
+        write_error("error: `run` and `test` require a built target; use `elisapkg build` first\n")
+        return EXIT_BUILD
+    write_error("error: unknown command; run `elisapkg --help`\n")
+    return EXIT_USAGE
+
+def main(argc: i64, argv: mutable void&) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    return Cli::run(argc, argv)
