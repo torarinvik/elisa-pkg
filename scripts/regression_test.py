@@ -133,7 +133,9 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
     misplaced_identity = valid.replace('"targets":', '"name":"shadow","targets":')
     misplaced_package_field = valid.replace('"version": "0.1.0"', '"version": "0.1.0", "entry":"src/main.elisa"', 1)
     misplaced_target_field = valid.replace('"kind": "bin"', '"kind": "bin", "license":"MIT"', 1)
-    for invalid in [valid.replace('"schema-version": 1,', '"schema-version": 1'), valid + '{}', unsupported_registry, misplaced_identity, misplaced_package_field, misplaced_target_field]:
+    missing_target_entry = valid.replace(', "entry": "src/main.elisa"', '', 1)
+    missing_target_kind = valid.replace(', "kind": "bin"', '', 1)
+    for invalid in [valid.replace('"schema-version": 1,', '"schema-version": 1'), valid + '{}', unsupported_registry, misplaced_identity, misplaced_package_field, misplaced_target_field, missing_target_entry, missing_target_kind]:
         manifest.write_text(invalid)
         result = subprocess.run([BIN, 'check-manifest'], cwd=project, capture_output=True, timeout=120)
         assert result.returncode != 0
