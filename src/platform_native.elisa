@@ -1,0 +1,941 @@
+# Private operating-system implementation for elisapkg.
+#
+# This module contains policy-aware filesystem code in Elisa. The only native
+# boundary is the small set of libc/POSIX primitives declared below; no package
+# manager policy is implemented in C.
+
+@link_name("open")
+extern native_open(path: cstr, flags: i64, ...) -> i64
+@link_name("openat")
+extern native_openat(directory: i64, path: cstr, flags: i64, ...) -> i64
+@link_name("mkdirat")
+extern native_mkdirat(directory: i64, path: cstr, mode: i64) -> i64
+@link_name("unlinkat")
+extern native_unlinkat(directory: i64, path: cstr, flags: i64) -> i64
+@link_name("renameat")
+extern native_renameat(old_directory: i64, old_path: cstr, new_directory: i64, new_path: cstr) -> i64
+@link_name("linkat")
+extern native_linkat(old_directory: i64, old_path: cstr, new_directory: i64, new_path: cstr, flags: i64) -> i64
+@link_name("read")
+extern native_read(fd: i64, buffer: mutable void&, count: usize) -> i64
+@link_name("write")
+extern native_write(fd: i64, buffer: void&, count: usize) -> i64
+@link_name("close")
+extern native_close(fd: i64) -> i64
+@link_name("dup")
+extern native_dup(fd: i64) -> i64
+@link_name("fsync")
+extern native_fsync(fd: i64) -> i64
+@link_name("fchmod")
+extern native_fchmod(fd: i64, mode: i64) -> i64
+@link_name("fchdir")
+extern native_fchdir(fd: i64) -> i64
+@link_name("fstat")
+extern native_fstat(fd: i64, stat: mutable void&) -> i64
+@link_name("fstatat")
+extern native_fstatat(directory: i64, path: cstr, stat: mutable void&, flags: i64) -> i64
+@link_name("lseek")
+extern native_lseek(fd: i64, offset: i64, whence: i64) -> i64
+@link_name("getcwd")
+extern native_getcwd(buffer: void&, size: usize) -> void&
+@link_name("strlen")
+extern native_strlen(value: cstr) -> usize
+@link_name("getenv")
+extern native_getenv(name: cstr) -> u8&?
+@link_name("realpath")
+extern native_realpath(path: cstr, resolved: void&?) -> u8&?
+@link_name("free")
+extern native_free(value: void&)
+@link_name("getpid")
+extern native_getpid() -> i64
+@link_name("__error")
+extern native_errno() -> mutable i64&
+@link_name("fopen")
+extern native_fopen(path: cstr, mode: cstr) -> mutable heap void&?
+@link_name("fdopen")
+extern native_fdopen(fd: i64, mode: cstr) -> mutable heap void&?
+@link_name("ferror")
+extern native_ferror(stream: heap void&) -> int
+@link_name("fclose")
+extern native_fclose(stream: heap void&) -> int
+@link_name("fread")
+extern native_fread(buffer: mutable void&, size: usize, count: usize, stream: void&) -> usize
+@link_name("fwrite")
+extern native_fwrite(buffer: void&, size: usize, count: usize, stream: void&) -> usize
+@link_name("opendir")
+extern native_opendir(path: cstr) -> mutable heap void&?
+@link_name("fdopendir")
+extern native_fdopendir(fd: i64) -> mutable heap void&?
+@link_name("readdir")
+extern native_readdir(directory: heap void&) -> mutable heap void&?
+@link_name("closedir")
+extern native_closedir(directory: heap void&) -> i64
+@link_name("fork")
+extern native_fork() -> i64
+@link_name("execvp")
+extern native_execvp(path: cstr, argv: mutable cstr&&) -> i64
+@link_name("_exit")
+extern native_exit(code: i64)
+@link_name("setpgid")
+extern native_setpgid(pid: i64, group: i64) -> i64
+@link_name("waitpid")
+extern native_waitpid(pid: i64, status: mutable i64&, options: i64) -> i64
+@link_name("kill")
+extern native_kill(pid: i64, signal: i64) -> i64
+@link_name("clock_gettime")
+extern native_clock_gettime(clock: i64, timespec: mutable void&) -> i64
+@link_name("nanosleep")
+extern native_nanosleep(request: void&, remaining: mutable void&) -> i64
+@link_name("setrlimit")
+extern native_setrlimit(resource: i64, limits: void&) -> i64
+
+module PlatformNative:
+    public:
+        def read_package_file(path: cstr, output: mutable u8&, capacity: usize) -> i64 can[Unsafe.PointerCast]:
+            return -22 if capacity == 0.usize()
+            fd: i64 = open_package_file(path)
+            return fd if fd < 0
+            return close_error(fd, -21) if not regular_fd(fd)
+            used: mutable usize = 0.usize()
+            while used < capacity |output, used, capacity, fd|:
+                raw: mutable void& = (&output[used]).cast[mutable void&] can Unsafe.PointerCast
+                amount: i64 = native_read(fd, raw, capacity - used)
+                if amount < 0:
+                    _ = native_close(fd)
+                    return negative_errno()
+                break if amount == 0
+                used <- used + amount.usize()
+            _ = native_close(fd)
+            return -27 if used == capacity
+            return used.i64()
+
+        def package_file_size(path: cstr) -> i64:
+            fd: i64 = open_package_file(path)
+            return fd if fd < 0
+            return close_error(fd, -21) if not regular_fd(fd)
+            size: i64 = native_lseek(fd, 0, 2)
+            _ = native_close(fd)
+            return -5 if size < 0
+            return size
+
+        def is_directory(path: cstr) -> i64:
+            fd: i64 = open_directory_path(path)
+            return 0 if fd < 0
+            _ = native_close(fd)
+            return 1
+
+        def extract_ustar(archive: darray[u8]&, destination: darray[u8]&) -> i64:
+            return -22 if archive.count < 1024.usize() or archive.count > 67108864.usize() or archive.count % 512.usize() != 0.usize() or destination.count == 0.usize()
+            destination_c: mutable darray[u8] = []
+            for index in 0..<destination.count |destination_c, destination|:
+                destination_c.push(destination[index])
+            destination_c.push(0)
+            destination_name: cstr = (&destination_c[0]).cast[cstr] can Unsafe.PointerCast
+            root: i64 = open_directory_path(destination_name)
+            return root if root < 0
+            return close_error(root, -39) if not directory_empty(root)
+            seen: mutable darray[u8] = []
+            cursor: mutable usize = 0.usize()
+            entries: mutable usize = 0.usize()
+            result: mutable i64 = -22
+            while cursor + 512.usize() <= archive.count |archive, cursor, entries, seen, root, result|:
+                if archive_block_zero(archive, cursor):
+                    if cursor + 1024.usize() == archive.count and entries > 0.usize() and archive_block_zero(archive, cursor + 512.usize()):
+                        result <- 0
+                    break
+                return extraction_failure(root, seen, -22) if cursor + 1024.usize() > archive.count
+                return extraction_failure(root, seen, -22) if not archive_header_shape(archive, cursor)
+                name: mutable darray[u8] = []
+                for index in 0..<100 |archive, cursor, name|:
+                    break if archive[cursor + index] == 0
+                    name.push(archive[cursor + index])
+                return extraction_failure(root, seen, -22) if name.count == 0 or name.count >= 100 or not archive_entry_safe(name) or archive_name_seen(seen, name)
+                return extraction_failure(root, seen, -22) if not archive_metadata_zero(archive, cursor, name.count)
+                mode: mutable usize = 0.usize()
+                uid: mutable usize = 0.usize()
+                gid: mutable usize = 0.usize()
+                size: mutable usize = 0.usize()
+                mtime: mutable usize = 0.usize()
+                stored_checksum: mutable usize = 0.usize()
+                return extraction_failure(root, seen, -22) if not parse_octal_raw(archive, cursor + 100.usize(), 8.usize(), &mode) or not parse_octal_raw(archive, cursor + 108.usize(), 8.usize(), &uid) or not parse_octal_raw(archive, cursor + 116.usize(), 8.usize(), &gid) or not parse_octal_raw(archive, cursor + 124.usize(), 12.usize(), &size) or not parse_octal_raw(archive, cursor + 136.usize(), 12.usize(), &mtime) or not parse_octal_raw(archive, cursor + 148.usize(), 8.usize(), &stored_checksum)
+                return extraction_failure(root, seen, -22) if mode != 420.usize() or uid != 0.usize() or gid != 0.usize() or mtime != 0.usize() or size > 67108864.usize() - 1024.usize()
+                checksum: mutable usize = 0.usize()
+                for index in 0..<512 |archive, cursor, checksum|:
+                    checksum <- checksum + (32.usize() if index >= 148.usize() and index < 156.usize() else archive[cursor + index].usize())
+                return extraction_failure(root, seen, -22) if checksum != stored_checksum
+                data_start: usize = cursor + 512.usize()
+                return extraction_failure(root, seen, -22) if size > archive.count - data_start
+                data_end: usize = data_start + size
+                padding: usize = (512.usize() - (size % 512.usize())) % 512.usize()
+                return extraction_failure(root, seen, -22) if padding > archive.count - data_end or not archive_range_zero(archive, data_end, padding)
+                parent_copy: mutable darray[u8] = []
+                leaf_offset: mutable usize = 0.usize()
+                parent: i64 = archive_open_parent(root, name, &parent_copy, &leaf_offset)
+                return extraction_failure(root, seen, -22) if parent < 0
+                leaf: cstr = (&parent_copy[leaf_offset]).cast[cstr] can Unsafe.PointerCast
+                file: i64 = native_openat(parent, leaf, flags_write_create_exclusive(), 420)
+                if file < 0:
+                    _ = native_close(parent)
+                    return extraction_failure(root, seen, -17)
+                written: mutable usize = 0.usize()
+                write_failed: mutable bool = false
+                while written < size |archive, data_start, file, written, size, write_failed|:
+                    data: void& = (&archive[data_start + written]).cast[void&] can Unsafe.PointerCast
+                    amount: i64 = native_write(file, data, size - written)
+                    if amount <= 0:
+                        write_failed <- true
+                        break
+                    written <- written + amount.usize()
+                sync_status: i64 = native_fsync(file)
+                close_status: i64 = native_close(file)
+                if write_failed or sync_status != 0 or close_status != 0:
+                    _ = native_unlinkat(parent, leaf, 0)
+                    _ = native_close(parent)
+                    return extraction_failure(root, seen, -5)
+                _ = native_close(parent)
+                for index in 0..<name.count |seen, name|:
+                    seen.push(name[index])
+                seen.push(0)
+                entries <- entries + 1.usize()
+                return extraction_failure(root, seen, -22) if entries > 4096.usize()
+                cursor <- data_end + padding
+            _ = native_close(root)
+            return result
+
+        def mkdir(path: cstr, mode: u16) -> i64:
+            parent: mutable darray[u8] = []
+            leaf: mutable darray[u8] = []
+            return -22 if not split_parent_leaf(path, &parent, &leaf)
+            parent_name: cstr = (&parent[0]).cast[cstr] can Unsafe.PointerCast
+            leaf_name: cstr = (&leaf[0]).cast[cstr] can Unsafe.PointerCast
+            directory: i64 = open_directory_path(parent_name)
+            return directory if directory < 0
+            result: i64 = native_mkdirat(directory, leaf_name, mode.i64())
+            errno_value: i64 = native_errno()
+            _ = native_close(directory)
+            return 0 if result == 0 else -errno_value
+
+        def access(path: cstr, mode: i64) -> i64:
+            return -22 if mode != 0 and mode != 1
+            fd: i64 = open_package_file(path)
+            return fd if fd < 0
+            if mode == 1:
+                stat: mutable darray[u8] = []
+                stat.resize(144)
+                raw: mutable void& = (&stat[0]).cast[mutable void&] can Unsafe.PointerCast
+                if native_fstat(fd, raw) != 0:
+                    errno_value: i64 = native_errno()
+                    _ = native_close(fd)
+                    return -errno_value
+                mode_bits: u64 = read_u16(stat, 4)
+                _ = native_close(fd)
+                return -21 if (mode_bits & 61440.u64()) != regular_mode
+                return -13 if (mode_bits & 73.u64()) == 0
+            _ = native_close(fd)
+            return 0
+
+        def chmod(path: cstr, mode: u16) -> i64:
+            parent: mutable darray[u8] = []
+            leaf: mutable darray[u8] = []
+            return -22 if not split_parent_leaf(path, &parent, &leaf)
+            parent_name: cstr = (&parent[0]).cast[cstr] can Unsafe.PointerCast
+            leaf_name: cstr = (&leaf[0]).cast[cstr] can Unsafe.PointerCast
+            directory: i64 = open_directory_path(parent_name)
+            return directory if directory < 0
+            fd: i64 = native_openat(directory, leaf_name, flags_read_no_follow())
+            open_error: i64 = native_errno()
+            if fd < 0:
+                _ = native_close(directory)
+                return -open_error
+            result: i64 = native_fchmod(fd, mode.i64())
+            errno_value: i64 = native_errno()
+            _ = native_close(fd)
+            _ = native_close(directory)
+            return 0 if result == 0 else -errno_value
+
+        def unlink(path: cstr) -> i64:
+            return unlink_kind(path, 0)
+
+        def rmdir(path: cstr) -> i64:
+            return unlink_kind(path, 2)
+
+        def link(old_path: cstr, new_path: cstr) -> i64:
+            return link_or_rename(old_path, new_path, false)
+
+        def rename(old_path: cstr, new_path: cstr) -> i64:
+            return link_or_rename(old_path, new_path, true)
+
+        def chdir(path: cstr) -> i64:
+            directory: i64 = open_directory_path(path)
+            return directory if directory < 0
+            result: i64 = native_fchdir(directory)
+            errno_value: i64 = native_errno()
+            _ = native_close(directory)
+            return 0 if result == 0 else -errno_value
+
+        def realpath(path: cstr, resolved: mutable u8&, capacity: usize) -> cstr? can[Unsafe.PointerCast]:
+            return null if native_strlen(path) > 4096.usize()
+            found: u8&? = native_realpath(path, null)
+            if found is canonical:
+                length: usize = native_strlen(canonical.cast[cstr] can Unsafe.PointerCast)
+                if length + 1.usize() <= capacity:
+                    source: cstr = canonical.cast[cstr] can Unsafe.PointerCast
+                    for index in 0..<length |resolved, source|:
+                        resolved[index] <- source[index].u8()
+                    resolved[length] <- 0
+                    native_free(canonical.cast[void&] can Unsafe.PointerCast)
+                    return (&resolved[0]).cast[cstr] can Unsafe.PointerCast
+                native_free(canonical.cast[void&] can Unsafe.PointerCast)
+            return null
+
+        def collect_files(root: cstr, output: mutable u8&, capacity: usize) -> i64 can[Memory.Allocate, Unsafe.PointerCast]:
+            return -22 if not cstr_equal(root, ".") or capacity == 0.usize()
+            paths: mutable darray[u8] = []
+            if not collect_directory(".", &paths, 0.usize()):
+                return -5
+            rows: mutable darray[darray[u8]] = []
+            cursor: mutable usize = 0.usize()
+            while cursor < paths.count:
+                row: mutable darray[u8] = []
+                while cursor < paths.count and paths[cursor] != 0:
+                    row.push(paths[cursor])
+                    cursor <- cursor + 1.usize()
+                return -5 if row.count == 0.usize() or cursor >= paths.count
+                rows.push(row)
+                return -75 if rows.count > 4096.usize()
+                cursor <- cursor + 1.usize()
+            used_rows: mutable darray[bool] = []
+            used_rows.resize(rows.count)
+            used: mutable usize = 0.usize()
+            for _item in 0..<rows.count |rows, used_rows, output, used, capacity|:
+                best: mutable usize = rows.count
+                for candidate in 0..<rows.count |rows, used_rows, best, candidate|:
+                    continue if used_rows[candidate]
+                    best <- candidate if best == rows.count or path_less(rows[candidate], rows[best])
+                return -7 if best == rows.count or used + rows[best].count + 1.usize() > capacity
+                for index in 0..<rows[best].count |output, rows, best, used|:
+                    output[used + index] <- rows[best][index]
+                used <- used + rows[best].count
+                output[used] <- 0
+                used <- used + 1.usize()
+                used_rows[best] <- true
+            return used.i64()
+
+        def mkstemp(template_path: mutable u8&) -> i64 can[Memory.Allocate, Unsafe.PointerCast]:
+            path_length: usize = native_strlen((&template_path[0]).cast[cstr] can Unsafe.PointerCast)
+            path: cstr = (&template_path[0]).cast[cstr] can Unsafe.PointerCast
+            parent: mutable darray[u8] = []
+            leaf: mutable darray[u8] = []
+            return -22 if not split_parent_leaf(path, &parent, &leaf)
+            return -22 if leaf.count < 7.usize()
+            suffix: usize = leaf.count - 7.usize()
+            for index in 0..<6 |leaf|:
+                return -22 if leaf[suffix + index] != 88
+            parent_name: cstr = (&parent[0]).cast[cstr] can Unsafe.PointerCast
+            directory: i64 = open_directory_path(parent_name)
+            return directory if directory < 0
+            alphabet: cstr = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+            for attempt in 0..<256 |leaf, alphabet, directory, template_path, path_length|:
+                value: mutable u64 = (native_getpid().u64() * 1103515245.u64() + attempt.u64() * 12345.u64())
+                for index in 0..<6 |leaf, alphabet, value|:
+                    leaf[suffix + index] <- alphabet[(value % 62.u64()).usize()].u8()
+                    value <- value / 62.u64() + 17.u64()
+                leaf_name: cstr = (&leaf[0]).cast[cstr] can Unsafe.PointerCast
+                fd: i64 = native_openat(directory, leaf_name, flags_read_write_create_exclusive(), 384)
+                if fd >= 0:
+                    start: usize = path_length - leaf.count
+                    for index in 0..<leaf.count |template_path, leaf, start|:
+                        template_path[start + index] <- leaf[index]
+                    _ = native_close(directory)
+                    return fd
+                return negative_errno() if native_errno() != 17
+            _ = native_close(directory)
+            return -17
+
+        def fork() -> i64:
+            return native_fork()
+
+        def execvp(path: cstr, argv: mutable cstr&&) -> i64:
+            return native_execvp(path, argv)
+
+        def process_exit(code: i64):
+            native_exit(code)
+
+        def set_process_group() -> i64:
+            result: i64 = native_setpgid(0, 0)
+            return 0 if result == 0 else negative_errno()
+
+        def set_process_limits(profile: i64) -> i64 can[Memory.Allocate, Unsafe.PointerCast]:
+            cpu: mutable i64 = 0
+            file_size: mutable i64 = 0
+            if profile == 1:
+                cpu <- 600
+                file_size <- 134217728
+            elif profile == 2:
+                cpu <- 120
+                file_size <- 67108864
+            return -22 if cpu == 0 or file_size == 0
+            cpu_limit: mutable darray[u8] = limit_bytes(cpu)
+            file_limit: mutable darray[u8] = limit_bytes(file_size)
+            cpu_raw: void& = (&cpu_limit[0]).cast[void&] can Unsafe.PointerCast
+            file_raw: void& = (&file_limit[0]).cast[void&] can Unsafe.PointerCast
+            return negative_errno() if native_setrlimit(0, cpu_raw) != 0
+            return negative_errno() if native_setrlimit(1, file_raw) != 0
+            core_limit: mutable darray[u8] = limit_bytes(0)
+            core_raw: void& = (&core_limit[0]).cast[void&] can Unsafe.PointerCast
+            return negative_errno() if native_setrlimit(4, core_raw) != 0
+            return 0
+
+        def waitpid_timeout(pid: i64, status: mutable i64&, timeout_ms: i64) -> i64 can[Memory.Allocate, Unsafe.PointerCast]:
+            return -22 if pid <= 0 or timeout_ms <= 0
+            started: i64 = monotonic_milliseconds()
+            return -5 if started < 0
+            deadline: i64 = started + timeout_ms if started <= 9223372036854775807 - timeout_ms else 9223372036854775807
+            while true |status, pid, deadline|:
+                waited: i64 = native_waitpid(pid, status, 1)
+                if waited == pid:
+                    return 0
+                if waited < 0:
+                    continue if native_errno() == 4
+                    return negative_errno()
+                now: i64 = monotonic_milliseconds()
+                return -5 if now < 0
+                if now >= deadline:
+                    _ = native_kill(-pid, 9)
+                    _ = native_kill(pid, 9)
+                    while native_waitpid(pid, status, 0) < 0 and native_errno() == 4 |pid, status|:
+                        _ = 0
+                    return -110
+                pause: mutable darray[u8] = timespec_bytes(0, 10000000)
+                pause_raw: void& = (&pause[0]).cast[void&] can Unsafe.PointerCast
+                remaining: mutable darray[u8] = timespec_bytes(0, 0)
+                remaining_raw: mutable void& = (&remaining[0]).cast[mutable void&] can Unsafe.PointerCast
+                _ = native_nanosleep(pause_raw, remaining_raw)
+            return -110
+
+        def timeout_error() -> i64:
+            return -110
+
+        def fopen(path: cstr, mode: cstr) -> mutable heap void&? can[Unsafe.PointerCast]:
+            return null if not cstr_equal(mode, "rb") and not cstr_equal(mode, "wxb")
+            if cstr_equal(mode, "rb"):
+                fd: i64 = open_package_file(path)
+                return null if fd < 0
+                if not regular_fd(fd):
+                    _ = native_close(fd)
+                    return null
+                stream: mutable heap void&? = native_fdopen(fd, "rb")
+                if stream is opened:
+                    return opened
+                _ = native_close(fd)
+                return null
+            parent: mutable darray[u8] = []
+            leaf: mutable darray[u8] = []
+            return null if not split_parent_leaf(path, &parent, &leaf)
+            parent_name: cstr = (&parent[0]).cast[cstr] can Unsafe.PointerCast
+            leaf_name: cstr = (&leaf[0]).cast[cstr] can Unsafe.PointerCast
+            directory: i64 = open_directory_path(parent_name)
+            return null if directory < 0
+            fd: i64 = native_openat(directory, leaf_name, flags_write_create_exclusive(), 384)
+            _ = native_close(directory)
+            return null if fd < 0
+            stream: mutable heap void&? = native_fdopen(fd, "wb")
+            if stream is opened:
+                return opened
+            _ = native_close(fd)
+            return null
+
+        def ferror(stream: heap void&) -> int:
+            return native_ferror(stream)
+
+        def fclose(stream: heap void&) -> int:
+            return native_fclose(stream)
+
+        def fread(buffer: mutable void&, size: usize, count: usize, stream: void&) -> usize:
+            return native_fread(buffer, size, count, stream)
+
+        def fwrite(buffer: void&, size: usize, count: usize, stream: void&) -> usize:
+            return native_fwrite(buffer, size, count, stream)
+
+    private:
+        def directory_empty(directory: i64) -> bool can[Unsafe.PointerCast]:
+            duplicate: i64 = native_dup(directory)
+            return false if duplicate < 0
+            stream: mutable heap void&? = native_fdopendir(duplicate)
+            if stream is opened:
+                while true |opened|:
+                    entry: mutable heap void&? = native_readdir(opened)
+                    if entry is record:
+                        raw: mutable u8& = record.cast[mutable u8&] can Unsafe.PointerCast
+                        name_length: usize = raw[18].usize() + raw[19].usize() * 256.usize()
+                        continue if name_length == 1.usize() and raw[21] == 46
+                        continue if name_length == 2.usize() and raw[21] == 46 and raw[22] == 46
+                        _ = native_closedir(opened)
+                        return false
+                    break
+                _ = native_closedir(opened)
+                return true
+            _ = native_close(duplicate)
+            return false
+
+        def archive_block_zero(archive: darray[u8]&, offset: usize) -> bool:
+            return false if offset + 512.usize() > archive.count
+            for index in 0..<512 |archive, offset|:
+                return false if archive[offset + index] != 0
+            return true
+
+        def archive_range_zero(archive: darray[u8]&, offset: usize, length: usize) -> bool:
+            return false if offset + length > archive.count
+            for index in 0..<length |archive, offset|:
+                return false if archive[offset + index] != 0
+            return true
+
+        def archive_header_shape(archive: darray[u8]&, offset: usize) -> bool:
+            return archive[offset + 257] == 117 and archive[offset + 258] == 115 and archive[offset + 259] == 116 and archive[offset + 260] == 97 and archive[offset + 261] == 114 and archive[offset + 262] == 0 and archive[offset + 263] == 48 and archive[offset + 264] == 48 and archive[offset + 156] == 48
+
+        def archive_metadata_zero(archive: darray[u8]&, offset: usize, name_length: usize) -> bool:
+            return false if not archive_range_zero(archive, offset + name_length + 1.usize(), 100.usize() - name_length - 1.usize())
+            return false if not archive_range_zero(archive, offset + 157.usize(), 100.usize())
+            return false if not archive_range_zero(archive, offset + 265.usize(), 80.usize())
+            return false if not archive_range_zero(archive, offset + 345.usize(), 155.usize())
+            return archive_range_zero(archive, offset + 500.usize(), 12.usize())
+
+        def parse_octal_raw(value: darray[u8]&, offset: usize, width: usize, out: mutable usize&) -> bool:
+            return false if width < 2.usize() or offset + width > value.count
+            cursor: mutable usize = offset
+            finish: usize = offset + width
+            parsed: mutable usize = 0.usize()
+            digits: mutable usize = 0.usize()
+            while cursor < finish and value[cursor] >= 48 and value[cursor] <= 55:
+                digit: usize = (value[cursor] - 48).usize()
+                return false if parsed > (18446744073709551615.usize() - digit) / 8.usize()
+                parsed <- parsed * 8.usize() + digit
+                digits <- digits + 1.usize()
+                cursor <- cursor + 1.usize()
+            return false if digits == 0.usize() or cursor >= finish or (value[cursor] != 0 and value[cursor] != 32)
+            cursor <- cursor + 1.usize()
+            while cursor < finish:
+                return false if value[cursor] != 0 and value[cursor] != 32
+                cursor <- cursor + 1.usize()
+            out <- parsed
+            return true
+
+        def archive_entry_safe(name: darray[u8]&) -> bool:
+            return false if name.count == 0.usize() or name.count >= 100.usize() or name[0] == 47 or name[0] == 92 or name[name.count - 1.usize()] == 47 or name[name.count - 1.usize()] == 92
+            return false if name.count >= 2.usize() and name[1] == 58
+            segment_start: mutable usize = 0.usize()
+            for index in 0..=name.count |name, segment_start|:
+                if index < name.count and name[index] != 47:
+                    return false if name[index] < 32 or name[index] == 127 or name[index] == 92 or name[index] == 58
+                    continue
+                segment_length: usize = index - segment_start
+                return false if segment_length == 0.usize() or segment_length == 1.usize() and name[segment_start] == 46 or segment_length == 2.usize() and name[segment_start] == 46 and name[segment_start + 1.usize()] == 46
+                segment_start <- index + 1.usize()
+            return true
+
+        def archive_name_seen(seen: darray[u8]&, wanted: darray[u8]&) -> bool:
+            cursor: mutable usize = 0.usize()
+            while cursor < seen.count:
+                end: mutable usize = cursor
+                while end < seen.count and seen[end] != 0:
+                    end <- end + 1.usize()
+                common: usize = end - cursor if end - cursor < wanted.count else wanted.count
+                matches: mutable bool = true
+                for index in 0..<common |seen, wanted, cursor, matches|:
+                    left: mutable u8 = seen[cursor + index]
+                    right: mutable u8 = wanted[index]
+                    left <- left + 32 if left >= 65 and left <= 90
+                    right <- right + 32 if right >= 65 and right <= 90
+                    matches <- false if left != right
+                if matches:
+                    return true if end - cursor == wanted.count or common < wanted.count and wanted[common] == 47 or common < end - cursor and seen[cursor + common] == 47
+                cursor <- end + 1.usize()
+            return false
+
+        def archive_open_parent(root: i64, name: darray[u8]&, copy_out: mutable darray[u8]&, leaf_offset: mutable usize&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            for index in 0..<name.count |copy_out, name|:
+                copy_out.push(name[index])
+            copy_out.push(0)
+            slash: mutable usize = 0.usize()
+            for index in 0..<name.count |copy_out, slash|:
+                slash <- index + 1.usize() if copy_out[index] == 47
+            leaf_offset <- slash
+            return -22 if leaf_offset >= name.count
+            directory: mutable i64 = native_dup(root)
+            return negative_errno() if directory < 0
+            start: mutable usize = 0.usize()
+            while start < leaf_offset:
+                finish: mutable usize = start
+                while finish < leaf_offset and copy_out[finish] != 47:
+                    finish <- finish + 1.usize()
+                copy_out[finish] <- 0
+                part: cstr = (&copy_out[start]).cast[cstr] can Unsafe.PointerCast
+                next: mutable i64 = native_openat(directory, part, flags_directory() + flag_no_follow)
+                if next < 0 and native_errno() == 2:
+                    if native_mkdirat(directory, part, 493) != 0 and native_errno() != 17:
+                        return close_error(directory, negative_errno())
+                    next <- native_openat(directory, part, flags_directory() + flag_no_follow)
+                return close_error(directory, negative_errno()) if next < 0
+                _ = native_close(directory)
+                directory <- next
+                start <- finish + 1.usize()
+            return directory
+
+        def extraction_failure(root: i64, seen: darray[u8]&, errno_value: i64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            cleanup_archive_files(root, seen)
+            _ = native_close(root)
+            return errno_value
+
+        def cleanup_archive_files(root: i64, seen: darray[u8]&) -> void can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            cursor: mutable usize = 0.usize()
+            while cursor < seen.count:
+                end: mutable usize = cursor
+                while end < seen.count and seen[end] != 0:
+                    end <- end + 1.usize()
+                name: mutable darray[u8] = []
+                for index in cursor..<end |name, seen|:
+                    name.push(seen[index])
+                copy: mutable darray[u8] = []
+                leaf_offset: mutable usize = 0.usize()
+                parent: i64 = archive_open_parent(root, name, &copy, &leaf_offset)
+                if parent >= 0:
+                    leaf: cstr = (&copy[leaf_offset]).cast[cstr] can Unsafe.PointerCast
+                    _ = native_unlinkat(parent, leaf, 0)
+                    _ = native_close(parent)
+                cursor <- end + 1.usize()
+
+        const flag_read_only: i64 = 0
+        const flag_write_only: i64 = 1
+        const flag_read_write: i64 = 2
+        const flag_nonblock: i64 = 4
+        const flag_no_follow: i64 = 256
+        const flag_create: i64 = 512
+        const flag_exclusive: i64 = 2048
+        const flag_directory: i64 = 1048576
+        const flag_close_on_exec: i64 = 16777216
+        const at_remove_directory: i64 = 2
+        const at_no_follow: i64 = 32
+        const regular_mode: u64 = 32768
+        const directory_mode: u64 = 16384
+        const symlink_mode: u64 = 40960
+
+        def flags_directory() -> i64:
+            return flag_read_only + flag_directory + flag_close_on_exec
+
+        def flags_read_no_follow() -> i64:
+            return flag_read_only + flag_no_follow + flag_close_on_exec
+
+        def flags_file_read() -> i64:
+            return flag_read_only + flag_no_follow + flag_close_on_exec + flag_nonblock
+
+        def flags_read_write_create_exclusive() -> i64:
+            return flag_read_write + flag_create + flag_exclusive + flag_no_follow + flag_close_on_exec
+
+        def flags_write_create_exclusive() -> i64:
+            return flag_write_only + flag_create + flag_exclusive + flag_no_follow + flag_close_on_exec
+
+        def error_code() -> i64:
+            value: i64 = native_errno()
+            return value if value > 0 else 5
+
+        def negative_errno() -> i64:
+            value: i64 = native_errno()
+            return -value if value > 0 else -5
+
+        def cstr_equal(left: cstr, right: cstr) -> bool:
+            left_length: usize = native_strlen(left)
+            right_length: usize = native_strlen(right)
+            return false if left_length != right_length
+            for index in 0..<left_length |left, right|:
+                return false if left[index].u8() != right[index].u8()
+            return true
+
+        def split_parent_leaf(path: cstr, parent: mutable darray[u8]&, leaf: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            length: usize = native_strlen(path)
+            return false if length == 0 or length > 4096
+            slash: mutable usize = length
+            while slash > 0 and path[slash - 1].u8() != 47:
+                slash <- slash - 1.usize()
+            leaf_start: usize = slash
+            return false if leaf_start == length
+            for index in leaf_start..<length |path, leaf|:
+                leaf.push(path[index].u8())
+            leaf.push(0)
+            leaf_name: cstr = (&leaf[0]).cast[cstr] can Unsafe.PointerCast
+            return false if leaf.count <= 1.usize() or cstr_equal(leaf_name, ".") or cstr_equal(leaf_name, "..")
+            if slash == 0:
+                parent.push(46)
+            elif slash == 1:
+                parent.push(47)
+            else:
+                for index in 0..<(slash - 1.usize()) |path, parent|:
+                    parent.push(path[index].u8())
+            parent.push(0)
+            return true
+
+        def open_directory_path(path: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            length: usize = native_strlen(path)
+            return -22 if length == 0 or length > 4096
+            path_copy: mutable darray[u8] = []
+            for index in 0..<length |path_copy, path|:
+                path_copy.push(path[index].u8())
+            path_copy.push(0)
+            absolute: bool = path_copy[0] == 47
+            directory: mutable i64 = native_open("/" if absolute else ".", flags_directory())
+            return -error_code() if directory < 0
+            start: mutable usize = 0.usize()
+            while start < length and path_copy[start] == 47 |path_copy, start|:
+                start <- start + 1.usize()
+            while start < length:
+                finish: mutable usize = start
+                while finish < length and path_copy[finish] != 47 |path_copy, finish|:
+                    finish <- finish + 1.usize()
+                path_copy[finish] <- 0
+                part: cstr = (&path_copy[start]).cast[cstr] can Unsafe.PointerCast
+                if not cstr_equal(part, "."):
+                    return close_error(directory, -22) if cstr_equal(part, "..")
+                    next: i64 = native_openat(directory, part, flags_directory() + flag_no_follow)
+                    return close_error(directory, -error_code()) if next < 0
+                    _ = native_close(directory)
+                    directory <- next
+                start <- finish + 1.usize()
+            while start < length and path_copy[start] == 47 |path_copy, start|:
+                    start <- start + 1.usize()
+            return directory
+
+        def open_package_file(path: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            length: usize = native_strlen(path)
+            return -22 if length == 0 or length > 4096
+            path_copy: mutable darray[u8] = []
+            for index in 0..<length |path_copy, path|:
+                path_copy.push(path[index].u8())
+            path_copy.push(0)
+            absolute: bool = path_copy[0] == 47
+            directory: mutable i64 = native_open("/" if absolute else ".", flags_directory())
+            return -error_code() if directory < 0
+            start: mutable usize = 0.usize()
+            while start < length and path_copy[start] == 47 |path_copy, start|:
+                start <- start + 1.usize()
+            while start < length:
+                finish: mutable usize = start
+                while finish < length and path_copy[finish] != 47 |path_copy, finish|:
+                    finish <- finish + 1.usize()
+                had_slash: bool = finish < length
+                path_copy[finish] <- 0
+                part: cstr = (&path_copy[start]).cast[cstr] can Unsafe.PointerCast
+                return close_error(directory, -22) if cstr_equal(part, "") or cstr_equal(part, "..")
+                flags: i64 = flags_file_read() + (flag_directory if had_slash else 0)
+                next: i64 = native_openat(directory, part, flags)
+                return close_error(directory, -error_code()) if next < 0
+                _ = native_close(directory)
+                directory <- next
+                return directory if not had_slash
+                start <- finish + 1.usize()
+                while start < length and path_copy[start] == 47 |path_copy, start|:
+                    start <- start + 1.usize()
+            _ = native_close(directory)
+            return -22
+
+        def close_error(fd: i64, errno_value: i64) -> i64:
+            _ = native_close(fd)
+            return errno_value
+
+        def unlink_kind(path: cstr, flags: i64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            parent: mutable darray[u8] = []
+            leaf: mutable darray[u8] = []
+            return -22 if not split_parent_leaf(path, &parent, &leaf)
+            parent_name: cstr = (&parent[0]).cast[cstr] can Unsafe.PointerCast
+            leaf_name: cstr = (&leaf[0]).cast[cstr] can Unsafe.PointerCast
+            directory: i64 = open_directory_path(parent_name)
+            return directory if directory < 0
+            result: i64 = native_unlinkat(directory, leaf_name, flags)
+            errno_value: i64 = error_code()
+            _ = native_close(directory)
+            return 0 if result == 0 else -errno_value
+
+        def stat_mode(directory: i64, path: cstr, out: mutable darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            out.resize(144)
+            raw: mutable void& = (&out[0]).cast[mutable void&] can Unsafe.PointerCast
+            result: i64 = native_fstatat(directory, path, raw, at_no_follow)
+            return 0 if result == 0
+            return -error_code()
+
+        def link_or_rename(old_path: cstr, new_path: cstr, is_move: bool) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            old_parent: mutable darray[u8] = []
+            old_leaf: mutable darray[u8] = []
+            new_parent: mutable darray[u8] = []
+            new_leaf: mutable darray[u8] = []
+            return -22 if not split_parent_leaf(old_path, &old_parent, &old_leaf) or not split_parent_leaf(new_path, &new_parent, &new_leaf)
+            old_name: cstr = (&old_parent[0]).cast[cstr] can Unsafe.PointerCast
+            old_leaf_name: cstr = (&old_leaf[0]).cast[cstr] can Unsafe.PointerCast
+            new_name: cstr = (&new_parent[0]).cast[cstr] can Unsafe.PointerCast
+            new_leaf_name: cstr = (&new_leaf[0]).cast[cstr] can Unsafe.PointerCast
+            old_directory: i64 = open_directory_path(old_name)
+            return old_directory if old_directory < 0
+            new_directory: i64 = open_directory_path(new_name)
+            return close_two_error(old_directory, new_directory, new_directory) if new_directory < 0
+            old_stat: mutable darray[u8] = []
+            return close_two_error(old_directory, new_directory, -5) if stat_mode(old_directory, old_leaf_name, &old_stat) != 0
+            old_mode: u64 = read_u16(old_stat, 4)
+            return close_two_error(old_directory, new_directory, -22) if (old_mode & 61440.u64()) != regular_mode
+            new_stat: mutable darray[u8] = []
+            new_result: i64 = stat_mode(new_directory, new_leaf_name, &new_stat)
+            result: mutable i64 = 0
+            if is_move:
+                if new_result == 0:
+                    new_mode: u64 = read_u16(new_stat, 4)
+                    return close_two_error(old_directory, new_directory, -40) if (new_mode & 61440.u64()) == symlink_mode
+                    return close_two_error(old_directory, new_directory, -21) if (new_mode & 61440.u64()) != regular_mode
+                elif new_result != -2:
+                    return close_two_error(old_directory, new_directory, new_result)
+                result <- native_renameat(old_directory, old_leaf_name, new_directory, new_leaf_name)
+            else:
+                return close_two_error(old_directory, new_directory, -17) if new_result == 0
+                return close_two_error(old_directory, new_directory, new_result) if new_result != -2
+                result <- native_linkat(old_directory, old_leaf_name, new_directory, new_leaf_name, 0)
+            errno_value: i64 = error_code()
+            _ = native_close(old_directory)
+            _ = native_close(new_directory)
+            return 0 if result == 0 else -errno_value
+
+        def close_two_error(left: i64, right: i64, errno_value: i64) -> i64:
+            _ = native_close(left)
+            _ = native_close(right)
+            return errno_value
+
+        def read_u16(value: darray[u8]&, offset: usize) -> u64:
+            return value[offset].u64() + value[offset + 1.usize()].u64() * 256.u64()
+
+        def regular_fd(fd: i64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            stat: mutable darray[u8] = []
+            stat.resize(144)
+            raw: mutable void& = (&stat[0]).cast[mutable void&] can Unsafe.PointerCast
+            return native_fstat(fd, raw) == 0 and (read_u16(stat, 4) & 61440.u64()) == regular_mode
+
+        def limit_bytes(value: i64) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
+            out: mutable darray[u8] = []
+            out.resize(16)
+            unsigned: mutable u64 = value.u64()
+            for index in 0..<8 |out, unsigned|:
+                out[index] <- (unsigned & 255.u64()).u8()
+                unsigned <- unsigned / 256.u64()
+            for index in 8..<16 |out|:
+                out[index] <- out[index - 8.usize()]
+            return out
+
+        def timespec_bytes(seconds: i64, nanoseconds: i64) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
+            out: mutable darray[u8] = []
+            out.resize(16)
+            values: darray[i64] = [seconds, nanoseconds]
+            for word in 0..<2 |out, values, word|:
+                value: mutable u64 = values[word].u64()
+                for byte in 0..<8 |out, value, word, byte|:
+                    out[word * 8.usize() + byte] <- (value & 255.u64()).u8()
+                    value <- value / 256.u64()
+            return out
+
+        def monotonic_milliseconds() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            stamp: mutable darray[u8] = []
+            stamp.resize(16)
+            raw: mutable void& = (&stamp[0]).cast[mutable void&] can Unsafe.PointerCast
+            return -1 if native_clock_gettime(6, raw) != 0
+            seconds: i64 = read_i64(stamp, 0)
+            nanos: i64 = read_i64(stamp, 8)
+            return 9223372036854775807 if seconds > 9223372036854775
+            return seconds * 1000 + nanos / 1000000
+
+        def read_i64(value: darray[u8]&, offset: usize) -> i64:
+            out: mutable u64 = 0
+            for index in 0..<8 |value, offset, out, index|:
+                out <- out + (value[offset + index].u64() << (index * 8.usize()))
+            return out.i64()
+
+        def collect_directory(path: cstr, out: mutable darray[u8]&, depth: usize) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return false if depth > 64.usize()
+            directory: mutable heap void&? = native_opendir(path)
+            if directory is stream:
+                while true |stream, out, path, depth|:
+                    entry: mutable heap void&? = native_readdir(stream)
+                    if entry is record:
+                        raw: mutable u8& = record.cast[mutable u8&] can Unsafe.PointerCast
+                        name_length: usize = raw[18].usize() + raw[19].usize() * 256.usize()
+                        continue if name_length == 0 or name_length > 255.usize()
+                        continue if (raw[20] == 4) or (raw[20] == 8 and forbidden_file_name(raw, 21, name_length))
+                        continue if name_is_dot(raw, 21, name_length)
+                        child: mutable darray[u8] = []
+                        if not cstr_equal(path, "."):
+                            for index in 0..<path_length(path) |child, path|:
+                                child.push(path[index].u8())
+                            child.push(47)
+                        for index in 0..<name_length |child, raw|:
+                            child.push(raw[21 + index])
+                        child.push(0)
+                        child_name: cstr = (&child[0]).cast[cstr] can Unsafe.PointerCast
+                        child_length: usize = path_length(child_name)
+                        return false if child_length == 0 or child_length > 4096.usize()
+                        if raw[20] == 4:
+                            continue if skip_directory(child_name)
+                            continue if not collect_directory(child_name, out, depth + 1.usize())
+                        elif raw[20] == 8:
+                            continue if skip_file(child_name)
+                            return false if out.count + child_length + 1.usize() > 16777216.usize()
+                            for index in 0..<child_length |out, child_name|:
+                                out.push(child_name[index].u8())
+                            out.push(0)
+                        else:
+                            break
+                    else:
+                        break
+                _ = native_closedir(stream)
+                return true
+            return false
+
+        def path_length(path: cstr) -> usize:
+            return native_strlen(path)
+
+        def path_less(left: darray[u8]&, right: darray[u8]&) -> bool:
+            limit: usize = left.count if left.count < right.count else right.count
+            for index in 0..<limit |left, right|:
+                return true if left[index] < right[index]
+                return false if left[index] > right[index]
+            return left.count < right.count
+
+        def name_is_dot(raw: mutable u8&, offset: usize, length: usize) -> bool:
+            return length == 1 and raw[offset] == 46 or length == 2 and raw[offset] == 46 and raw[offset + 1] == 46
+
+        def forbidden_file_name(raw: mutable u8&, offset: usize, length: usize) -> bool:
+            return false if length == 0
+            return raw[offset] == 46 and length >= 4 and raw[offset + 1] == 101 and raw[offset + 2] == 110 and raw[offset + 3] == 118
+
+        def skip_directory(path: cstr) -> bool:
+            return path_has_component(path, ".git") or path_has_component(path, ".hg") or path_has_component(path, ".svn") or path_has_component(path, ".elisapkg") or path_has_component(path, "build") or path_has_component(path, "target")
+
+        def skip_file(path: cstr) -> bool:
+            length: usize = native_strlen(path)
+            leaf_start: mutable usize = length
+            while leaf_start > 0 and path[leaf_start - 1].u8() != 47:
+                leaf_start <- leaf_start - 1.usize()
+            leaf: cstr = (&path[leaf_start]).cast[cstr] can Unsafe.PointerCast
+            return cstr_equal(leaf, "IMPLEMENTATION_PLAN.md") or cstr_equal(leaf, ".netrc") or cstr_equal(leaf, "credentials") or cstr_equal(leaf, "credentials.json") or cstr_equal(leaf, "id_rsa") or cstr_equal(leaf, "id_ed25519") or suffix_equal(leaf, ".pem") or suffix_equal(leaf, ".key")
+
+        def suffix_equal(value: cstr, suffix: cstr) -> bool:
+            length: usize = native_strlen(value)
+            suffix_length: usize = native_strlen(suffix)
+            return false if length < suffix_length
+            suffix_start: cstr = (&value[length - suffix_length]).cast[cstr] can Unsafe.PointerCast
+            return cstr_equal(suffix_start, suffix)
+
+        def path_has_component(path: cstr, wanted: cstr) -> bool:
+            wanted_length: usize = native_strlen(wanted)
+            length: usize = native_strlen(path)
+            start: mutable usize = 0
+            while start < length:
+                while start < length and path[start].u8() == 47:
+                    start <- start + 1.usize()
+                finish: mutable usize = start
+                while finish < length and path[finish].u8() != 47:
+                    finish <- finish + 1.usize()
+                segment: cstr = (&path[start]).cast[cstr] can Unsafe.PointerCast
+                return true if finish - start == wanted_length and cstr_equal(segment, wanted)
+                start <- finish + 1.usize()
+            return false

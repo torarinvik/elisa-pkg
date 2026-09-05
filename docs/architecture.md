@@ -20,7 +20,7 @@ The current source units are:
 | `Cache` | Digest-addressed blob paths and byte revalidation | Digest grammar and no-follow blob reads | A pathname is never accepted as proof; callers must publish and quarantine through the CLI transaction. |
 | `Cli` | `run(argc, argv)` | None | The public command surface delegates to private command helpers. |
 
-The current compiler backend requires foreign declarations at compilation-unit scope, so `Platform` wraps those declarations rather than placing them inside the module body. This keeps the exception local and documented. Callers use qualified names such as `Platform::pkg_fopen`, `Model::Version`, and `Security::remote_fetch_status`; `using` imports are deliberately avoided.
+The current compiler backend requires foreign declarations at compilation-unit scope, so the private `PlatformNative` module keeps those declarations and the descriptor-relative policy helpers together. `Platform` exposes only the reviewed wrapper surface. Callers use qualified names such as `Platform::pkg_fopen`, `Model::Version`, and `Security::remote_fetch_status`; `using` imports are deliberately avoided.
 
 The current CLI also has a local deployment path. `install --local` stays in
 the command layer, but delegates digesting and filesystem publication to the
@@ -30,7 +30,8 @@ destination match; remote installation remains behind `Security` and `Trust`.
 
 The package writer asks `Platform` for a sorted, regular-file-only directory
 walk, then applies manifest include patterns and the `Archive` path policy in
-Elisa before reading bytes. The native seam applies conservative file exclusions but performs no archive
+Elisa before reading bytes. `PlatformNative` applies conservative file
+exclusions and descriptor-relative no-follow traversal but performs no archive
 serialization, which keeps filesystem traversal separate from the public
 archive format. `Archive::verify_ustar_archive` parses the resulting bytes
 again, so the file is only exposed after bounds, checksum, duplicate-entry,

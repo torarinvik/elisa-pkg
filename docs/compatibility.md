@@ -15,20 +15,21 @@ ELISA_ALLOW_STALE_STAGE1=1 \
 scripts/build.sh
 ```
 
-`scripts/build.sh` compiles the reviewed C filesystem seam with C11 warnings
-as errors, combines it with the selected runtime object, and invokes the
-compiler wrapper with `ELISA_STAGE1_SEMANTIC_GATE=1` supplied by the package
-manager's child build environment. The wrapper and stage1 executable must be
-explicitly present and executable.
+`scripts/build.sh` invokes the compiler wrapper with the selected Elisa runtime
+object and `ELISA_STAGE1_SEMANTIC_GATE=1` supplied by the package manager's
+child build environment. Filesystem traversal, archive extraction, and process
+policy are compiled from Elisa; only direct libc/POSIX primitives cross the
+private FFI boundary. The wrapper and stage1 executable must be explicitly
+present and executable.
 
 ## Capability matrix
 
 | Capability | Current implementation | Evidence | Limitation |
 | --- | --- | --- | --- |
 | argv, stdout, stderr | Elisa wrappers | `scripts/test.sh` | Output streaming is intentionally small |
-| regular file read/write | Elisa plus reviewed C seam | C analyzer and regression suite | Shared hostile directories need handle-based mutation |
-| no-follow source read | `openat`/`O_NOFOLLOW` C seam | native regression fixture | Explicit `..` path dependencies remain user-owned inputs |
-| sorted regular-file walk | `nftw(FTW_PHYS)` seam | package reproducibility tests | Extraction accepts regular files and creates only parent directories |
+| regular file read/write | Elisa plus direct libc FFI | Elisa probe and regression suite | Shared hostile directories need handle-based mutation |
+| no-follow source read | `openat`/`O_NOFOLLOW` through the private Elisa platform module | Elisa platform probe | Explicit `..` path dependencies remain user-owned inputs |
+| sorted regular-file walk | bounded `opendir`/`readdir` traversal through the private Elisa platform module | package reproducibility tests | Extraction accepts regular files and creates only parent directories |
 | atomic file replacement | `mkstemp` + `fsync` + rename | lockfile fixtures | Directory fsync is platform-dependent |
 | exclusive publication | hard-link from fsynced temp | install fixtures | Prefix lock is a mkdir lock, not a kernel lease |
 | process execution | argv array through `env -i`, private process groups, monotonic deadlines, and resource profiles | compiler environment fixture and native timeout seam | No OS sandbox; signalled child processes return 130 |

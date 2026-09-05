@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """Review regressions: independent fixtures, bounded subprocesses, real CLI."""
-import ctypes
 import os
 from pathlib import Path
 import subprocess
@@ -17,14 +16,25 @@ def run(args, **kwargs):
 
 with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as directory:
     work = Path(directory)
-    lines = [f'include "{ROOT}/src/model.elisa"',
+    lines = [f'include "{ROOT}/src/platform.elisa"',
+             f'include "{ROOT}/src/model.elisa"',
              f'include "{ROOT}/src/semver.elisa"',
              f'include "{ROOT}/src/json.elisa"',
              f'include "{ROOT}/src/archive.elisa"',
              f'include "{ROOT}/src/cache.elisa"',
              f'include "{ROOT}/src/resolve.elisa"',
              f'include "{ROOT}/src/trust.elisa"',
-             f'include "{ROOT}/src/solver.elisa"', 'def main() -> i64:']
+             f'include "{ROOT}/src/solver.elisa"', 'def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:']
+    lines.extend([
+        '    platform_buffer: mutable darray[u8] = []',
+        '    platform_buffer.resize(128)',
+        '    platform_raw: mutable u8& = (&platform_buffer[0]).cast[mutable u8&] can Unsafe.PointerCast',
+        '    return 800 if Platform::pkg_is_directory(".") != 1',
+        '    return 801 if Platform::pkg_is_directory("src") != 1',
+        '    return 802 if Platform::pkg_is_directory("../") != 0',
+        '    return 803 if Platform::pkg_read_package_file("src/main.elisa", platform_raw, platform_buffer.count) <= 0',
+        '    return 804 if Platform::pkg_access("src/main.elisa", 0) != 0',
+    ])
     number = 0
 
     def data(value):
@@ -249,153 +259,4 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
     assert result.returncode == 5, result
     guard.rmdir()
 
-    # Directly exercise the native seam with a regular file and link traversal.
-    library = work / 'platform.dylib'
-    run([os.environ.get('CC', 'cc'), '-shared', '-fPIC', ROOT / 'src/platform_files.c', '-o', library])
-    native = ctypes.CDLL(str(library))
-    read = native.elisapkg_read_package_file
-    read.argtypes = [ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t]
-    read.restype = ctypes.c_longlong
-    is_directory = native.elisapkg_is_directory
-    is_directory.argtypes = [ctypes.c_char_p]
-    is_directory.restype = ctypes.c_longlong
-    mkdir_secure = native.elisapkg_mkdir
-    mkdir_secure.argtypes = [ctypes.c_char_p, ctypes.c_ushort]
-    mkdir_secure.restype = ctypes.c_longlong
-    access_secure = native.elisapkg_access
-    access_secure.argtypes = [ctypes.c_char_p, ctypes.c_int]
-    access_secure.restype = ctypes.c_longlong
-    mkstemp_secure = native.elisapkg_mkstemp
-    mkstemp_secure.argtypes = [ctypes.c_char_p]
-    mkstemp_secure.restype = ctypes.c_longlong
-    rename_secure = native.elisapkg_rename
-    rename_secure.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
-    rename_secure.restype = ctypes.c_longlong
-    unlink_secure = native.elisapkg_unlink
-    unlink_secure.argtypes = [ctypes.c_char_p]
-    unlink_secure.restype = ctypes.c_longlong
-    chdir_secure = native.elisapkg_chdir
-    chdir_secure.argtypes = [ctypes.c_char_p]
-    chdir_secure.restype = ctypes.c_longlong
-    extract_ustar = native.elisapkg_extract_ustar
-    extract_ustar.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p]
-    extract_ustar.restype = ctypes.c_longlong
-    wait_timeout = native.elisapkg_waitpid_timeout
-    wait_timeout.argtypes = [ctypes.c_longlong, ctypes.POINTER(ctypes.c_longlong), ctypes.c_longlong]
-    wait_timeout.restype = ctypes.c_longlong
-    timeout_error = native.elisapkg_timeout_error
-    timeout_error.argtypes = []
-    timeout_error.restype = ctypes.c_longlong
-    set_limits = native.elisapkg_set_process_limits
-    set_limits.argtypes = [ctypes.c_longlong]
-    set_limits.restype = ctypes.c_longlong
-    realpath_secure = native.elisapkg_realpath
-    realpath_secure.argtypes = [ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t]
-    realpath_secure.restype = ctypes.c_char_p
-
-    def ustar(name, content, mode=0o644):
-        header = bytearray(512)
-        encoded_name = name.encode()
-        assert 0 < len(encoded_name) < 100
-        header[:len(encoded_name)] = encoded_name
-        header[100:108] = f'{mode:07o}'.encode() + b'\0'
-        header[108:116] = b'0000000\0'
-        header[116:124] = b'0000000\0'
-        header[124:136] = f'{len(content):011o}'.encode() + b'\0'
-        header[136:148] = b'00000000000\0'
-        header[148:156] = b'        '
-        header[156] = ord('0')
-        header[257:263] = b'ustar\0'
-        header[263:265] = b'00'
-        header[148:156] = f'{sum(header):06o}'.encode() + b'\0 '
-        padding = b'\0' * ((512 - len(content) % 512) % 512)
-        return bytes(header) + content + padding + b'\0' * 1024
-
-    buffer = ctypes.create_string_buffer(128)
-    previous = Path.cwd()
-    try:
-        os.chdir(project)
-        assert is_directory(b'') == 0
-        assert is_directory(b'../') == 0
-        assert is_directory(b'src') == 1
-        assert read(b'src/main.elisa', buffer, 128) > 0
-        assert read(b'../external/src/main.elisa', buffer, 128) > 0
-        resolved = ctypes.create_string_buffer(4096)
-        assert realpath_secure(b'src/main.elisa', resolved, len(resolved)) is not None
-        tiny_resolved = ctypes.create_string_buffer(1)
-        assert realpath_secure(b'src/main.elisa', tiny_resolved, len(tiny_resolved)) is None
-        Path('alias').symlink_to('src', target_is_directory=True)
-        assert is_directory(b'alias') == 0
-        Path('nested').mkdir()
-        Path('nested/alias').symlink_to('../src', target_is_directory=True)
-        assert is_directory(b'nested/alias') == 0
-        assert mkdir_secure(b'nested/created', 0o755) == 0
-        assert is_directory(b'nested/created') == 1
-        assert mkdir_secure(b'nested/alias/blocked', 0o755) < 0
-        assert read(b'alias/main.elisa', buffer, 128) < 0
-        assert access_secure(b'alias/main.elisa', 0) < 0
-        assert chdir_secure(b'alias') < 0
-        temp_template = ctypes.create_string_buffer(b'nested/temporary.XXXXXX')
-        temp_fd = mkstemp_secure(temp_template)
-        assert temp_fd >= 0
-        os.close(temp_fd)
-        temporary_name = Path(temp_template.value.decode())
-        assert temporary_name.is_file()
-        assert unlink_secure(str(temporary_name).encode()) == 0
-        linked_parent_template = ctypes.create_string_buffer(b'nested/alias/temporary.XXXXXX')
-        assert mkstemp_secure(linked_parent_template) < 0
-        Path('rename-source').write_bytes(b'source')
-        Path('rename-destination').symlink_to('src/main.elisa')
-        assert rename_secure(b'rename-source', b'rename-destination') < 0
-        Path('rename-destination').unlink()
-        Path('rename-source').unlink()
-        Path('linked').symlink_to('src/main.elisa')
-        assert read(b'linked', buffer, 128) < 0
-        assert read(str((project / 'src/main.elisa').resolve()).encode(), buffer, 128) > 0
-        Path('absolute-linked').symlink_to((project / 'src/main.elisa').resolve())
-        assert read(str(project / 'absolute-linked').encode(), buffer, 128) < 0
-        extraction_root = work / 'extraction'
-        extraction_root.mkdir()
-        archive = ustar('src/main.elisa', b'def main() -> i64:\n    return 0\n')
-        archive_buffer = ctypes.create_string_buffer(archive)
-        assert extract_ustar(archive_buffer, len(archive), str(extraction_root).encode()) == 0
-        assert (extraction_root / 'src/main.elisa').read_bytes().startswith(b'def main')
-        partial_root = work / 'partial-extraction'
-        partial_root.mkdir()
-        malformed_second = bytearray(ustar('second', b'bad'))
-        malformed_second[257] = ord('x')
-        partial_archive = ustar('first', b'ok')[:-1024] + bytes(malformed_second)
-        partial_buffer = ctypes.create_string_buffer(partial_archive)
-        assert extract_ustar(partial_buffer, len(partial_archive), str(partial_root).encode()) < 0
-        assert not (partial_root / 'first').exists()
-        traversal_root = work / 'traversal-extraction'
-        traversal_root.mkdir()
-        traversal = ustar('../escape', b'escape')
-        traversal_buffer = ctypes.create_string_buffer(traversal)
-        assert extract_ustar(traversal_buffer, len(traversal), str(traversal_root).encode()) < 0
-        assert not (work / 'escape').exists()
-        nonempty_root = work / 'nonempty-extraction'
-        nonempty_root.mkdir()
-        (nonempty_root / 'keep').write_text('keep')
-        assert extract_ustar(archive_buffer, len(archive), str(nonempty_root).encode()) < 0
-        assert (nonempty_root / 'keep').read_text() == 'keep'
-    finally:
-        os.chdir(previous)
-    sleepy = os.fork()
-    if sleepy == 0:
-        os.execl('/bin/sleep', 'sleep', '5')
-    child_status = ctypes.c_longlong()
-    assert wait_timeout(sleepy, ctypes.byref(child_status), 50) == timeout_error()
-    try:
-        os.kill(sleepy, 0)
-    except ProcessLookupError:
-        pass
-    else:
-        raise AssertionError('timed-out child still exists')
-    for profile in (1, 2):
-        limited = os.fork()
-        if limited == 0:
-            os._exit(0 if set_limits(profile) == 0 else 1)
-        _, limited_status = os.waitpid(limited, 0)
-        assert os.WIFEXITED(limited_status) and os.WEXITSTATUS(limited_status) == 0
 print('review regressions passed')

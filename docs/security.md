@@ -75,8 +75,9 @@ PAX/GNU extensions and compression are not accepted. Before the archive is
 written, a second parser verifies its magic, octal fields, checksum, regular
 file mode, case-folded duplicate names, data padding, zeroed extension fields,
 and exactly two zero end blocks. The `Archive` staged extractor repeats the
-same restrictions in the native seam, requires an empty destination, creates
-parent directories with `openat`/`mkdirat` and `O_NOFOLLOW`, and publishes each
+same restrictions in the private Elisa platform module, requires an empty
+destination, creates parent directories with `openat`/`mkdirat` and
+`O_NOFOLLOW` through FFI, and publishes each
 regular file with `O_EXCL` plus `fsync`; it removes files it created if
 extraction fails. Remote publication still requires signed metadata and
 publisher authorization.
