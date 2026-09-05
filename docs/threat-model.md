@@ -7,7 +7,7 @@ Git data, cache records, and compiler diagnostics as hostile input.
 | Asset | Attacker capability | Required property | Current defense | Remaining gate |
 | --- | --- | --- | --- | --- |
 | package identity and version | registry/CDN replacement | authenticated name, registry, version binding | remote operations disabled | signed metadata and delegation |
-| source archive bytes | mirror or cache poisoning | exact digest and safe extraction | deterministic writer and verifier; no remote fetch | verified source store |
+| source archive bytes | mirror or cache poisoning | exact digest and safe extraction | deterministic writer/verifier plus no-follow staged extraction; no remote fetch | verified source store |
 | trusted metadata state | replay/freeze/rollback | expiry and monotonic version checks | precheck contracts only | persistent signed trust state |
 | project manifest/lock pair | crash or concurrent editor | recoverable consistent mutation | journaled local edits | bounded mutation lock and kill-point matrix |
 | credentials | malicious package/compiler/log path | scoped storage and redaction | scrubbed compiler environment; remote disabled | credential-store adapter and redirect tests |

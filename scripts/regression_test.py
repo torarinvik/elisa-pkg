@@ -255,6 +255,28 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
     chdir_secure = native.elisapkg_chdir
     chdir_secure.argtypes = [ctypes.c_char_p]
     chdir_secure.restype = ctypes.c_longlong
+    extract_ustar = native.elisapkg_extract_ustar
+    extract_ustar.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p]
+    extract_ustar.restype = ctypes.c_longlong
+
+    def ustar(name, content, mode=0o644):
+        header = bytearray(512)
+        encoded_name = name.encode()
+        assert 0 < len(encoded_name) < 100
+        header[:len(encoded_name)] = encoded_name
+        header[100:108] = f'{mode:07o}'.encode() + b'\0'
+        header[108:116] = b'0000000\0'
+        header[116:124] = b'0000000\0'
+        header[124:136] = f'{len(content):011o}'.encode() + b'\0'
+        header[136:148] = b'00000000000\0'
+        header[148:156] = b'        '
+        header[156] = ord('0')
+        header[257:263] = b'ustar\0'
+        header[263:265] = b'00'
+        header[148:156] = f'{sum(header):06o}'.encode() + b'\0 '
+        padding = b'\0' * ((512 - len(content) % 512) % 512)
+        return bytes(header) + content + padding + b'\0' * 1024
+
     buffer = ctypes.create_string_buffer(128)
     previous = Path.cwd()
     try:
@@ -294,6 +316,23 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
         assert read(str((project / 'src/main.elisa').resolve()).encode(), buffer, 128) > 0
         Path('absolute-linked').symlink_to((project / 'src/main.elisa').resolve())
         assert read(str(project / 'absolute-linked').encode(), buffer, 128) < 0
+        extraction_root = work / 'extraction'
+        extraction_root.mkdir()
+        archive = ustar('src/main.elisa', b'def main() -> i64:\n    return 0\n')
+        archive_buffer = ctypes.create_string_buffer(archive)
+        assert extract_ustar(archive_buffer, len(archive), str(extraction_root).encode()) == 0
+        assert (extraction_root / 'src/main.elisa').read_bytes().startswith(b'def main')
+        traversal_root = work / 'traversal-extraction'
+        traversal_root.mkdir()
+        traversal = ustar('../escape', b'escape')
+        traversal_buffer = ctypes.create_string_buffer(traversal)
+        assert extract_ustar(traversal_buffer, len(traversal), str(traversal_root).encode()) < 0
+        assert not (work / 'escape').exists()
+        nonempty_root = work / 'nonempty-extraction'
+        nonempty_root.mkdir()
+        (nonempty_root / 'keep').write_text('keep')
+        assert extract_ustar(archive_buffer, len(archive), str(nonempty_root).encode()) < 0
+        assert (nonempty_root / 'keep').read_text() == 'keep'
     finally:
         os.chdir(previous)
 print('review regressions passed')

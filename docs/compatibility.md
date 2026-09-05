@@ -28,7 +28,7 @@ explicitly present and executable.
 | argv, stdout, stderr | Elisa wrappers | `scripts/test.sh` | Output streaming is intentionally small |
 | regular file read/write | Elisa plus reviewed C seam | C analyzer and regression suite | Shared hostile directories need handle-based mutation |
 | no-follow source read | `openat`/`O_NOFOLLOW` C seam | native regression fixture | Explicit `..` path dependencies remain user-owned inputs |
-| sorted regular-file walk | `nftw(FTW_PHYS)` seam | package reproducibility tests | No extraction support yet |
+| sorted regular-file walk | `nftw(FTW_PHYS)` seam | package reproducibility tests | Extraction accepts regular files and creates only parent directories |
 | atomic file replacement | `mkstemp` + `fsync` + rename | lockfile fixtures | Directory fsync is platform-dependent |
 | exclusive publication | hard-link from fsynced temp | install fixtures | Prefix lock is a mkdir lock, not a kernel lease |
 | process execution | argv array through `env -i` | compiler environment fixture | No OS sandbox or process-tree cancellation; signalled child processes return 130 |
@@ -38,7 +38,7 @@ explicitly present and executable.
 | deterministic graph solver | bounded in-memory backtracking module | solver fixture in `scripts/regression_test.py` | CLI still resolves local paths through its existing graph walker |
 | TLS, registry transport | disabled | fail-closed command tests | Requires reviewed transport adapter |
 | signed metadata | disabled | fail-closed trust policy | Requires protocol/provider review and trust-state persistence |
-| archive extraction | disabled | deterministic writer/verifier and package receipts | Safe staging primitives are still a milestone |
+| archive extraction | staged primitive only | descriptor-relative no-follow ustar extraction with exclusive regular-file creation | Remote acquisition remains disabled; callers must provide a private empty staging directory |
 
 Unsupported hosts and missing capabilities must produce an actionable error;
 they must not silently fall back to an unreviewed shell or network path.

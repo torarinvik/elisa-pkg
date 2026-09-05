@@ -23,7 +23,11 @@ Controlled local dependency reads may use normalized `..` path segments so
 sibling packages remain supported; target and state paths are validated before
 they reach this seam.
 
-Archive extraction is a separate boundary. The accepted subset is regular files and directories only, with bounded compressed and expanded sizes, no links/devices/special modes, no absolute or traversal paths, no duplicate or case-colliding names, private staging, and atomic publication into a verified content store. Cache pathnames and receipts are never treated as proof of verification.
+Archive extraction is a separate boundary. The accepted subset is regular files
+with parent directories created by the extractor, bounded archive and file
+sizes, no links/devices/special modes, no absolute or traversal paths, no
+duplicate or case-colliding names, and a private empty staging directory. Cache
+pathnames and receipts are never treated as proof of verification.
 
 Manifest bytes must be valid UTF-8 before field interpretation. The local
 target validator rejects absolute, parent, dot-prefixed, and
@@ -53,8 +57,12 @@ state/VCS directories, and credential-like filenames before reading bytes;
 PAX/GNU extensions and compression are not accepted. Before the archive is
 written, a second parser verifies its magic, octal fields, checksum, regular
 file mode, case-folded duplicate names, data padding, zeroed extension fields,
-and exactly two zero end blocks. Remote publication still requires signed
-metadata and publisher authorization.
+and exactly two zero end blocks. The `Archive` staged extractor repeats the
+same restrictions in the native seam, requires an empty destination, creates
+parent directories with `openat`/`mkdirat` and `O_NOFOLLOW`, and publishes each
+regular file with `O_EXCL` plus `fsync`; it removes files it created if
+extraction fails. Remote publication still requires signed metadata and
+publisher authorization.
 
 `cache verify` treats `.elisapkg/package.tar` and `.elisapkg/package.receipt` as
 an all-or-nothing pair. The receipt records the package identity, manifest

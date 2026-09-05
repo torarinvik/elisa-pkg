@@ -10,7 +10,7 @@ The current source units are:
 | `Model` | `Version` and `CommandOptions` value contracts | Schema-policy constants and future normalized records | No handles, credentials, or unverified source bytes cross the model API. |
 | `Trust` | Verification result codes, policy contract, diagnostics, and metadata prechecks | Protocol/provider selection and private comparison helpers | Prechecks cover expiry, rollback, namespace, and algorithm policy; only a reviewed provider may return authenticated trust. |
 | `Security` | Fail-closed statuses and user-facing denial messages | Trust-protocol selection state | Remote operations cannot become enabled by a URL, flag, or lockfile alone. |
-| `Archive` | Safe relative-entry policy and deterministic ustar headers | Path-segment checks and fixed tar metadata | Packaging and future extraction must use the same traversal guard; long-name extensions remain disabled. |
+| `Archive` | Safe relative-entry policy, deterministic ustar headers, and staged extraction contract | Path-segment checks, fixed tar metadata, and no-follow file creation | Remote acquisition is still disabled; long-name extensions remain disabled. |
 | `Manifest` | Manifest entry-path policy | Schema/path policy marker | Target paths are checked through `Archive`; parser state remains private to validation. |
 | `Json` | Bounded duplicate-key rejection for JSON objects | Lexical cursors and seen-key tables | It rejects ambiguity at the byte boundary; callers still own schema and type validation. |
 | `SemVer` | Version precedence and initial range matching | Requirement parser helpers and grammar constants | Resolver code receives parsed bounds instead of interpreting range text itself. |
