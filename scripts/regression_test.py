@@ -81,6 +81,11 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
     check('Trust::precheck_threshold(1, 2) == Trust::VerificationCode.ThresholdInsufficient')
     check('Trust::precheck_revocation(true) == Trust::VerificationCode.RevokedKey')
     check('Trust::precheck_clock(9, 8) == Trust::VerificationCode.ClockRollback')
+    trust_key = data('k' * 32)
+    trust_signature = data('s' * 64)
+    check(f'Trust::precheck_key_material("ed25519", {trust_key}, {trust_signature}) == Trust::VerificationCode.Valid')
+    check(f'Trust::precheck_key_material("ed25519", {data("short")}, {trust_signature}) == Trust::VerificationCode.MalformedKey')
+    check(f'Trust::precheck_key_material("ed25519", {trust_key}, {data("short")}) == Trust::VerificationCode.MalformedSignature')
     cache_digest = data('a' * 64)
     cache_path: str = 'cache_path'
     lines.append(f'    {cache_path}: mutable darray[u8] = []')
