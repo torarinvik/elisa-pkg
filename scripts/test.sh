@@ -112,6 +112,11 @@ mkdir -p "$CASE"
   mv elisapkg.lock.good elisapkg.lock
   "$BIN" build >/dev/null
   "$BIN" build --frozen >/dev/null
+  printf '%s\n' 'def main() -> i64:' '    return 0' > src/alternate.elisa
+  cp elisapkg.json elisapkg.target.good
+  sed 's#src/main.elisa#src/alternate.elisa#' elisapkg.target.good > elisapkg.json
+  "$BIN" build >/dev/null
+  mv elisapkg.target.good elisapkg.json
   "$BIN" run -- >/dev/null
   "$BIN" package --list >/dev/null
   PROBE="$CASE/compiler-env-probe.sh"
