@@ -31,7 +31,7 @@ explicitly present and executable.
 | sorted regular-file walk | `nftw(FTW_PHYS)` seam | package reproducibility tests | No extraction support yet |
 | atomic file replacement | `mkstemp` + `fsync` + rename | lockfile fixtures | Directory fsync is platform-dependent |
 | exclusive publication | hard-link from fsynced temp | install fixtures | Prefix lock is a mkdir lock, not a kernel lease |
-| process execution | argv array through `env -i` | compiler environment fixture | No OS sandbox or process-tree cancellation yet |
+| process execution | argv array through `env -i` | compiler environment fixture | No OS sandbox or process-tree cancellation; signalled child processes return 130 |
 | semantic checking | mandatory stage1 gate | invalid-source fixture | Supported toolchain must still be pinned for release |
 | SHA-256 | in-language implementation | FIPS known-answer fixture | Digest is not publisher authentication |
 | JSON grammar | bounded iterative validator | manifest and regression fixtures | No decoded value tree or source locations |
