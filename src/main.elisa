@@ -181,14 +181,21 @@ def read_package_file_into(path: darray[u8]&, out: mutable darray[u8]&) -> bool 
     return true
 
 def read_cstr_into(path_name: cstr, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    return false if out.count == 0.usize()
     stream: mutable heap void&? = Platform::pkg_fopen(path_name, O_READ)
     if stream is open_stream:
         out_raw: mutable void& = (&out[0]).cast[mutable void&] can Unsafe.PointerCast
         got: usize = Platform::pkg_fread(out_raw, 1, out.count, open_stream)
+        oversized: mutable bool = false
+        if got == out.count:
+            probe: mutable darray[u8] = []
+            probe.resize(1)
+            probe_raw: mutable void& = (&probe[0]).cast[mutable void&] can Unsafe.PointerCast
+            oversized <- Platform::pkg_fread(probe_raw, 1, 1, open_stream) > 0.usize()
         failed: bool = Platform::pkg_ferror(open_stream) != 0
         out.resize(got)
         _ = Platform::pkg_fclose(open_stream)
-        return not failed
+        return not failed and not oversized
     return false
 
 def write_fd_all(fd: i64, value: darray[u8]&) -> bool can[Unsafe.PointerCast, Console.Write]:
@@ -2357,6 +2364,10 @@ def run_build(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Con
     manifest_raw: mutable darray[u8] = []
     manifest_raw.resize(1048577)
     return EXIT_BUILD if not read_cstr_into("elisapkg.json", &manifest_raw)
+    manifest_digest_bytes: mutable darray[u8] = []
+    manifest_digest: mutable darray[u8] = []
+    return EXIT_BUILD if Integrity::sha256(manifest_raw, &manifest_digest_bytes) != Integrity::DigestCode.Ok
+    return EXIT_BUILD if not Integrity::hex_digest(manifest_digest_bytes, &manifest_digest)
     target_entry: mutable darray[u8] = []
     return EXIT_BUILD if not first_target_entry(manifest_raw, &target_entry)
     target_entry_c: mutable darray[u8] = []
@@ -2405,10 +2416,12 @@ def run_build(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Con
     if Platform::pkg_getenv("ELISA_ALLOW_STALE_STAGE1") is configured_stale:
         allow_stale <- configured_stale.cast[cstr]
     receipt: mutable darray[u8] = []
-    bytes_push_view(&receipt, "elisapkg-build-receipt:1\nentry:")
+    bytes_push_view(&receipt, "elisapkg-build-receipt:2\nentry:")
     bytes_push_array(&receipt, target_entry)
     bytes_push_view(&receipt, "\nsource-digest:sha256:")
     bytes_push_array(&receipt, source_digest)
+    bytes_push_view(&receipt, "\nmanifest-digest:sha256:")
+    bytes_push_array(&receipt, manifest_digest)
     bytes_push_view(&receipt, "\ncompiler:")
     bytes_push_cstr(&receipt, compiler)
     bytes_push_view(&receipt, "\nstage1-bin:")
@@ -2424,7 +2437,24 @@ def run_build(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Con
     path_with_nul_into(&receipt_path, &receipt_c)
     artifact_name: cstr = (&artifact_c[0]).cast[cstr] can Unsafe.PointerCast
     receipt_name: cstr = (&receipt_c[0]).cast[cstr] can Unsafe.PointerCast
-    # Receipt v1 omits included sources and compiler contents. Recompile until
+    if cstr_file_exists(artifact_name) and cstr_file_exists(receipt_name):
+        cached_artifact: mutable darray[u8] = []
+        cached_receipt: mutable darray[u8] = []
+        cached_receipt.resize(4096)
+        if read_package_file_into(&artifact, &cached_artifact) and read_cstr_into(receipt_name, &cached_receipt):
+            cached_digest_bytes: mutable darray[u8] = []
+            cached_digest: mutable darray[u8] = []
+            if Integrity::sha256(cached_artifact, &cached_digest_bytes) == Integrity::DigestCode.Ok and Integrity::hex_digest(cached_digest_bytes, &cached_digest):
+                expected_receipt: mutable darray[u8] = []
+                bytes_push_array(&expected_receipt, receipt)
+                bytes_push_view(&expected_receipt, "\nartifact-digest:sha256:")
+                bytes_push_array(&expected_receipt, cached_digest)
+                bytes_push_view(&expected_receipt, "\n")
+                if bytes_equal(cached_receipt, expected_receipt):
+                    write_ok("built .elisapkg/build/app (cached)\n")
+                    _ = options
+                    return EXIT_OK
+    # Receipt v2 still omits included sources and compiler contents. Recompile until
     # every effective input can be fingerprinted without accepting stale code.
     # mkstemp keeps the compiler output path exclusive for the whole child
     # process, preventing a predictable temporary symlink from redirecting the

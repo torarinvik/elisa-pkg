@@ -55,8 +55,10 @@ in `scripts/regression_test.py`.
 
 ## D-007: build reuse
 
-Receipt version 1 does not fingerprint included sources or complete compiler
-contents, so builds recompile until a complete build key exists. A failed child
+Receipt version 2 fingerprints the selected target source, manifest bytes,
+compiler configuration, and output artifact. A matching receipt and verified
+artifact may be reused; included non-target sources and complete compiler
+contents remain outside the key and require a future expansion. A failed child
 or invalid output never replaces the last known-good artifact. Fixture:
 compiler-failure and artifact-preservation cases in the regression suite.
 
