@@ -128,6 +128,8 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
         assert result.returncode == 2, (command, result)
     result = subprocess.run([BIN, 'update', 'missing'], cwd=project, capture_output=True, timeout=120)
     assert result.returncode == 3, result
+    result = subprocess.run([BIN, 'test'], cwd=project, capture_output=True, timeout=120)
+    assert result.returncode == 2, result
     lock = project / 'elisapkg.lock'
     before = lock.stat()
     run([BIN, 'resolve', '--frozen'], cwd=project, stdout=subprocess.DEVNULL)
