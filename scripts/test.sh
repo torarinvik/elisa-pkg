@@ -183,6 +183,27 @@ PY
   mv src/main.elisa.good src/main.elisa
   "$BIN" run -- >/dev/null
   "$BIN" package --list >/dev/null
+  "$BIN" package >/dev/null
+  cp .elisapkg/package.tar .elisapkg/package.tar.good
+  "$BIN" package >/dev/null
+  cmp .elisapkg/package.tar.good .elisapkg/package.tar >/dev/null
+  tar -tf .elisapkg/package.tar | grep -F 'elisapkg.json' >/dev/null
+  if tar -tf .elisapkg/package.tar | grep -E 'IMPLEMENTATION_PLAN|\.elisapkg/|\.env|\.pem|\.key' >/dev/null; then
+    echo "package archive included a forbidden path" >&2
+    exit 1
+  fi
+  printf '%s' secret > src/.env
+  printf '%s' secret > src/private.pem
+  "$BIN" package >/dev/null
+  if tar -tf .elisapkg/package.tar | grep -E 'src/\.env|src/private\.pem' >/dev/null; then
+    echo "package archive included a credential-like file" >&2
+    exit 1
+  fi
+  python3 - <<'PY'
+from pathlib import Path
+for name in ("src/.env", "src/private.pem"):
+    Path(name).unlink()
+PY
   PREFIX="$CASE/local-prefix"
   ELISAPKG_INSTALL_PREFIX="$PREFIX" "$BIN" install --local >/dev/null
   test -x "$PREFIX/bin/app"
@@ -240,12 +261,8 @@ PY
   "$BIN" tree | grep -F 'app 0.1.0' >/dev/null
   "$BIN" tree | grep -F 'local-util 1.2.3' >/dev/null
   "$BIN" why local-util | grep -F 'app -> local-util' >/dev/null
-  if "$BIN" package >/dev/null 2>&1; then
-    echo "archive creation unexpectedly bypassed its release gate" >&2
-    exit 1
-  else
-    test "$?" -eq 7
-  fi
+  "$BIN" package >/dev/null
+  test -s .elisapkg/package.tar
   "$BIN" update local-util >/dev/null
   if "$BIN" add local-util --path local-util >/dev/null 2>&1; then
     echo "duplicate dependency was accepted" >&2

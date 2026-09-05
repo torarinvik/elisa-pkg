@@ -7,6 +7,7 @@ module Archive:
         def is_safe_entry(entry: darray[u8]&) -> bool:
             return false if entry.count == 0.usize() or entry.count > 4096.usize()
             return false if entry[0] == 47 or entry[0] == 92
+            return false if entry.count >= 2.usize() and entry[1] == 58
             return false if entry.count == 1.usize() and entry[0] == 46
             return false if entry.count >= 2.usize() and entry[0] == 46 and entry[1] == 47
             return false if contains_backslash(entry)
@@ -16,7 +17,50 @@ module Archive:
             return false if entry.count >= 2.usize() and entry[entry.count - 2.usize()] == 47 and entry[entry.count - 1.usize()] == 46
             return true
 
+        # ustar's name field is intentionally bounded. Long-name/PAX/GNU
+        # extensions are rejected until their canonical semantics have a
+        # dedicated parser and test corpus.
+        def tar_file_header(entry: darray[u8]&, size: usize) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
+            return [] if not is_safe_entry(entry) or entry.count > 100.usize()
+            header: mutable darray[u8] = []
+            header.resize(512)
+            for index in 0..<entry.count |header, entry|:
+                header[index] <- entry[index]
+            write_octal(&header, 100, 420, 8)
+            write_octal(&header, 108, 0, 8)
+            write_octal(&header, 116, 0, 8)
+            write_octal(&header, 124, size, 12)
+            write_octal(&header, 136, 0, 12)
+            for index in 148..<156 |header|:
+                header[index] <- 32
+            header[156] <- 48
+            header[257] <- 117
+            header[258] <- 115
+            header[259] <- 116
+            header[260] <- 97
+            header[261] <- 114
+            header[262] <- 0
+            header[263] <- 48
+            header[264] <- 48
+            checksum: mutable usize = 0.usize()
+            for index in 0..<512 |header, checksum|:
+                checksum <- checksum + header[index].usize()
+            write_octal(&header, 148, checksum, 7)
+            header[154] <- 0
+            header[155] <- 32
+            return header
+
     private:
+        def write_octal(header: mutable darray[u8]&, offset: usize, value: usize, width: usize) -> void:
+            return if width == 0.usize()
+            divisor: mutable usize = 1.usize()
+            for _step in 1..<(width - 1.usize()) |divisor|:
+                divisor <- divisor * 8.usize()
+            for step in 0..<(width - 1.usize()) |header, offset, width, value, divisor, step|:
+                header[offset + step] <- 48 + ((value / divisor) % 8.usize()).u8()
+                divisor <- divisor / 8.usize() if divisor > 1.usize()
+            header[offset + width - 1.usize()] <- 0
+
         def contains_backslash(entry: darray[u8]&) -> bool:
             for index in 0..<entry.count |entry|:
                 return true if entry[index] == 92

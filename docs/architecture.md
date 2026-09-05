@@ -10,7 +10,7 @@ The current source units are:
 | `Model` | `Version` and `CommandOptions` value contracts | Schema-policy constants and future normalized records | No handles, credentials, or unverified source bytes cross the model API. |
 | `Trust` | Verification result codes, policy contract, and diagnostics | Protocol/provider selection | A valid digest or TLS session cannot bypass signed metadata and publisher authorization. |
 | `Security` | Fail-closed statuses and user-facing denial messages | Trust-protocol selection state | Remote operations cannot become enabled by a URL, flag, or lockfile alone. |
-| `Archive` | Shared safe relative-entry policy | Path-segment checks | Future archive extraction and packaging must use the same traversal guard. |
+| `Archive` | Safe relative-entry policy and deterministic ustar headers | Path-segment checks and fixed tar metadata | Packaging and future extraction must use the same traversal guard; long-name extensions remain disabled. |
 | `Manifest` | Manifest entry-path policy | Schema/path policy marker | Target paths are checked through `Archive`; parser state remains private to validation. |
 | `Json` | Bounded duplicate-key rejection for JSON objects | Lexical cursors and seen-key tables | It rejects ambiguity at the byte boundary; callers still own schema and type validation. |
 | `SemVer` | Version precedence and initial range matching | Requirement parser helpers and grammar constants | Resolver code receives parsed bounds instead of interpreting range text itself. |
@@ -24,6 +24,12 @@ the command layer, but delegates digesting and filesystem publication to the
 same platform and integrity primitives used by builds. Its receipt is treated
 as an ownership claim only after the executable bytes, package name, and exact
 destination match; remote installation remains behind `Security` and `Trust`.
+
+The package writer asks `Platform` for a sorted, regular-file-only directory
+walk, then applies manifest include patterns and the `Archive` path policy in
+Elisa before reading bytes. The native seam performs no archive selection or
+serialization, which keeps filesystem traversal separate from the public
+archive format and makes the byte stream suitable for later signing.
 
 Future implementation modules should follow the same pattern:
 

@@ -33,6 +33,12 @@ destinations, records the artifact SHA-256 digest, and only uninstalls when the
 receipt, package name, path, and current bytes all match. A changed executable
 or receipt is left in place for manual recovery.
 
+The local package writer emits only regular files in sorted ustar order with
+zero timestamps and normalized ownership. It rejects unsafe or overlong names,
+state/VCS directories, and credential-like filenames before reading bytes;
+PAX/GNU extensions and compression are not accepted, and remote publication
+still requires signed metadata and publisher authorization.
+
 `cache gc --dry-run` does not delete anything. Actual cache collection remains
 disabled until it can mark live lock, lease, and installation references and
 recheck them before unlinking immutable entries.
