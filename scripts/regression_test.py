@@ -126,6 +126,8 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
     for command in [['resolve', 'unexpected'], ['check-manifest', 'unexpected']]:
         result = subprocess.run([BIN, *command], cwd=project, capture_output=True, timeout=120)
         assert result.returncode == 2, (command, result)
+    result = subprocess.run([BIN, 'update', 'missing'], cwd=project, capture_output=True, timeout=120)
+    assert result.returncode == 3, result
     lock = project / 'elisapkg.lock'
     before = lock.stat()
     run([BIN, 'resolve', '--frozen'], cwd=project, stdout=subprocess.DEVNULL)
