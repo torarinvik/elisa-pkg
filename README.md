@@ -41,6 +41,9 @@ Builds execute trusted Elisa source under the selected compiler. Dependency buil
 
 Compiler and application subprocesses receive a minimal environment through an `env -i` argv invocation. Only the selected compiler bootstrap variables (`ELISA_STAGE1_BIN`, `ELISA_RUNTIME_OBJ`, and `ELISA_ALLOW_STALE_STAGE1`) are copied when present; registry credentials and unrelated variables are excluded.
 
+Builds also force `ELISA_STAGE1_SEMANTIC_GATE=1`; a semantic-check failure is a
+build failure and cannot be replaced by successful object emission.
+
 ## Development
 
 Run the deterministic smoke suite with:

@@ -15,3 +15,7 @@ covered by FIPS known-answer tests and is used only as a content primitive;
 Build subprocesses receive no credentials and no arbitrary dependency scripts. Compile-time execution is currently trusted-source execution; sandboxing is not claimed. A security review, fuzz corpus, interruption/concurrency tests, key rotation/revocation exercise, and compromise-recovery drill are release blockers for remote support.
 
 The local executor starts compiler and application children through `/usr/bin/env -i` with a fixed PATH. It retains only the three compiler bootstrap variables needed by the self-hosting wrapper and never forwards the parent environment wholesale. This is credential minimization, not a sandbox: the selected compiler and trusted source still have the operating-system privileges of the invoking user.
+
+Every package build additionally sets `ELISA_STAGE1_SEMANTIC_GATE=1` in the
+controlled child environment. A semantic diagnostic therefore stops the build
+before an artifact can be reported as successful.

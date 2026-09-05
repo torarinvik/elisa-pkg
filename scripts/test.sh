@@ -121,6 +121,15 @@ mkdir -p "$CASE"
   sed 's#src/main.elisa#src/alternate.elisa#' elisapkg.target.good > elisapkg.json
   "$BIN" build >/dev/null
   mv elisapkg.target.good elisapkg.json
+  cp src/main.elisa src/main.elisa.good
+  printf '%s\n' 'def main() -> i64:' '    return' > src/main.elisa
+  if "$BIN" build >/dev/null 2>&1; then
+    echo "semantic-invalid source was accepted" >&2
+    exit 1
+  else
+    test "$?" -eq 6
+  fi
+  mv src/main.elisa.good src/main.elisa
   "$BIN" run -- >/dev/null
   "$BIN" package --list >/dev/null
   PROBE="$CASE/compiler-env-probe.sh"
