@@ -68,8 +68,12 @@ def check(value: darray[u8]&, expected: cstr) -> bool:
 def main() -> i64:
     empty: mutable darray[u8] = []
     abc: mutable darray[u8] = [97, 98, 99]
+    thousand: mutable darray[u8] = []
+    for _index in 0..<1000 |thousand|:
+        thousand.push(97)
     return 1 if not check(empty, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
     return 2 if not check(abc, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+    return 3 if not check(thousand, "41edece42d63e8d9bf515a9ba6932e1c20cbc9f5a5d134645adb5db1b9737ea3")
     return 0
 EOF
 ELISA_STAGE1_BIN="${ELISA_STAGE1_BIN:-$ELISA_COMPILER_ROOT/bin/elisac-stage1}" \
