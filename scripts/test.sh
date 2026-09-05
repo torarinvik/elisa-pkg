@@ -157,6 +157,14 @@ mkdir -p "$CASE"
   test -f .elisapkg/build/app
   "$BIN" clean >/dev/null
   test ! -e .elisapkg/build/app
+  mkdir -p .elisapkg
+  cp elisapkg.json .elisapkg/transaction.manifest
+  cp elisapkg.json recovered.manifest
+  printf '%s\n' 'prepared-no-lock' > .elisapkg/transaction.state
+  printf '%s\n' '{}' > elisapkg.json
+  "$BIN" check-manifest >/dev/null
+  cmp recovered.manifest elisapkg.json >/dev/null
+  test ! -e .elisapkg/transaction.state
 )
 
 BAD="$ROOT/build/invalid-package"

@@ -268,6 +268,68 @@ def remove_empty_directory(path: darray[u8]&) -> bool can[Memory.Allocate, Abort
     return true if not cstr_file_exists(path_name)
     return Platform::pkg_rmdir(path_name) == 0
 
+def remove_cstr_file(path_name: cstr) -> bool:
+    return true if not cstr_file_exists(path_name)
+    return Platform::pkg_unlink(path_name) == 0
+
+def transaction_cleanup() -> bool:
+    return false if not remove_cstr_file(".elisapkg/transaction.manifest")
+    return false if not remove_cstr_file(".elisapkg/transaction.lock")
+    return false if not remove_cstr_file(".elisapkg/transaction.state")
+    return true
+
+def transaction_begin(original_manifest: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+    return false if cstr_file_exists(".elisapkg/transaction.state")
+    return false if not write_cstr_file(".elisapkg/transaction.manifest", original_manifest)
+    state: mutable darray[u8] = []
+    if cstr_file_exists("elisapkg.lock"):
+        original_lock: mutable darray[u8] = []
+        original_lock.resize(1048577)
+        if not read_cstr_into("elisapkg.lock", &original_lock) or not write_cstr_file(".elisapkg/transaction.lock", &original_lock):
+            _ = transaction_cleanup()
+            return false
+        bytes_push_view(&state, "prepared-lock\n")
+    else:
+        bytes_push_view(&state, "prepared-no-lock\n")
+    return write_cstr_file(".elisapkg/transaction.state", &state)
+
+def transaction_mark_manifest() -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+    state: mutable darray[u8] = []
+    bytes_push_view(&state, "manifest-replaced\n")
+    return write_cstr_file(".elisapkg/transaction.state", &state)
+
+def transaction_restore() -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+    state: mutable darray[u8] = []
+    state.resize(128)
+    return false if not read_cstr_into(".elisapkg/transaction.state", &state)
+    original_manifest: mutable darray[u8] = []
+    original_manifest.resize(1048577)
+    return false if not read_cstr_into(".elisapkg/transaction.manifest", &original_manifest)
+    return false if not write_cstr_file("elisapkg.json", &original_manifest)
+    if bytes_equal_view(state, "prepared-lock\n") or bytes_equal_view(state, "manifest-replaced\n"):
+        original_lock: mutable darray[u8] = []
+        original_lock.resize(1048577)
+        return false if not read_cstr_into(".elisapkg/transaction.lock", &original_lock)
+        return false if not write_cstr_file("elisapkg.lock", &original_lock)
+    else:
+        return false if not remove_cstr_file("elisapkg.lock")
+    return transaction_cleanup()
+
+def transaction_recover() -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+    return true if not cstr_file_exists(".elisapkg/transaction.state")
+    state: mutable darray[u8] = []
+    state.resize(128)
+    return false if not read_cstr_into(".elisapkg/transaction.state", &state)
+    if bytes_equal_view(state, "complete\n"):
+        return transaction_cleanup()
+    return transaction_restore()
+
+def transaction_commit() -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+    state: mutable darray[u8] = []
+    bytes_push_view(&state, "complete\n")
+    return false if not write_cstr_file(".elisapkg/transaction.state", &state)
+    return transaction_cleanup()
+
 def safe_relative_entry(entry: darray[u8]&) -> bool:
     return Manifest::is_safe_relative_entry(entry)
 
@@ -1538,15 +1600,19 @@ def run_add(argc: i64, slots: mutable cstr&&) -> i64 can[Console.Write, Memory.A
     if updated.count == 0.usize():
         write_error("error: dependency is already declared or the manifest has no dependency object\n")
         return EXIT_RESOLVE
-    return EXIT_SOURCE if not write_cstr_file("elisapkg.json", &updated)
+    return EXIT_SECURITY if not transaction_begin(raw)
+    if not write_cstr_file("elisapkg.json", &updated) or not transaction_mark_manifest():
+        _ = transaction_restore()
+        return EXIT_SOURCE
     options: Model::CommandOptions = Model::CommandOptions{locked: false, offline: true, frozen: false, json: false, verbose: false}
     resolved: i64 = run_resolve(&root, options)
     if resolved != EXIT_OK:
-        restored: bool = write_cstr_file("elisapkg.json", &raw)
+        restored: bool = transaction_restore()
         if not restored:
             write_error("error: dependency edit failed and the original manifest could not be restored\n")
             return EXIT_SECURITY
         return resolved
+    return EXIT_SECURITY if not transaction_commit()
     write_ok("added local dependency ")
     write_bytes(1, &alias)
     write_ok(" from ")
@@ -1744,15 +1810,19 @@ def run_remove(argc: i64, slots: mutable cstr&&) -> i64 can[Console.Write, Memor
     if updated.count == 0.usize():
         write_error("error: dependency is not declared; no manifest or lockfile mutation was performed\n")
         return EXIT_RESOLVE
-    return EXIT_SOURCE if not write_cstr_file("elisapkg.json", &updated)
+    return EXIT_SECURITY if not transaction_begin(raw)
+    if not write_cstr_file("elisapkg.json", &updated) or not transaction_mark_manifest():
+        _ = transaction_restore()
+        return EXIT_SOURCE
     options: Model::CommandOptions = Model::CommandOptions{locked: false, offline: true, frozen: false, json: false, verbose: false}
     resolved: i64 = run_resolve(&root, options)
     if resolved != EXIT_OK:
-        restored: bool = write_cstr_file("elisapkg.json", &raw)
+        restored: bool = transaction_restore()
         if not restored:
             write_error("error: dependency removal failed and the original manifest could not be restored\n")
             return EXIT_SECURITY
         return resolved
+    return EXIT_SECURITY if not transaction_commit()
     write_ok("removed local dependency ")
     write_bytes(1, &alias)
     write_ok("\n")
@@ -1963,6 +2033,7 @@ def cli_main(argc: i64, argv: mutable void&) -> i64 can[Console.Write, Memory.Al
             scan_index <- scan_index + 1
     if has_manifest_path:
         return EXIT_USAGE if manifest_path.count == 0.usize() or not change_to_manifest_path(&manifest_path)
+    return EXIT_SECURITY if not transaction_recover()
     # `.` means the process working directory and keeps path operations on a
     # non-empty, well-defined byte buffer.
     start: mutable darray[u8] = [46]
