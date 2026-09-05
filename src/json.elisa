@@ -1,0 +1,65 @@
+# Bounded JSON lexical safety checks shared by manifest and lock boundaries.
+# This is intentionally a small structural pass, not a value decoder. It
+# rejects duplicate keys in every object so later field lookup cannot silently
+# choose a different meaning from another conforming JSON implementation.
+
+module Json:
+    public:
+        def unique_object_keys(raw: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            object_ids: mutable darray[usize] = []
+            seen_object_ids: mutable darray[usize] = []
+            seen_starts: mutable darray[usize] = []
+            seen_ends: mutable darray[usize] = []
+            next_object_id: mutable usize = 0.usize()
+            in_string: mutable bool = false
+            escaped: mutable bool = false
+            string_start: mutable usize = 0.usize()
+            for index in 0..<raw.count |raw, object_ids, seen_object_ids, seen_starts, seen_ends, next_object_id, in_string, escaped, string_start|:
+                byte: u8 = raw[index]
+                if in_string:
+                    if escaped:
+                        escaped <- false
+                    elif byte == 92:
+                        escaped <- true
+                    elif byte == 34:
+                        after: mutable usize = index + 1.usize()
+                        while after < raw.count and is_space(raw[after]) |raw, after|:
+                            after <- after + 1.usize()
+                        if after < raw.count and raw[after] == 58 and object_ids.count > 0.usize():
+                            current_id: usize = object_ids[object_ids.count - 1.usize()]
+                            return false if duplicate_key(raw, string_start, index, current_id, seen_object_ids, seen_starts, seen_ends)
+                            return false if seen_object_ids.count >= 65536.usize()
+                            seen_object_ids.push(current_id)
+                            seen_starts.push(string_start)
+                            seen_ends.push(index)
+                        in_string <- false
+                    continue
+                if byte == 34:
+                    in_string <- true
+                    string_start <- index + 1.usize()
+                elif byte == 123:
+                    return false if object_ids.count >= 65536.usize()
+                    object_ids.push(next_object_id)
+                    next_object_id <- next_object_id + 1.usize()
+                elif byte == 125:
+                    return false if object_ids.count == 0.usize()
+                    object_ids.resize(object_ids.count - 1.usize())
+            return false if in_string or escaped or object_ids.count != 0.usize()
+            return true
+
+    private:
+        def is_space(byte: u8) -> bool:
+            return byte == 32 or byte == 9 or byte == 10 or byte == 13
+
+        def duplicate_key(raw: darray[u8]&, start: usize, end: usize, object_id: usize, seen_object_ids: darray[usize]&, seen_starts: darray[usize]&, seen_ends: darray[usize]&) -> bool:
+            return false if end < start
+            for item in 0..<seen_object_ids.count |raw, seen_object_ids, seen_starts, seen_ends, start, end, object_id|:
+                continue if seen_object_ids[item] != object_id
+                prior_start: usize = seen_starts[item]
+                prior_end: usize = seen_ends[item]
+                continue if prior_end - prior_start != end - start
+                matches: mutable bool = true
+                for offset in 0..<(end - start) |raw, start, prior_start, matches|:
+                    matches <- false if raw[start + offset] != raw[prior_start + offset]
+                return true if matches
+            return false
