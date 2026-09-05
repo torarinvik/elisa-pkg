@@ -1,0 +1,66 @@
+# Deterministic in-memory resolution primitives.
+#
+# This module is deliberately provider-agnostic. A future registry adapter may
+# translate authenticated metadata into the bounded catalog representation, but
+# this selector never performs I/O, interprets URLs, or receives trust keys.
+
+include "./model.elisa"
+include "./semver.elisa"
+
+module Resolve:
+    public:
+        # Select the highest valid version in a newline-separated catalog that
+        # satisfies one SemVer requirement. Empty catalogs, malformed entries,
+        # duplicate versions, and overlarge records fail closed.
+        def select_highest_version(catalog: darray[u8]&, requirement: darray[u8]&, selected: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            return false if catalog.count == 0.usize() or catalog.count > 1048576.usize()
+            parsed_requirement: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
+            return false if not SemVer::parse_requirement(requirement, &parsed_requirement)
+            cursor: mutable usize = 0.usize()
+            found: mutable bool = false
+            best: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
+            seen: mutable darray[u8] = []
+            candidates: mutable usize = 0.usize()
+            while cursor < catalog.count:
+                finish: mutable usize = cursor
+                while finish < catalog.count and catalog[finish] != 10 |catalog, finish|:
+                    finish <- finish + 1.usize()
+                line_end: mutable usize = finish
+                line_end <- line_end - 1.usize() if line_end > cursor and catalog[line_end - 1.usize()] == 13
+                return false if line_end == cursor or line_end - cursor > 128.usize()
+                candidate_text: mutable darray[u8] = []
+                for index in cursor..<line_end |catalog, candidate_text|:
+                    candidate_text.push(catalog[index])
+                candidate: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
+                return false if not SemVer::parse(candidate_text, &candidate)
+                return false if version_seen(seen, candidate_text)
+                for index in 0..<candidate_text.count |seen, candidate_text|:
+                    seen.push(candidate_text[index])
+                seen.push(0)
+                candidates <- candidates + 1.usize()
+                return false if candidates > 4096.usize()
+                if SemVer::matches(parsed_requirement, candidate) and (not found or SemVer::compare(candidate, best) > 0):
+                    best <- candidate
+                    selected.resize(0)
+                    for index in 0..<candidate_text.count |selected, candidate_text|:
+                        selected.push(candidate_text[index])
+                    found <- true
+                cursor <- finish + 1.usize()
+            return found
+
+    private:
+        def version_seen(seen: darray[u8]&, wanted: darray[u8]&) -> bool:
+            cursor: mutable usize = 0.usize()
+            while cursor < seen.count:
+                finish: mutable usize = cursor
+                while finish < seen.count and seen[finish] != 0 |seen, finish|:
+                    finish <- finish + 1.usize()
+                return true if finish - cursor == wanted.count and slice_equal(seen, cursor, finish, wanted)
+                cursor <- finish + 1.usize()
+            return false
+
+        def slice_equal(value: darray[u8]&, start: usize, finish: usize, wanted: darray[u8]&) -> bool:
+            return false if finish < start or finish - start != wanted.count
+            for index in 0..<wanted.count |value, start, wanted|:
+                return false if value[start + index] != wanted[index]
+            return true

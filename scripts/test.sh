@@ -52,6 +52,43 @@ ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_COMPILER_ROOT/build/runtime/elisa
   "$ELISA_COMPILER_ROOT/scripts/elisac_stage1.sh" -emit exe -o "$SEMVER_BIN" "$SEMVER_PROBE"
 "$SEMVER_BIN"
 
+# The resolver primitive has no network/provider dependency. Verify highest
+# satisfying selection, prerelease ordering, and fail-closed catalog parsing.
+RESOLVE_PROBE="$ROOT/build/resolve-probe-$$.elisa"
+RESOLVE_BIN="$ROOT/build/resolve-probe-$$"
+cat > "$RESOLVE_PROBE" <<EOF
+include "$ROOT/src/resolve.elisa"
+
+def same(value: darray[u8]&, expected: cstr) -> bool:
+    length: mutable usize = 0.usize()
+    while expected[length].u8() != 0:
+        length <- length + 1.usize()
+    return false if value.count != length
+    for index in 0..<length |value, expected|:
+        return false if value[index] != expected[index].u8()
+    return true
+
+def main() -> i64:
+    catalog: mutable darray[u8] = [49, 46, 48, 46, 48, 10, 49, 46, 53, 46, 48, 10, 49, 46, 53, 46, 48, 45, 97, 108, 112, 104, 97, 10, 50, 46, 48, 46, 48, 10]
+    caret: mutable darray[u8] = [94, 49, 46, 48, 46, 48]
+    selected: mutable darray[u8] = []
+    return 1 if not Resolve::select_highest_version(catalog, caret, &selected)
+    return 2 if not same(selected, "1.5.0")
+    pair: mutable darray[u8] = [62, 61, 49, 46, 53, 46, 48, 32, 60, 50, 46, 48, 46, 48]
+    return 3 if not Resolve::select_highest_version(catalog, pair, &selected)
+    return 4 if not same(selected, "1.5.0")
+    duplicate: mutable darray[u8] = [49, 46, 48, 46, 48, 10, 49, 46, 48, 46, 48, 10]
+    return 5 if Resolve::select_highest_version(duplicate, caret, &selected)
+    invalid: mutable darray[u8] = [49, 46, 48, 10]
+    return 6 if Resolve::select_highest_version(invalid, caret, &selected)
+    return 0
+EOF
+ELISA_STAGE1_BIN="${ELISA_STAGE1_BIN:-$ELISA_COMPILER_ROOT/bin/elisac-stage1}" \
+ELISA_ALLOW_STALE_STAGE1="${ELISA_ALLOW_STALE_STAGE1:-0}" \
+ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_COMPILER_ROOT/build/runtime/elisacore_runtime.o}" \
+  "$ELISA_COMPILER_ROOT/scripts/elisac_stage1.sh" -emit exe -o "$RESOLVE_BIN" "$RESOLVE_PROBE"
+"$RESOLVE_BIN"
+
 # Verify the in-language SHA-256 implementation against the two canonical
 # FIPS vectors used by the package-integrity path.
 HASH_PROBE="$ROOT/build/hash-probe-$$.elisa"
