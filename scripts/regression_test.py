@@ -122,6 +122,8 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
 
     run([BIN, 'init', work / 'project'], stdout=subprocess.DEVNULL)
     project = work / 'project'
+    conflict_init = subprocess.run([BIN, 'init', work / 'conflict', '--lib', '--bin'], capture_output=True, timeout=120)
+    assert conflict_init.returncode == 2, conflict_init
     run([BIN, 'resolve'], cwd=project, stdout=subprocess.DEVNULL)
     for command in [['resolve', 'unexpected'], ['check-manifest', 'unexpected']]:
         result = subprocess.run([BIN, *command], cwd=project, capture_output=True, timeout=120)
