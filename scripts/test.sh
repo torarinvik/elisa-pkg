@@ -94,6 +94,15 @@ mkdir -p "$CASE"
   "$BIN" resolve >/dev/null
   grep -F '"name":"nested-util"' elisapkg.lock >/dev/null
   "$BIN" resolve --frozen >/dev/null
+  cp local-util/elisapkg.json local-util/elisapkg.json.good
+  sed 's/1.2.3/1.2.4/' local-util/elisapkg.json.good > local-util/elisapkg.json
+  if "$BIN" resolve --frozen >/dev/null 2>&1; then
+    echo "frozen mode accepted a changed dependency manifest" >&2
+    exit 1
+  else
+    test "$?" -eq 3
+  fi
+  mv local-util/elisapkg.json.good local-util/elisapkg.json
   cp elisapkg.lock elisapkg.lock.good
   printf '%s\n' '{}' > elisapkg.lock
   if "$BIN" resolve --frozen >/dev/null 2>&1; then

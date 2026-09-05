@@ -19,4 +19,9 @@ Registry entries will add the registry identity, exact version, immutable source
 
 Local path resolution walks reachable local dependencies transitively. Paths are normalized relative to the project root (`a/../b` is recorded as `b`), duplicate package names must resolve to the same path and version, and package records are sorted by canonical package name before serialization.
 
+Each local record also carries `manifest-digest`, a SHA-256 digest of the exact
+validated manifest bytes. It detects manifest drift in frozen resolution; source
+file/archive digests remain a separate release gate and are not implied by this
+field.
+
 Canonical bytes are UTF-8, two-space indentation, LF endings, deterministic member ordering, sorted package and edge arrays, and exactly one terminal newline. The resolver version is part of the format so changing candidate ordering or trust policy cannot silently reuse an old result.

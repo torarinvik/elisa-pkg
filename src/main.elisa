@@ -318,6 +318,42 @@ def valid_target_entries(raw: darray[u8]&, root: darray[u8]&) -> bool can[Memory
             in_string <- false
     return found > 0.usize()
 
+def first_target_entry(raw: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+    in_string: mutable bool = false
+    escaped: mutable bool = false
+    string_start: mutable usize = 0.usize()
+    for index in 0..<raw.count |raw, in_string, escaped, string_start, out|:
+        byte: u8 = raw[index]
+        if not in_string:
+            if byte == 34:
+                in_string <- true
+                string_start <- index + 1.usize()
+        elif escaped:
+            escaped <- false
+        elif byte == 92:
+            escaped <- true
+        elif byte == 34:
+            after: mutable usize = index + 1.usize()
+            while after < raw.count and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
+                after <- after + 1.usize()
+            matched: mutable bool = after < raw.count and raw[after] == 58 and index - string_start == 5.usize()
+            if matched:
+                for key_index in 0..<5.usize() |raw, string_start, matched|:
+                    matched <- false if raw[string_start + key_index] != "entry"[key_index].u8()
+            if matched:
+                after <- after + 1.usize()
+                while after < raw.count and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
+                    after <- after + 1.usize()
+                return false if after >= raw.count or raw[after] != 34
+                after <- after + 1.usize()
+                while after < raw.count and raw[after] != 34 |raw, after, out|:
+                    return false if raw[after] == 92
+                    out.push(raw[after])
+                    after <- after + 1.usize()
+                return safe_relative_entry(out)
+            in_string <- false
+    return false
+
 # ---------- semantic versions ---------------------------------------------------------
 
 def parse_version(value: darray[u8]&, out: mutable Model::Version&) -> bool:
@@ -1027,6 +1063,14 @@ def canonical_transitive_local_lock(name: darray[u8]&, version: darray[u8]&, raw
         selected_path: mutable darray[u8] = []
         selected_version: mutable darray[u8] = []
         return [] if not queue_field_at(queue, selected, 0, &selected_path) or not queue_field_at(queue, selected, 2, &selected_version)
+        selected_manifest_path: mutable darray[u8] = []
+        path_join_into(&selected_path, "elisapkg.json", &selected_manifest_path)
+        selected_manifest: mutable darray[u8] = []
+        return [] if not read_file_into(&selected_manifest_path, &selected_manifest)
+        selected_digest: mutable darray[u8] = []
+        selected_digest_bytes: mutable darray[u8] = []
+        return [] if Integrity::sha256(selected_manifest, &selected_digest_bytes) != Integrity::DigestCode.Ok
+        return [] if not Integrity::hex_digest(selected_digest_bytes, &selected_digest)
         out.push(44) if not first
         bytes_push_view(&out, "\n    {\"name\":\"")
         bytes_push_array(&out, selected_name)
@@ -1034,7 +1078,9 @@ def canonical_transitive_local_lock(name: darray[u8]&, version: darray[u8]&, raw
         bytes_push_array(&out, selected_version)
         bytes_push_view(&out, "\",\"source\":{\"type\":\"path\",\"path\":\"")
         bytes_push_array(&out, selected_path)
-        bytes_push_view(&out, "\"}}")
+        bytes_push_view(&out, "\"},\"manifest-digest\":\"sha256:")
+        bytes_push_array(&out, selected_digest)
+        bytes_push_view(&out, "\"}")
         for index in 0..<selected_name.count |emitted, selected_name|:
             emitted.push(selected_name[index])
         emitted.push(0)
@@ -1696,7 +1742,29 @@ def run_package(start: darray[u8]&) -> i64 can[Console.Write, Memory.Allocate, A
     if not project_manifest_exists():
         write_error("error: could not find elisapkg.json in the current directory\n")
         return EXIT_USAGE
-    write_ok("package files:\n  elisapkg.json\n  src/main.elisa\n")
+    raw: mutable darray[u8] = []
+    raw.resize(1048577)
+    return EXIT_USAGE if not read_cstr_into("elisapkg.json", &raw)
+    package_name: mutable darray[u8] = []
+    package_version: mutable darray[u8] = []
+    return EXIT_USAGE if not validate_manifest_at(raw, start, &package_name, &package_version)
+    entry: mutable darray[u8] = []
+    return EXIT_USAGE if not first_target_entry(raw, &entry)
+    write_ok("package files:\n  elisapkg.json\n")
+    if file_exists(&entry):
+        write_ok("  ")
+        write_bytes(1, &entry)
+        write_ok("\n")
+    lock_path: mutable darray[u8] = []
+    path_join_into(start, "elisapkg.lock", &lock_path)
+    if file_exists(&lock_path):
+        write_ok("  elisapkg.lock\n")
+    license_path: mutable darray[u8] = []
+    path_join_into(start, "LICENSE", &license_path)
+    write_ok("  LICENSE\n") if file_exists(&license_path)
+    readme_path: mutable darray[u8] = []
+    path_join_into(start, "README.md", &readme_path)
+    write_ok("  README.md\n") if file_exists(&readme_path)
     write_error("note: signing is required before publish; this command only previews files\n")
     return EXIT_OK
 
