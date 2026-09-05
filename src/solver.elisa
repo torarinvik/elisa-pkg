@@ -1,0 +1,170 @@
+# Deterministic bounded dependency solving.
+#
+# This module accepts already authenticated candidate metadata. It never reads
+# files or performs network operations. The caller owns source identity and
+# signature policy; this module only proves that one stable candidate per
+# package identity satisfies every accumulated requirement.
+
+include "./model.elisa"
+include "./semver.elisa"
+
+module Solver:
+    public:
+        const enum SolveCode of u8:
+            Solved
+            Unsatisfiable
+            Malformed
+            ResourceLimit
+
+        struct Constraint:
+            package: mutable darray[u8]
+            requirement: mutable darray[u8]
+
+        struct Candidate:
+            package: mutable darray[u8]
+            version: mutable Model::Version
+            dependencies: mutable darray[Constraint]
+            yanked: mutable bool
+
+        # Candidates are expected to have been checked against authenticated
+        # metadata before entering this API. `selected` receives candidate
+        # indexes in canonical package-name order.
+        def solve(candidates: darray[Candidate]&, roots: darray[Constraint]&, selected: mutable darray[usize]&) -> SolveCode can[Memory.Allocate, Abort.Panic]:
+            selected.resize(0)
+            return SolveCode.Malformed if candidates.count == 0.usize() or candidates.count > 4096.usize() or roots.count > 4096.usize()
+            package_slots: mutable darray[usize] = []
+            for candidate_index in 0..<candidates.count |candidates, package_slots|:
+                return SolveCode.Malformed if not solver_valid_name(candidates[candidate_index].package)
+                existing: mutable bool = false
+                for slot_index in 0..<package_slots.count |candidates, package_slots, candidate_index, existing|:
+                    existing <- true if solver_equal(candidates[package_slots[slot_index]].package, candidates[candidate_index].package)
+                if not existing:
+                    package_slots.push(candidate_index)
+                for dependency_index in 0..<candidates[candidate_index].dependencies.count |candidates, candidate_index|:
+                    dependency: Constraint = candidates[candidate_index].dependencies[dependency_index]
+                    return SolveCode.Malformed if not solver_valid_name(dependency.package) or dependency.requirement.count == 0.usize()
+                for previous in 0..<candidate_index |candidates, candidate_index|:
+                    return SolveCode.Malformed if solver_equal(candidates[previous].package, candidates[candidate_index].package) and SemVer::compare(candidates[previous].version, candidates[candidate_index].version) == 0
+            for root_index in 0..<roots.count |roots|:
+                return SolveCode.Malformed if not solver_valid_name(roots[root_index].package) or roots[root_index].requirement.count == 0.usize()
+            solver_sort_slots(&package_slots, candidates)
+            constraints: mutable darray[Constraint] = []
+            for index in 0..<roots.count |constraints, roots|:
+                constraints.push(roots[index])
+            assigned: mutable darray[i64] = []
+            for _index in 0..<package_slots.count |assigned|:
+                assigned.push(-1)
+            decisions: mutable usize = 0.usize()
+            result: SolveCode = solver_search(candidates, package_slots, &constraints, &assigned, &decisions)
+            return result if result != SolveCode.Solved
+            for slot in 0..<assigned.count |assigned, selected|:
+                return SolveCode.Malformed if assigned[slot] < 0
+                selected.push(assigned[slot].usize())
+            return SolveCode.Solved
+
+    private:
+        const max_decisions: usize = 16384
+        const max_constraints: usize = 16384
+
+        def solver_search(candidates: darray[Candidate]&, package_slots: darray[usize]&, constraints: mutable darray[Constraint]&, assigned: mutable darray[i64]&, decisions: mutable usize&) -> SolveCode can[Memory.Allocate, Abort.Panic]:
+            return SolveCode.ResourceLimit if decisions >= max_decisions or constraints.count > max_constraints
+            for constraint_index in 0..<constraints.count |constraints, package_slots, candidates|:
+                return SolveCode.Unsatisfiable if solver_slot_for(constraints[constraint_index].package, package_slots, candidates) == package_slots.count
+            best_slot: mutable usize = package_slots.count
+            best_count: mutable usize = 18446744073709551615.usize()
+            for slot in 0..<package_slots.count |package_slots, assigned, candidates, constraints, best_slot, best_count|:
+                continue if assigned[slot] >= 0
+                possible: mutable usize = 0.usize()
+                has_requirement: mutable bool = false
+                for constraint_index in 0..<constraints.count |constraints, candidates, package_slots, slot, has_requirement|:
+                    has_requirement <- true if solver_slot_for(constraints[constraint_index].package, package_slots, candidates) == slot
+                continue if not has_requirement
+                for candidate_index in 0..<candidates.count |candidates, package_slots, slot, constraints, possible|:
+                    continue if solver_slot_for(candidates[candidate_index].package, package_slots, candidates) != slot or candidates[candidate_index].yanked
+                    possible <- possible + 1.usize() if solver_candidate_satisfies(candidates[candidate_index], package_slots[slot], constraints, package_slots, candidates)
+                return SolveCode.Unsatisfiable if possible == 0.usize()
+                if possible < best_count:
+                    best_count <- possible
+                    best_slot <- slot
+            if best_slot == package_slots.count:
+                return SolveCode.Solved
+
+            order: mutable darray[usize] = []
+            for candidate_index in 0..<candidates.count |candidates, package_slots, best_slot, constraints, order|:
+                continue if solver_slot_for(candidates[candidate_index].package, package_slots, candidates) != best_slot or candidates[candidate_index].yanked
+                order.push(candidate_index) if solver_candidate_satisfies(candidates[candidate_index], package_slots[best_slot], constraints, package_slots, candidates)
+            solver_sort_candidates(&order, candidates)
+            for order_index in 0..<order.count |order, candidates, package_slots, best_slot, constraints, assigned, decisions|:
+                candidate_index: usize = order[order_index]
+                assigned[best_slot] <- candidate_index.i64()
+                constraint_mark: usize = constraints.count
+                decisions <- decisions + 1.usize()
+                for dependency_index in 0..<candidates[candidate_index].dependencies.count |candidates, candidate_index, constraints|:
+                    constraints.push(candidates[candidate_index].dependencies[dependency_index])
+                result: SolveCode = solver_search(candidates, package_slots, constraints, assigned, decisions)
+                return result if result == SolveCode.Solved or result == SolveCode.ResourceLimit or result == SolveCode.Malformed
+                constraints.resize(constraint_mark)
+                assigned[best_slot] <- -1
+            return SolveCode.Unsatisfiable
+
+        def solver_candidate_satisfies(candidate: Candidate, slot_candidate: usize, constraints: darray[Constraint]&, package_slots: darray[usize]&, candidates: darray[Candidate]&) -> bool:
+            for index in 0..<constraints.count |candidate, slot_candidate, constraints, package_slots, candidates|:
+                continue if solver_slot_for(constraints[index].package, package_slots, candidates) != solver_slot_for(candidates[slot_candidate].package, package_slots, candidates)
+                requirement: darray[u8] = constraints[index].requirement
+                parsed: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
+                return false if not SemVer::parse_requirement(requirement, &parsed)
+                return false if not SemVer::matches(parsed, candidate.version)
+            return true
+
+        def solver_slot_for(package: darray[u8]&, package_slots: darray[usize]&, candidates: darray[Candidate]&) -> usize:
+            for slot in 0..<package_slots.count |package, package_slots, candidates|:
+                return slot if solver_equal(package, candidates[package_slots[slot]].package)
+            return package_slots.count
+
+        def solver_sort_slots(slots: mutable darray[usize]&, candidates: darray[Candidate]&) -> void:
+            for index in 1..<slots.count |slots, candidates, index|:
+                value: usize = slots[index]
+                cursor: mutable usize = index
+                while cursor > 0.usize() and solver_less(candidates[value].package, candidates[slots[cursor - 1.usize()]].package):
+                    slots[cursor] <- slots[cursor - 1.usize()]
+                    cursor <- cursor - 1.usize()
+                slots[cursor] <- value
+
+        def solver_sort_candidates(order: mutable darray[usize]&, candidates: darray[Candidate]&) -> void:
+            for index in 1..<order.count |order, candidates, index|:
+                value: usize = order[index]
+                cursor: mutable usize = index
+                while cursor > 0.usize() and solver_candidate_before(value, order[cursor - 1.usize()], candidates):
+                    order[cursor] <- order[cursor - 1.usize()]
+                    cursor <- cursor - 1.usize()
+                order[cursor] <- value
+
+        def solver_candidate_before(left: usize, right: usize, candidates: darray[Candidate]&) -> bool:
+            comparison: i64 = SemVer::compare(candidates[left].version, candidates[right].version)
+            return true if comparison > 0
+            return false if comparison < 0
+            return solver_less(candidates[left].package, candidates[right].package)
+
+        def solver_valid_name(value: darray[u8]&) -> bool:
+            return false if value.count == 0.usize() or value.count > 64.usize()
+            return false if value[0] < 97 or value[0] > 122
+            previous_hyphen: mutable bool = false
+            for index in 0..<value.count |value, previous_hyphen|:
+                byte: u8 = value[index]
+                return false if (byte < 97 or byte > 122) and (byte < 48 or byte > 57) and byte != 45
+                return false if byte == 45 and (index == value.count - 1.usize() or previous_hyphen)
+                previous_hyphen <- byte == 45
+            return true
+
+        def solver_equal(left: darray[u8]&, right: darray[u8]&) -> bool:
+            return false if left.count != right.count
+            for index in 0..<left.count |left, right|:
+                return false if left[index] != right[index]
+            return true
+
+        def solver_less(left: darray[u8]&, right: darray[u8]&) -> bool:
+            limit: usize = left.count if left.count < right.count else right.count
+            for index in 0..<limit |left, right|:
+                return true if left[index] < right[index]
+                return false if left[index] > right[index]
+            return left.count < right.count

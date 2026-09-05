@@ -22,7 +22,8 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
              f'include "{ROOT}/src/json.elisa"',
              f'include "{ROOT}/src/archive.elisa"',
              f'include "{ROOT}/src/resolve.elisa"',
-             f'include "{ROOT}/src/trust.elisa"', 'def main() -> i64:']
+             f'include "{ROOT}/src/trust.elisa"',
+             f'include "{ROOT}/src/solver.elisa"', 'def main() -> i64:']
     number = 0
 
     def data(value):
@@ -68,6 +69,27 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
     check('not Archive::verify_ustar_archive(archive)')
     namespace, package = data('acme'), data('acme/../evil')
     check(f'Trust::precheck_namespace({package}, {namespace}) == Trust::VerificationCode.UnauthorizedNamespace')
+    lines.extend([
+        '    solver_name: mutable darray[u8] = [97]',
+        '    solver_requirement: mutable darray[u8] = [94,49,46,48,46,48]',
+        '    solver_roots: mutable darray[Solver::Constraint] = []',
+        '    solver_roots.push(Solver::Constraint{package: solver_name, requirement: solver_requirement})',
+        '    solver_dependencies: mutable darray[Solver::Constraint] = []',
+        '    solver_candidates: mutable darray[Solver::Candidate] = []',
+        '    solver_candidates.push(Solver::Candidate{package: solver_name, version: Model::Version{major: 1, minor: 0, patch: 0, prerelease: false}, dependencies: solver_dependencies, yanked: false})',
+        '    solver_candidates.push(Solver::Candidate{package: solver_name, version: Model::Version{major: 1, minor: 1, patch: 0, prerelease: false}, dependencies: solver_dependencies, yanked: false})',
+        '    solver_selected: mutable darray[usize] = []',
+        '    solver_result: mutable Solver::SolveCode = Solver::solve(solver_candidates, solver_roots, &solver_selected)',
+    ])
+    check('solver_result == Solver::SolveCode.Solved')
+    check('solver_selected.count == 1.usize()')
+    check('solver_selected[0] == 1.usize()')
+    lines.append('    solver_candidates[1].yanked <- true')
+    lines.append('    solver_result <- Solver::solve(solver_candidates, solver_roots, &solver_selected)')
+    check('solver_result == Solver::SolveCode.Solved and solver_selected[0] == 0.usize()')
+    lines.append('    solver_candidates[0].yanked <- true')
+    lines.append('    solver_result <- Solver::solve(solver_candidates, solver_roots, &solver_selected)')
+    check('solver_result == Solver::SolveCode.Unsatisfiable')
     lines.append('    return 0')
     source = work / 'probe.elisa'
     source.write_text('\n'.join(lines) + '\n')
