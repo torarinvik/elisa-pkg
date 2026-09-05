@@ -100,6 +100,9 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
     run([BIN, 'init', work / 'project'], stdout=subprocess.DEVNULL)
     project = work / 'project'
     run([BIN, 'resolve'], cwd=project, stdout=subprocess.DEVNULL)
+    for command in [['resolve', 'unexpected'], ['check-manifest', 'unexpected']]:
+        result = subprocess.run([BIN, *command], cwd=project, capture_output=True, timeout=120)
+        assert result.returncode == 2, (command, result)
     lock = project / 'elisapkg.lock'
     before = lock.stat()
     run([BIN, 'resolve', '--frozen'], cwd=project, stdout=subprocess.DEVNULL)
@@ -127,7 +130,8 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
     manifest = project / 'elisapkg.json'
     valid = manifest.read_text()
     unsupported_registry = valid.replace('"dependencies": {}', '"dependencies":{"remote":{"registry":"default","version":"^1.0.0"}}')
-    for invalid in [valid.replace('"schema-version": 1,', '"schema-version": 1'), valid + '{}', unsupported_registry]:
+    misplaced_identity = valid.replace('"targets":', '"name":"shadow","targets":')
+    for invalid in [valid.replace('"schema-version": 1,', '"schema-version": 1'), valid + '{}', unsupported_registry, misplaced_identity]:
         manifest.write_text(invalid)
         result = subprocess.run([BIN, 'check-manifest'], cwd=project, capture_output=True, timeout=120)
         assert result.returncode != 0
