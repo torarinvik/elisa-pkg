@@ -359,11 +359,8 @@ PY
     echo "cache verification accepted a corrupted content-addressed blob" >&2
     exit 1
   fi
-  python3 - <<PY
-from pathlib import Path
-Path("$PACKAGE_BLOB").unlink()
-PY
   "$BIN" package >/dev/null
+  test -n "$(find .elisapkg/cache/quarantine -type f | head -n 1)"
   cmp package.tar.good .elisapkg/package.tar >/dev/null
   cmp package.receipt.good .elisapkg/package.receipt >/dev/null
   tar -tf .elisapkg/package.tar | grep -F 'elisapkg.json' >/dev/null

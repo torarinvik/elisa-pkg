@@ -45,9 +45,10 @@ if any identity cannot be captured, that build does not reuse an existing
 artifact. Included non-target sources remain outside this receipt and require
 a future build-key expansion.
 `cache gc --dry-run` is likewise read-only and reports that there is no shared
-cache to sweep; destructive garbage collection stays disabled until leases,
-quarantine, and concurrent-reader rules are implemented for the local blob
-store.
+cache to sweep; destructive garbage collection stays disabled until leases and
+concurrent-reader rules are implemented for the local blob store. A new package
+operation quarantines a corrupted active blob before republishing its verified
+replacement.
 
 Commands that inspect or build a project accept `--manifest-path PATH`; PATH may name the project directory or its `elisapkg.json`. Local path resolution walks the dependency graph transitively, sorts package records by canonical name, normalizes relative paths, records SHA-256 manifest and first-target source digests, and rejects conflicting duplicate package identities. Target paths are resolved with `realpath` and must remain below their package root, including when a symlink is present. `clean` removes only the known `.elisapkg/build/app`, `.elisapkg/package.tar`, and `.elisapkg/package.receipt` outputs plus empty build directories. Registry dependency declarations are syntax-checked locally, including exact, caret, tilde, and comparison SemVer ranges; the pure `Resolve` selector is covered by in-memory fixtures, while CLI resolution remains fail-closed until a verified registry provider exists.
 
