@@ -137,11 +137,14 @@ def make_directory(path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, 
         continue if work[index] != 47
         work[index] <- 0
         prefix: cstr = (&work[0]).cast[cstr] can Unsafe.PointerCast
-        _ = Platform::pkg_mkdir(prefix, 493.u16())
+        created: i64 = Platform::pkg_mkdir(prefix, 493.u16())
+        valid: bool = created == 0 or Platform::pkg_is_directory(prefix) == 1
         work[index] <- 47
+        return false if not valid
     final_path: cstr = (&work[0]).cast[cstr] can Unsafe.PointerCast
-    _ = Platform::pkg_mkdir(final_path, 493.u16())
-    return true
+    created: i64 = Platform::pkg_mkdir(final_path, 493.u16())
+    return false if created != 0 and Platform::pkg_is_directory(final_path) != 1
+    return Platform::pkg_is_directory(final_path) == 1
 
 def read_file_into(path: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
     path_c: mutable darray[u8] = []
@@ -346,6 +349,9 @@ def transaction_cleanup() -> bool:
     return true
 
 def transaction_begin(original_manifest: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+    state_root: mutable darray[u8] = []
+    bytes_push_view(&state_root, ".elisapkg")
+    return false if not make_directory(&state_root)
     guard: mutable darray[u8] = []
     bytes_push_view(&guard, ".elisapkg/transaction.guard")
     guard_c: mutable darray[u8] = []
@@ -1768,13 +1774,12 @@ def run_init(argc: i64, slots: mutable cstr&&) -> i64 can[Console.Write, Memory.
     manifest_path: mutable darray[u8] = []
     path_join_into(root, "elisapkg.json", &manifest_path)
     return EXIT_USAGE if file_exists(&manifest_path)
-    _ = make_directory(&root)
+    return EXIT_SOURCE if not make_directory(&root)
     source: mutable darray[u8] = []
     state: mutable darray[u8] = []
     path_join_into(root, "src", &source)
     path_join_into(root, ".elisapkg", &state)
-    _ = make_directory(&source)
-    _ = make_directory(&state)
+    return EXIT_SOURCE if not make_directory(&source) or not make_directory(&state)
     manifest: mutable darray[u8] = []
     bytes_push_view(&manifest, "{\n  \"schema-version\": 1,\n  \"package\": {\n    \"name\": \"app\",\n    \"version\": \"0.1.0\",\n    \"description\": \"An Elisa application\",\n    \"license\": \"MIT\",\n    \"elisa\": \">=0.1.0 <1.0.0\"\n  },\n  \"targets\": [{\"name\": \"app\", \"kind\": \"")
     bytes_push_cstr(&manifest, target_kind)
@@ -2057,8 +2062,7 @@ def run_install_local(start: darray[u8]&, options: Model::CommandOptions) -> i64
     receipt_dir: mutable darray[u8] = []
     path_join_into(prefix, "bin", &bin_dir)
     path_join_into(prefix, "share/elisapkg/receipts", &receipt_dir)
-    _ = make_directory(&bin_dir)
-    _ = make_directory(&receipt_dir)
+    return 7 if not make_directory(&bin_dir) or not make_directory(&receipt_dir)
     name_c: mutable darray[u8] = []
     path_with_nul_into(&name, &name_c)
     name_raw: cstr = (&name_c[0]).cast[cstr] can Unsafe.PointerCast
@@ -2261,6 +2265,7 @@ def run_clean() -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.P
     receipt: mutable darray[u8] = []
     package_archive: mutable darray[u8] = []
     path_join_into(root, ".elisapkg", &state)
+    return EXIT_BUILD if not make_directory(&state)
     path_join_into(state, "build", &build_dir)
     path_join_into(build_dir, "app", &artifact)
     path_join_into(build_dir, "receipt", &receipt)
@@ -2465,6 +2470,9 @@ def run_package(argc: i64, slots: mutable cstr&&, start: darray[u8]&) -> i64 can
         return EXIT_OK
     lock_options: Model::CommandOptions = Model::CommandOptions{locked: true, offline: true, frozen: true, json: false, verbose: false}
     return EXIT_RESOLVE if run_resolve(start, lock_options) != EXIT_OK
+    state_root: mutable darray[u8] = []
+    bytes_push_view(&state_root, ".elisapkg")
+    return 7 if not make_directory(&state_root)
     archive: mutable darray[u8] = []
     return 7 if not package_archive_bytes(raw, entry, &archive)
     return 7 if not Archive::verify_ustar_archive(archive)
@@ -2537,7 +2545,7 @@ def run_build(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Con
     path_join_into(start, ".elisapkg/build", &build_dir)
     path_join_into(build_dir, "app", &artifact)
     path_join_into(build_dir, "receipt", &receipt_path)
-    _ = make_directory(&build_dir)
+    return EXIT_BUILD if not make_directory(&build_dir)
     compiler: mutable cstr = "elisac-stage1"
     if Platform::pkg_getenv("ELISAPKG_COMPILER") is configured:
         compiler <- configured.cast[cstr]

@@ -232,6 +232,13 @@ long long elisapkg_package_file_size(const char *path) {
     return (long long)info.st_size;
 }
 
+long long elisapkg_is_directory(const char *path) {
+    if (path == NULL) return 0;
+    struct stat info;
+    if (lstat(path, &info) != 0) return 0;
+    return S_ISDIR(info.st_mode) && !S_ISLNK(info.st_mode) ? 1 : 0;
+}
+
 long long elisapkg_read_package_file(const char *path, unsigned char *output, size_t capacity) {
     if (output == NULL || capacity == 0) return -EINVAL;
     int file = open_package_file(path);
