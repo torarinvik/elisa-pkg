@@ -81,4 +81,5 @@ the same exclusive temporary-file, `fsync`, atomic-rename, and parent-directory
 `fsync` sequence. A malformed clock or a later observation below that value is
 rejected before trust history can advance, protecting expiry checks from a
 wall-clock rollback. Older installations without a clock sidecar start at
-zero and create it on their next verified selection.
+zero and create it on their next verified selection; once records exist, a
+missing sidecar is treated as unavailable state rather than a reset.

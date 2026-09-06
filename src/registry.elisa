@@ -923,11 +923,13 @@ module Registry:
             read_status: ResultCode = trust_state_read(state_path, &state)
             return trust_state_finish(lock_path, read_status) if read_status != ResultCode.Ok
             observed_clock: mutable u64 = 0
+            clock_missing: mutable bool = false
             clock_path_start: usize = state_path.count
             registry_push_text(&state_path, ".clock")
-            clock_status: ResultCode = trust_clock_read(state_path, &observed_clock)
+            clock_status: ResultCode = trust_clock_read(state_path, &observed_clock, &clock_missing)
             state_path.resize(clock_path_start)
             return trust_state_finish(lock_path, clock_status) if clock_status != ResultCode.Ok
+            return trust_state_finish(lock_path, ResultCode.TrustStateUnavailable) if clock_missing and state.count > 23.usize()
             now: i64 = Platform::pkg_wall_clock_seconds()
             return trust_state_finish(lock_path, ResultCode.TrustStateUnavailable) if now < 0
             return trust_state_finish(lock_path, ResultCode.ClockRollback) if observed_clock > now.u64()
@@ -966,14 +968,17 @@ module Registry:
             return trust_state_finish(lock_path, ResultCode.TrustStateUnavailable) if not trust_state_write(state_path, state)
             return trust_state_finish(lock_path, ResultCode.Ok)
 
-        def trust_clock_read(path: darray[u8]&, out: mutable u64&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+        def trust_clock_read(path: darray[u8]&, out: mutable u64&, missing: mutable bool&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out <- 0
+            missing <- false
             loaded: mutable darray[u8] = []
             if not read_file(path, 64.usize(), &loaded):
                 path_c: mutable darray[u8] = []
                 path_with_nul(path, &path_c)
                 path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
-                return ResultCode.Ok if Platform::pkg_package_file_size(path_name) == -2
+                if Platform::pkg_package_file_size(path_name) == -2:
+                    missing <- true
+                    return ResultCode.Ok
                 return ResultCode.TrustStateUnavailable
             return ResultCode.TrustStateMalformed if loaded.count < 8.usize() or loaded.count > 64.usize()
             prefix: cstr = "clock:"

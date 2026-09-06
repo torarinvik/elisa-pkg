@@ -236,6 +236,11 @@ if ELISAPKG_REGISTRY_DIR="$ROOT" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUS
   exit 1
 fi
 rm -f "$TRUST_STATE_FILE.clock"
+if ELISAPKG_REGISTRY_DIR="$ROOT" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
+  echo "missing trust-state clock was accepted" >&2
+  exit 1
+fi
+printf 'clock:0\n' > "$TRUST_STATE_FILE.clock"
 mkdir "$TRUST_STATE_FILE.lock"
 if ELISAPKG_REGISTRY_DIR="$ROOT" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
   echo "trust-state lock was ignored" >&2

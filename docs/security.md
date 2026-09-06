@@ -25,7 +25,9 @@ or unavailable state is a security error. The default path is
 operations still remain disabled until transport and publisher delegation are
 reviewed. A sibling `.clock` file records the greatest observed wall-clock
 timestamp through the same atomic publication path; malformed values and clock
-rollback fail closed before expiry or trust-state updates.
+rollback fail closed before expiry or trust-state updates. Removing the sidecar
+after trust history exists is also an unavailable-state error, so deletion
+cannot reset the rollback floor.
 
 State-directory creation and atomic file publication use descriptor-anchored
 `mkdirat`/`openat`/`renameat`/`linkat` traversal. Reads, temporary files,
