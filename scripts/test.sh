@@ -492,6 +492,15 @@ mkdir -p "$CASE"
   mv elisapkg.root.good elisapkg.json
   "$BIN" build >/dev/null
   "$BIN" build --frozen >/dev/null
+  "$BIN" build --profile release >/dev/null
+  test -s .elisapkg/build/release/app
+  grep -F 'profile:release' .elisapkg/build/release/app.receipt >/dev/null
+  if "$BIN" build --profile release --profile debug >/dev/null 2>&1; then
+    echo "duplicate build profile was accepted" >&2
+    exit 1
+  else
+    test "$?" -eq 2
+  fi
   if "$BIN" update app >/dev/null 2>&1; then
     echo "targeted update accepted the root package" >&2
     exit 1
