@@ -439,6 +439,12 @@ mkdir -p "$CASE"
   mv elisapkg.root.good elisapkg.json
   "$BIN" build >/dev/null
   "$BIN" build --frozen >/dev/null
+  if "$BIN" update app >/dev/null 2>&1; then
+    echo "targeted update accepted the root package" >&2
+    exit 1
+  else
+    test "$?" -eq 2
+  fi
   TOOLCHAIN_WRAPPER="$CASE/compiler-wrapper.sh"
   printf '%s\n' '#!/bin/sh' "exec '$ELISA_COMPILER_ROOT/scripts/elisac_stage1.sh' \"\$@\"" > "$TOOLCHAIN_WRAPPER"
   chmod +x "$TOOLCHAIN_WRAPPER"
