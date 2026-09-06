@@ -376,6 +376,7 @@ EOF
   cd "$READONLY_REGISTRY_CASE"
   env -u ELISAPKG_REGISTRY_DIR -u ELISAPKG_TRUST_STATE "$BIN" tree | grep -F 'dep 1.0.0' >/dev/null
   env -u ELISAPKG_REGISTRY_DIR -u ELISAPKG_TRUST_STATE "$BIN" why dep | grep -F 'readonly-app -> dep' >/dev/null
+  env -u ELISAPKG_REGISTRY_DIR -u ELISAPKG_TRUST_STATE "$BIN" resolve --frozen >/dev/null
 )
 
 CASE="$ROOT/build/test-package-$(date +%s%N)"
