@@ -16,7 +16,8 @@ REGISTRY/
   PACKAGE/VERSION/archive.tar
 ```
 
-`root.ed25519` is exactly 32 raw Ed25519 public-key bytes. `index` is a
+`root.ed25519` is exactly 32 raw Ed25519 public-key bytes, and `metadata.sig`
+is exactly 64 raw Ed25519 signature bytes. `index` is a
 newline-separated list of unique, complete SemVer versions. The resolver picks
 the highest version satisfying the requested exact, caret, tilde, or comparison
 requirement.
