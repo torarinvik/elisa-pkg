@@ -675,17 +675,23 @@ module PlatformNative:
         def waitpid_timeout(pid: i64, status: mutable i64&, timeout_ms: i64) -> i64 can[Memory.Allocate, Unsafe.PointerCast]:
             return -22 if pid <= 0 or timeout_ms <= 0
             started: i64 = monotonic_milliseconds()
-            return -5 if started < 0
+            if started < 0:
+                reap_status: i64 = terminate_and_reap(pid, &status)
+                return reap_status if reap_status != 0 else -5
             deadline: i64 = started + timeout_ms if started <= 9223372036854775807 - timeout_ms else 9223372036854775807
             while true |status, pid, deadline|:
                 waited: i64 = native_waitpid(pid, status, 1)
                 if waited == pid:
                     return 0
                 if waited < 0:
-                    continue if current_errno() == 4
-                    return negative_errno()
+                    wait_errno: i64 = current_errno()
+                    continue if wait_errno == 4
+                    reap_status: i64 = terminate_and_reap(pid, &status)
+                    return reap_status if reap_status != 0 else negative_value(wait_errno)
                 now: i64 = monotonic_milliseconds()
-                return -5 if now < 0
+                if now < 0:
+                    reap_status: i64 = terminate_and_reap(pid, &status)
+                    return reap_status if reap_status != 0 else -5
                 if now >= deadline:
                     reap_status: i64 = terminate_and_reap(pid, &status)
                     return reap_status if reap_status != 0 else -110
