@@ -522,6 +522,13 @@ PY
   else
     test "$?" -eq 6
   fi
+  TOO_LONG_TOOLCHAIN_VALUE="$(python3 -c 'print("x" * 4097)')"
+  if ELISA_STAGE1_BIN="$TOO_LONG_TOOLCHAIN_VALUE" "$BIN" build >/dev/null 2>&1; then
+    echo "oversized compiler bootstrap override unexpectedly succeeded" >&2
+    exit 1
+  else
+    test "$?" -eq 6
+  fi
   printf '%s\n' 'def main() -> i64:' '    return 7' > src/main.elisa
   if "$BIN" run -- >/dev/null 2>&1; then
     echo "run discarded the child exit status" >&2
