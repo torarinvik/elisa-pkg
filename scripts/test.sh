@@ -45,6 +45,8 @@ def main() -> i64:
     return 12 if SemVer::compare_text(alpha, stable) != -1
     return 13 if SemVer::compare_text(beta, alpha) != 1
     return 14 if SemVer::compare_text(stable, alpha) != 1
+    empty_range: mutable darray[u8] = [62, 49, 46, 48, 46, 48, 46, 48, 32, 60, 61, 49, 46, 48, 46, 48]
+    return 15 if SemVer::parse_requirement(empty_range, &blank)
     return 0
 EOF
 ELISA_STAGE1_BIN="${ELISA_STAGE1_BIN:-$ELISA_COMPILER_ROOT/bin/elisac-stage1}" \

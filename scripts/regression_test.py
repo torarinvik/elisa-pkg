@@ -64,6 +64,8 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
         check('SemVer::matches(req, Model::Version{major: 1, minor: 7, patch: 0, prerelease: false})')
     for value in ['^18446744073709551615.0.0', '~1.18446744073709551615.0', '>=1.0.0 >=2.0.0', '1.0.0-alpha']:
         check(f'not SemVer::parse_requirement({data(value)}, &req)')
+    for value in ['>1.0.0 <=1.0.0', '>=1.0.0 <1.0.0']:
+        check(f'not SemVer::parse_requirement({data(value)}, &req)')
     left, right = data('1.0.0-alpha.1'), data('1.0.0-alpha.2')
     check(f'SemVer::compare_text({left}, {right}) == -1')
     lines.extend([
