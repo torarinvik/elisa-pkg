@@ -534,6 +534,15 @@ PY
     echo "package archive included a forbidden path" >&2
     exit 1
   fi
+  printf '%s' marker > .git
+  printf '%s' marker > .hg
+  printf '%s' marker > .svn
+  "$BIN" package --list > package-files-vcs.txt
+  if grep -E '(^|/)(\.git|\.hg|\.svn)$' package-files-vcs.txt >/dev/null; then
+    echo "package listing included a VCS marker file" >&2
+    exit 1
+  fi
+  rm -f .git .hg .svn package-files-vcs.txt
   printf '%s' secret > src/.env
   printf '%s' secret > src/private.pem
   "$BIN" package >/dev/null
