@@ -544,9 +544,10 @@ PY
   fi
   rm -f .git .hg .svn package-files-vcs.txt
   printf '%s' secret > src/.env
+  printf '%s' secret > src/config.env
   printf '%s' secret > src/private.pem
   "$BIN" package >/dev/null
-  if tar -tf .elisapkg/package.tar | grep -E 'src/\.env|src/private\.pem' >/dev/null; then
+  if tar -tf .elisapkg/package.tar | grep -E 'src/\.env|src/config\.env|src/private\.pem' >/dev/null; then
     echo "package archive included a credential-like file" >&2
     exit 1
   fi
@@ -564,7 +565,7 @@ PY
   mv .elisapkg/package.receipt.saved .elisapkg/package.receipt
   python3 - <<'PY'
 from pathlib import Path
-for name in ("src/.env", "src/private.pem"):
+for name in ("src/.env", "src/config.env", "src/private.pem"):
     Path(name).unlink()
 PY
   PREFIX="$CASE/local-prefix"

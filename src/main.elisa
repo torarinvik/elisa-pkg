@@ -128,6 +128,14 @@ def bytes_ends_with(value: darray[u8]&, suffix: darray[u8]&) -> bool:
         return false if value[offset + index] != suffix[index]
     return true
 
+def bytes_ends_with_view(value: darray[u8]&, suffix: cstr) -> bool:
+    suffix_count: usize = Platform::pkg_strlen(suffix)
+    return false if suffix_count > value.count
+    offset: usize = value.count - suffix_count
+    for index in 0..<suffix_count |value, suffix, offset|:
+        return false if value[offset + index] != suffix[index].u8()
+    return true
+
 def write_bytes(fd: i64, value: darray[u8]&) -> void can[Console.Write, Unsafe.PointerCast]:
     offset: mutable usize = 0.usize()
     while offset < value.count |value, offset|:
@@ -434,7 +442,7 @@ def remove_state_directory(path: darray[u8]&) -> bool can[Memory.Allocate, Abort
     path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
     result: i64 = Platform::pkg_rmdir(path_name)
     # A retained cache makes the state directory intentionally non-empty.
-    return true if result == 0 or result == -2 or result == -39
+    return true if result == 0 or result == -2 or result == -Platform::pkg_directory_not_empty_error()
     return false
 
 def remove_cstr_file(path_name: cstr) -> bool:
@@ -3163,8 +3171,9 @@ def run_install_local(start: darray[u8]&, options: Model::CommandOptions) -> i64
 
 def run_install(argc: i64, slots: mutable cstr&&, start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
     local_seen: mutable bool = false
+    package_seen: mutable bool = false
     index: mutable i64 = 2
-    while index < argc |slots, index, local_seen|:
+    while index < argc |slots, index, local_seen, package_seen|:
         argument: cstr = slots[index].cast[cstr]
         if cstr_equal(argument, "--local"):
             return EXIT_USAGE if local_seen
@@ -3172,9 +3181,13 @@ def run_install(argc: i64, slots: mutable cstr&&, start: darray[u8]&, options: M
         elif cstr_equal(argument, "--bin"):
             return EXIT_USAGE if index + 1 >= argc
             index <- index + 1
+        elif not package_seen:
+            package_seen <- true
         else:
             return EXIT_USAGE
         index <- index + 1
+    return EXIT_USAGE if local_seen and package_seen
+    return EXIT_USAGE if not local_seen and not package_seen
     if local_seen:
         return run_install_local(start, options)
     write_error(Security::install_message())
@@ -3548,7 +3561,7 @@ def publish_path_forbidden(path: darray[u8]&) -> bool:
         leaf.push(path[index])
     return true if bytes_equal_view(leaf, ".git") or bytes_equal_view(leaf, ".hg") or bytes_equal_view(leaf, ".svn") or bytes_equal_view(leaf, "id_rsa") or bytes_equal_view(leaf, "id_ed25519") or bytes_equal_view(leaf, ".env")
     return true if leaf.count >= 4.usize() and leaf[0] == 46 and leaf[1] == 101 and leaf[2] == 110 and leaf[3] == 118
-    return true if bytes_count(leaf, ".pem") > 0.usize() or bytes_count(leaf, ".key") > 0.usize()
+    return true if bytes_ends_with_view(leaf, ".env") or bytes_count(leaf, ".pem") > 0.usize() or bytes_count(leaf, ".key") > 0.usize()
     return false
 
 def source_tree_digest_into(out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
