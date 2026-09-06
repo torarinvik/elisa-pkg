@@ -210,8 +210,8 @@ def read_file_into(path: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memo
             probe_raw: mutable void& = (&chunk[0]).cast[mutable void&] can Unsafe.PointerCast
             oversized <- Platform::pkg_fread(probe_raw, 1, 1, open_stream) > 0.usize()
         failed: bool = Platform::pkg_ferror(open_stream) != 0
-        _ = Platform::pkg_fclose(open_stream)
-        return false if oversized or failed
+        close_status: i64 = Platform::pkg_fclose(open_stream)
+        return false if oversized or failed or close_status != 0
         return true
     return false
 
@@ -246,8 +246,8 @@ def read_cstr_into(path_name: cstr, out: mutable darray[u8]&) -> bool can[Memory
             oversized <- Platform::pkg_fread(probe_raw, 1, 1, open_stream) > 0.usize()
         failed: bool = Platform::pkg_ferror(open_stream) != 0
         out.resize(got)
-        _ = Platform::pkg_fclose(open_stream)
-        return not failed and not oversized
+        close_status: i64 = Platform::pkg_fclose(open_stream)
+        return not failed and not oversized and close_status == 0
     return false
 
 def write_fd_all(fd: i64, value: darray[u8]&) -> bool can[Unsafe.PointerCast, Console.Write]:
@@ -277,7 +277,9 @@ def write_cstr_file(path_name: cstr, value: darray[u8]&) -> bool can[Memory.Allo
         _ = Platform::pkg_close(fd)
         _ = Platform::pkg_unlink(temp_name)
         return false
-    _ = Platform::pkg_close(fd)
+    if Platform::pkg_close(fd) != 0:
+        _ = Platform::pkg_unlink(temp_name)
+        return false
     if Platform::pkg_rename(temp_name, path_name) != 0:
         _ = Platform::pkg_unlink(temp_name)
         return false
@@ -298,7 +300,9 @@ def write_cstr_file_noclobber(path_name: cstr, value: darray[u8]&) -> bool can[M
         _ = Platform::pkg_close(fd)
         _ = Platform::pkg_unlink(temp_name)
         return false
-    _ = Platform::pkg_close(fd)
+    if Platform::pkg_close(fd) != 0:
+        _ = Platform::pkg_unlink(temp_name)
+        return false
     linked: bool = Platform::pkg_link(temp_name, path_name) == 0
     _ = Platform::pkg_unlink(temp_name)
     return linked and Platform::pkg_fsync_parent(path_name) == 0
@@ -3996,8 +4000,10 @@ def run_build(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Con
     temp_template.push(0)
     temp_fd: i64 = Platform::pkg_mkstemp(&temp_template)
     return EXIT_BUILD if temp_fd < 0
-    _ = Platform::pkg_close(temp_fd)
     temp_name: cstr = (&temp_template[0]).cast[cstr] can Unsafe.PointerCast
+    if Platform::pkg_close(temp_fd) != 0:
+        _ = Platform::pkg_unlink(temp_name)
+        return EXIT_BUILD
     # An explicit compiler is required for reproducible builds. PATH lookup is
     # delegated to execvp only after the user has selected the executable.
     stage1_env: mutable darray[u8] = []
