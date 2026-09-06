@@ -516,6 +516,12 @@ PY
     echo "compiler child inherited a parent secret" >&2
     exit 1
   fi
+  if ELISAPKG_COMPILER='-invalid-compiler' "$BIN" build >/dev/null 2>&1; then
+    echo "option-shaped compiler override unexpectedly succeeded" >&2
+    exit 1
+  else
+    test "$?" -eq 6
+  fi
   printf '%s\n' 'def main() -> i64:' '    return 7' > src/main.elisa
   if "$BIN" run -- >/dev/null 2>&1; then
     echo "run discarded the child exit status" >&2
