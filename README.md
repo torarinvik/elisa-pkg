@@ -2,7 +2,7 @@
 
 `elisapkg` is the Elisa Packaging System, implemented in Elisa. The repository currently contains the first local vertical slice: strict manifest checks, deterministic lockfiles, frozen builds, local project scaffolding, toolchain invocation, and fail-closed remote-source policy.
 
-The source uses explicit Elisa modules. `Cli::run` is the public command boundary; `Platform` wraps the minimal FFI seam; `Model` contains value contracts; `Json` rejects duplicate keys and invalid UTF-8 before schema lookup; `Integrity` computes SHA-256 digests; `Trust` defines signed-metadata verification results and the fail-closed production policy; and `Security` owns remote-operation decisions. See [`docs/architecture.md`](docs/architecture.md) for the visibility and namespace rules.
+The source uses explicit Elisa modules. `Cli::run` is the public command boundary; `Platform` wraps the minimal FFI seam and byte-wise C-string helpers; `Model` contains value contracts; `Json` rejects duplicate keys and invalid UTF-8 before schema lookup; `Integrity` computes SHA-256 digests; `Trust` defines signed-metadata verification results and the fail-closed production policy; and `Security` owns remote-operation decisions. See [`docs/architecture.md`](docs/architecture.md) for the visibility and namespace rules.
 
 ## Bootstrap
 

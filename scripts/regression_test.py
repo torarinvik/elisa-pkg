@@ -104,6 +104,11 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
     trust_key = data('k' * 32)
     trust_signature = data('s' * 64)
     check(f'Trust::precheck_key_material("ed25519", {trust_key}, {trust_signature}) == Trust::VerificationCode.Valid')
+    lines.extend([
+        '    algorithm_storage: mutable darray[u8] = [101,100,50,53,53,49,57,0]',
+        '    algorithm_name: cstr = (&algorithm_storage[0]).cast[cstr] can Unsafe.PointerCast',
+    ])
+    check('Trust::precheck_algorithm(algorithm_name) == Trust::VerificationCode.Valid')
     check(f'Trust::precheck_key_material("ed25519", {data("short")}, {trust_signature}) == Trust::VerificationCode.MalformedKey')
     check(f'Trust::precheck_key_material("ed25519", {trust_key}, {data("short")}) == Trust::VerificationCode.MalformedSignature')
     cache_digest = data('a' * 64)

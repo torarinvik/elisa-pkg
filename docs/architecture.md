@@ -6,7 +6,7 @@ The current source units are:
 
 | Module | Public surface | Private state | Boundary rule |
 | --- | --- | --- | --- |
-| `Platform` | Namespaced wrappers for the small libc/process seam | File modes and future platform policy | Only platform wrappers may refer to foreign declarations; reads, temporary files, directory creation, path mutations, and bounded process waits use no-follow or monotonic-deadline primitives. |
+| `Platform` | Namespaced wrappers for the small libc/process seam, including byte-wise C-string comparison | File modes and future platform policy | Only platform wrappers may refer to foreign declarations; reads, temporary files, directory creation, path mutations, and bounded process waits use no-follow or monotonic-deadline primitives. |
 | `Model` | `Version` and `CommandOptions` value contracts | Schema-policy constants and future normalized records | No handles, credentials, or unverified source bytes cross the model API. |
 | `Trust` | Verification result codes, policy contract, diagnostics, metadata prechecks, and exact-byte detached verification | Provider status mapping and private comparison helpers | Prechecks cover expiry, rollback, namespace, and algorithm policy; the provider is reached only after key/signature shape checks. |
 | `Security` | Fail-closed statuses and user-facing denial messages | Trust-protocol selection state | Remote operations cannot become enabled by a URL, flag, or lockfile alone. |
