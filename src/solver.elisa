@@ -57,6 +57,11 @@ module Solver:
             decisions: mutable usize = 0.usize()
             result: SolveCode = solver_search(candidates, package_slots, &constraints, &assigned, &decisions)
             return result if result != SolveCode.Solved
+            # A dependency edge can point at an already selected package, so
+            # satisfiability alone does not rule out A -> B -> A (or A -> A).
+            # Reject cycles after selection before exposing indexes to lockfile
+            # serialization or compiler planning.
+            return SolveCode.Malformed if not solver_selected_graph_acyclic(candidates, package_slots, assigned)
             for slot in 0..<assigned.count |assigned, selected|:
                 return SolveCode.Malformed if assigned[slot] < 0
                 selected.push(assigned[slot].usize())
@@ -117,6 +122,36 @@ module Solver:
                 parsed: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
                 return false if not SemVer::parse_requirement(requirement, &parsed)
                 return false if not SemVer::matches(parsed, candidate.version)
+            return true
+
+        def solver_selected_graph_acyclic(candidates: darray[Candidate]&, package_slots: darray[usize]&, selected: darray[i64]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            return false if selected.count != package_slots.count
+            colors: mutable darray[u8] = []
+            colors.resize(package_slots.count)
+            stack_slots: mutable darray[usize] = []
+            stack_edges: mutable darray[usize] = []
+            for start in 0..<package_slots.count |candidates, package_slots, selected, colors, stack_slots, stack_edges|:
+                continue if colors[start] != 0
+                stack_slots.push(start)
+                stack_edges.push(0)
+                colors[start] <- 1
+                while stack_slots.count > 0 |candidates, package_slots, selected, colors, stack_slots, stack_edges|:
+                    current_slot: usize = stack_slots[stack_slots.count - 1.usize()]
+                    candidate: Candidate = candidates[selected[current_slot].usize()]
+                    edge_cursor: usize = stack_edges[stack_edges.count - 1.usize()]
+                    if edge_cursor >= candidate.dependencies.count:
+                        colors[current_slot] <- 2
+                        stack_slots.resize(stack_slots.count - 1.usize())
+                        stack_edges.resize(stack_edges.count - 1.usize())
+                        continue
+                    stack_edges[stack_edges.count - 1.usize()] <- edge_cursor + 1.usize()
+                    dependency_slot: usize = solver_slot_for(candidate.dependencies[edge_cursor].package, package_slots, candidates)
+                    return false if dependency_slot == package_slots.count
+                    return false if colors[dependency_slot] == 1
+                    continue if colors[dependency_slot] == 2
+                    stack_slots.push(dependency_slot)
+                    stack_edges.push(0)
+                    colors[dependency_slot] <- 1
             return true
 
         def solver_slot_for(package: darray[u8]&, package_slots: darray[usize]&, candidates: darray[Candidate]&) -> usize:

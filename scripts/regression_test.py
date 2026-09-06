@@ -164,6 +164,23 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
     ])
     check('solver_result == Solver::SolveCode.Solved')
     check('solver_selected_two.count == 2.usize() and solver_selected_two[0] == 0.usize() and solver_selected_two[1] == 2.usize()')
+    lines.extend([
+        '    cycle_a_name: mutable darray[u8] = [99]',
+        '    cycle_b_name: mutable darray[u8] = [100]',
+        '    cycle_requirement: mutable darray[u8] = [94,49,46,48,46,48]',
+        '    cycle_a_dependencies: mutable darray[Solver::Constraint] = []',
+        '    cycle_b_dependencies: mutable darray[Solver::Constraint] = []',
+        '    cycle_a_dependencies.push(Solver::Constraint{package: cycle_b_name, requirement: cycle_requirement})',
+        '    cycle_b_dependencies.push(Solver::Constraint{package: cycle_a_name, requirement: cycle_requirement})',
+        '    cycle_candidates: mutable darray[Solver::Candidate] = []',
+        '    cycle_candidates.push(Solver::Candidate{package: cycle_a_name, version: Model::Version{major: 1, minor: 0, patch: 0, prerelease: false}, dependencies: cycle_a_dependencies, yanked: false})',
+        '    cycle_candidates.push(Solver::Candidate{package: cycle_b_name, version: Model::Version{major: 1, minor: 0, patch: 0, prerelease: false}, dependencies: cycle_b_dependencies, yanked: false})',
+        '    cycle_roots: mutable darray[Solver::Constraint] = []',
+        '    cycle_roots.push(Solver::Constraint{package: cycle_a_name, requirement: cycle_requirement})',
+        '    cycle_selected: mutable darray[usize] = []',
+        '    cycle_result: Solver::SolveCode = Solver::solve(cycle_candidates, cycle_roots, &cycle_selected)',
+    ])
+    check('cycle_result == Solver::SolveCode.Malformed and cycle_selected.count == 0.usize()')
     lines.append('    return 0')
     source = work / 'probe.elisa'
     source.write_text('\n'.join(lines) + '\n')
