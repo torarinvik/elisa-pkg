@@ -101,5 +101,8 @@ The local registry fixture uses a detached Ed25519 signature over the exact
 metadata bytes. The trust root is a separate 32-byte file; metadata binds the
 registry path, package, selected SemVer, archive relative path, byte size, and
 SHA-256 digest. The resolver validates the archive as deterministic ustar and
-recomputes its digest before returning success. A network transport, publisher
-delegation, and persisted rollback state remain separate release gates.
+recomputes its digest before returning success. Registry file reads reject
+symlinked descendants by requiring `realpath` equality, and a no-argument
+locked fetch reauthenticates every v3 record before caching it. A network
+transport, publisher delegation, and persisted rollback state remain separate
+release gates.
