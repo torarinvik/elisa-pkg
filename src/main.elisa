@@ -3025,13 +3025,31 @@ def run_update(argc: i64, slots: mutable cstr&&) -> i64 can[Console.Write, Memor
         bytes_push_cstr(&wanted, slots[2].cast[cstr])
         return EXIT_USAGE if not valid_package_name(wanted)
     root: mutable darray[u8] = [46]
+    raw: mutable darray[u8] = []
+    raw.resize(1048577)
+    return EXIT_USAGE if not read_cstr_into("elisapkg.json", &raw)
+    root_name: mutable darray[u8] = []
+    root_version: mutable darray[u8] = []
+    return EXIT_USAGE if not validate_manifest_at(raw, &root, &root_name, &root_version)
+    return EXIT_SECURITY if not transaction_begin(raw)
     options: Model::CommandOptions = Model::CommandOptions{locked: false, offline: true, frozen: false, json: false, verbose: false}
     resolved: i64 = run_resolve(&root, options)
-    return resolved if resolved != EXIT_OK
+    if resolved != EXIT_OK:
+        restored: bool = transaction_restore()
+        if not restored:
+            write_error("error: update failed and the original manifest or lockfile could not be restored\n")
+            return EXIT_SECURITY
+        return resolved
     if wanted.count > 0.usize():
         lock: mutable darray[u8] = []
         lock.resize(1048577)
-        return EXIT_RESOLVE if not read_cstr_into("elisapkg.lock", &lock) or not lock_contains_package(lock, wanted)
+        if not read_cstr_into("elisapkg.lock", &lock) or not lock_contains_package(lock, wanted):
+            _ = transaction_restore()
+            return EXIT_RESOLVE
+    if not transaction_mark_lock():
+        _ = transaction_restore()
+        return EXIT_SECURITY
+    return EXIT_SECURITY if not transaction_commit()
     write_ok("updated local dependency lock\n")
     return EXIT_OK
 
