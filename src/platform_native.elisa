@@ -717,7 +717,9 @@ module PlatformNative:
             return false if duplicate < 0
             stream: mutable heap void&? = native_fdopendir(duplicate)
             if stream is opened:
-                while true |opened|:
+                failed: mutable bool = false
+                while true |opened, failed|:
+                    native_errno()[0] <- 0
                     entry: mutable heap void&? = native_readdir(opened)
                     if entry is record:
                         raw: mutable u8& = record.cast[mutable u8&] can Unsafe.PointerCast
@@ -726,9 +728,10 @@ module PlatformNative:
                         continue if name_length == 2.usize() and raw[21] == 46 and raw[22] == 46
                         _ = native_closedir(opened)
                         return false
+                    failed <- current_errno() != 0
                     break
                 _ = native_closedir(opened)
-                return true
+                return not failed
             _ = native_close(duplicate)
             return false
 
@@ -1121,11 +1124,14 @@ module PlatformNative:
             directory_fd: i64 = open_directory_path(path)
             return false if directory_fd < 0
             duplicate: i64 = native_dup(directory_fd)
-            return false if duplicate < 0
+            if duplicate < 0:
+                _ = native_close(directory_fd)
+                return false
             directory: mutable heap void&? = native_fdopendir(duplicate)
             _ = native_close(directory_fd)
             if directory is stream:
                 while true |stream, out, path, depth|:
+                    native_errno()[0] <- 0
                     entry: mutable heap void&? = native_readdir(stream)
                     if entry is record:
                         raw: mutable u8& = record.cast[mutable u8&] can Unsafe.PointerCast
@@ -1143,26 +1149,31 @@ module PlatformNative:
                         child.push(0)
                         child_name: cstr = (&child[0]).cast[cstr] can Unsafe.PointerCast
                         child_length: usize = path_length(child_name)
-                        return false if child_length == 0 or child_length > 4096.usize()
+                        return directory_failure(stream) if child_length == 0 or child_length > 4096.usize()
                         directory_probe: i64 = open_directory_path(child_name)
                         if directory_probe >= 0:
                             _ = native_close(directory_probe)
                             continue if skip_directory(child_name)
-                            return false if not collect_directory(child_name, out, depth + 1.usize())
+                            return directory_failure(stream) if not collect_directory(child_name, out, depth + 1.usize())
                         else:
                             file_probe: i64 = open_package_file(child_name)
                             continue if file_probe < 0
                             _ = native_close(file_probe)
                             continue if skip_file(child_name)
-                            return false if out.count + child_length + 1.usize() > 16777216.usize()
+                            return directory_failure(stream) if out.count + child_length + 1.usize() > 16777216.usize()
                             for index in 0..<child_length |out, child_name|:
                                 out.push(child_name[index].u8())
                             out.push(0)
                     else:
+                        return directory_failure(stream) if current_errno() != 0
                         break
                 _ = native_closedir(stream)
                 return true
             _ = native_close(duplicate)
+            return false
+
+        def directory_failure(stream: heap void&) -> bool:
+            _ = native_closedir(stream)
             return false
 
         def path_length(path: cstr) -> usize:
