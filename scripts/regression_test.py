@@ -135,6 +135,21 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
     check('solver_result == Solver::SolveCode.Solved')
     check('solver_selected.count == 1.usize()')
     check('solver_selected[0] == 1.usize()')
+    lines.extend([
+        '    solver_bad_requirement: mutable darray[u8] = [49,46,48]',
+        '    solver_bad_roots: mutable darray[Solver::Constraint] = []',
+        '    solver_bad_roots.push(Solver::Constraint{package: solver_name, requirement: solver_bad_requirement})',
+        '    solver_bad_selected: mutable darray[usize] = []',
+        '    solver_bad_result: Solver::SolveCode = Solver::solve(solver_candidates, solver_bad_roots, &solver_bad_selected)',
+    ])
+    check('solver_bad_result == Solver::SolveCode.Malformed and solver_bad_selected.count == 0.usize()')
+    lines.extend([
+        '    solver_pre_candidates: mutable darray[Solver::Candidate] = []',
+        '    solver_pre_candidates.push(Solver::Candidate{package: solver_name, version: Model::Version{major: 1, minor: 0, patch: 0, prerelease: true}, dependencies: solver_dependencies, yanked: false})',
+        '    solver_pre_selected: mutable darray[usize] = []',
+        '    solver_pre_result: Solver::SolveCode = Solver::solve(solver_pre_candidates, solver_roots, &solver_pre_selected)',
+    ])
+    check('solver_pre_result == Solver::SolveCode.Malformed and solver_pre_selected.count == 0.usize()')
     lines.append('    solver_candidates[1].yanked <- true')
     lines.append('    solver_result <- Solver::solve(solver_candidates, solver_roots, &solver_selected)')
     check('solver_result == Solver::SolveCode.Solved and solver_selected[0] == 0.usize()')
