@@ -389,6 +389,13 @@ EOF
   env -u ELISAPKG_REGISTRY_DIR -u ELISAPKG_TRUST_STATE "$BIN" tree | grep -F 'dep 1.0.0' >/dev/null
   env -u ELISAPKG_REGISTRY_DIR -u ELISAPKG_TRUST_STATE "$BIN" why dep | grep -F 'readonly-app -> dep' >/dev/null
   env -u ELISAPKG_REGISTRY_DIR -u ELISAPKG_TRUST_STATE "$BIN" resolve --frozen >/dev/null
+  ELISAPKG_REGISTRY_DIR="$READONLY_REGISTRY_CASE/provider-does-not-exist" env -u ELISAPKG_TRUST_STATE "$BIN" resolve --offline >/dev/null
+  if ELISAPKG_REGISTRY_DIR="$READONLY_REGISTRY_CASE/provider-does-not-exist" env -u ELISAPKG_TRUST_STATE "$BIN" fetch --offline dep 1.0.0 >/dev/null 2>&1; then
+    echo "offline package-specific fetch unexpectedly reached a provider" >&2
+    exit 1
+  else
+    test "$?" -eq 3
+  fi
 )
 
 CASE="$ROOT/build/test-package-$(date +%s%N)"
