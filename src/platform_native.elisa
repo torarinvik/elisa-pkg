@@ -484,7 +484,9 @@ module PlatformNative:
                     start: usize = path_length - leaf.count + 1.usize()
                     for index in 0..<leaf.count |template_path, leaf, start|:
                         template_path[start + index] <- leaf[index]
-                    _ = native_close(directory)
+                    if native_close(directory) != 0:
+                        _ = native_close(fd)
+                        return -5
                     return fd
                 return negative_errno() if current_errno() != 17
             _ = native_close(directory)
@@ -799,8 +801,7 @@ module PlatformNative:
                         return false
                     failed <- current_errno() != 0
                     break
-                _ = native_closedir(opened)
-                return not failed
+                return not failed and native_closedir(opened) == 0
             _ = native_close(duplicate)
             return false
 
@@ -904,7 +905,7 @@ module PlatformNative:
                     next <- native_openat(directory, part, flags_directory() + flag_no_follow)
                 return close_error(directory, negative_errno()) if next < 0
                 return close_error(directory, negative_errno()) if native_fsync(directory) != 0
-                _ = native_close(directory)
+                return close_error(next, -5) if native_close(directory) != 0
                 directory <- next
                 start <- finish + 1.usize()
             return directory
@@ -1018,7 +1019,7 @@ module PlatformNative:
                     return close_error(directory, -22) if cstr_equal(part, "..")
                     next: i64 = native_openat(directory, part, flags_directory() + flag_no_follow)
                     return close_error(directory, -error_code()) if next < 0
-                    _ = native_close(directory)
+                    return close_error(next, -5) if native_close(directory) != 0
                     directory <- next
                 start <- finish + 1.usize()
             while start < length and path_copy[start] == 47 |path_copy, start|:
@@ -1055,7 +1056,7 @@ module PlatformNative:
                 flags: i64 = flags_file_read() + (flag_directory if had_slash else 0)
                 next: i64 = native_openat(directory, part, flags)
                 return close_error(directory, -error_code()) if next < 0
-                _ = native_close(directory)
+                return close_error(next, -5) if native_close(directory) != 0
                 directory <- next
                 return directory if not had_slash
                 start <- finish + 1.usize()
@@ -1206,7 +1207,13 @@ module PlatformNative:
                 _ = native_close(directory_fd)
                 return false
             directory: mutable heap void&? = native_fdopendir(duplicate)
-            _ = native_close(directory_fd)
+            directory_close_status: i64 = native_close(directory_fd)
+            if directory_close_status != 0:
+                if directory is stream:
+                    _ = native_closedir(stream)
+                else:
+                    _ = native_close(duplicate)
+                return false
             if directory is stream:
                 while true |stream, out, path, depth|:
                     native_errno()[0] <- 0
@@ -1232,13 +1239,13 @@ module PlatformNative:
                         return directory_failure(stream) if child_length == 0 or child_length > 4096.usize()
                         directory_probe: i64 = open_directory_path(child_name)
                         if directory_probe >= 0:
-                            _ = native_close(directory_probe)
+                            return directory_failure(stream) if native_close(directory_probe) != 0
                             continue if skip_directory(child_name)
                             return directory_failure(stream) if not collect_directory(child_name, out, depth + 1.usize())
                         else:
                             file_probe: i64 = open_package_file(child_name)
                             continue if file_probe < 0
-                            _ = native_close(file_probe)
+                            return directory_failure(stream) if native_close(file_probe) != 0
                             continue if skip_file(child_name)
                             return directory_failure(stream) if out.count + child_length + 1.usize() > 16777216.usize()
                             for index in 0..<child_length |out, child_name|:
@@ -1247,8 +1254,7 @@ module PlatformNative:
                     else:
                         return directory_failure(stream) if current_errno() != 0
                         break
-                _ = native_closedir(stream)
-                return true
+                return native_closedir(stream) == 0
             _ = native_close(duplicate)
             return false
 
