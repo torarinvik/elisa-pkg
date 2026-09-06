@@ -390,6 +390,29 @@ EOF
   env -u ELISAPKG_REGISTRY_DIR -u ELISAPKG_TRUST_STATE "$BIN" why dep | grep -F 'readonly-app -> dep' >/dev/null
   env -u ELISAPKG_REGISTRY_DIR -u ELISAPKG_TRUST_STATE "$BIN" resolve --frozen >/dev/null
   ELISAPKG_REGISTRY_DIR="$READONLY_REGISTRY_CASE/provider-does-not-exist" env -u ELISAPKG_TRUST_STATE "$BIN" resolve --offline >/dev/null
+  cp elisapkg.lock elisapkg.lock.valid
+  python3 - "$READONLY_REGISTRY_CASE/elisapkg.lock" <<'PY'
+from pathlib import Path
+import sys
+
+lock_path = Path(sys.argv[1])
+text = lock_path.read_text()
+marker = '"packages": [{"name":"dep"'
+root_record = ('"packages": [{"name":"readonly-app","version":"0.1.0",'
+               '"source":{"type":"registry","registry":"primary","archive":"dep.tar"},'
+               '"archive-size":1,"archive-digest":"sha256:' + ('0' * 64) + '",'
+               '"metadata-digest":"sha256:' + ('0' * 64) + '"}, {"name":"dep"')
+if marker not in text:
+    raise SystemExit('registry fixture marker missing')
+lock_path.write_text(text.replace(marker, root_record, 1))
+PY
+  if env -u ELISAPKG_REGISTRY_DIR -u ELISAPKG_TRUST_STATE "$BIN" resolve --frozen >/dev/null 2>&1; then
+    echo "frozen registry resolution accepted a root package record" >&2
+    exit 1
+  else
+    test "$?" -eq 3
+  fi
+  mv elisapkg.lock.valid elisapkg.lock
   if ELISAPKG_REGISTRY_DIR="$READONLY_REGISTRY_CASE/provider-does-not-exist" env -u ELISAPKG_TRUST_STATE "$BIN" fetch --offline dep 1.0.0 >/dev/null 2>&1; then
     echo "offline package-specific fetch unexpectedly reached a provider" >&2
     exit 1
