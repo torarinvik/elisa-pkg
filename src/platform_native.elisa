@@ -190,7 +190,11 @@ module PlatformNative:
         def getenv(name: cstr) -> u8&?:
             return native_getenv(name)
         def write(fd: i64, buffer: void&, count: usize) -> i64 can[Console.Write]:
-            return native_write(fd, buffer, count) can Console.Write
+            while true |fd, buffer, count|:
+                result: i64 = native_write(fd, buffer, count) can Console.Write
+                continue if result < 0 and current_errno() == 4
+                return result
+            return -5
         def close(fd: i64) -> i64:
             return native_close(fd)
         def fsync(fd: i64) -> i64:
@@ -207,8 +211,10 @@ module PlatformNative:
                 raw: mutable void& = (&output[used]).cast[mutable void&] can Unsafe.PointerCast
                 amount: i64 = native_read(fd, raw, capacity - used)
                 if amount < 0:
+                    errno_value: i64 = current_errno()
+                    continue if errno_value == 4
                     _ = native_close(fd)
-                    return negative_errno()
+                    return negative_value(errno_value)
                 break if amount == 0
                 if amount > (capacity - used).i64():
                     _ = native_close(fd)
@@ -294,6 +300,7 @@ module PlatformNative:
                 while written < size |archive, data_start, file, written, size, write_failed|:
                     data: void& = (&archive[data_start + written]).cast[void&] can Unsafe.PointerCast
                     amount: i64 = native_write(file, data, size - written)
+                    continue if amount < 0 and current_errno() == 4
                     if amount <= 0:
                         write_failed <- true
                         break
@@ -617,6 +624,7 @@ module PlatformNative:
             while written < value.count |value, written, fd, failed|:
                 raw: void& = (&value[written]).cast[void&] can Unsafe.PointerCast
                 amount: i64 = native_write(fd, raw, value.count - written)
+                continue if amount < 0 and current_errno() == 4
                 if amount <= 0:
                     failed <- true
                     break
@@ -872,7 +880,7 @@ module PlatformNative:
             segment_start: mutable usize = 0.usize()
             for index in 0..=name.count |name, segment_start|:
                 if index < name.count and name[index] != 47:
-                    return false if name[index] < 32 or name[index] == 127 or name[index] == 92 or name[index] == 58
+                    return false if name[index] < 32 or name[index] > 127 or name[index] == 92 or name[index] == 58
                     continue
                 segment_length: usize = index - segment_start
                 return false if segment_length == 0.usize() or segment_length == 1.usize() and name[segment_start] == 46 or segment_length == 2.usize() and name[segment_start] == 46 and name[segment_start + 1.usize()] == 46
