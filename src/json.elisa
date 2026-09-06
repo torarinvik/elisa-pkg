@@ -9,7 +9,18 @@ module Json:
         # values and separators, with a fixed maximum nesting depth.
         def valid_document(raw: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
             return false if raw.count == 0.usize() or raw.count > 1048576.usize() or not valid_utf8(raw)
+            # The root frame has kind 0. Object frames use kind 1 and array
+            # frames use kind 2. A frame state is one of:
+            #   root: 0=value, 1=done
+            #   object: 2=key-or-close, 3=key-after-comma, 4=colon,
+            #           5=comma-or-close
+            #   array: 6=value-or-close-at-start, 7=comma-or-close,
+            #          0=value-after-comma
+            # Parent frames are marked 8 (object), 9 (array), or 10 (root)
+            # while a nested value is being parsed. Keeping container kind
+            # separate avoids inferring it from a transient value state.
             states: mutable darray[u8] = [0]
+            kinds: mutable darray[u8] = [0]
             cursor: mutable usize = 0.usize()
             while cursor < raw.count:
                 byte: u8 = raw[cursor]
@@ -18,21 +29,20 @@ module Json:
                     continue
                 top: usize = states.count - 1.usize()
                 state: u8 = states[top]
-                # 0=value, 1=done, 2=object key or end, 3=key,
-                # 4=colon, 5=object separator, 6=array value or end,
-                # 7=array separator.
                 if state == 1:
                     return false
-                if (state == 2 or state == 5) and byte == 125:
+                if kinds[top] == 1 and (state == 2 or state == 5) and byte == 125:
                     states.resize(top)
+                    kinds.resize(top)
                     current: usize = states.count - 1.usize()
-                    states[current] <- 1 if current == 0.usize() else (5 if states[current - 1.usize()] == 8 else 7)
+                    states[current] <- 1 if states[current] == 10 else (5 if states[current] == 8 else 7)
                     cursor <- cursor + 1.usize()
                     continue
-                if (state == 6 or state == 7) and byte == 93:
+                if kinds[top] == 2 and (state == 6 or state == 7) and byte == 93:
                     states.resize(top)
+                    kinds.resize(top)
                     current: usize = states.count - 1.usize()
-                    states[current] <- 1 if current == 0.usize() else (5 if states[current - 1.usize()] == 8 else 7)
+                    states[current] <- 1 if states[current] == 10 else (5 if states[current] == 8 else 7)
                     cursor <- cursor + 1.usize()
                     continue
                 if state == 4:
@@ -45,8 +55,10 @@ module Json:
                     states[top] <- 3 if state == 5 else 0
                     cursor <- cursor + 1.usize()
                     continue
-                key: bool = state == 2 or state == 3
-                return false if key and byte != 34
+                object_key: bool = kinds[top] == 1 and (state == 2 or state == 3)
+                expects_value: bool = state == 0 or state == 6
+                return false if object_key and byte != 34
+                return false if not object_key and not expects_value
                 if byte == 34:
                     cursor <- cursor + 1.usize()
                     closed: mutable bool = false
@@ -70,30 +82,19 @@ module Json:
                                 return false if escape != 34 and escape != 92 and escape != 47 and escape != 98 and escape != 102 and escape != 110 and escape != 114 and escape != 116
                                 cursor <- cursor + 1.usize()
                     return false if not closed
-                    states[top] <- 4 if key else 1
+                    states[top] <- 4 if object_key else (5 if kinds[top] == 1 else (7 if kinds[top] == 2 else 1))
                 elif byte == 123 or byte == 91:
-                    return false if states.count >= 65.usize()
-                    states[top] <- 1
+                    return false if not expects_value or states.count >= 65.usize()
+                    states[top] <- 8 if kinds[top] == 1 else (9 if kinds[top] == 2 else 10)
                     states.push(2 if byte == 123 else 6)
+                    kinds.push(1 if byte == 123 else 2)
                     cursor <- cursor + 1.usize()
                 else:
                     start: usize = cursor
                     while cursor < raw.count and not is_space(raw[cursor]) and raw[cursor] != 44 and raw[cursor] != 93 and raw[cursor] != 125:
                         cursor <- cursor + 1.usize()
                     return false if not json_scalar(raw, start, cursor)
-                    states[top] <- 1
-                # The parent container determines the separator after a value.
-                if states[top] == 1 and top > 0.usize():
-                    states[top] <- 5 if state == 0 and states[top - 1.usize()] == 8 else 7
-                # Container kind lives in the suspended parent slot.
-                if byte == 123:
-                    states[top] <- 8
-                elif byte == 91:
-                    states[top] <- 9
-                # After closing a child, its parent is handled below next pass.
-                while states.count > 0.usize() and (states[states.count - 1.usize()] == 8 or states[states.count - 1.usize()] == 9):
-                    current: usize = states.count - 1.usize()
-                    states[current] <- 1 if current == 0.usize() else (5 if states[current - 1.usize()] == 8 else 7)
+                    states[top] <- 5 if kinds[top] == 1 else (7 if kinds[top] == 2 else 1)
             return states.count == 1.usize() and states[0] == 1
 
         def valid_utf8(raw: darray[u8]&) -> bool:
