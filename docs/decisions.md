@@ -87,7 +87,8 @@ operator recovery.
 
 Every successfully packaged archive is hard-linked into the local
 `.elisapkg/cache/sha256/<prefix>/<digest>` store after deterministic archive
-verification. `cache verify` rehashes both the visible archive and its receipt
+verification, and the containing directory is flushed before the package
+receipt is published. `cache verify` rehashes both the visible archive and its receipt
 backing blob; a missing or corrupted blob is a security failure. A subsequent
 package operation moves a corrupted active blob to the quarantine directory
 before publishing a replacement. The move uses exclusive hard-link publication

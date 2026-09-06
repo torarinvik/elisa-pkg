@@ -111,8 +111,9 @@ missing pair member, changed archive, changed lock, or changed manifest is a
 security failure rather than a cache miss. The archive is also retained as a
 local content-addressed hard-link under `.elisapkg/cache/sha256/<prefix>/`; the
 same digest is recomputed from that blob, so a corrupted cache object cannot be
-consumed as a normal miss. When a package operation quarantines a corrupt active
-blob, it publishes the evidence with an exclusive hard link and refuses to replace
+consumed as a normal miss. Package publication flushes the cache directory after
+linking the verified blob and before publishing the receipt. When a package
+operation quarantines a corrupt active blob, it publishes the evidence with an exclusive hard link and refuses to replace
 an existing `<digest>.invalid` record.
 
 `cache gc --dry-run` does not delete anything. Actual cache collection remains
