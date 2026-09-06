@@ -177,6 +177,70 @@ ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_COMPILER_ROOT/build/runtime/elisa
   "$ELISA_COMPILER_ROOT/scripts/elisac_stage1.sh" -emit exe -o "$REGISTRY_BIN" "$REGISTRY_PROBE"
 env -u ELISAPKG_REGISTRY_DIR "$REGISTRY_BIN"
 
+# Persistent trust state is outside the project lockfile. Verify monotonic
+# versions, same-version digest pinning, durable re-entry, and fail-closed
+# malformed/duplicate history handling through the public Registry boundary.
+TRUST_STATE_PROBE="$ROOT/build/trust-state-probe-$$.elisa"
+TRUST_STATE_BIN="$ROOT/build/trust-state-probe-$$"
+TRUST_STATE_FILE="$ROOT/build/trust-state-$$.state"
+TRUST_STATE_REPEAT_PROBE="$ROOT/build/trust-state-repeat-$$.elisa"
+TRUST_STATE_REPEAT_BIN="$ROOT/build/trust-state-repeat-$$"
+cat > "$TRUST_STATE_PROBE" <<EOF
+include "$ROOT/src/registry.elisa"
+
+def filled(value: u8) -> darray[u8]:
+    out: mutable darray[u8] = []
+    for _index in 0..<64 |out|:
+        out.push(value)
+    return out
+
+def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+    package: mutable darray[u8] = [97,112,112]
+    v1: mutable darray[u8] = [49,46,48,46,48]
+    v0: mutable darray[u8] = [48,46,57,46,48]
+    v2: mutable darray[u8] = [50,46,48,46,48]
+    digest_a: mutable darray[u8] = filled(97)
+    digest_b: mutable darray[u8] = filled(98)
+    return 1 if Registry::record_trusted(package, v1, digest_a) != Registry::ResultCode.Ok
+    return 2 if Registry::record_trusted(package, v0, digest_a) != Registry::ResultCode.RollbackDetected
+    return 3 if Registry::record_trusted(package, v1, digest_b) != Registry::ResultCode.DigestMismatch
+    return 4 if Registry::record_trusted(package, v2, digest_b) != Registry::ResultCode.Ok
+    return 5 if Registry::record_trusted(package, v2, digest_b) != Registry::ResultCode.Ok
+    return 0
+EOF
+ELISA_STAGE1_BIN="${ELISA_STAGE1_BIN:-$ELISA_COMPILER_ROOT/bin/elisac-stage1}" \
+ELISA_ALLOW_STALE_STAGE1="${ELISA_ALLOW_STALE_STAGE1:-0}" \
+ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_COMPILER_ROOT/build/runtime/elisacore_runtime.o}" \
+  "$ELISA_COMPILER_ROOT/scripts/elisac_stage1.sh" -emit exe -o "$TRUST_STATE_BIN" "$TRUST_STATE_PROBE"
+ELISAPKG_REGISTRY_DIR="$ROOT" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_BIN"
+cat > "$TRUST_STATE_REPEAT_PROBE" <<EOF
+include "$ROOT/src/registry.elisa"
+def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+    package: mutable darray[u8] = [97,112,112]
+    digest: mutable darray[u8] = []
+    for _index in 0..<64 |digest|:
+        digest.push(98)
+    version: mutable darray[u8] = [50,46,48,46,48]
+    return 0 if Registry::record_trusted(package, version, digest) == Registry::ResultCode.Ok else 1
+EOF
+ELISA_STAGE1_BIN="${ELISA_STAGE1_BIN:-$ELISA_COMPILER_ROOT/bin/elisac-stage1}" \
+ELISA_ALLOW_STALE_STAGE1="${ELISA_ALLOW_STALE_STAGE1:-0}" \
+ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_COMPILER_ROOT/build/runtime/elisacore_runtime.o}" \
+  "$ELISA_COMPILER_ROOT/scripts/elisac_stage1.sh" -emit exe -o "$TRUST_STATE_REPEAT_BIN" "$TRUST_STATE_REPEAT_PROBE"
+ELISAPKG_REGISTRY_DIR="$ROOT" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_REPEAT_BIN"
+test -s "$TRUST_STATE_FILE"
+mkdir "$TRUST_STATE_FILE.lock"
+if ELISAPKG_REGISTRY_DIR="$ROOT" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
+  echo "trust-state lock was ignored" >&2
+  exit 1
+fi
+rmdir "$TRUST_STATE_FILE.lock"
+printf 'invalid trust state\n' > "$TRUST_STATE_FILE"
+if ELISAPKG_REGISTRY_DIR="$ROOT" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
+  echo "malformed trust state was accepted" >&2
+  exit 1
+fi
+
 # Verify the in-language SHA-256 implementation against the two canonical
 # FIPS vectors used by the package-integrity path.
 HASH_PROBE="$ROOT/build/hash-probe-$$.elisa"

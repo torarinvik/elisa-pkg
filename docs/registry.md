@@ -62,6 +62,16 @@ cache boundary. `Archive::extract_ustar_archive` can extract only into a private
 empty staging directory; it rejects links, unsafe path components, duplicate
 case-folded names, nonzero metadata fields, oversized files, and malformed
 checksums, and uses descriptor-relative no-follow operations for every parent.
-Network/TLS transport, persistent trust-state rollback counters, and publisher
-authorization are still disabled until their independent security review gates
-are complete.
+Network/TLS transport and publisher authorization are still disabled until
+their independent security review gates are complete. Signed selections are
+also recorded in a user-owned trust-state file after archive verification. By
+default the file is
+`$HOME/.local/share/elisapkg/trust/<sha256-of-registry-root>.state`; set
+`ELISAPKG_TRUST_STATE` to an absolute path when an isolated state location is
+needed. The file is written through an exclusive lock directory, a temporary
+file, `fsync`, atomic rename, and parent-directory `fsync`. Each package's
+history is monotonic: a lower version is rejected, and a same-version digest
+change is rejected. History is independent of the project lockfile, so
+restoring or deleting a project cannot reset rollback protection. A stale lock
+directory is left for manual recovery and causes a fail-closed trust-state
+error rather than being removed automatically.

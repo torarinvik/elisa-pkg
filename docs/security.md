@@ -14,9 +14,16 @@ temporary insecure mode.
 Before enabling remote packages, the implementation must use an established signed-metadata protocol and an audited cryptographic provider. The client must bootstrap a trusted root out of band, validate threshold-signed role metadata and namespace delegation, bind identity/version/registry/archive digest and size together, enforce expiry and monotonic rollback protection, and persist trusted metadata versions atomically. The Elisa `Trust` module already exposes fail-closed prechecks for those bindings, publisher attestation, thresholds, revocation, and clock rollback; these prechecks never substitute for cryptographic verification. Publisher authorization must cover the exact deterministic archive bytes. Unknown algorithms, missing thresholds, stale or replayed metadata, invalid signatures, revoked keys, and unauthorized namespaces are hard failures.
 
 The `Trust` module exposes metadata prechecks for expiry, rollback, namespace,
-and algorithm policy plus an exact-byte detached Ed25519 verification gate. The
-default production policy still rejects network operations until transport,
-publisher delegation, and persistent trust state are implemented.
+and algorithm policy plus an exact-byte detached Ed25519 verification gate.
+Verified local-registry selections persist monotonic package/version/digest
+records outside the project in a user-owned trust-state file. Updates hold an
+exclusive lock directory and publish the complete state with a durable atomic
+rename. Lower versions and same-version digest changes fail closed; malformed
+or unavailable state is a security error. The default path is
+`$HOME/.local/share/elisapkg/trust/<sha256-of-registry-root>.state`, with
+`ELISAPKG_TRUST_STATE` available for an explicit absolute path. Network
+operations still remain disabled until transport and publisher delegation are
+reviewed.
 
 State-directory creation and atomic file publication use descriptor-anchored
 `mkdirat`/`openat`/`renameat`/`linkat` traversal. Reads, temporary files,
@@ -111,9 +118,9 @@ artifact digest all match; included non-target sources remain outside the
 current key. An unavailable toolchain identity disables reuse rather than
 silently trusting a stale artifact.
 
-These changes supply detached Ed25519 verification for the local registry
-fixture, but do not supply the planned remote transport, publisher delegation,
-or execution sandbox. Project mutation and installation still assume a trusted,
-user-owned directory;
-concurrent malicious changes to state or installation directories require further
-handle-based filesystem work before hostile shared directories are supported.
+These changes supply detached Ed25519 verification and persistent rollback
+state for the local registry fixture, but do not supply the planned remote
+transport, publisher delegation, or execution sandbox. Project mutation and
+installation still assume a trusted, user-owned directory; concurrent
+malicious changes to installation directories require further handle-based
+filesystem work before hostile shared directories are supported.

@@ -30,6 +30,8 @@ module Registry:
             DigestMismatch
             ArchiveMissing
             ResourceLimit
+            TrustStateUnavailable
+            TrustStateMalformed
 
         # Decode dependency constraints from already authenticated metadata.
         # The output is kept separate from metadata records because the current
@@ -78,6 +80,12 @@ module Registry:
             digest: mutable darray[u8] = []
             return ResultCode.DigestMismatch if Integrity::sha256(out, &digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(digest_bytes, &digest) or not bytes_equal(digest, expected_digest)
             return ResultCode.Ok
+
+        # Record the authenticated immutable package identity in user-owned
+        # trust state. This is separate from the project lockfile so deleting
+        # or restoring a project cannot reset rollback protection.
+        def record_trusted(package: darray[u8]&, version: darray[u8]&, digest: darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            return trust_state_record(package, version, digest)
 
         # Resolve one package from the configured local registry and verify its
         # detached Ed25519 metadata before returning any artifact path. The
@@ -175,9 +183,19 @@ module Registry:
             return "registry archive digest does not match metadata" if code == ResultCode.DigestMismatch
             return "registry archive is missing or unreadable" if code == ResultCode.ArchiveMissing
             return "registry metadata exceeds the configured resource limit" if code == ResultCode.ResourceLimit
+            return "registry trust state is unavailable" if code == ResultCode.TrustStateUnavailable
+            return "registry trust state is malformed" if code == ResultCode.TrustStateMalformed
             return "unknown registry result"
 
     private:
+        def registry_push_text(out: mutable darray[u8]&, value: cstr) -> void can[Memory.Allocate, Abort.Panic]:
+            length: usize = Platform::pkg_strlen(value)
+            for index in 0..<length |out, value|:
+                out.push(value[index].u8())
+
+        def registry_push_array(out: mutable darray[u8]&, value: darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
+            for index in 0..<value.count |out, value|:
+                out.push(value[index])
 
         def registry_version_seen(seen: darray[u8]&, wanted: darray[u8]&) -> bool:
             cursor: mutable usize = 0
@@ -670,6 +688,212 @@ module Registry:
             parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
             return false if not SemVer::parse(version, &parsed)
             return SemVer::compare(parsed, previous) < 0
+
+        def trust_state_directory(path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            path_c: mutable darray[u8] = []
+            path_with_nul(path, &path_c)
+            path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
+            created: i64 = Platform::pkg_mkdir(path_name, 448.u16())
+            return created == 0 or Platform::pkg_is_directory(path_name) == 1
+
+        def trust_state_path(root: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            out.resize(0)
+            override: u8&? = Platform::pkg_getenv("ELISAPKG_TRUST_STATE")
+            if override is configured:
+                value: cstr = configured.cast[cstr]
+                length: usize = Platform::pkg_strlen(value)
+                return false if length == 0 or length > 4096 or value[0].u8() != 47
+                for index in 0..<length |out, value|:
+                    byte: u8 = value[index].u8()
+                    return false if byte == 0 or byte < 32 or byte == 92
+                    out.push(byte)
+                return out[out.count - 1.usize()] != 47
+            home_ref: u8&? = Platform::pkg_getenv("HOME")
+            if home_ref is home_value:
+                home: cstr = home_value.cast[cstr]
+                return trust_state_path_for_home(root, home, &out)
+            return false
+
+        def trust_state_path_for_home(root: darray[u8]&, home: cstr, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            home_length: usize = Platform::pkg_strlen(home)
+            return false if home_length == 0 or home_length > 3800 or home[0].u8() != 47
+            root_digest_bytes: mutable darray[u8] = []
+            root_digest: mutable darray[u8] = []
+            return false if Integrity::sha256(root, &root_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(root_digest_bytes, &root_digest)
+            base: mutable darray[u8] = []
+            for index in 0..<home_length |base, home|:
+                base.push(home[index].u8())
+            registry_push_text(&base, "/.local/share/elisapkg/trust")
+            parent: mutable darray[u8] = []
+            for index in 0..<home_length |parent, home|:
+                parent.push(home[index].u8())
+            registry_push_text(&parent, "/.local")
+            return false if not trust_state_directory(&parent)
+            parent.resize(home_length)
+            registry_push_text(&parent, "/.local/share")
+            return false if not trust_state_directory(&parent)
+            parent.resize(home_length)
+            registry_push_text(&parent, "/.local/share/elisapkg")
+            return false if not trust_state_directory(&parent)
+            return false if not trust_state_directory(&base)
+            for index in 0..<base.count |out, base|:
+                out.push(base[index])
+            out.push(47)
+            for index in 0..<root_digest.count |out, root_digest|:
+                out.push(root_digest[index])
+            registry_push_text(&out, ".state")
+            return out.count <= 4096
+
+        def trust_state_read(path: darray[u8]&, out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            out.resize(0)
+            path_c: mutable darray[u8] = []
+            path_with_nul(path, &path_c)
+            path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
+            loaded: mutable darray[u8] = []
+            if not read_file(path, &loaded):
+                return ResultCode.Ok if Platform::pkg_access(path_name, 0) != 0
+                return ResultCode.TrustStateUnavailable
+            return ResultCode.TrustStateMalformed if loaded.count == 0 or loaded.count > 1048576 or not bytes_starts_with_text(loaded, "elisapkg-trust-state:1\n")
+            for index in 0..<loaded.count |out, loaded|:
+                out.push(loaded[index])
+            return ResultCode.Ok
+
+        def trust_state_find(state: darray[u8]&, package: darray[u8]&, version_out: mutable darray[u8]&, digest_out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic]:
+            version_out.resize(0)
+            digest_out.resize(0)
+            cursor: mutable usize = 23.usize()
+            found: mutable bool = false
+            while cursor < state.count:
+                finish: mutable usize = cursor
+                while finish < state.count and state[finish] != 10 |state, finish|:
+                    finish <- finish + 1.usize()
+                return ResultCode.TrustStateMalformed if finish == cursor
+                first_separator: mutable usize = cursor
+                while first_separator < finish and state[first_separator] != 32 |state, first_separator|:
+                    first_separator <- first_separator + 1.usize()
+                second_separator: mutable usize = first_separator + 1.usize()
+                while second_separator < finish and state[second_separator] != 32 |state, second_separator|:
+                    second_separator <- second_separator + 1.usize()
+                return ResultCode.TrustStateMalformed if first_separator == cursor or second_separator >= finish or first_separator + 1.usize() == second_separator or second_separator + 1.usize() >= finish
+                line_package: mutable darray[u8] = []
+                line_version: mutable darray[u8] = []
+                line_digest: mutable darray[u8] = []
+                for index in cursor..<first_separator |line_package, state|:
+                    line_package.push(state[index])
+                for index in (first_separator + 1.usize())..<second_separator |line_version, state|:
+                    line_version.push(state[index])
+                for index in (second_separator + 1.usize())..<finish |line_digest, state|:
+                    line_digest.push(state[index])
+                return ResultCode.TrustStateMalformed if not registry_valid_name(line_package) or not valid_digest(line_digest)
+                parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
+                return ResultCode.TrustStateMalformed if not SemVer::parse(line_version, &parsed) or parsed.prerelease
+                previous: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
+                should_copy: mutable bool = false
+                if bytes_equal(line_package, package):
+                    if found:
+                        return ResultCode.TrustStateMalformed if not SemVer::parse(version_out, &previous)
+                        return ResultCode.TrustStateMalformed if SemVer::compare(parsed, previous) < 0
+                        return ResultCode.TrustStateMalformed if SemVer::compare(parsed, previous) == 0 and not bytes_equal(digest_out, line_digest)
+                        should_copy <- SemVer::compare(parsed, previous) > 0
+                    else:
+                        should_copy <- true
+                    if should_copy:
+                        version_out.resize(0)
+                        digest_out.resize(0)
+                        for index in 0..<line_version.count |version_out, line_version|:
+                            version_out.push(line_version[index])
+                        for index in 0..<line_digest.count |digest_out, line_digest|:
+                            digest_out.push(line_digest[index])
+                    found <- true
+                cursor <- finish + 1.usize()
+            return ResultCode.Ok
+
+        def bytes_starts_with_text(value: darray[u8]&, expected: cstr) -> bool:
+            length: usize = Platform::pkg_strlen(expected)
+            return false if value.count < length
+            for index in 0..<length |value, expected|:
+                return false if value[index] != expected[index].u8()
+            return true
+
+        def trust_state_release(lock_path: darray[u8]&) -> void can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            path_c: mutable darray[u8] = []
+            path_with_nul(lock_path, &path_c)
+            lock_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
+            _ = Platform::pkg_rmdir(lock_name)
+
+        def trust_state_finish(lock_path: darray[u8]&, code: ResultCode) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            trust_state_release(lock_path)
+            return code
+
+        def trust_state_write(path: darray[u8]&, value: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            template: mutable darray[u8] = []
+            for index in 0..<path.count |template, path|:
+                template.push(path[index])
+            registry_push_text(&template, ".tmp.XXXXXX")
+            template.push(0)
+            raw_template: mutable u8& = (&template[0]).cast[mutable u8&] can Unsafe.PointerCast
+            fd: i64 = Platform::pkg_mkstemp(raw_template)
+            return false if fd < 0
+            written: mutable usize = 0.usize()
+            failed: mutable bool = false
+            while written < value.count |value, written, fd, failed|:
+                chunk: void& = (&value[written]).cast[void&] can Unsafe.PointerCast
+                amount: i64 = Platform::pkg_write(fd, chunk, value.count - written) can Console.Write
+                if amount <= 0 or amount > (value.count - written).i64():
+                    failed <- true
+                    break
+                written <- written + amount.usize()
+            failed <- true if not failed and Platform::pkg_fsync(fd) != 0
+            _ = Platform::pkg_close(fd)
+            temp_name: cstr = (&template[0]).cast[cstr] can Unsafe.PointerCast
+            path_c: mutable darray[u8] = []
+            path_with_nul(path, &path_c)
+            path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
+            if failed or Platform::pkg_rename(temp_name, path_name) != 0:
+                _ = Platform::pkg_unlink(temp_name)
+                return false
+            return Platform::pkg_fsync_parent(path_name) == 0
+
+        def trust_state_record(package: darray[u8]&, version: darray[u8]&, digest: darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            return ResultCode.InvalidConfiguration if not registry_valid_name(package) or not Archive::is_safe_entry(version) or not valid_digest(digest)
+            parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
+            return ResultCode.InvalidConfiguration if not SemVer::parse(version, &parsed) or parsed.prerelease
+            root: mutable darray[u8] = []
+            return ResultCode.NotConfigured if not configured_root(&root)
+            state_path: mutable darray[u8] = []
+            return ResultCode.TrustStateUnavailable if not trust_state_path(root, &state_path)
+            lock_path: mutable darray[u8] = []
+            for index in 0..<state_path.count |lock_path, state_path|:
+                lock_path.push(state_path[index])
+            registry_push_text(&lock_path, ".lock")
+            return ResultCode.TrustStateUnavailable if lock_path.count > 4096
+            lock_c: mutable darray[u8] = []
+            path_with_nul(lock_path, &lock_c)
+            lock_name: cstr = (&lock_c[0]).cast[cstr] can Unsafe.PointerCast
+            return ResultCode.TrustStateUnavailable if Platform::pkg_mkdir(lock_name, 448.u16()) != 0
+            state: mutable darray[u8] = []
+            read_status: ResultCode = trust_state_read(state_path, &state)
+            return trust_state_finish(lock_path, read_status) if read_status != ResultCode.Ok
+            previous_version: mutable darray[u8] = []
+            previous_digest: mutable darray[u8] = []
+            find_status: ResultCode = trust_state_find(state, package, &previous_version, &previous_digest) if state.count > 0 else ResultCode.Ok
+            return trust_state_finish(lock_path, find_status) if find_status != ResultCode.Ok
+            if previous_version.count > 0.usize():
+                previous: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
+                return trust_state_finish(lock_path, ResultCode.TrustStateMalformed) if not SemVer::parse(previous_version, &previous)
+                return trust_state_finish(lock_path, ResultCode.RollbackDetected) if SemVer::compare(parsed, previous) < 0
+                return trust_state_finish(lock_path, ResultCode.DigestMismatch) if SemVer::compare(parsed, previous) == 0 and not bytes_equal(previous_digest, digest)
+                return trust_state_finish(lock_path, ResultCode.Ok) if SemVer::compare(parsed, previous) == 0
+            if state.count == 0:
+                registry_push_text(&state, "elisapkg-trust-state:1\n")
+            registry_push_array(&state, package)
+            state.push(32)
+            registry_push_array(&state, version)
+            state.push(32)
+            registry_push_array(&state, digest)
+            state.push(10)
+            return trust_state_finish(lock_path, ResultCode.TrustStateUnavailable) if not trust_state_write(state_path, state)
+            return trust_state_finish(lock_path, ResultCode.Ok)
 
         def metadata_root_object(raw: darray[u8]&) -> bool:
             first: mutable usize = 0

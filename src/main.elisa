@@ -1842,7 +1842,7 @@ def append_registry_lock_preferences(lock: darray[u8]&, unlock: darray[u8]&, can
         registry_exact_requirement(parsed, &exact)
         constraints.push(Solver::Constraint{package: package, requirement: exact})
 
-def canonical_registry_lock(name: darray[u8]&, version: darray[u8]&, raw: darray[u8]&, root: darray[u8]&, roots: darray[Solver::Constraint]&, preferred_lock: darray[u8]&, unlock: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+def canonical_registry_lock(name: darray[u8]&, version: darray[u8]&, raw: darray[u8]&, root: darray[u8]&, roots: darray[Solver::Constraint]&, preferred_lock: darray[u8]&, unlock: darray[u8]&, persist_trust: bool) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
     out: mutable darray[u8] = []
     root_digest_bytes: mutable darray[u8] = []
     root_digest: mutable darray[u8] = []
@@ -1961,6 +1961,9 @@ def canonical_registry_lock(name: darray[u8]&, version: darray[u8]&, raw: darray
         archive_size: mutable u64 = 0
         final_status: Registry::ResultCode = Registry::resolve(candidate.package, exact, Model::Version{major:0,minor:0,patch:0,prerelease:false}, &selected_text, &archive, &digest, &archive_size, &metadata)
         return [] if final_status != Registry::ResultCode.Ok
+        if persist_trust:
+            trust_status: Registry::ResultCode = Registry::record_trusted(candidate.package, selected_text, digest)
+            return [] if trust_status != Registry::ResultCode.Ok
         metadata_digest_bytes: mutable darray[u8] = []
         metadata_digest: mutable darray[u8] = []
         return [] if Integrity::sha256(metadata, &metadata_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(metadata_digest_bytes, &metadata_digest)
@@ -1993,7 +1996,7 @@ def canonical_lock_for_manifest(name: darray[u8]&, version: darray[u8]&, raw: da
         return [] if has_local_dependency
         empty_lock: mutable darray[u8] = []
         empty_unlock: mutable darray[u8] = []
-        return canonical_registry_lock(name, version, raw, root, registry_roots, empty_lock, empty_unlock)
+        return canonical_registry_lock(name, version, raw, root, registry_roots, empty_lock, empty_unlock, false)
     return canonical_transitive_local_lock(name, version, raw, root)
 
 def canonical_lock_for_manifest_with_options(name: darray[u8]&, version: darray[u8]&, raw: darray[u8]&, root: darray[u8]&, options: Model::CommandOptions, preferred_lock: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -2005,7 +2008,7 @@ def canonical_lock_for_manifest_with_options(name: darray[u8]&, version: darray[
         unlock: mutable darray[u8] = []
         if Platform::pkg_strlen(options.update_name) > 0.usize():
             bytes_push_cstr(&unlock, options.update_name)
-        return canonical_registry_lock(name, version, raw, root, registry_roots, preferred_lock, unlock)
+        return canonical_registry_lock(name, version, raw, root, registry_roots, preferred_lock, unlock, true)
     return canonical_transitive_local_lock(name, version, raw, root)
 
 def bytes_push_array(out: mutable darray[u8]&, value: darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
@@ -2801,6 +2804,14 @@ def fetch_registry_lock(manifest: darray[u8]&, lock: darray[u8]&, root_name: dar
             write_error("\n")
             return EXIT_SECURITY if archive_status == Registry::ResultCode.DigestMismatch or archive_status == Registry::ResultCode.MalformedMetadata
             return EXIT_SOURCE
+        trust_status: Registry::ResultCode = Registry::record_trusted(package, version_text, digest)
+        if trust_status != Registry::ResultCode.Ok:
+            write_error("error: ")
+            write_error(Registry::result_message(trust_status))
+            write_error(" while recording locked ")
+            write_bytes(2, &package)
+            write_error("\n")
+            return EXIT_SECURITY
         return EXIT_SOURCE if not cache_store_verified_blob(digest, archive_bytes)
         write_ok("verified locked registry artifact ")
         write_bytes(1, &package)
@@ -2876,6 +2887,14 @@ def run_fetch(argc: i64, slots: mutable cstr&&, start: darray[u8]&, options: Mod
             write_error("\n")
             return EXIT_SECURITY if archive_status == Registry::ResultCode.DigestMismatch or archive_status == Registry::ResultCode.MalformedMetadata
             return EXIT_SOURCE
+        trust_status: Registry::ResultCode = Registry::record_trusted(package, selected, digest)
+        if trust_status != Registry::ResultCode.Ok:
+            write_error("error: ")
+            write_error(Registry::result_message(trust_status))
+            write_error(" while recording ")
+            write_bytes(2, &package)
+            write_error("\n")
+            return EXIT_SECURITY
         return EXIT_SOURCE if not cache_store_verified_blob(digest, archive_bytes)
         write_ok("verified registry artifact ")
         write_bytes(1, &package)
