@@ -54,6 +54,31 @@ module Registry:
             return ResultCode.MalformedMetadata if out.count == 0 or out.count > 1048576
             return ResultCode.Ok
 
+        # Read one archive selected by authenticated metadata. The caller must
+        # supply the exact version, archive leaf, digest, and size returned by
+        # `resolve`; this boundary never follows a URL or accepts an arbitrary
+        # path. The bytes are checked again immediately before they are handed
+        # to cache or extraction code so a mutable fixture cannot race the
+        # metadata verification step unnoticed.
+        def read_archive(package: darray[u8]&, version: darray[u8]&, archive: darray[u8]&, expected_digest: darray[u8]&, expected_size: u64, out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            out.resize(0)
+            return ResultCode.InvalidConfiguration if not valid_package_path(package) or not Archive::is_safe_entry(version) or not Archive::is_safe_entry(archive) or not valid_digest(expected_digest) or expected_size > 67108864
+            root: mutable darray[u8] = []
+            return ResultCode.NotConfigured if not configured_root(&root)
+            return ResultCode.InvalidConfiguration if not valid_registry_root(root)
+            path: mutable darray[u8] = []
+            return ResultCode.InvalidConfiguration if not join_path_version(root, package, version, &path)
+            path.push(47)
+            for index in 0..<archive.count |path, archive|:
+                path.push(archive[index])
+            return ResultCode.ArchiveMissing if not read_file(path, out)
+            return ResultCode.DigestMismatch if out.count.u64() != expected_size
+            return ResultCode.MalformedMetadata if not Archive::verify_ustar_archive(out)
+            digest_bytes: mutable darray[u8] = []
+            digest: mutable darray[u8] = []
+            return ResultCode.DigestMismatch if Integrity::sha256(out, &digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(digest_bytes, &digest) or not bytes_equal(digest, expected_digest)
+            return ResultCode.Ok
+
         # Resolve one package from the configured local registry and verify its
         # detached Ed25519 metadata before returning any artifact path. The
         # returned archive path is relative to the registry root and has passed

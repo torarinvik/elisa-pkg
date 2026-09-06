@@ -267,6 +267,48 @@ def write_cstr_file_noclobber(path_name: cstr, value: darray[u8]&) -> bool can[M
     _ = Platform::pkg_unlink(temp_name)
     return linked
 
+def cache_store_verified_blob(digest: darray[u8]&, content: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+    # Cache publication is content-addressed and immutable. Verify the bytes
+    # before creating any cache entry, then revalidate the final pathname after
+    # the exclusive link so a concurrent writer or replacement cannot turn a
+    # successful fetch into an unverified cache hit.
+    return false if not Archive::verify_ustar_archive(content)
+    digest_bytes: mutable darray[u8] = []
+    actual: mutable darray[u8] = []
+    return false if Integrity::sha256(content, &digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(digest_bytes, &actual) or not bytes_equal(actual, digest)
+    blob_path: mutable darray[u8] = []
+    return false if not Cache::blob_path(digest, &blob_path)
+    cache_parent: mutable darray[u8] = []
+    bytes_push_view(&cache_parent, ".elisapkg/cache/sha256/")
+    cache_parent.push(digest[0])
+    cache_parent.push(digest[1])
+    return false if not make_directory(&cache_parent)
+    blob_name: mutable darray[u8] = []
+    path_with_nul_into(&blob_path, &blob_name)
+    blob_c: cstr = (&blob_name[0]).cast[cstr] can Unsafe.PointerCast
+    if cstr_file_exists(blob_c):
+        return true if Cache::verify_blob(digest)
+        quarantine_parent: mutable darray[u8] = []
+        quarantine_path: mutable darray[u8] = []
+        bytes_push_view(&quarantine_parent, ".elisapkg/cache/quarantine")
+        bytes_push_view(&quarantine_path, ".elisapkg/cache/quarantine/")
+        bytes_push_array(&quarantine_path, digest)
+        bytes_push_view(&quarantine_path, ".invalid")
+        return false if not make_directory(&quarantine_parent)
+        quarantine_name: mutable darray[u8] = []
+        path_with_nul_into(&quarantine_path, &quarantine_name)
+        quarantine_c: cstr = (&quarantine_name[0]).cast[cstr] can Unsafe.PointerCast
+        return false if Platform::pkg_rename(blob_c, quarantine_c) != 0
+    return true if write_cstr_file_noclobber(blob_c, content) and Cache::verify_blob(digest)
+    return Cache::verify_blob(digest)
+
+def cache_read_verified_blob(digest: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    out.resize(0)
+    return false if not Cache::verify_blob(digest)
+    path: mutable darray[u8] = []
+    return false if not Cache::blob_path(digest, &path)
+    return read_package_file_into(&path, &out)
+
 def cstr_file_exists(path_name: cstr) -> bool:
     return Platform::pkg_access(path_name, 0) == 0
 
@@ -2293,6 +2335,8 @@ def run_fetch(argc: i64, slots: mutable cstr&&, start: darray[u8]&, options: Mod
         if requirement.count == 0:
             write_error("error: fetch PACKAGE requires an exact SemVer requirement\n")
             return EXIT_USAGE
+        exact_version: mutable Model::Version = Model::Version{major: 0,minor: 0,patch: 0,prerelease: false}
+        return EXIT_USAGE if not SemVer::parse(requirement, &exact_version)
         selected: mutable darray[u8] = []
         archive: mutable darray[u8] = []
         digest: mutable darray[u8] = []
@@ -2306,13 +2350,22 @@ def run_fetch(argc: i64, slots: mutable cstr&&, start: darray[u8]&, options: Mod
             write_error("\n")
             return EXIT_SECURITY if registry_status == Registry::ResultCode.InvalidSignature or registry_status == Registry::ResultCode.MissingTrustRoot
             return EXIT_RESOLVE
+        archive_bytes: mutable darray[u8] = []
+        archive_status: Registry::ResultCode = Registry::read_archive(package, selected, archive, digest, archive_size, &archive_bytes)
+        if archive_status != Registry::ResultCode.Ok:
+            write_error("error: ")
+            write_error(Registry::result_message(archive_status))
+            write_error("\n")
+            return EXIT_SECURITY if archive_status == Registry::ResultCode.DigestMismatch or archive_status == Registry::ResultCode.MalformedMetadata
+            return EXIT_SOURCE
+        return EXIT_SOURCE if not cache_store_verified_blob(digest, archive_bytes)
         write_ok("verified registry artifact ")
         write_bytes(1, &package)
         write_ok(" ")
         write_bytes(1, &selected)
         write_ok(" sha256:")
         write_bytes(1, &digest)
-        write_ok("\n")
+        write_ok(" (cached)\n")
         _ = start
         _ = options
         return EXIT_OK
