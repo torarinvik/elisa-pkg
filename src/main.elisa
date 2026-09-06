@@ -2384,6 +2384,7 @@ def project_manifest_exists() -> bool:
 
 def usage() -> void can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
     write_ok("elisapkg — Elisa Packaging System\n\nUsage: elisapkg <command> [options]\n\nCommands:\n  init [PATH] [--bin|--lib]    create a package\n  check-manifest              validate elisapkg.json\n  add NAME --path PATH        add a verified local path dependency\n  add NAME --version RANGE --registry primary\n                              add a signed registry dependency\n  remove NAME                 remove a declared dependency\n  update [NAME]               recompute the dependency lock\n  resolve [--locked|--offline]\n                              validate and write elisapkg.lock\n  tree                        show the resolved package graph\n  metadata --json             print normalized package metadata\n  doctor                      report toolchain and trust capabilities\n  build [--bin NAME|--lib NAME|--test NAME]\n                              compile a selected target\n  run [--bin NAME] -- ARGS    build and run a binary target\n  test [--test NAME]          build and run a selected test target\n  clean                       remove known local build/package outputs\n  fetch [PACKAGE REQUIREMENT] verify locked sources or a signed local registry artifact\n  cache verify                inspect cached verification records\n  cache gc --dry-run          preview unreachable cache entries\n  package [--list]            create or preview the deterministic archive\n  install --local             install the current built binary into the user prefix\n  uninstall --local NAME      remove a receipt-owned local binary\n\nModes: --locked  --offline  --frozen  --json  --verbose\n")
+    write_ok("  why NAME                    show the root edge for a locked package\n")
     write_ok("remote publish/install/uninstall are trust-gated; use install --local for a receipt-backed local binary\n")
 
 def current_directory_into(out: mutable darray[u8]&) -> void can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -4097,10 +4098,19 @@ def cli_main(argc: i64, argv: mutable void&) -> i64 can[Console.Write, Memory.Al
     start: mutable darray[u8] = [46]
     options: mutable Model::CommandOptions = Model::CommandOptions{locked: false, offline: false, frozen: false, json: false, verbose: false, target_name: "", target_kind: "", update_name: ""}
     flags_ok: mutable bool = true
+    positional_count: mutable i64 = 0
+    separator_seen: mutable bool = false
     index: mutable i64 = 2
-    while index < effective_argc |effective_slots, options, flags_ok, index|:
+    while index < effective_argc |effective_slots, options, flags_ok, positional_count, separator_seen, index|:
         flag: cstr = effective_slots[index].cast[cstr]
-        break if cstr_equal(flag, "--")
+        if cstr_equal(flag, "--"):
+            separator_seen <- true
+            flags_ok <- false if not (cstr_equal(command, "run") or cstr_equal(command, "test"))
+            index <- index + 1
+            continue
+        if separator_seen:
+            index <- index + 1
+            continue
         if cstr_equal(flag, "--bin") or cstr_equal(flag, "--lib") or cstr_equal(flag, "--test"):
             target_allowed: bool = (cstr_equal(command, "build") and (cstr_equal(flag, "--bin") or cstr_equal(flag, "--lib") or cstr_equal(flag, "--test"))) or (cstr_equal(command, "run") and cstr_equal(flag, "--bin")) or (cstr_equal(command, "test") and cstr_equal(flag, "--test")) or (cstr_equal(command, "install") and cstr_equal(flag, "--bin"))
             flags_ok <- false if not target_allowed or index + 1 >= effective_argc
@@ -4122,10 +4132,11 @@ def cli_main(argc: i64, argv: mutable void&) -> i64 can[Console.Write, Memory.Al
         options.verbose <- true if cstr_equal(flag, "--verbose")
         flag_length: usize = Platform::pkg_strlen(flag)
         is_positional: bool = flag_length > 0.usize() and flag[0].u8() != 45
-        positional_allowed: bool = (cstr_equal(command, "why") and index == 2) or (cstr_equal(command, "install") and index == 2) or (cstr_equal(command, "uninstall") and (index == 2 or (index == 3 and cstr_equal(effective_slots[2].cast[cstr], "--local")))) or (cstr_equal(command, "cache") and index == 2) or (cstr_equal(command, "fetch") and (index == 2 or index == 3))
+        positional_allowed: bool = (cstr_equal(command, "why") and positional_count == 0) or (cstr_equal(command, "install") and positional_count == 0) or (cstr_equal(command, "uninstall") and positional_count == 0) or (cstr_equal(command, "cache") and positional_count == 0) or (cstr_equal(command, "fetch") and positional_count < 2)
         recognized: bool = is_positional and positional_allowed
         recognized <- true if not is_positional and (cstr_equal(flag, "--locked") or cstr_equal(flag, "--offline") or cstr_equal(flag, "--frozen") or cstr_equal(flag, "--json") or cstr_equal(flag, "--verbose") or (cstr_equal(flag, "--list") and cstr_equal(command, "package")) or (cstr_equal(flag, "--dry-run") and cstr_equal(command, "cache")) or (cstr_equal(command, "install") and cstr_equal(flag, "--local")) or (cstr_equal(command, "uninstall") and cstr_equal(flag, "--local")))
         flags_ok <- false if not recognized
+        positional_count <- positional_count + 1 if recognized and is_positional
         index <- index + 1
     if cstr_equal(command, "run") and Platform::pkg_strlen(options.target_kind) == 0.usize():
         options.target_kind <- "bin"
@@ -4156,7 +4167,7 @@ def cli_main(argc: i64, argv: mutable void&) -> i64 can[Console.Write, Memory.Al
         return run_uninstall(effective_argc, effective_slots)
     if cstr_equal(command, "clean"):
         return run_clean()
-    if cstr_equal(command, "cache") and effective_argc > 2 and cstr_equal(effective_slots[2].cast[cstr], "verify"):
+    if cstr_equal(command, "cache") and effective_argc == 3 and cstr_equal(effective_slots[2].cast[cstr], "verify"):
         return run_cache_verify(&start)
     if cstr_equal(command, "cache"):
         return run_cache_gc(effective_argc, effective_slots)

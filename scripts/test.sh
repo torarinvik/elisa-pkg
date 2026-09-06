@@ -625,6 +625,18 @@ PY
   else
     test "$?" -eq 2
   fi
+  if "$BIN" build -- ignored >/dev/null 2>&1; then
+    echo "build silently accepted arguments after --" >&2
+    exit 1
+  else
+    test "$?" -eq 2
+  fi
+  if "$BIN" cache verify --dry-run >/dev/null 2>&1; then
+    echo "cache verify silently accepted --dry-run" >&2
+    exit 1
+  else
+    test "$?" -eq 2
+  fi
   "$BIN" publish >/dev/null 2>&1 && exit 1 || test "$?" -eq 5
   "$BIN" install app >/dev/null 2>&1 && exit 1 || test "$?" -eq 5
   "$BIN" fetch --offline >/dev/null
