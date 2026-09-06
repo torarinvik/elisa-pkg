@@ -111,7 +111,9 @@ artifact digest all match; included non-target sources remain outside the
 current key. An unavailable toolchain identity disables reuse rather than
 silently trusting a stale artifact.
 
-These changes do not supply the planned remote verifier or execution sandbox.
-Project mutation and installation still assume a trusted, user-owned directory;
+These changes supply detached Ed25519 verification for the local registry
+fixture, but do not supply the planned remote transport, publisher delegation,
+or execution sandbox. Project mutation and installation still assume a trusted,
+user-owned directory;
 concurrent malicious changes to state or installation directories require further
 handle-based filesystem work before hostile shared directories are supported.
