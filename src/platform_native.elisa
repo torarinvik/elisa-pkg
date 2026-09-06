@@ -368,6 +368,114 @@ module PlatformNative:
         def process_exit(code: i64):
             native_exit(code)
 
+        def verify_ed25519(public_key: darray[u8]&, message: darray[u8]&, signature: darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return -22 if public_key.count != 32.usize() or signature.count != 64.usize()
+            encoded_key: mutable darray[u8] = [48, 42, 48, 5, 6, 3, 43, 101, 112, 3, 33, 0]
+            for index in 0..<public_key.count |encoded_key, public_key|:
+                encoded_key.push(public_key[index])
+            public_path: mutable darray[u8] = []
+            message_path: mutable darray[u8] = []
+            signature_path: mutable darray[u8] = []
+            return -38 if not write_temp_blob("/private/tmp/elisapkg-key.XXXXXX", encoded_key, &public_path)
+            if not write_temp_blob("/private/tmp/elisapkg-message.XXXXXX", message, &message_path):
+                _ = remove_temp_blob(public_path)
+                return -38
+            if not write_temp_blob("/private/tmp/elisapkg-signature.XXXXXX", signature, &signature_path):
+                _ = remove_temp_blob(public_path)
+                _ = remove_temp_blob(message_path)
+                return -38
+            public_name: cstr = (&public_path[0]).cast[cstr] can Unsafe.PointerCast
+            message_name: cstr = (&message_path[0]).cast[cstr] can Unsafe.PointerCast
+            signature_name: cstr = (&signature_path[0]).cast[cstr] can Unsafe.PointerCast
+            args: mutable darray[cstr] = []
+            args.push("/usr/bin/env")
+            args.push("-i")
+            args.push("PATH=/opt/homebrew/opt/openssl@3/bin:/opt/homebrew/opt/openssl/bin:/usr/bin:/bin")
+            args.push("openssl")
+            args.push("pkeyutl")
+            args.push("-verify")
+            args.push("-pubin")
+            args.push("-inkey")
+            args.push(public_name)
+            args.push("-keyform")
+            args.push("DER")
+            args.push("-rawin")
+            args.push("-in")
+            args.push(message_name)
+            args.push("-sigfile")
+            args.push(signature_name)
+            args.push(null)
+            child_argv: mutable cstr&& = (&args[0]).cast[mutable cstr&&] can Unsafe.PointerCast
+            pid: i64 = native_fork()
+            result: mutable i64 = -1
+            if pid == 0:
+                _ = native_setpgid(0, 0)
+                if set_process_limits(2) != 0:
+                    native_exit(126)
+                _ = native_execvp("/usr/bin/env", child_argv)
+                native_exit(127)
+            elif pid > 0:
+                status: mutable i64 = 0
+                waited: i64 = waitpid_timeout(pid, &status, 10000)
+                result <- -110 if waited == -110
+                result <- waited if waited < 0 and waited != -110
+                result <- 0 if waited == 0 and status == 0
+                result <- -38 if waited == 0 and status / 256 == 127
+            remove_status: i64 = remove_temp_blob(public_path)
+            _ = remove_temp_blob(message_path)
+            _ = remove_temp_blob(signature_path)
+            return result if remove_status == 0 or result != 0 else remove_status
+
+        def write_temp_blob(prefix: cstr, value: darray[u8]&, path_out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            template: mutable darray[u8] = []
+            length: mutable usize = native_strlen(prefix)
+            return false if length == 0 or length > 4096
+            for index in 0..<length |template, prefix|:
+                template.push(prefix[index].u8())
+            template.push(0)
+            raw_template: mutable u8& = (&template[0]).cast[mutable u8&] can Unsafe.PointerCast
+            fd: mutable i64 = mkstemp(raw_template)
+            if fd < 0 and length > 13.usize():
+                is_private_tmp: mutable bool = true
+                private_prefix: darray[u8] = [47, 112, 114, 105, 118, 97, 116, 101, 47, 116, 109, 112, 47]
+                for index in 0..<13 |is_private_tmp, prefix, private_prefix|:
+                    is_private_tmp <- is_private_tmp and prefix[index].u8() == private_prefix[index]
+                if is_private_tmp:
+                    template <- []
+                    fallback_prefix: darray[u8] = [47, 116, 109, 112, 47]
+                    for index in 0..<5 |template, fallback_prefix|:
+                        template.push(fallback_prefix[index])
+                    for index in 13..<length |template, prefix|:
+                        template.push(prefix[index].u8())
+                    template.push(0)
+                    length <- template.count - 1.usize()
+                    raw_template <- (&template[0]).cast[mutable u8&] can Unsafe.PointerCast
+                    fd <- mkstemp(raw_template)
+            return false if fd < 0
+            written: mutable usize = 0.usize()
+            failed: mutable bool = false
+            while written < value.count |value, written, fd, failed|:
+                raw: void& = (&value[written]).cast[void&] can Unsafe.PointerCast
+                amount: i64 = native_write(fd, raw, value.count - written)
+                if amount <= 0:
+                    failed <- true
+                    break
+                written <- written + amount.usize()
+            if not failed and native_fsync(fd) != 0:
+                failed <- true
+            _ = native_close(fd)
+            if failed:
+                _ = remove_temp_blob(template)
+                return false
+            for index in 0..<length |path_out, template|:
+                path_out.push(template[index])
+            path_out.push(0)
+            return true
+
+        def remove_temp_blob(path: darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            path_name: cstr = (&path[0]).cast[cstr] can Unsafe.PointerCast
+            return unlink_kind(path_name, 0)
+
         def set_process_group() -> i64:
             result: i64 = native_setpgid(0, 0)
             return 0 if result == 0 else negative_errno()
