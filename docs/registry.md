@@ -15,15 +15,16 @@ The directory must be an absolute, symlink-free path. Its layout is:
 
 ```text
 REGISTRY/
-  root.ed25519
   PACKAGE/index
   PACKAGE/VERSION/metadata.json
   PACKAGE/VERSION/metadata.sig
   PACKAGE/VERSION/archive.tar
 ```
 
-`root.ed25519` is exactly 32 raw Ed25519 public-key bytes, and `metadata.sig`
-is exactly 64 raw Ed25519 signature bytes. `index` is a
+Set `ELISAPKG_REGISTRY_TRUST_ROOT` to an independently provisioned absolute
+file containing exactly 32 raw Ed25519 public-key bytes. The key must not be
+stored under the mutable registry directory. `metadata.sig` is exactly 64 raw
+Ed25519 signature bytes. `index` is a
 newline-separated list of unique, complete SemVer versions. The resolver picks
 the highest version satisfying the requested exact, caret, tilde, or comparison
 requirement.

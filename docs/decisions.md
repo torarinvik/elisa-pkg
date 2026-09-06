@@ -98,7 +98,9 @@ implemented. Fixture: package receipt and corrupted-blob cases in
 ## D-011: registry verification before use
 
 The local registry fixture uses a detached Ed25519 signature over the exact
-metadata bytes. The trust root is a separate 32-byte file; metadata binds the
+metadata bytes. The trust root is an independently provisioned 32-byte file
+selected through `ELISAPKG_REGISTRY_TRUST_ROOT`, outside the mutable registry
+directory; metadata binds the
 registry path, package, selected SemVer, archive relative path, byte size, and
 SHA-256 digest. The resolver validates the archive as deterministic ustar and
 recomputes its digest before returning success. Registry file reads reject
