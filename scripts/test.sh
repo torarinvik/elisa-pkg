@@ -807,6 +807,16 @@ if (cd "$BAD" && "$BIN" check-manifest >/dev/null 2>&1); then
   echo "non-string registry was accepted" >&2
   exit 1
 fi
+printf '%s\n' '{"schema-version":1,"package":{"name":"good","version":"1.0.0"},"targets":[{"name":"target","kind":"bin","entry":"src/main.elisa"}],"dependencies":{"foo":{"path":"local","extra":true}}}' > "$BAD/elisapkg.json"
+if (cd "$BAD" && "$BIN" check-manifest >/dev/null 2>&1); then
+  echo "unknown local dependency field was accepted" >&2
+  exit 1
+fi
+printf '%s\n' '{"schema-version":1,"package":{"name":"good","version":"1.0.0"},"targets":[{"name":"target","kind":"bin","entry":"src/main.elisa"}],"dependencies":{"foo":{"version":"^1.0.0","registry":"primary","extra":true}}}' > "$BAD/elisapkg.json"
+if (cd "$BAD" && "$BIN" check-manifest >/dev/null 2>&1); then
+  echo "unknown registry dependency field was accepted" >&2
+  exit 1
+fi
 printf '%s\n' '{"schema-version":1,"package":{"name":"good","version":"1.0.0"},"targets":[{"name":"target","kind":"bin","entry":"src/main.elisa"}],"dependencies":{"foo":{"git":"https://example.invalid/foo","rev":"0123456789abcdef0123456789abcdef01234567"}}}' > "$BAD/elisapkg.json"
 if (cd "$BAD" && "$BIN" check-manifest >/dev/null 2>&1); then
   echo "unsupported Git dependency was accepted" >&2
