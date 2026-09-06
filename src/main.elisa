@@ -69,6 +69,14 @@ def bytes_equal_view(left: darray[u8]&, right: cstr) -> bool:
         false return if left[index] != right_byte
     return true
 
+def cstr_equal(left: cstr, right: cstr) -> bool:
+    left_length: usize = Platform::pkg_strlen(left)
+    right_length: usize = Platform::pkg_strlen(right)
+    return false if left_length != right_length
+    for index in 0..<left_length |left, right|:
+        return false if left[index].u8() != right[index].u8()
+    return true
+
 def bytes_count(haystack: darray[u8]&, needle: cstr) -> usize:
     needle_length: usize = Platform::pkg_strlen(needle)
     total: mutable usize = 0.usize()
@@ -1986,6 +1994,35 @@ def append_local_dependency(raw: darray[u8]&, alias: darray[u8]&, path: darray[u
         out.push(raw[index])
     return out
 
+def append_registry_dependency(raw: darray[u8]&, alias: darray[u8]&, requirement: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    out: mutable darray[u8] = []
+    dependency_start: usize = json_key_value_offset(raw, "dependencies")
+    dependency_end: usize = json_object_end(raw, dependency_start)
+    return [] if dependency_start >= raw.count or dependency_end <= dependency_start
+    return [] if object_has_direct_key(raw, dependency_start, dependency_end, alias)
+    has_existing: mutable bool = false
+    if dependency_end > dependency_start + 1.usize():
+        for index in (dependency_start + 1.usize())..<dependency_end |raw, has_existing|:
+            byte: u8 = raw[index]
+            if byte != 32 and byte != 9 and byte != 10 and byte != 13:
+                has_existing <- true
+                break
+    for index in 0..<dependency_end |out, raw|:
+        out.push(raw[index])
+    if has_existing:
+        out.push(44)
+        out.push(32)
+    out.push(34)
+    for alias_index in 0..<alias.count |out, alias|:
+        out.push(alias[alias_index])
+    bytes_push_view(&out, "\": {\"registry\": \"primary\", \"version\": \"")
+    for requirement_index in 0..<requirement.count |out, requirement|:
+        out.push(requirement[requirement_index])
+    bytes_push_view(&out, "\"}")
+    for index in dependency_end..<raw.count |out, raw|:
+        out.push(raw[index])
+    return out
+
 def find_dependency_span(raw: darray[u8]&, alias: darray[u8]&, start_out: mutable usize&, end_out: mutable usize&) -> bool can[Memory.Allocate, Abort.Panic]:
     dependency_start: usize = json_key_value_offset(raw, "dependencies")
     dependency_end: usize = json_object_end(raw, dependency_start)
@@ -2069,7 +2106,7 @@ def project_manifest_exists() -> bool:
     return current
 
 def usage() -> void can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-    write_ok("elisapkg — Elisa Packaging System\n\nUsage: elisapkg <command> [options]\n\nCommands:\n  init [PATH] [--bin|--lib]    create a package\n  check-manifest              validate elisapkg.json\n  add NAME --path PATH        add a verified local path dependency\n  remove NAME                 remove a declared local dependency\n  update [NAME]               recompute the local dependency lock\n  resolve [--locked|--offline]\n                              validate and write elisapkg.lock\n  tree                        show the resolved package graph\n  metadata --json             print normalized package metadata\n  doctor                      report toolchain and trust capabilities\n  build                       compile the package entry point\n  run -- ARGS                 build and run\n  test                        build and run the declared test target\n  clean                       remove known local build/package outputs\n  fetch [PACKAGE REQUIREMENT] verify locked sources or a signed local registry artifact\n  cache verify                inspect cached verification records\n  cache gc --dry-run          preview unreachable cache entries\n  package [--list]            create or preview the deterministic archive\n  install --local             install the current built binary into the user prefix\n  uninstall --local NAME      remove a receipt-owned local binary\n\nModes: --locked  --offline  --frozen  --json  --verbose\n")
+    write_ok("elisapkg — Elisa Packaging System\n\nUsage: elisapkg <command> [options]\n\nCommands:\n  init [PATH] [--bin|--lib]    create a package\n  check-manifest              validate elisapkg.json\n  add NAME --path PATH        add a verified local path dependency\n  add NAME --version RANGE --registry primary\n                              add a signed registry dependency\n  remove NAME                 remove a declared dependency\n  update [NAME]               recompute the dependency lock\n  resolve [--locked|--offline]\n                              validate and write elisapkg.lock\n  tree                        show the resolved package graph\n  metadata --json             print normalized package metadata\n  doctor                      report toolchain and trust capabilities\n  build                       compile the package entry point\n  run -- ARGS                 build and run\n  test                        build and run the declared test target\n  clean                       remove known local build/package outputs\n  fetch [PACKAGE REQUIREMENT] verify locked sources or a signed local registry artifact\n  cache verify                inspect cached verification records\n  cache gc --dry-run          preview unreachable cache entries\n  package [--list]            create or preview the deterministic archive\n  install --local             install the current built binary into the user prefix\n  uninstall --local NAME      remove a receipt-owned local binary\n\nModes: --locked  --offline  --frozen  --json  --verbose\n")
     write_ok("remote publish/install/uninstall are trust-gated; use install --local for a receipt-backed local binary\n")
 
 def current_directory_into(out: mutable darray[u8]&) -> void can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -2151,26 +2188,35 @@ def run_init(argc: i64, slots: mutable cstr&&) -> i64 can[Console.Write, Memory.
     return EXIT_OK
 
 def run_add(argc: i64, slots: mutable cstr&&) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-    return EXIT_USAGE if argc != 5 or slots[3].cast[cstr] != "--path"
+    local_form: bool = argc == 5 and cstr_equal(slots[3].cast[cstr], "--path")
+    registry_form: bool = argc == 7 and cstr_equal(slots[3].cast[cstr], "--version") and cstr_equal(slots[5].cast[cstr], "--registry") and cstr_equal(slots[6].cast[cstr], "primary")
+    return EXIT_USAGE if not local_form and not registry_form
     alias: mutable darray[u8] = []
     bytes_push_cstr(&alias, slots[2].cast[cstr])
     return EXIT_USAGE if not valid_package_name(alias)
-    dependency_path: mutable darray[u8] = []
-    bytes_push_cstr(&dependency_path, slots[4].cast[cstr])
-    return EXIT_USAGE if not valid_dependency_path(dependency_path)
     root: mutable darray[u8] = [46]
     root_name: mutable darray[u8] = []
     root_version: mutable darray[u8] = []
     return EXIT_USAGE if not load_package_at(&root, &root_name, &root_version)
-    dependency_name: mutable darray[u8] = []
-    dependency_version: mutable darray[u8] = []
-    return EXIT_RESOLVE if not load_package_at(&dependency_path, &dependency_name, &dependency_version)
-    return EXIT_RESOLVE if not bytes_equal(alias, dependency_name) or bytes_equal(alias, root_name)
+    dependency_path: mutable darray[u8] = []
+    requirement: mutable darray[u8] = []
+    if local_form:
+        bytes_push_cstr(&dependency_path, slots[4].cast[cstr])
+        return EXIT_USAGE if not valid_dependency_path(dependency_path)
+        dependency_name: mutable darray[u8] = []
+        dependency_version: mutable darray[u8] = []
+        return EXIT_RESOLVE if not load_package_at(&dependency_path, &dependency_name, &dependency_version)
+        return EXIT_RESOLVE if not bytes_equal(alias, dependency_name) or bytes_equal(alias, root_name)
+    else:
+        bytes_push_cstr(&requirement, slots[4].cast[cstr])
+        parsed_requirement: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
+        return EXIT_USAGE if not SemVer::parse_requirement(requirement, &parsed_requirement)
+        return EXIT_RESOLVE if bytes_equal(alias, root_name)
     raw: mutable darray[u8] = []
     raw.resize(1048577)
     return EXIT_USAGE if not read_cstr_into("elisapkg.json", &raw)
     return EXIT_USAGE if not validate_manifest_at(raw, &root, &root_name, &root_version)
-    updated: darray[u8] = append_local_dependency(raw, alias, dependency_path)
+    updated: darray[u8] = append_local_dependency(raw, alias, dependency_path) if local_form else append_registry_dependency(raw, alias, requirement)
     if updated.count == 0.usize():
         write_error("error: dependency is already declared or the manifest has no dependency object\n")
         return EXIT_RESOLVE
@@ -2190,10 +2236,16 @@ def run_add(argc: i64, slots: mutable cstr&&) -> i64 can[Console.Write, Memory.A
         _ = transaction_restore()
         return EXIT_SECURITY
     return EXIT_SECURITY if not transaction_commit()
-    write_ok("added local dependency ")
+    write_ok("added ")
+    write_ok("local " if local_form else "registry ")
+    write_ok("dependency ")
     write_bytes(1, &alias)
-    write_ok(" from ")
-    write_bytes(1, &dependency_path)
+    if local_form:
+        write_ok(" from ")
+        write_bytes(1, &dependency_path)
+    else:
+        write_ok(" with requirement ")
+        write_bytes(1, &requirement)
     write_ok("\n")
     return EXIT_OK
 
