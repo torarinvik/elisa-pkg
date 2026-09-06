@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Review regressions: independent fixtures, bounded subprocesses, real CLI."""
 import os
-from pathlib import Path
 import subprocess
 import tempfile
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BIN = ROOT / 'build/elisapkg'
@@ -215,20 +215,20 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
 
     run([BIN, 'init', work / 'project'], stdout=subprocess.DEVNULL)
     project = work / 'project'
-    conflict_init = subprocess.run([BIN, 'init', work / 'conflict', '--lib', '--bin'], capture_output=True, timeout=120)
+    conflict_init = subprocess.run([BIN, 'init', work / 'conflict', '--lib', '--bin'], capture_output=True, timeout=120, check=False)
     assert conflict_init.returncode == 2, conflict_init
     run([BIN, 'resolve'], cwd=project, stdout=subprocess.DEVNULL)
     for command in [['resolve', 'unexpected'], ['check-manifest', 'unexpected']]:
-        result = subprocess.run([BIN, *command], cwd=project, capture_output=True, timeout=120)
+        result = subprocess.run([BIN, *command], cwd=project, capture_output=True, timeout=120, check=False)
         assert result.returncode == 2, (command, result)
     for command in [['resolve', '--list'], ['build', '--dry-run'], ['build', '--version']]:
-        result = subprocess.run([BIN, *command], cwd=project, capture_output=True, timeout=120)
+        result = subprocess.run([BIN, *command], cwd=project, capture_output=True, timeout=120, check=False)
         assert result.returncode == 2, (command, result)
-    duplicate_manifest_path = subprocess.run([BIN, 'check-manifest', '--manifest-path', project / 'elisapkg.json', '--manifest-path', project / 'elisapkg.json'], capture_output=True, timeout=120)
+    duplicate_manifest_path = subprocess.run([BIN, 'check-manifest', '--manifest-path', project / 'elisapkg.json', '--manifest-path', project / 'elisapkg.json'], capture_output=True, timeout=120, check=False)
     assert duplicate_manifest_path.returncode == 2, duplicate_manifest_path
-    result = subprocess.run([BIN, 'update', 'missing'], cwd=project, capture_output=True, timeout=120)
+    result = subprocess.run([BIN, 'update', 'missing'], cwd=project, capture_output=True, timeout=120, check=False)
     assert result.returncode == 3, result
-    result = subprocess.run([BIN, 'test'], cwd=project, capture_output=True, timeout=120)
+    result = subprocess.run([BIN, 'test'], cwd=project, capture_output=True, timeout=120, check=False)
     assert result.returncode == 2, result
     lock = project / 'elisapkg.lock'
     before = lock.stat()
@@ -267,7 +267,7 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
         '{"schema-version":1,"package":{"name":"collision-root","version":"0.2.0"},'
         '"targets":[{"name":"collision-root","kind":"lib","entry":"src/main.elisa"}],'
         '"dependencies":{}}\n')
-    result = subprocess.run([BIN, 'resolve'], cwd=collision_root, capture_output=True, timeout=120)
+    result = subprocess.run([BIN, 'resolve'], cwd=collision_root, capture_output=True, timeout=120, check=False)
     assert result.returncode == 3, result
 
     manifest = project / 'elisapkg.json'
@@ -280,13 +280,13 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
     missing_target_kind = valid.replace(', "kind": "bin"', '', 1)
     for invalid in [valid.replace('"schema-version": 1,', '"schema-version": 1'), valid + '{}', unsupported_registry, misplaced_identity, misplaced_package_field, misplaced_target_field, missing_target_entry, missing_target_kind]:
         manifest.write_text(invalid)
-        result = subprocess.run([BIN, 'check-manifest'], cwd=project, capture_output=True, timeout=120)
+        result = subprocess.run([BIN, 'check-manifest'], cwd=project, capture_output=True, timeout=120, check=False)
         assert result.returncode != 0
     manifest.write_text(valid)
     legacy_only = project / 'manifest.json'
     legacy_only.write_text(valid)
     manifest.unlink()
-    result = subprocess.run([BIN, 'check-manifest'], cwd=project, capture_output=True, timeout=120)
+    result = subprocess.run([BIN, 'check-manifest'], cwd=project, capture_output=True, timeout=120, check=False)
     assert result.returncode == 2, result
     manifest.write_text(valid)
     legacy_only.unlink()
@@ -299,13 +299,13 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
     compiler.chmod(0o755)
     environment = dict(os.environ, ELISAPKG_COMPILER=str(compiler))
     result = subprocess.run([BIN, 'build'], cwd=project, env=environment,
-                            capture_output=True, timeout=120)
+                            capture_output=True, timeout=120, check=False)
     assert result.returncode == 6, result
     assert artifact.read_bytes() == b'previous working output'
 
     guard = project / '.elisapkg/transaction.guard'
     guard.mkdir()
-    result = subprocess.run([BIN, 'check-manifest'], cwd=project, capture_output=True, timeout=120)
+    result = subprocess.run([BIN, 'check-manifest'], cwd=project, capture_output=True, timeout=120, check=False)
     assert result.returncode == 5, result
     guard.rmdir()
 

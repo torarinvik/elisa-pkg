@@ -675,8 +675,18 @@ PY
   else
     test "$?" -eq 2
   fi
-  "$BIN" publish >/dev/null 2>&1 && exit 1 || test "$?" -eq 5
-  "$BIN" install app >/dev/null 2>&1 && exit 1 || test "$?" -eq 5
+  if "$BIN" publish >/dev/null 2>&1; then
+    echo "publish unexpectedly succeeded" >&2
+    exit 1
+  else
+    test "$?" -eq 5
+  fi
+  if "$BIN" install app >/dev/null 2>&1; then
+    echo "remote install unexpectedly succeeded" >&2
+    exit 1
+  else
+    test "$?" -eq 5
+  fi
   "$BIN" fetch --offline >/dev/null
   test -f .elisapkg/build/app
   "$BIN" clean >/dev/null
