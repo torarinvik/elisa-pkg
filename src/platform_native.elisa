@@ -915,12 +915,13 @@ module PlatformNative:
             return directory
 
         def extraction_failure(root: i64, seen: darray[u8]&, errno_value: i64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            cleanup_archive_files(root, seen)
-            return -5 if native_close(root) != 0
+            cleanup_ok: bool = cleanup_archive_files(root, seen)
+            return -5 if not cleanup_ok or native_close(root) != 0
             return errno_value
 
-        def cleanup_archive_files(root: i64, seen: darray[u8]&) -> void can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+        def cleanup_archive_files(root: i64, seen: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             cursor: mutable usize = 0.usize()
+            cleanup_ok: mutable bool = true
             while cursor < seen.count:
                 end: mutable usize = cursor
                 while end < seen.count and seen[end] != 0:
@@ -933,9 +934,13 @@ module PlatformNative:
                 parent: i64 = archive_open_parent(root, name, &copy, &leaf_offset)
                 if parent >= 0:
                     leaf: cstr = (&copy[leaf_offset]).cast[cstr] can Unsafe.PointerCast
-                    _ = native_unlinkat(parent, leaf, 0)
-                    _ = native_close(parent)
+                    removed: i64 = native_unlinkat(parent, leaf, 0)
+                    cleanup_ok <- false if removed != 0 and current_errno() != 2
+                    cleanup_ok <- false if native_close(parent) != 0
+                else:
+                    cleanup_ok <- false
                 cursor <- end + 1.usize()
+            return cleanup_ok
 
         const regular_mode: u64 = 32768
         const directory_mode: u64 = 16384
