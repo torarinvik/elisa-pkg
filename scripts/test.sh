@@ -593,6 +593,19 @@ PY
   cp .elisapkg/package.receipt package.receipt.good
   test -s .elisapkg/package.receipt
   "$BIN" cache verify | grep -F 'package archive and receipt verified' >/dev/null
+  mv .elisapkg/package.tar .elisapkg/package.tar.real
+  mv .elisapkg/package.receipt .elisapkg/package.receipt.real
+  ln -s package.tar.real .elisapkg/package.tar
+  ln -s package.receipt.real .elisapkg/package.receipt
+  if "$BIN" cache verify >/dev/null 2>&1; then
+    echo "cache verification accepted symlinked package evidence" >&2
+    exit 1
+  else
+    test "$?" -eq 5
+  fi
+  rm .elisapkg/package.tar .elisapkg/package.receipt
+  mv .elisapkg/package.tar.real .elisapkg/package.tar
+  mv .elisapkg/package.receipt.real .elisapkg/package.receipt
   PACKAGE_BLOB="$(find .elisapkg/cache/sha256 -type f | head -n 1)"
   test -n "$PACKAGE_BLOB"
   printf '%s' junk >> "$PACKAGE_BLOB"
