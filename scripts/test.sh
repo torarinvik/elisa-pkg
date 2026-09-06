@@ -636,6 +636,38 @@ mkdir -p "$LIB_CASE"
   test ! -e .elisapkg/build/app.o
 )
 
+# Named targets must have independent artifact names and selectors. Building a
+# binary, library, and test from one manifest exercises the same target graph
+# without allowing one target's output or run path to shadow another's.
+MULTI_CASE="$ROOT/build/multi-target-$$"
+mkdir -p "$MULTI_CASE"
+"$BIN" init "$MULTI_CASE" >/dev/null
+(
+  cd "$MULTI_CASE"
+  printf '%s\n' 'def main() -> i64:' '    return 0' > src/tool.elisa
+  printf '%s\n' 'def main() -> i64:' '    return 0' > src/util.elisa
+  printf '%s\n' 'def main() -> i64:' '    return 0' > src/checks.elisa
+  cat > elisapkg.json <<'EOF'
+{"schema-version":1,"package":{"name":"multi","version":"0.1.0"},"targets":[{"name":"app","kind":"bin","entry":"src/main.elisa"},{"name":"tool","kind":"bin","entry":"src/tool.elisa"},{"name":"util","kind":"lib","entry":"src/util.elisa"},{"name":"checks","kind":"test","entry":"src/checks.elisa"}],"dependencies":{}}
+EOF
+  "$BIN" check-manifest >/dev/null
+  "$BIN" resolve >/dev/null
+  "$BIN" build --bin tool >/dev/null
+  test -x .elisapkg/build/tool
+  test ! -e .elisapkg/build/app
+  "$BIN" build --lib util >/dev/null
+  test -f .elisapkg/build/util.o
+  "$BIN" test --test checks >/dev/null
+  test -x .elisapkg/build/checks
+  "$BIN" run --bin tool -- >/dev/null
+  if "$BIN" build --bin missing >/dev/null 2>&1; then
+    echo "unknown named target was accepted" >&2
+    exit 1
+  else
+    test "$?" -eq 6
+  fi
+)
+
 # Keep this hostile-path fixture isolated per invocation. A previous interrupted
 # run may leave its symlink probes behind, and reusing the directory would make
 # the next test fail before exercising the package manager.

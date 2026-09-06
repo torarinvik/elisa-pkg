@@ -650,6 +650,41 @@ def first_target_entry(raw: darray[u8]&, out: mutable darray[u8]&) -> bool can[M
             in_string <- false
     return false
 
+def select_target(raw: darray[u8]&, options: Model::CommandOptions, name_out: mutable darray[u8]&, kind_out: mutable darray[u8]&, entry_out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+    name_out.resize(0)
+    kind_out.resize(0)
+    entry_out.resize(0)
+    targets_start: usize = json_key_value_offset(raw, "targets")
+    return false if targets_start >= raw.count or raw[targets_start] != 91
+    targets_end: usize = json_array_end(raw, targets_start)
+    return false if targets_end <= targets_start
+    cursor: mutable usize = targets_start + 1.usize()
+    while cursor < targets_end:
+        while cursor < targets_end and ((raw[cursor] == 32) or (raw[cursor] == 9) or (raw[cursor] == 10) or (raw[cursor] == 13) or (raw[cursor] == 44)):
+            cursor <- cursor + 1.usize()
+        break if cursor >= targets_end
+        return false if raw[cursor] != 123
+        object_end: usize = json_object_end(raw, cursor)
+        return false if object_end <= cursor or object_end >= targets_end
+        candidate_name: mutable darray[u8] = []
+        candidate_kind: mutable darray[u8] = []
+        candidate_entry: mutable darray[u8] = []
+        return false if not object_string_value(raw, cursor, object_end, "name", &candidate_name) or not object_string_value(raw, cursor, object_end, "kind", &candidate_kind) or not object_string_value(raw, cursor, object_end, "entry", &candidate_entry)
+        name_requested: bool = Platform::pkg_strlen(options.target_name) != 0.usize()
+        kind_requested: bool = Platform::pkg_strlen(options.target_kind) != 0.usize()
+        name_matches: bool = not name_requested or bytes_equal_view(candidate_name, options.target_name)
+        kind_matches: bool = not kind_requested or bytes_equal_view(candidate_kind, options.target_kind)
+        if name_matches and kind_matches:
+            for index in 0..<candidate_name.count |name_out, candidate_name|:
+                name_out.push(candidate_name[index])
+            for index in 0..<candidate_kind.count |kind_out, candidate_kind|:
+                kind_out.push(candidate_kind[index])
+            for index in 0..<candidate_entry.count |entry_out, candidate_entry|:
+                entry_out.push(candidate_entry[index])
+            return true
+        cursor <- object_end + 1.usize()
+    return false
+
 def first_target_kind(raw: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
     out.resize(0)
     in_string: mutable bool = false
@@ -2283,7 +2318,7 @@ def project_manifest_exists() -> bool:
     return current
 
 def usage() -> void can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-    write_ok("elisapkg — Elisa Packaging System\n\nUsage: elisapkg <command> [options]\n\nCommands:\n  init [PATH] [--bin|--lib]    create a package\n  check-manifest              validate elisapkg.json\n  add NAME --path PATH        add a verified local path dependency\n  add NAME --version RANGE --registry primary\n                              add a signed registry dependency\n  remove NAME                 remove a declared dependency\n  update [NAME]               recompute the dependency lock\n  resolve [--locked|--offline]\n                              validate and write elisapkg.lock\n  tree                        show the resolved package graph\n  metadata --json             print normalized package metadata\n  doctor                      report toolchain and trust capabilities\n  build                       compile the package entry point\n  run -- ARGS                 build and run\n  test                        build and run the declared test target\n  clean                       remove known local build/package outputs\n  fetch [PACKAGE REQUIREMENT] verify locked sources or a signed local registry artifact\n  cache verify                inspect cached verification records\n  cache gc --dry-run          preview unreachable cache entries\n  package [--list]            create or preview the deterministic archive\n  install --local             install the current built binary into the user prefix\n  uninstall --local NAME      remove a receipt-owned local binary\n\nModes: --locked  --offline  --frozen  --json  --verbose\n")
+    write_ok("elisapkg — Elisa Packaging System\n\nUsage: elisapkg <command> [options]\n\nCommands:\n  init [PATH] [--bin|--lib]    create a package\n  check-manifest              validate elisapkg.json\n  add NAME --path PATH        add a verified local path dependency\n  add NAME --version RANGE --registry primary\n                              add a signed registry dependency\n  remove NAME                 remove a declared dependency\n  update [NAME]               recompute the dependency lock\n  resolve [--locked|--offline]\n                              validate and write elisapkg.lock\n  tree                        show the resolved package graph\n  metadata --json             print normalized package metadata\n  doctor                      report toolchain and trust capabilities\n  build [--bin NAME|--lib NAME|--test NAME]\n                              compile a selected target\n  run [--bin NAME] -- ARGS    build and run a binary target\n  test [--test NAME]          build and run a selected test target\n  clean                       remove known local build/package outputs\n  fetch [PACKAGE REQUIREMENT] verify locked sources or a signed local registry artifact\n  cache verify                inspect cached verification records\n  cache gc --dry-run          preview unreachable cache entries\n  package [--list]            create or preview the deterministic archive\n  install --local             install the current built binary into the user prefix\n  uninstall --local NAME      remove a receipt-owned local binary\n\nModes: --locked  --offline  --frozen  --json  --verbose\n")
     write_ok("remote publish/install/uninstall are trust-gated; use install --local for a receipt-backed local binary\n")
 
 def current_directory_into(out: mutable darray[u8]&) -> void can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -2406,7 +2441,7 @@ def run_add(argc: i64, slots: mutable cstr&&) -> i64 can[Console.Write, Memory.A
     if not write_cstr_file("elisapkg.json", &updated) or not transaction_mark_manifest():
         _ = transaction_restore()
         return EXIT_SOURCE
-    options: Model::CommandOptions = Model::CommandOptions{locked: false, offline: true, frozen: false, json: false, verbose: false}
+    options: Model::CommandOptions = Model::CommandOptions{locked: false, offline: true, frozen: false, json: false, verbose: false, target_name: "", target_kind: ""}
     resolved: i64 = run_resolve(&root, options)
     if resolved != EXIT_OK:
         restored: bool = transaction_restore()
@@ -2586,13 +2621,15 @@ def run_test(argc: i64, slots: mutable cstr&&, start: darray[u8]&, options: Mode
     raw: mutable darray[u8] = []
     raw.resize(1048577)
     return EXIT_USAGE if not read_cstr_into("elisapkg.json", &raw)
-    kind: mutable darray[u8] = []
-    return EXIT_USAGE if not first_target_kind(raw, &kind) or not bytes_equal_view(kind, "test")
+    selected_name: mutable darray[u8] = []
+    selected_kind: mutable darray[u8] = []
+    selected_entry: mutable darray[u8] = []
+    return EXIT_USAGE if not select_target(raw, options, &selected_name, &selected_kind, &selected_entry) or not bytes_equal_view(selected_kind, "test")
     # Reusing the normal build path keeps dependency, lock, and compiler-
     # environment checks identical while multi-target planning is completed.
     status: i64 = run_build(start, options)
     return status if status != EXIT_OK
-    return run_program(argc, slots, "test")
+    return run_program(argc, slots, options, "test")
 
 def object_sha256_equals(raw: darray[u8]&, object_start: usize, object_end: usize, field: cstr, expected: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
     encoded: mutable darray[u8] = []
@@ -2872,8 +2909,10 @@ def run_install_local(start: darray[u8]&, options: Model::CommandOptions) -> i64
     manifest_raw: mutable darray[u8] = []
     manifest_raw.resize(1048577)
     return EXIT_BUILD if not read_cstr_into("elisapkg.json", &manifest_raw)
+    target_name: mutable darray[u8] = []
     target_kind: mutable darray[u8] = []
-    return EXIT_BUILD if not first_target_kind(manifest_raw, &target_kind)
+    target_entry: mutable darray[u8] = []
+    return EXIT_BUILD if not select_target(manifest_raw, options, &target_name, &target_kind, &target_entry)
     if not bytes_equal_view(target_kind, "bin"):
         write_error("error: install --local requires a binary target\n")
         return 7
@@ -2882,7 +2921,12 @@ def run_install_local(start: darray[u8]&, options: Model::CommandOptions) -> i64
     return EXIT_USAGE if not load_package_at(&root, &name, &version)
     return EXIT_BUILD if run_build(start, options) != EXIT_OK
     artifact: mutable darray[u8] = []
-    path_join_into(start, ".elisapkg/build/app", &artifact)
+    target_name_c: mutable darray[u8] = []
+    path_with_nul_into(&target_name, &target_name_c)
+    target_name_raw: cstr = (&target_name_c[0]).cast[cstr] can Unsafe.PointerCast
+    build_dir: mutable darray[u8] = []
+    path_join_into(start, ".elisapkg/build", &build_dir)
+    path_join_into(build_dir, target_name_raw, &artifact)
     artifact_bytes: mutable darray[u8] = []
     return 7 if not read_package_file_into(&artifact, &artifact_bytes)
     digest_bytes: mutable darray[u8] = []
@@ -2946,7 +2990,13 @@ def run_install_local(start: darray[u8]&, options: Model::CommandOptions) -> i64
     return EXIT_OK
 
 def run_install(argc: i64, slots: mutable cstr&&, start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-    if argc == 3 and cstr_equal(slots[2].cast[cstr], "--local"):
+    local_seen: mutable bool = false
+    index: mutable i64 = 2
+    while index < argc |slots, index, local_seen|:
+        break if cstr_equal(slots[index].cast[cstr], "--")
+        local_seen <- true if cstr_equal(slots[index].cast[cstr], "--local")
+        index <- index + 1
+    if local_seen:
         return run_install_local(start, options)
     write_error(Security::install_message())
     return Security::install_status()
@@ -3057,7 +3107,7 @@ def run_remove(argc: i64, slots: mutable cstr&&) -> i64 can[Console.Write, Memor
     if not write_cstr_file("elisapkg.json", &updated) or not transaction_mark_manifest():
         _ = transaction_restore()
         return EXIT_SOURCE
-    options: Model::CommandOptions = Model::CommandOptions{locked: false, offline: true, frozen: false, json: false, verbose: false}
+    options: Model::CommandOptions = Model::CommandOptions{locked: false, offline: true, frozen: false, json: false, verbose: false, target_name: "", target_kind: ""}
     resolved: i64 = run_resolve(&root, options)
     if resolved != EXIT_OK:
         restored: bool = transaction_restore()
@@ -3089,7 +3139,7 @@ def run_update(argc: i64, slots: mutable cstr&&) -> i64 can[Console.Write, Memor
     root_version: mutable darray[u8] = []
     return EXIT_USAGE if not validate_manifest_at(raw, &root, &root_name, &root_version)
     return EXIT_SECURITY if not transaction_begin(raw)
-    options: Model::CommandOptions = Model::CommandOptions{locked: false, offline: true, frozen: false, json: false, verbose: false}
+    options: Model::CommandOptions = Model::CommandOptions{locked: false, offline: true, frozen: false, json: false, verbose: false, target_name: "", target_kind: ""}
     resolved: i64 = run_resolve(&root, options)
     if resolved != EXIT_OK:
         restored: bool = transaction_restore()
@@ -3357,7 +3407,7 @@ def run_package(argc: i64, slots: mutable cstr&&, start: darray[u8]&) -> i64 can
             cursor <- cursor + 1.usize()
         write_error("note: signing is required before publish; this command only previews files\n")
         return EXIT_OK
-    lock_options: Model::CommandOptions = Model::CommandOptions{locked: true, offline: true, frozen: true, json: false, verbose: false}
+    lock_options: Model::CommandOptions = Model::CommandOptions{locked: true, offline: true, frozen: true, json: false, verbose: false, target_name: "", target_kind: ""}
     return EXIT_RESOLVE if run_resolve(start, lock_options) != EXIT_OK
     lock_raw: mutable darray[u8] = []
     lock_raw.resize(1048577)
@@ -3449,10 +3499,10 @@ def run_build(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Con
     manifest_digest: mutable darray[u8] = []
     return EXIT_BUILD if Integrity::sha256(manifest_raw, &manifest_digest_bytes) != Integrity::DigestCode.Ok
     return EXIT_BUILD if not Integrity::hex_digest(manifest_digest_bytes, &manifest_digest)
-    target_entry: mutable darray[u8] = []
-    return EXIT_BUILD if not first_target_entry(manifest_raw, &target_entry)
+    target_name: mutable darray[u8] = []
     target_kind: mutable darray[u8] = []
-    return EXIT_BUILD if not first_target_kind(manifest_raw, &target_kind)
+    target_entry: mutable darray[u8] = []
+    return EXIT_BUILD if not select_target(manifest_raw, options, &target_name, &target_kind, &target_entry)
     is_library: bool = bytes_equal_view(target_kind, "lib")
     return EXIT_BUILD if not (is_library or bytes_equal_view(target_kind, "bin") or bytes_equal_view(target_kind, "test"))
     target_entry_c: mutable darray[u8] = []
@@ -3494,11 +3544,19 @@ def run_build(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Con
     artifact: mutable darray[u8] = []
     receipt_path: mutable darray[u8] = []
     path_join_into(start, ".elisapkg/build", &build_dir)
-    artifact_leaf: mutable cstr = "app"
+    artifact_leaf_storage: mutable darray[u8] = []
+    for index in 0..<target_name.count |artifact_leaf_storage, target_name|:
+        artifact_leaf_storage.push(target_name[index])
+    artifact_leaf_storage.push(0)
+    artifact_leaf: mutable cstr = (&artifact_leaf_storage[0]).cast[cstr] can Unsafe.PointerCast
     emit_kind: mutable cstr = "exe"
     artifact_access_mode: mutable i64 = 1
     if is_library:
-        artifact_leaf <- "app.o"
+        artifact_leaf_storage.resize(artifact_leaf_storage.count - 1.usize())
+        artifact_leaf_storage.push(46)
+        artifact_leaf_storage.push(111)
+        artifact_leaf_storage.push(0)
+        artifact_leaf <- (&artifact_leaf_storage[0]).cast[cstr] can Unsafe.PointerCast
         emit_kind <- "obj"
         artifact_access_mode <- 0
     artifact_label: mutable darray[u8] = []
@@ -3648,10 +3706,8 @@ def run_build(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Con
         temp_template.push(build_dir[index])
     if temp_template.count == 0.usize() or temp_template[temp_template.count - 1.usize()] != 47:
         temp_template.push(47)
-    if is_library:
-        bytes_push_view(&temp_template, "app.o.tmp.XXXXXX")
-    else:
-        bytes_push_view(&temp_template, "app.tmp.XXXXXX")
+    bytes_push_cstr(&temp_template, artifact_leaf)
+    bytes_push_view(&temp_template, ".tmp.XXXXXX")
     temp_template.push(0)
     temp_raw: mutable u8& = (&temp_template[0]).cast[mutable u8&] can Unsafe.PointerCast
     temp_fd: i64 = Platform::pkg_mkstemp(temp_raw)
@@ -3746,20 +3802,34 @@ def run_build(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Con
     _ = options
     return EXIT_OK
 
-def run_program(argc: i64, slots: mutable cstr&&, expected_kind: cstr) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+def run_program(argc: i64, slots: mutable cstr&&, options: Model::CommandOptions, expected_kind: cstr) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
     manifest_raw: mutable darray[u8] = []
     manifest_raw.resize(1048577)
     return EXIT_BUILD if not read_cstr_into("elisapkg.json", &manifest_raw)
+    target_name: mutable darray[u8] = []
     target_kind: mutable darray[u8] = []
-    return EXIT_BUILD if not first_target_kind(manifest_raw, &target_kind)
+    target_entry: mutable darray[u8] = []
+    return EXIT_BUILD if not select_target(manifest_raw, options, &target_name, &target_kind, &target_entry)
     if not bytes_equal_view(target_kind, expected_kind):
         write_error("error: selected target does not produce an executable\n")
         return EXIT_BUILD
+    artifact_leaf_storage: mutable darray[u8] = []
+    for item in 0..<target_name.count |artifact_leaf_storage, target_name|:
+        artifact_leaf_storage.push(target_name[item])
+    artifact_leaf_storage.push(0)
+    artifact_leaf: cstr = (&artifact_leaf_storage[0]).cast[cstr] can Unsafe.PointerCast
+    build_root: mutable darray[u8] = []
+    bytes_push_view(&build_root, ".elisapkg/build")
+    artifact_path: mutable darray[u8] = []
+    path_join_into(build_root, artifact_leaf, &artifact_path)
+    artifact_path_c: mutable darray[u8] = []
+    path_with_nul_into(&artifact_path, &artifact_path_c)
+    artifact_name: cstr = (&artifact_path_c[0]).cast[cstr] can Unsafe.PointerCast
     args: mutable darray[cstr] = []
     args.push("/usr/bin/env")
     args.push("-i")
     args.push("PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin")
-    args.push(".elisapkg/build/app")
+    args.push(artifact_name)
     index: mutable i64 = 2
     while index < argc and not cstr_equal(slots[index].cast[cstr], "--") |slots, index|:
         index <- index + 1
@@ -3864,11 +3934,26 @@ def cli_main(argc: i64, argv: mutable void&) -> i64 can[Console.Write, Memory.Al
     # `.` means the process working directory and keeps path operations on a
     # non-empty, well-defined byte buffer.
     start: mutable darray[u8] = [46]
-    options: mutable Model::CommandOptions = Model::CommandOptions{locked: false, offline: false, frozen: false, json: false, verbose: false}
+    options: mutable Model::CommandOptions = Model::CommandOptions{locked: false, offline: false, frozen: false, json: false, verbose: false, target_name: "", target_kind: ""}
     flags_ok: mutable bool = true
-    for index in 2..<effective_argc |effective_slots, options, flags_ok|:
+    index: mutable i64 = 2
+    while index < effective_argc |effective_slots, options, flags_ok, index|:
         flag: cstr = effective_slots[index].cast[cstr]
         break if cstr_equal(flag, "--")
+        if cstr_equal(flag, "--bin") or cstr_equal(flag, "--lib") or cstr_equal(flag, "--test"):
+            target_allowed: bool = (cstr_equal(command, "build") and (cstr_equal(flag, "--bin") or cstr_equal(flag, "--lib") or cstr_equal(flag, "--test"))) or (cstr_equal(command, "run") and cstr_equal(flag, "--bin")) or (cstr_equal(command, "test") and cstr_equal(flag, "--test")) or (cstr_equal(command, "install") and cstr_equal(flag, "--bin"))
+            flags_ok <- false if not target_allowed or index + 1 >= effective_argc
+            if flags_ok:
+                target_value: cstr = effective_slots[index + 1].cast[cstr]
+                target_length: usize = Platform::pkg_strlen(target_value)
+                flags_ok <- false if target_length == 0.usize() or target_length > 64.usize() or target_value[0].u8() == 45 or Platform::pkg_strlen(options.target_name) != 0.usize()
+                if flags_ok:
+                    options.target_name <- target_value
+                    options.target_kind <- "bin" if cstr_equal(flag, "--bin")
+                    options.target_kind <- "lib" if cstr_equal(flag, "--lib")
+                    options.target_kind <- "test" if cstr_equal(flag, "--test")
+            index <- index + 2
+            continue
         options.locked <- true if cstr_equal(flag, "--locked")
         options.offline <- true if cstr_equal(flag, "--offline")
         options.frozen <- true if cstr_equal(flag, "--frozen")
@@ -3880,6 +3965,11 @@ def cli_main(argc: i64, argv: mutable void&) -> i64 can[Console.Write, Memory.Al
         recognized: bool = is_positional and positional_allowed
         recognized <- true if not is_positional and (cstr_equal(flag, "--locked") or cstr_equal(flag, "--offline") or cstr_equal(flag, "--frozen") or cstr_equal(flag, "--json") or cstr_equal(flag, "--verbose") or (cstr_equal(flag, "--list") and cstr_equal(command, "package")) or (cstr_equal(flag, "--dry-run") and cstr_equal(command, "cache")) or (cstr_equal(command, "install") and cstr_equal(flag, "--local")) or (cstr_equal(command, "uninstall") and cstr_equal(flag, "--local")))
         flags_ok <- false if not recognized
+        index <- index + 1
+    if cstr_equal(command, "run") and Platform::pkg_strlen(options.target_kind) == 0.usize():
+        options.target_kind <- "bin"
+    if cstr_equal(command, "test") and Platform::pkg_strlen(options.target_kind) == 0.usize():
+        options.target_kind <- "test"
     if not flags_ok:
         write_error("error: unknown option; run `elisapkg --help`\n")
         return EXIT_USAGE
@@ -3916,7 +4006,7 @@ def cli_main(argc: i64, argv: mutable void&) -> i64 can[Console.Write, Memory.Al
         if cstr_equal(command, "run"):
             build_status: i64 = run_build(&start, options)
             return build_status if build_status != EXIT_OK
-            return run_program(effective_argc, effective_slots, "bin")
+            return run_program(effective_argc, effective_slots, options, "bin")
         return run_test(effective_argc, effective_slots, &start, options)
     write_error("error: unknown command; run `elisapkg --help`\n")
     return EXIT_USAGE

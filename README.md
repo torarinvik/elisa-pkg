@@ -22,8 +22,9 @@ build/elisapkg init path/to/app
 (cd path/to/app && ../../build/elisapkg check-manifest)
 (cd path/to/app && ../../build/elisapkg resolve)
 (cd path/to/app && ../../build/elisapkg build)
-(cd path/to/app && ../../build/elisapkg run --)
-(cd path/to/app && ../../build/elisapkg test)
+(cd path/to/app && ../../build/elisapkg build --bin app)
+(cd path/to/app && ../../build/elisapkg run --bin app --)
+(cd path/to/app && ../../build/elisapkg test --test app-tests)
 (cd path/to/app && ELISAPKG_INSTALL_PREFIX="$HOME/.local" ../../build/elisapkg install --local)
 ```
 
@@ -50,7 +51,7 @@ concurrent-reader rules are implemented for the local blob store. A new package
 operation quarantines a corrupted active blob before republishing its verified
 replacement.
 
-Project commands accept `--manifest-path PATH`; PATH may name the project directory or its `elisapkg.json`, including dependency mutations such as `add`, `remove`, and `update`. Local path resolution walks the dependency graph transitively, sorts package records by canonical name, normalizes relative paths, records SHA-256 manifest and first-target source digests, and rejects conflicting duplicate package identities. Target paths are resolved with `realpath` and must remain below their package root, including when a symlink is present. Binary and test targets emit `.elisapkg/build/app`; library targets emit the regular `.elisapkg/build/app.o` object. Build receipts and cache validation bind the target kind and artifact name, while `run` and `install --local` reject library targets before attempting execution or publication. `clean` removes both known build artifacts plus `.elisapkg/package.tar`, `.elisapkg/package.receipt`, and empty build directories. Registry dependency declarations are syntax-checked locally, including exact, caret, tilde, and comparison SemVer ranges. Registry-only graphs use the signed local `primary` provider described in [`docs/registry.md`](docs/registry.md), produce lockfile version 3, and can be cached with `fetch PACKAGE VERSION`; mixed local/registry graphs and network transport remain fail-closed.
+Project commands accept `--manifest-path PATH`; PATH may name the project directory or its `elisapkg.json`, including dependency mutations such as `add`, `remove`, and `update`. Local path resolution walks the dependency graph transitively, sorts package records by canonical name, normalizes relative paths, records SHA-256 manifest and first-target source digests, and rejects conflicting duplicate package identities. Target paths are resolved with `realpath` and must remain below their package root, including when a symlink is present. `build` selects the first target by default or a named target with `--bin NAME`, `--lib NAME`, or `--test NAME`; executable and test artifacts use the target name under `.elisapkg/build/`, while libraries use the same name with an `.o` suffix. Build receipts and cache validation bind the target kind and artifact name, while `run --bin NAME` and `install --local --bin NAME` reject library targets before attempting execution or publication. `test --test NAME` selects a named test target. `clean` removes known build artifacts plus `.elisapkg/package.tar`, `.elisapkg/package.receipt`, and empty build directories. Registry dependency declarations are syntax-checked locally, including exact, caret, tilde, and comparison SemVer ranges. Registry-only graphs use the signed local `primary` provider described in [`docs/registry.md`](docs/registry.md), produce lockfile version 3, and can be cached with `fetch PACKAGE VERSION`; mixed local/registry graphs and network transport remain fail-closed.
 
 `package --list` previews the validated file set. `package` writes a bounded,
 deterministic ustar archive to `.elisapkg/package.tar`, with sorted regular
