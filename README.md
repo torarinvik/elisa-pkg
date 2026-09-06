@@ -43,8 +43,9 @@ compiler inputs. A matching receipt and artifact are reused; changing the
 root, dependency graph, or target source forces a fresh compiler invocation.
 Compiler, stage1, and runtime content identities are included in the receipt;
 if any identity cannot be captured, that build does not reuse an existing
-artifact. Included non-target sources remain outside this receipt and require
-a future build-key expansion.
+artifact. The receipt also includes a deterministic digest of every sanitized
+source-tree file, so additions, removals, renames, and changes to non-target
+sources invalidate reuse.
 `cache gc --dry-run` is likewise read-only and reports that there is no shared
 cache to sweep; destructive garbage collection stays disabled until leases and
 concurrent-reader rules are implemented for the local blob store. A new package

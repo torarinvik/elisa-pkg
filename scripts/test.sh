@@ -428,6 +428,30 @@ mkdir -p "$CASE"
       exit 1
       ;;
   esac
+  printf '%s\n' 'source tree mutation must invalidate the receipt' > src/helper.elisa
+  source_tree_build_output="$("$BIN" build)"
+  case "$source_tree_build_output" in
+    *"(cached)"*)
+      echo "new source file was accepted from the cache" >&2
+      exit 1
+      ;;
+  esac
+  source_tree_cached_output="$("$BIN" build)"
+  case "$source_tree_cached_output" in
+    *"(cached)"*) ;;
+    *)
+      echo "unchanged source tree was not reused" >&2
+      exit 1
+      ;;
+  esac
+  printf '%s\n' 'source tree mutation must invalidate the receipt again' >> src/helper.elisa
+  source_tree_mutated_output="$("$BIN" build)"
+  case "$source_tree_mutated_output" in
+    *"(cached)"*)
+      echo "changed non-target source was accepted from the cache" >&2
+      exit 1
+      ;;
+  esac
   printf '%s\n' '# content mutation must invalidate the receipt' >> "$TOOLCHAIN_WRAPPER"
   wrapper_mutated_output="$(ELISAPKG_COMPILER="$TOOLCHAIN_WRAPPER" "$BIN" build)"
   case "$wrapper_mutated_output" in

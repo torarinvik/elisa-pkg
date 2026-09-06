@@ -3480,6 +3480,46 @@ def publish_path_forbidden(path: darray[u8]&) -> bool:
     return true if bytes_count(leaf, ".pem") > 0.usize() or bytes_count(leaf, ".key") > 0.usize()
     return false
 
+def source_tree_digest_into(out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    # Build inputs are the complete sanitized source tree, not only the
+    # selected entry file. The native walker returns a deterministic,
+    # NUL-separated list and excludes build state, VCS data, and credential
+    # names before any file is opened. Hash each path with its content digest
+    # so a source rename, addition, deletion, or mutation cannot leave a stale
+    # artifact looking reusable.
+    out.resize(0)
+    buffer: mutable darray[u8] = []
+    buffer.resize(16777216)
+    buffer_raw: mutable u8& = (&buffer[0]).cast[mutable u8&] can Unsafe.PointerCast
+    collected: i64 = Platform::pkg_collect_files(".", buffer_raw, buffer.count)
+    return false if collected < 0
+    fingerprint: mutable darray[u8] = []
+    cursor: mutable usize = 0.usize()
+    while cursor < collected.usize():
+        path: mutable darray[u8] = []
+        while cursor < collected.usize() and buffer[cursor] != 0 |buffer, cursor, path|:
+            path.push(buffer[cursor])
+            cursor <- cursor + 1.usize()
+        return false if cursor >= collected.usize() or path.count == 0.usize()
+        cursor <- cursor + 1.usize()
+        content: mutable darray[u8] = []
+        return false if not read_package_file_into(&path, &content)
+        digest_bytes: mutable darray[u8] = []
+        return false if Integrity::sha256(content, &digest_bytes) != Integrity::DigestCode.Ok
+        for index in 0..<path.count |fingerprint, path|:
+            fingerprint.push(path[index])
+        fingerprint.push(0)
+        for index in 0..<digest_bytes.count |fingerprint, digest_bytes|:
+            fingerprint.push(digest_bytes[index])
+        fingerprint.push(0)
+    digest_bytes: mutable darray[u8] = []
+    return false if Integrity::sha256(fingerprint, &digest_bytes) != Integrity::DigestCode.Ok
+    digest_hex: mutable darray[u8] = []
+    return false if not Integrity::hex_digest(digest_bytes, &digest_hex)
+    for index in 0..<digest_hex.count |out, digest_hex|:
+        out.push(digest_hex[index])
+    return true
+
 def collect_package_paths(raw: darray[u8]&, target: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
     out.resize(0)
     buffer: mutable darray[u8] = []
@@ -3697,6 +3737,8 @@ def run_build(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Con
     lock_digest: mutable darray[u8] = []
     return EXIT_BUILD if Integrity::sha256(lock_raw, &lock_digest_bytes) != Integrity::DigestCode.Ok
     return EXIT_BUILD if not Integrity::hex_digest(lock_digest_bytes, &lock_digest)
+    source_tree_digest: mutable darray[u8] = []
+    return EXIT_BUILD if not source_tree_digest_into(&source_tree_digest)
     target_source: mutable darray[u8] = []
     target_source_size: i64 = Platform::pkg_package_file_size(target_entry_raw)
     return EXIT_BUILD if target_source_size < 0 or target_source_size > 67108864
@@ -3818,12 +3860,14 @@ def run_build(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Con
                 bytes_push_array(&runtime_identity, runtime_digest)
     toolchain_identity_ok: bool = compiler_identity_ok and stage1_identity_ok and runtime_identity_ok
     receipt: mutable darray[u8] = []
-    bytes_push_view(&receipt, "elisapkg-build-receipt:5\nentry:")
+    bytes_push_view(&receipt, "elisapkg-build-receipt:6\nentry:")
     bytes_push_array(&receipt, target_entry)
     bytes_push_view(&receipt, "\ntarget-kind:")
     bytes_push_array(&receipt, target_kind)
     bytes_push_view(&receipt, "\nartifact:")
     bytes_push_cstr(&receipt, artifact_leaf)
+    bytes_push_view(&receipt, "\nsource-tree-digest:sha256:")
+    bytes_push_array(&receipt, source_tree_digest)
     bytes_push_view(&receipt, "\nsource-digest:sha256:")
     bytes_push_array(&receipt, source_digest)
     bytes_push_view(&receipt, "\nmanifest-digest:sha256:")
