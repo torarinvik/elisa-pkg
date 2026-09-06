@@ -96,6 +96,58 @@ extern native_nanosleep(request: void&, remaining: mutable void&) -> i64
 @link_name("setrlimit")
 extern native_setrlimit(resource: i64, limits: void&) -> i64
 
+static if ELISA_TARGET_OS_LINUX:
+    # Linux x86_64 and arm64 use the POSIX open flag values below.
+    # Keep these in Elisa so the FFI declarations stay ABI-neutral.
+    const flag_read_only: i64 = 0
+    const flag_write_only: i64 = 1
+    const flag_read_write: i64 = 2
+    const flag_nonblock: i64 = 2048
+    const flag_no_follow: i64 = 131072
+    const flag_create: i64 = 64
+    const flag_exclusive: i64 = 128
+    const flag_directory: i64 = 65536
+    const flag_close_on_exec: i64 = 524288
+    const stat_mode_offset: usize = 24
+    const dirent_type_offset: usize = 18
+    const dirent_name_offset: usize = 19
+    const monotonic_clock_id: i64 = 1
+static else:
+    const flag_read_only: i64 = 0
+    const flag_write_only: i64 = 1
+    const flag_read_write: i64 = 2
+    const flag_nonblock: i64 = 4
+    const flag_no_follow: i64 = 256
+    const flag_create: i64 = 512
+    const flag_exclusive: i64 = 2048
+    const flag_directory: i64 = 1048576
+    const flag_close_on_exec: i64 = 16777216
+    const stat_mode_offset: usize = 4
+    const dirent_type_offset: usize = 20
+    const dirent_name_offset: usize = 21
+    const monotonic_clock_id: i64 = 6
+
+static if ELISA_TARGET_OS_LINUX:
+    def dirent_name_length(raw: mutable u8&) -> usize:
+        record_length: usize = raw[16].usize() + raw[17].usize() * 256.usize()
+        return 0 if record_length <= dirent_name_offset
+        available: usize = record_length - dirent_name_offset
+        return 0 if available > 255.usize()
+        index: mutable usize = 0.usize()
+        while index < available |raw, index|:
+            return index if raw[dirent_name_offset + index] == 0
+            index <- index + 1.usize()
+        return 0
+
+    def dirent_type(raw: mutable u8&) -> u8:
+        return raw[dirent_type_offset]
+static else:
+    def dirent_name_length(raw: mutable u8&) -> usize:
+        return raw[18].usize() + raw[19].usize() * 256.usize()
+
+    def dirent_type(raw: mutable u8&) -> u8:
+        return raw[dirent_type_offset]
+
 module PlatformNative:
     public:
         # Raw libc calls are kept behind this module's named wrappers. The
@@ -282,7 +334,7 @@ module PlatformNative:
                     errno_value: i64 = current_errno()
                     _ = native_close(fd)
                     return -errno_value
-                mode_bits: u64 = read_u16(stat, 4)
+                mode_bits: u64 = read_u16(stat, stat_mode_offset)
                 if (mode_bits & 61440.u64()) != regular_mode:
                     _ = native_close(fd)
                     return -21
@@ -869,15 +921,6 @@ module PlatformNative:
                     _ = native_close(parent)
                 cursor <- end + 1.usize()
 
-        const flag_read_only: i64 = 0
-        const flag_write_only: i64 = 1
-        const flag_read_write: i64 = 2
-        const flag_nonblock: i64 = 4
-        const flag_no_follow: i64 = 256
-        const flag_create: i64 = 512
-        const flag_exclusive: i64 = 2048
-        const flag_directory: i64 = 1048576
-        const flag_close_on_exec: i64 = 16777216
         const at_remove_directory: i64 = 2
         const at_no_follow: i64 = 32
         const regular_mode: u64 = 32768
@@ -1056,7 +1099,7 @@ module PlatformNative:
             result: mutable i64 = 0
             if is_move:
                 if new_result == 0:
-                    new_mode: u64 = read_u16(new_stat, 4)
+                    new_mode: u64 = read_u16(new_stat, stat_mode_offset)
                     return close_two_error(old_directory, new_directory, -40) if (new_mode & 61440.u64()) == symlink_mode
                     return close_two_error(old_directory, new_directory, -21) if (new_mode & 61440.u64()) != regular_mode
                 if new_result != 0 and new_errno != 2:
@@ -1083,7 +1126,7 @@ module PlatformNative:
             stat: mutable darray[u8] = []
             stat.resize(144)
             raw: mutable void& = (&stat[0]).cast[mutable void&] can Unsafe.PointerCast
-            return native_fstat(fd, raw) == 0 and (read_u16(stat, 4) & 61440.u64()) == regular_mode
+            return native_fstat(fd, raw) == 0 and (read_u16(stat, stat_mode_offset) & 61440.u64()) == regular_mode
 
         def limit_bytes(value: i64) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
             out: mutable darray[u8] = []
@@ -1111,7 +1154,7 @@ module PlatformNative:
             stamp: mutable darray[u8] = []
             stamp.resize(16)
             raw: mutable void& = (&stamp[0]).cast[mutable void&] can Unsafe.PointerCast
-            return -1 if native_clock_gettime(6, raw) != 0
+            return -1 if native_clock_gettime(monotonic_clock_id, raw) != 0
             seconds: i64 = read_i64(stamp, 0)
             nanos: i64 = read_i64(stamp, 8)
             return 9223372036854775807 if seconds > 9223372036854775
@@ -1142,17 +1185,17 @@ module PlatformNative:
                     entry: mutable heap void&? = native_readdir(stream)
                     if entry is record:
                         raw: mutable u8& = record.cast[mutable u8&] can Unsafe.PointerCast
-                        name_length: usize = raw[18].usize() + raw[19].usize() * 256.usize()
+                        name_length: usize = dirent_name_length(raw)
                         continue if name_length == 0 or name_length > 255.usize()
-                        continue if raw[20] == 8 and forbidden_file_name(raw, 21, name_length)
-                        continue if name_is_dot(raw, 21, name_length)
+                        continue if dirent_type(raw) == 8 and forbidden_file_name(raw, dirent_name_offset, name_length)
+                        continue if name_is_dot(raw, dirent_name_offset, name_length)
                         child: mutable darray[u8] = []
                         if not cstr_equal(path, "."):
                             for index in 0..<path_length(path) |child, path|:
                                 child.push(path[index].u8())
                             child.push(47)
                         for index in 0..<name_length |child, raw|:
-                            child.push(raw[21 + index])
+                            child.push(raw[dirent_name_offset + index])
                         child.push(0)
                         child_name: cstr = (&child[0]).cast[cstr] can Unsafe.PointerCast
                         child_length: usize = path_length(child_name)
