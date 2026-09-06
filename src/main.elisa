@@ -1815,7 +1815,34 @@ def registry_exact_requirement(version: Model::Version, out: mutable darray[u8]&
     out.push(46)
     registry_append_decimal(out, version.patch)
 
-def canonical_registry_lock(name: darray[u8]&, version: darray[u8]&, raw: darray[u8]&, root: darray[u8]&, roots: darray[Solver::Constraint]&) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+def registry_candidate_matches(candidates: darray[Solver::Candidate]&, package: darray[u8]&, version: Model::Version) -> bool:
+    for index in 0..<candidates.count |candidates, package, version|:
+        return true if bytes_equal(candidates[index].package, package) and SemVer::compare(candidates[index].version, version) == 0
+    return false
+
+def registry_constraint_present(constraints: darray[Solver::Constraint]&, package: darray[u8]&) -> bool:
+    for index in 0..<constraints.count |constraints, package|:
+        return true if bytes_equal(constraints[index].package, package)
+    return false
+
+def append_registry_lock_preferences(lock: darray[u8]&, unlock: darray[u8]&, candidates: darray[Solver::Candidate]&, constraints: mutable darray[Solver::Constraint]&) -> void can[Memory.Allocate, Abort.Panic]:
+    return if lock.count == 0.usize() or not Json::valid_document(lock) or not Json::unique_object_keys(lock) or not lock_version_is(lock, 3)
+    for index in 0..<lock.count |lock, unlock, candidates, constraints|:
+        continue if lock[index] != 123
+        object_end: usize = json_object_end(lock, index)
+        continue if object_end <= index
+        package: mutable darray[u8] = []
+        version_text: mutable darray[u8] = []
+        continue if not object_string_value(lock, index, object_end, "name", &package) or not object_string_value(lock, index, object_end, "version", &version_text)
+        continue if unlock.count > 0.usize() and bytes_equal(package, unlock)
+        parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
+        continue if not SemVer::parse(version_text, &parsed) or parsed.prerelease
+        continue if not registry_candidate_matches(candidates, package, parsed) or registry_constraint_present(constraints, package)
+        exact: mutable darray[u8] = []
+        registry_exact_requirement(parsed, &exact)
+        constraints.push(Solver::Constraint{package: package, requirement: exact})
+
+def canonical_registry_lock(name: darray[u8]&, version: darray[u8]&, raw: darray[u8]&, root: darray[u8]&, roots: darray[Solver::Constraint]&, preferred_lock: darray[u8]&, unlock: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
     out: mutable darray[u8] = []
     root_digest_bytes: mutable darray[u8] = []
     root_digest: mutable darray[u8] = []
@@ -1885,7 +1912,17 @@ def canonical_registry_lock(name: darray[u8]&, version: darray[u8]&, raw: darray
         return [] if processed > 4096
 
     selected_indexes: mutable darray[usize] = []
-    solve_status: Solver::SolveCode = Solver::solve(candidates, roots, &selected_indexes)
+    solve_constraints: mutable darray[Solver::Constraint] = []
+    for index in 0..<roots.count |roots, solve_constraints|:
+        solve_constraints.push(roots[index])
+    append_registry_lock_preferences(preferred_lock, unlock, candidates, &solve_constraints)
+    solve_status: mutable Solver::SolveCode = Solver::solve(candidates, solve_constraints, &selected_indexes)
+    # A stale locked choice must not make an otherwise solvable graph appear
+    # unsatisfiable. Retry without preferences when a pinned candidate no
+    # longer satisfies the current manifest or its transitive metadata.
+    if solve_status == Solver::SolveCode.Unsatisfiable and solve_constraints.count > roots.count:
+        selected_indexes.resize(0)
+        solve_status <- Solver::solve(candidates, roots, &selected_indexes)
     return [] if solve_status != Solver::SolveCode.Solved
     bytes_push_view(&out, "{\n  \"lock-version\": 3,\n  \"resolver\": \"elisapkg-registry-v1\",\n  \"package\": {\n    \"name\": \"")
     bytes_push_array(&out, name)
@@ -1954,7 +1991,21 @@ def canonical_lock_for_manifest(name: darray[u8]&, version: darray[u8]&, raw: da
     return [] if not collect_registry_roots(raw, &registry_roots, &has_local_dependency)
     if registry_roots.count > 0.usize():
         return [] if has_local_dependency
-        return canonical_registry_lock(name, version, raw, root, registry_roots)
+        empty_lock: mutable darray[u8] = []
+        empty_unlock: mutable darray[u8] = []
+        return canonical_registry_lock(name, version, raw, root, registry_roots, empty_lock, empty_unlock)
+    return canonical_transitive_local_lock(name, version, raw, root)
+
+def canonical_lock_for_manifest_with_options(name: darray[u8]&, version: darray[u8]&, raw: darray[u8]&, root: darray[u8]&, options: Model::CommandOptions, preferred_lock: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    registry_roots: mutable darray[Solver::Constraint] = []
+    has_local_dependency: mutable bool = false
+    return [] if not collect_registry_roots(raw, &registry_roots, &has_local_dependency)
+    if registry_roots.count > 0.usize():
+        return [] if has_local_dependency
+        unlock: mutable darray[u8] = []
+        if Platform::pkg_strlen(options.update_name) > 0.usize():
+            bytes_push_cstr(&unlock, options.update_name)
+        return canonical_registry_lock(name, version, raw, root, registry_roots, preferred_lock, unlock)
     return canonical_transitive_local_lock(name, version, raw, root)
 
 def bytes_push_array(out: mutable darray[u8]&, value: darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
@@ -2441,7 +2492,7 @@ def run_add(argc: i64, slots: mutable cstr&&) -> i64 can[Console.Write, Memory.A
     if not write_cstr_file("elisapkg.json", &updated) or not transaction_mark_manifest():
         _ = transaction_restore()
         return EXIT_SOURCE
-    options: Model::CommandOptions = Model::CommandOptions{locked: false, offline: true, frozen: false, json: false, verbose: false, target_name: "", target_kind: ""}
+    options: Model::CommandOptions = Model::CommandOptions{locked: false, offline: true, frozen: false, json: false, verbose: false, target_name: "", target_kind: "", update_name: ""}
     resolved: i64 = run_resolve(&root, options)
     if resolved != EXIT_OK:
         restored: bool = transaction_restore()
@@ -2553,7 +2604,11 @@ def run_resolve(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[C
     name: mutable darray[u8] = []
     version: mutable darray[u8] = []
     return EXIT_USAGE if not validate_manifest(raw, &name, &version)
-    lock: darray[u8] = canonical_lock_for_manifest(name, version, raw, start)
+    preferred_lock: mutable darray[u8] = []
+    if cstr_file_exists("elisapkg.lock"):
+        preferred_lock.resize(1048577)
+        _ = read_cstr_into("elisapkg.lock", &preferred_lock)
+    lock: darray[u8] = canonical_lock_for_manifest_with_options(name, version, raw, start, options, preferred_lock)
     return EXIT_RESOLVE if lock.count == 0.usize()
     if options.locked or options.frozen:
         return EXIT_RESOLVE if not cstr_file_exists("elisapkg.lock")
@@ -3107,7 +3162,7 @@ def run_remove(argc: i64, slots: mutable cstr&&) -> i64 can[Console.Write, Memor
     if not write_cstr_file("elisapkg.json", &updated) or not transaction_mark_manifest():
         _ = transaction_restore()
         return EXIT_SOURCE
-    options: Model::CommandOptions = Model::CommandOptions{locked: false, offline: true, frozen: false, json: false, verbose: false, target_name: "", target_kind: ""}
+    options: Model::CommandOptions = Model::CommandOptions{locked: false, offline: true, frozen: false, json: false, verbose: false, target_name: "", target_kind: "", update_name: ""}
     resolved: i64 = run_resolve(&root, options)
     if resolved != EXIT_OK:
         restored: bool = transaction_restore()
@@ -3139,7 +3194,9 @@ def run_update(argc: i64, slots: mutable cstr&&) -> i64 can[Console.Write, Memor
     root_version: mutable darray[u8] = []
     return EXIT_USAGE if not validate_manifest_at(raw, &root, &root_name, &root_version)
     return EXIT_SECURITY if not transaction_begin(raw)
-    options: Model::CommandOptions = Model::CommandOptions{locked: false, offline: true, frozen: false, json: false, verbose: false, target_name: "", target_kind: ""}
+    options: Model::CommandOptions = Model::CommandOptions{locked: false, offline: true, frozen: false, json: false, verbose: false, target_name: "", target_kind: "", update_name: ""}
+    if wanted.count > 0.usize():
+        options.update_name <- slots[2].cast[cstr]
     resolved: i64 = run_resolve(&root, options)
     if resolved != EXIT_OK:
         restored: bool = transaction_restore()
@@ -3407,7 +3464,7 @@ def run_package(argc: i64, slots: mutable cstr&&, start: darray[u8]&) -> i64 can
             cursor <- cursor + 1.usize()
         write_error("note: signing is required before publish; this command only previews files\n")
         return EXIT_OK
-    lock_options: Model::CommandOptions = Model::CommandOptions{locked: true, offline: true, frozen: true, json: false, verbose: false, target_name: "", target_kind: ""}
+    lock_options: Model::CommandOptions = Model::CommandOptions{locked: true, offline: true, frozen: true, json: false, verbose: false, target_name: "", target_kind: "", update_name: ""}
     return EXIT_RESOLVE if run_resolve(start, lock_options) != EXIT_OK
     lock_raw: mutable darray[u8] = []
     lock_raw.resize(1048577)
@@ -3934,7 +3991,7 @@ def cli_main(argc: i64, argv: mutable void&) -> i64 can[Console.Write, Memory.Al
     # `.` means the process working directory and keeps path operations on a
     # non-empty, well-defined byte buffer.
     start: mutable darray[u8] = [46]
-    options: mutable Model::CommandOptions = Model::CommandOptions{locked: false, offline: false, frozen: false, json: false, verbose: false, target_name: "", target_kind: ""}
+    options: mutable Model::CommandOptions = Model::CommandOptions{locked: false, offline: false, frozen: false, json: false, verbose: false, target_name: "", target_kind: "", update_name: ""}
     flags_ok: mutable bool = true
     index: mutable i64 = 2
     while index < effective_argc |effective_slots, options, flags_ok, index|:
