@@ -540,17 +540,33 @@ PY
   test ! -e .elisapkg/build/app
   mkdir -p .elisapkg
   cp elisapkg.json .elisapkg/transaction.manifest
+  cp elisapkg.lock .elisapkg/transaction.lock
   cp elisapkg.json recovered.manifest
-  printf '%s\n' 'prepared-no-lock' > .elisapkg/transaction.state
-  printf '%s\n' '{}' > elisapkg.json
+  printf '%s\n' 'prepared-lock' > .elisapkg/transaction.state
+  cp recovered.manifest elisapkg.json
   "$BIN" check-manifest >/dev/null
   cmp recovered.manifest elisapkg.json >/dev/null
   test ! -e .elisapkg/transaction.state
   cp recovered.manifest .elisapkg/transaction.manifest
+  cp elisapkg.lock .elisapkg/transaction.lock
+  printf '%s\n' '{}' > .elisapkg/transaction.new-manifest
   printf '%s\n' 'manifest-replaced' > .elisapkg/transaction.state
-  printf '%s\n' '{}' > elisapkg.json
+  cp .elisapkg/transaction.new-manifest elisapkg.json
   "$BIN" check-manifest >/dev/null
   cmp recovered.manifest elisapkg.json >/dev/null
+  test ! -e .elisapkg/transaction.state
+  cp recovered.manifest .elisapkg/transaction.manifest
+  cp elisapkg.lock .elisapkg/transaction.lock
+  printf '%s\n' 'prepared-lock' > .elisapkg/transaction.state
+  printf '%s\n' '{}' > elisapkg.json
+  if "$BIN" check-manifest >/dev/null 2>&1; then
+    echo "transaction recovery overwrote an external manifest edit" >&2
+    exit 1
+  else
+    test "$?" -eq 5
+  fi
+  cp recovered.manifest elisapkg.json
+  "$BIN" check-manifest >/dev/null
   test ! -e .elisapkg/transaction.state
   printf '%s\n' 'unrecognized-state' > .elisapkg/transaction.state
   if "$BIN" check-manifest >/dev/null 2>&1; then

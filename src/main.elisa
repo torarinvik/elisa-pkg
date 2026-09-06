@@ -394,6 +394,9 @@ def remove_cstr_file(path_name: cstr) -> bool:
 def transaction_cleanup() -> bool:
     return false if not remove_cstr_file(".elisapkg/transaction.manifest")
     return false if not remove_cstr_file(".elisapkg/transaction.lock")
+    return false if not remove_cstr_file(".elisapkg/transaction.new-manifest")
+    return false if not remove_cstr_file(".elisapkg/transaction.new-lock")
+    return false if not remove_cstr_file(".elisapkg/transaction.new-lock-missing")
     return false if not remove_cstr_file(".elisapkg/transaction.state")
     guard: mutable darray[u8] = []
     bytes_push_view(&guard, ".elisapkg/transaction.guard")
@@ -427,9 +430,23 @@ def transaction_begin(original_manifest: darray[u8]&) -> bool can[Memory.Allocat
     return write_cstr_file(".elisapkg/transaction.state", &state)
 
 def transaction_mark_manifest() -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+    new_manifest: mutable darray[u8] = []
+    new_manifest.resize(1048577)
+    return false if not read_cstr_into("elisapkg.json", &new_manifest)
+    return false if not write_cstr_file(".elisapkg/transaction.new-manifest", &new_manifest)
     state: mutable darray[u8] = []
     bytes_push_view(&state, "manifest-replaced\n")
     return write_cstr_file(".elisapkg/transaction.state", &state)
+
+def transaction_mark_lock() -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+    if cstr_file_exists("elisapkg.lock"):
+        new_lock: mutable darray[u8] = []
+        new_lock.resize(1048577)
+        return false if not read_cstr_into("elisapkg.lock", &new_lock)
+        return write_cstr_file(".elisapkg/transaction.new-lock", &new_lock)
+    missing: mutable darray[u8] = []
+    bytes_push_view(&missing, "missing\n")
+    return write_cstr_file(".elisapkg/transaction.new-lock-missing", &missing)
 
 def transaction_restore() -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
     state: mutable darray[u8] = []
@@ -440,11 +457,44 @@ def transaction_restore() -> bool can[Memory.Allocate, Abort.Panic, Unsafe.Point
     original_manifest: mutable darray[u8] = []
     original_manifest.resize(1048577)
     return false if not read_cstr_into(".elisapkg/transaction.manifest", &original_manifest)
-    return false if not write_cstr_file("elisapkg.json", &original_manifest)
-    if bytes_equal_view(state, "prepared-lock\n") or (bytes_equal_view(state, "manifest-replaced\n") and cstr_file_exists(".elisapkg/transaction.lock")):
-        original_lock: mutable darray[u8] = []
+    current_manifest: mutable darray[u8] = []
+    current_manifest.resize(1048577)
+    return false if not read_cstr_into("elisapkg.json", &current_manifest)
+    if bytes_equal_view(state, "manifest-replaced\n"):
+        new_manifest: mutable darray[u8] = []
+        new_manifest.resize(1048577)
+        return false if not read_cstr_into(".elisapkg/transaction.new-manifest", &new_manifest)
+        if not bytes_equal(current_manifest, new_manifest):
+            write_error("error: transaction recovery found an external manifest edit; recovery files were retained\n")
+            return false
+    elif not bytes_equal(current_manifest, original_manifest):
+        write_error("error: transaction recovery found an external manifest edit; recovery files were retained\n")
+        return false
+    original_lock_present: bool = cstr_file_exists(".elisapkg/transaction.lock")
+    original_lock: mutable darray[u8] = []
+    if original_lock_present:
         original_lock.resize(1048577)
         return false if not read_cstr_into(".elisapkg/transaction.lock", &original_lock)
+    current_lock_present: bool = cstr_file_exists("elisapkg.lock")
+    if current_lock_present:
+        current_lock: mutable darray[u8] = []
+        current_lock.resize(1048577)
+        return false if not read_cstr_into("elisapkg.lock", &current_lock)
+        if cstr_file_exists(".elisapkg/transaction.new-lock"):
+            new_lock: mutable darray[u8] = []
+            new_lock.resize(1048577)
+            return false if not read_cstr_into(".elisapkg/transaction.new-lock", &new_lock)
+            if not bytes_equal(current_lock, new_lock) and (not original_lock_present or not bytes_equal(current_lock, original_lock)):
+                write_error("error: transaction recovery found an external lockfile edit; recovery files were retained\n")
+                return false
+        elif not original_lock_present:
+            write_error("error: transaction recovery found an unexpected lockfile; recovery files were retained\n")
+            return false
+    elif original_lock_present or cstr_file_exists(".elisapkg/transaction.new-lock"):
+        write_error("error: transaction recovery found an external lockfile edit; recovery files were retained\n")
+        return false
+    return false if not write_cstr_file("elisapkg.json", &original_manifest)
+    if bytes_equal_view(state, "prepared-lock\n") or (bytes_equal_view(state, "manifest-replaced\n") and cstr_file_exists(".elisapkg/transaction.lock")):
         return false if not write_cstr_file("elisapkg.lock", &original_lock)
     else:
         return false if not remove_cstr_file("elisapkg.lock")
@@ -2136,6 +2186,9 @@ def run_add(argc: i64, slots: mutable cstr&&) -> i64 can[Console.Write, Memory.A
             write_error("error: dependency edit failed and the original manifest could not be restored\n")
             return EXIT_SECURITY
         return resolved
+    if not transaction_mark_lock():
+        _ = transaction_restore()
+        return EXIT_SECURITY
     return EXIT_SECURITY if not transaction_commit()
     write_ok("added local dependency ")
     write_bytes(1, &alias)
@@ -2610,6 +2663,9 @@ def run_remove(argc: i64, slots: mutable cstr&&) -> i64 can[Console.Write, Memor
             write_error("error: dependency removal failed and the original manifest could not be restored\n")
             return EXIT_SECURITY
         return resolved
+    if not transaction_mark_lock():
+        _ = transaction_restore()
+        return EXIT_SECURITY
     return EXIT_SECURITY if not transaction_commit()
     write_ok("removed local dependency ")
     write_bytes(1, &alias)
