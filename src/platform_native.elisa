@@ -581,9 +581,10 @@ module PlatformNative:
                 result <- 0 if waited == 0 and status == 0
                 result <- -38 if waited == 0 and status / 256 == 127
             remove_status: i64 = remove_temp_blob(public_path)
-            _ = remove_temp_blob(message_path)
-            _ = remove_temp_blob(signature_path)
-            return result if remove_status == 0 or result != 0 else remove_status
+            message_remove_status: i64 = remove_temp_blob(message_path)
+            signature_remove_status: i64 = remove_temp_blob(signature_path)
+            return -5 if remove_status != 0 or message_remove_status != 0 or signature_remove_status != 0
+            return result
 
         def write_temp_blob(prefix: cstr, value: darray[u8]&, path_out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             path_out.resize(0)
@@ -678,17 +679,31 @@ module PlatformNative:
                 now: i64 = monotonic_milliseconds()
                 return -5 if now < 0
                 if now >= deadline:
-                    _ = native_kill(-pid, 9)
-                    _ = native_kill(pid, 9)
-                    while native_waitpid(pid, status, 0) < 0 and current_errno() == 4 |pid, status|:
-                        _ = 0
-                    return -110
+                    reap_status: i64 = terminate_and_reap(pid, &status)
+                    return reap_status if reap_status != 0 else -110
                 pause: mutable darray[u8] = timespec_bytes(0, 10000000)
                 pause_raw: void& = (&pause[0]).cast[void&] can Unsafe.PointerCast
                 remaining: mutable darray[u8] = timespec_bytes(0, 0)
                 remaining_raw: mutable void& = (&remaining[0]).cast[mutable void&] can Unsafe.PointerCast
-                _ = native_nanosleep(pause_raw, remaining_raw)
+                sleep_status: i64 = native_nanosleep(pause_raw, remaining_raw)
+                if sleep_status != 0 and current_errno() != 4:
+                    sleep_errno: i64 = current_errno()
+                    reap_status: i64 = terminate_and_reap(pid, &status)
+                    return reap_status if reap_status != 0 else negative_value(sleep_errno)
             return -110
+
+        def terminate_and_reap(pid: i64, status: mutable i64&) -> i64:
+            _ = native_kill(-pid, 9)
+            _ = native_kill(pid, 9)
+            while true |pid, status|:
+                waited: i64 = native_waitpid(pid, status, 0)
+                return 0 if waited == pid
+                if waited < 0:
+                    errno_value: i64 = current_errno()
+                    return 0 if errno_value == 10
+                    continue if errno_value == 4
+                    return negative_value(errno_value)
+            return -5
 
         def timeout_error() -> i64:
             return -110
@@ -714,7 +729,11 @@ module PlatformNative:
             directory: i64 = open_directory_path(parent_name)
             return null if directory < 0
             fd: i64 = native_openat(directory, leaf_name, flags_write_create_exclusive(), 384)
-            _ = native_close(directory)
+            directory_close_status: i64 = native_close(directory)
+            if directory_close_status != 0:
+                if fd >= 0:
+                    _ = native_close(fd)
+                return null
             return null if fd < 0
             stream: mutable heap void&? = native_fdopen(fd, "wb")
             if stream is opened:
