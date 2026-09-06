@@ -142,6 +142,15 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
     lines.append('    solver_result <- Solver::solve(solver_candidates, solver_roots, &solver_selected)')
     check('solver_result == Solver::SolveCode.Unsatisfiable')
     lines.extend([
+        '    solver_extra_name: mutable darray[u8] = [98]',
+        '    solver_extra_candidates: mutable darray[Solver::Candidate] = []',
+        '    solver_extra_candidates.push(Solver::Candidate{package: solver_name, version: Model::Version{major: 1, minor: 0, patch: 0, prerelease: false}, dependencies: solver_dependencies, yanked: false})',
+        '    solver_extra_candidates.push(Solver::Candidate{package: solver_extra_name, version: Model::Version{major: 1, minor: 0, patch: 0, prerelease: false}, dependencies: solver_dependencies, yanked: false})',
+        '    solver_extra_selected: mutable darray[usize] = []',
+        '    solver_extra_result: Solver::SolveCode = Solver::solve(solver_extra_candidates, solver_roots, &solver_extra_selected)',
+    ])
+    check('solver_extra_result == Solver::SolveCode.Solved and solver_extra_selected.count == 1.usize() and solver_extra_selected[0] == 0.usize()')
+    lines.extend([
         '    solver_a_name: mutable darray[u8] = [97]',
         '    solver_b_name: mutable darray[u8] = [98]',
         '    solver_a_req_one: mutable darray[u8] = [94,49,46,48,46,48]',
