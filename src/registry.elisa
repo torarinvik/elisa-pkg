@@ -10,6 +10,7 @@ include "./archive.elisa"
 include "./integrity.elisa"
 include "./json.elisa"
 include "./resolve.elisa"
+include "./solver.elisa"
 include "./trust.elisa"
 
 module Registry:
@@ -28,6 +29,30 @@ module Registry:
             RollbackDetected
             DigestMismatch
             ArchiveMissing
+            ResourceLimit
+
+        # Decode dependency constraints from already authenticated metadata.
+        # The output is kept separate from metadata records because the current
+        # stage1 compiler cannot safely move recursive darray fields nested in a
+        # public record; keeping this buffer at the call boundary preserves
+        # ownership and makes the limitation explicit.
+        def read_dependencies(metadata: darray[u8]&, out: mutable darray[Solver::Constraint]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            return metadata_dependencies(metadata, out)
+
+        # Return the authenticated registry's bounded version index. The index
+        # itself is syntax-checked by the caller before it is used for solving;
+        # it never supplies a trust root or an archive identity.
+        def read_index(package: darray[u8]&, out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            out.resize(0)
+            return ResultCode.InvalidConfiguration if not valid_package_path(package)
+            root: mutable darray[u8] = []
+            return ResultCode.NotConfigured if not configured_root(&root)
+            return ResultCode.InvalidConfiguration if not valid_registry_root(root)
+            path: mutable darray[u8] = []
+            return ResultCode.InvalidConfiguration if not join_path_leaf(root, package, "index", &path)
+            return ResultCode.MissingIndex if not read_file(path, out)
+            return ResultCode.MalformedMetadata if out.count == 0 or out.count > 1048576
+            return ResultCode.Ok
 
         # Resolve one package from the configured local registry and verify its
         # detached Ed25519 metadata before returning any artifact path. The
@@ -123,9 +148,210 @@ module Registry:
             return "registry metadata rollback detected" if code == ResultCode.RollbackDetected
             return "registry archive digest does not match metadata" if code == ResultCode.DigestMismatch
             return "registry archive is missing or unreadable" if code == ResultCode.ArchiveMissing
+            return "registry metadata exceeds the configured resource limit" if code == ResultCode.ResourceLimit
             return "unknown registry result"
 
     private:
+
+        def registry_version_seen(seen: darray[u8]&, wanted: darray[u8]&) -> bool:
+            cursor: mutable usize = 0
+            while cursor < seen.count:
+                finish: mutable usize = cursor
+                while finish < seen.count and seen[finish] != 0 |seen, finish|:
+                    finish <- finish + 1
+                return true if finish - cursor == wanted.count and registry_slice_equal(seen, cursor, finish, wanted)
+                cursor <- finish + 1
+            return false
+
+        def registry_slice_equal(value: darray[u8]&, start: usize, finish: usize, wanted: darray[u8]&) -> bool:
+            return false if finish < start or finish - start != wanted.count
+            for item in 0..<wanted.count |value, start, wanted|:
+                return false if value[start + item] != wanted[item]
+            return true
+
+        def metadata_dependencies(raw: darray[u8]&, out: mutable darray[Solver::Constraint]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            out.resize(0)
+            dependency_start: usize = metadata_value_start(raw, "dependencies")
+            return true if dependency_start == raw.count
+            dependency_end: usize = metadata_object_end(raw, dependency_start)
+            return false if dependency_start >= raw.count or dependency_end <= dependency_start or raw[dependency_start] != 123
+            seen: mutable darray[u8] = []
+            in_string: mutable bool = false
+            escaped: mutable bool = false
+            string_start: mutable usize = 0
+            braces: mutable i64 = 1
+            brackets: mutable i64 = 0
+            for index in (dependency_start + 1)..<dependency_end |raw, out, seen, in_string, escaped, string_start, braces, brackets|:
+                byte: u8 = raw[index]
+                if not in_string:
+                    if byte == 34:
+                        in_string <- true
+                        string_start <- index + 1
+                    elif byte == 123:
+                        braces <- braces + 1
+                    elif byte == 125:
+                        braces <- braces - 1
+                    elif byte == 91:
+                        brackets <- brackets + 1
+                    elif byte == 93:
+                        brackets <- brackets - 1
+                elif escaped:
+                    escaped <- false
+                elif byte == 92:
+                    escaped <- true
+                elif byte == 34:
+                    after: mutable usize = index + 1
+                    while after < dependency_end and is_registry_space(raw[after]) |raw, after|:
+                        after <- after + 1
+                    if braces == 1 and brackets == 0 and after < dependency_end and raw[after] == 58:
+                        alias: mutable darray[u8] = []
+                        for item in string_start..<index |raw, alias|:
+                            alias.push(raw[item])
+                        return false if not registry_valid_name(alias) or registry_version_seen(seen, alias)
+                        for item in 0..<alias.count |seen, alias|:
+                            seen.push(alias[item])
+                        seen.push(0)
+                        after <- after + 1
+                        while after < dependency_end and is_registry_space(raw[after]) |raw, after|:
+                            after <- after + 1
+                        return false if after >= dependency_end or raw[after] != 123
+                        value_end: usize = metadata_object_end(raw, after)
+                        return false if value_end <= after or value_end > dependency_end
+                        requirement: mutable darray[u8] = []
+                        return false if not metadata_string_in_object(raw, after, value_end, "version", &requirement)
+                        parsed: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
+                        return false if not SemVer::parse_requirement(requirement, &parsed)
+                        registry_name: mutable darray[u8] = []
+                        return false if not metadata_string_in_object(raw, after, value_end, "registry", &registry_name) or not bytes_equal_text(registry_name, "primary")
+                        out.push(Solver::Constraint{package: alias, requirement: requirement})
+                    in_string <- false
+            return true
+
+        def metadata_value_start(raw: darray[u8]&, wanted: cstr) -> usize:
+            key_length: usize = Platform::pkg_strlen(wanted)
+            in_string: mutable bool = false
+            escaped: mutable bool = false
+            string_start: mutable usize = 0
+            braces: mutable i64 = 0
+            brackets: mutable i64 = 0
+            for index in 0..<raw.count |raw, in_string, escaped, string_start, braces, brackets|:
+                byte: u8 = raw[index]
+                if not in_string:
+                    if byte == 34:
+                        in_string <- true
+                        string_start <- index + 1
+                    elif byte == 123:
+                        braces <- braces + 1
+                    elif byte == 125:
+                        braces <- braces - 1
+                    elif byte == 91:
+                        brackets <- brackets + 1
+                    elif byte == 93:
+                        brackets <- brackets - 1
+                elif escaped:
+                    escaped <- false
+                elif byte == 92:
+                    escaped <- true
+                elif byte == 34:
+                    after: mutable usize = index + 1
+                    while after < raw.count and is_registry_space(raw[after]) |raw, after|:
+                        after <- after + 1
+                    if braces == 1 and brackets == 0 and after < raw.count and raw[after] == 58 and index - string_start == key_length:
+                        matched: mutable bool = true
+                        for item in 0..<key_length |raw, wanted, string_start, matched|:
+                            matched <- false if raw[string_start + item] != wanted[item].u8()
+                        if matched:
+                            after <- after + 1
+                            while after < raw.count and is_registry_space(raw[after]) |raw, after|:
+                                after <- after + 1
+                            return after
+                    in_string <- false
+            return raw.count
+
+        def metadata_object_end(raw: darray[u8]&, start: usize) -> usize:
+            return raw.count if start >= raw.count or raw[start] != 123
+            depth: mutable i64 = 0
+            in_string: mutable bool = false
+            escaped: mutable bool = false
+            for index in start..<raw.count |raw, depth, in_string, escaped|:
+                byte: u8 = raw[index]
+                if in_string:
+                    if escaped:
+                        escaped <- false
+                    elif byte == 92:
+                        escaped <- true
+                    elif byte == 34:
+                        in_string <- false
+                elif byte == 34:
+                    in_string <- true
+                elif byte == 123:
+                    depth <- depth + 1
+                elif byte == 125:
+                    depth <- depth - 1
+                    return index if depth == 0
+                    return raw.count if depth < 0
+            return raw.count
+
+        def metadata_string_in_object(raw: darray[u8]&, object_start: usize, object_end: usize, wanted: cstr, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            return false if object_start >= object_end or raw[object_start] != 123
+            key_length: usize = Platform::pkg_strlen(wanted)
+            in_string: mutable bool = false
+            escaped: mutable bool = false
+            string_start: mutable usize = 0
+            for index in (object_start + 1)..<object_end |raw, in_string, escaped, string_start|:
+                byte: u8 = raw[index]
+                if not in_string:
+                    if byte == 34:
+                        in_string <- true
+                        string_start <- index + 1
+                elif escaped:
+                    escaped <- false
+                elif byte == 92:
+                    escaped <- true
+                elif byte == 34:
+                    after: mutable usize = index + 1
+                    while after < object_end and is_registry_space(raw[after]) |raw, after|:
+                        after <- after + 1
+                    if after < object_end and raw[after] == 58 and index - string_start == key_length:
+                        matched: mutable bool = true
+                        for item in 0..<key_length |raw, wanted, string_start, matched|:
+                            matched <- false if raw[string_start + item] != wanted[item].u8()
+                        if matched:
+                            after <- after + 1
+                            while after < object_end and is_registry_space(raw[after]) |raw, after|:
+                                after <- after + 1
+                            return false if after >= object_end or raw[after] != 34
+                            after <- after + 1
+                            out.resize(0)
+                            while after < object_end and raw[after] != 34:
+                                return false if raw[after] < 32 or raw[after] == 92
+                                out.push(raw[after])
+                                after <- after + 1
+                            return after < object_end
+                    in_string <- false
+            return false
+
+        def is_registry_space(byte: u8) -> bool:
+            return byte == 32 or byte == 9 or byte == 10 or byte == 13
+
+        def bytes_equal_text(value: darray[u8]&, expected: cstr) -> bool:
+            length: usize = Platform::pkg_strlen(expected)
+            return false if value.count != length
+            for index in 0..<length |value, expected|:
+                return false if value[index] != expected[index].u8()
+            return true
+
+        def registry_valid_name(value: darray[u8]&) -> bool:
+            return false if value.count == 0 or value.count > 64
+            return false if value[0] < 97 or value[0] > 122
+            previous_hyphen: mutable bool = false
+            for index in 0..<value.count |value, previous_hyphen|:
+                byte: u8 = value[index]
+                return false if byte == 45 and (index == value.count - 1 or previous_hyphen)
+                return false if (byte < 97 or byte > 122) and (byte < 48 or byte > 57) and byte != 45
+                previous_hyphen <- byte == 45
+            return true
+
         def configured_root(out: mutable darray[u8]&) -> bool:
             value_ref: u8&? = Platform::pkg_getenv("ELISAPKG_REGISTRY_DIR")
             if value_ref is configured:

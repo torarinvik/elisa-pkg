@@ -16,6 +16,7 @@ include "./integrity.elisa"
 include "./json.elisa"
 include "./cache.elisa"
 include "./resolve.elisa"
+include "./solver.elisa"
 include "./registry.elisa"
 
 const EXIT_OK: i64 = 0
@@ -1394,7 +1395,254 @@ def canonical_transitive_local_lock(name: darray[u8]&, version: darray[u8]&, raw
     bytes_push_view(&out, "\n  ]\n}\n")
     return out
 
+def collect_registry_roots(raw: darray[u8]&, out: mutable darray[Solver::Constraint]&, has_local: mutable bool&) -> bool can[Memory.Allocate, Abort.Panic]:
+    out.resize(0)
+    has_local <- false
+    dependency_start: usize = json_key_value_offset(raw, "dependencies")
+    return true if dependency_start >= raw.count
+    dependency_end: usize = json_object_end(raw, dependency_start)
+    return false if dependency_end <= dependency_start or raw[dependency_start] != 123
+    in_string: mutable bool = false
+    escaped: mutable bool = false
+    string_start: mutable usize = 0
+    braces: mutable i64 = 1
+    brackets: mutable i64 = 0
+    for index in (dependency_start + 1)..<dependency_end |raw, out, has_local, in_string, escaped, string_start, braces, brackets|:
+        byte: u8 = raw[index]
+        if not in_string:
+            if byte == 34:
+                in_string <- true
+                string_start <- index + 1
+            elif byte == 123:
+                braces <- braces + 1
+            elif byte == 125:
+                braces <- braces - 1
+            elif byte == 91:
+                brackets <- brackets + 1
+            elif byte == 93:
+                brackets <- brackets - 1
+        elif escaped:
+            escaped <- false
+        elif byte == 92:
+            escaped <- true
+        elif byte == 34:
+            after: mutable usize = index + 1
+            while after < dependency_end and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
+                after <- after + 1
+            if braces == 1 and brackets == 0 and after < dependency_end and raw[after] == 58:
+                alias: mutable darray[u8] = []
+                for item in string_start..<index |raw, alias|:
+                    alias.push(raw[item])
+                after <- after + 1
+                while after < dependency_end and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
+                    after <- after + 1
+                value_end: usize = json_object_end(raw, after)
+                return false if after >= dependency_end or value_end <= after or raw[after] != 123 or value_end > dependency_end
+                path_key: mutable darray[u8] = [112, 97, 116, 104]
+                if object_has_direct_key(raw, after, value_end, path_key):
+                    has_local <- true
+                else:
+                    registry: mutable darray[u8] = []
+                    requirement: mutable darray[u8] = []
+                    return false if not object_string_value(raw, after, value_end, "registry", &registry) or not object_string_value(raw, after, value_end, "version", &requirement)
+                    return false if not bytes_equal_view(registry, "primary")
+                    out.push(Solver::Constraint{package: alias, requirement: requirement})
+            in_string <- false
+    return true
+
+def registry_queue_append(queue: mutable darray[u8]&, value: darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
+    for index in 0..<value.count |queue, value|:
+        queue.push(value[index])
+    queue.push(0)
+
+def registry_queue_contains(queue: darray[u8]&, wanted: darray[u8]&) -> bool:
+    cursor: mutable usize = 0
+    while cursor < queue.count:
+        finish: mutable usize = cursor
+        while finish < queue.count and queue[finish] != 0 |queue, finish|:
+            finish <- finish + 1
+        return true if finish - cursor == wanted.count and bytes_equal_range(queue, cursor, finish, wanted)
+        cursor <- finish + 1
+    return false
+
+def registry_queue_field_at(queue: darray[u8]&, record: usize, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+    cursor: mutable usize = 0
+    current: mutable usize = 0
+    while cursor < queue.count |queue, cursor, current, out|:
+        finish: mutable usize = cursor
+        while finish < queue.count and queue[finish] != 0 |queue, finish|:
+            finish <- finish + 1
+        if current == record:
+            out.resize(0)
+            for index in cursor..<finish |queue, out|:
+                out.push(queue[index])
+            return true
+        cursor <- finish + 1
+        current <- current + 1
+    return false
+
+def registry_append_decimal(out: mutable darray[u8]&, value: u64) -> void can[Memory.Allocate, Abort.Panic]:
+    digits: mutable darray[u8] = []
+    number: mutable u64 = value
+    if number == 0:
+        out.push(48)
+        return
+    while number > 0 |digits, number|:
+        digits.push(48 + (number % 10).u8())
+        number <- number / 10
+    index: mutable usize = digits.count
+    while index > 0 |out, digits, index|:
+        index <- index - 1
+        out.push(digits[index])
+
+def registry_exact_requirement(version: Model::Version, out: mutable darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
+    out.resize(0)
+    registry_append_decimal(out, version.major)
+    out.push(46)
+    registry_append_decimal(out, version.minor)
+    out.push(46)
+    registry_append_decimal(out, version.patch)
+
+def canonical_registry_lock(name: darray[u8]&, version: darray[u8]&, raw: darray[u8]&, root: darray[u8]&, roots: darray[Solver::Constraint]&) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+    out: mutable darray[u8] = []
+    root_digest_bytes: mutable darray[u8] = []
+    root_digest: mutable darray[u8] = []
+    return [] if Integrity::sha256(raw, &root_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(root_digest_bytes, &root_digest)
+    root_entry: mutable darray[u8] = []
+    return [] if not first_target_entry(raw, &root_entry)
+    root_entry_path: mutable darray[u8] = []
+    path_join_into(root, "", &root_entry_path)
+    for index in 0..<root_entry.count |root_entry_path, root_entry|:
+        root_entry_path.push(root_entry[index])
+    root_source: mutable darray[u8] = []
+    return [] if not read_package_file_into(&root_entry_path, &root_source)
+    root_source_digest_bytes: mutable darray[u8] = []
+    root_source_digest: mutable darray[u8] = []
+    return [] if Integrity::sha256(root_source, &root_source_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(root_source_digest_bytes, &root_source_digest)
+
+    candidates: mutable darray[Solver::Candidate] = []
+    package_queue: mutable darray[u8] = []
+    package_total: mutable usize = 0
+    for index in 0..<roots.count |roots, package_queue, package_total|:
+        return [] if registry_queue_contains(package_queue, roots[index].package)
+        registry_queue_append(&package_queue, roots[index].package)
+        package_total <- package_total + 1
+    processed: mutable usize = 0
+    while processed < package_total:
+        package: mutable darray[u8] = []
+        return [] if not registry_queue_field_at(package_queue, processed, &package)
+        index_data: mutable darray[u8] = []
+        index_status: Registry::ResultCode = Registry::read_index(package, &index_data)
+        return [] if index_status != Registry::ResultCode.Ok
+        cursor: mutable usize = 0
+        while cursor < index_data.count:
+            finish: mutable usize = cursor
+            while finish < index_data.count and index_data[finish] != 10 |index_data, finish|:
+                finish <- finish + 1
+            line_end: mutable usize = finish
+            line_end <- line_end - 1 if line_end > cursor and index_data[line_end - 1] == 13
+            return [] if line_end == cursor or line_end - cursor > 128
+            version_text: mutable darray[u8] = []
+            for item in cursor..<line_end |index_data, version_text|:
+                version_text.push(index_data[item])
+            parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
+            return [] if not SemVer::parse(version_text, &parsed)
+            selected_text: mutable darray[u8] = []
+            archive: mutable darray[u8] = []
+            digest: mutable darray[u8] = []
+            metadata: mutable darray[u8] = []
+            archive_size: mutable u64 = 0
+            exact: mutable darray[u8] = []
+            registry_exact_requirement(parsed, &exact)
+            candidate_status: Registry::ResultCode = Registry::resolve(package, exact, Model::Version{major:0,minor:0,patch:0,prerelease:false}, &selected_text, &archive, &digest, &archive_size, &metadata)
+            return [] if candidate_status != Registry::ResultCode.Ok
+            dependencies: mutable darray[Solver::Constraint] = []
+            return [] if not Registry::read_dependencies(metadata, &dependencies)
+            candidate_package: mutable darray[u8] = []
+            for item in 0..<package.count |candidate_package, package|:
+                candidate_package.push(package[item])
+            for dependency_index in 0..<dependencies.count |dependencies, package_queue, package_total|:
+                if not registry_queue_contains(package_queue, dependencies[dependency_index].package):
+                    registry_queue_append(&package_queue, dependencies[dependency_index].package)
+                    package_total <- package_total + 1
+            candidate: Solver::Candidate = Solver::Candidate{package: candidate_package, version: parsed, dependencies: dependencies, yanked: false}
+            candidates.push(candidate)
+            return [] if candidates.count > 4096
+            cursor <- finish + 1
+        processed <- processed + 1
+        return [] if processed > 4096
+
+    selected_indexes: mutable darray[usize] = []
+    solve_status: Solver::SolveCode = Solver::solve(candidates, roots, &selected_indexes)
+    return [] if solve_status != Solver::SolveCode.Solved
+    bytes_push_view(&out, "{\n  \"lock-version\": 3,\n  \"resolver\": \"elisapkg-registry-v1\",\n  \"package\": {\n    \"name\": \"")
+    bytes_push_array(&out, name)
+    bytes_push_view(&out, "\",\n    \"version\": \"")
+    bytes_push_array(&out, version)
+    bytes_push_view(&out, "\",\n    \"manifest-digest\": \"sha256:")
+    bytes_push_array(&out, root_digest)
+    bytes_push_view(&out, "\",\n    \"source-digest\": \"sha256:")
+    bytes_push_array(&out, root_source_digest)
+    bytes_push_view(&out, "\"\n  },\n  \"packages\": [")
+    emitted: mutable darray[u8] = []
+    first: mutable bool = true
+    for _step in 0..<selected_indexes.count |selected_indexes, candidates, emitted, out, first|:
+        found: mutable bool = false
+        selected_slot: mutable usize = selected_indexes.count
+        selected_name: mutable darray[u8] = []
+        for item in 0..<selected_indexes.count |selected_indexes, candidates, emitted, found, selected_slot, selected_name|:
+            candidate_index: usize = selected_indexes[item]
+            candidate_name: darray[u8] = candidates[candidate_index].package
+            continue if emitted_contains_slice(emitted, candidate_name, 0, candidate_name.count)
+            if not found or bytes_less(candidate_name, selected_name):
+                selected_slot <- item
+                selected_name.resize(0)
+                for byte_index in 0..<candidate_name.count |selected_name, candidate_name|:
+                    selected_name.push(candidate_name[byte_index])
+                found <- true
+        return [] if not found
+        candidate_index: usize = selected_indexes[selected_slot]
+        candidate: Solver::Candidate = candidates[candidate_index]
+        exact: mutable darray[u8] = []
+        registry_exact_requirement(candidate.version, &exact)
+        selected_text: mutable darray[u8] = []
+        archive: mutable darray[u8] = []
+        digest: mutable darray[u8] = []
+        metadata: mutable darray[u8] = []
+        archive_size: mutable u64 = 0
+        final_status: Registry::ResultCode = Registry::resolve(candidate.package, exact, Model::Version{major:0,minor:0,patch:0,prerelease:false}, &selected_text, &archive, &digest, &archive_size, &metadata)
+        return [] if final_status != Registry::ResultCode.Ok
+        metadata_digest_bytes: mutable darray[u8] = []
+        metadata_digest: mutable darray[u8] = []
+        return [] if Integrity::sha256(metadata, &metadata_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(metadata_digest_bytes, &metadata_digest)
+        out.push(44) if not first
+        bytes_push_view(&out, "\n    {\"name\":\"")
+        bytes_push_array(&out, selected_name)
+        bytes_push_view(&out, "\",\"version\":\"")
+        bytes_push_array(&out, selected_text)
+        bytes_push_view(&out, "\",\"source\":{\"type\":\"registry\",\"registry\":\"primary\",\"archive\":\"")
+        bytes_push_array(&out, archive)
+        bytes_push_view(&out, "\"},\"archive-size\":")
+        registry_append_decimal(&out, archive_size)
+        bytes_push_view(&out, ",\"archive-digest\":\"sha256:")
+        bytes_push_array(&out, digest)
+        bytes_push_view(&out, "\",\"metadata-digest\":\"sha256:")
+        bytes_push_array(&out, metadata_digest)
+        bytes_push_view(&out, "\"}")
+        for byte_index in 0..<selected_name.count |emitted, selected_name|:
+            emitted.push(selected_name[byte_index])
+        emitted.push(0)
+        first <- false
+    bytes_push_view(&out, "\n  ]\n}\n")
+    return out
+
 def canonical_lock_for_manifest(name: darray[u8]&, version: darray[u8]&, raw: darray[u8]&, root: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    registry_roots: mutable darray[Solver::Constraint] = []
+    has_local_dependency: mutable bool = false
+    return [] if not collect_registry_roots(raw, &registry_roots, &has_local_dependency)
+    if registry_roots.count > 0.usize():
+        return [] if has_local_dependency
+        return canonical_registry_lock(name, version, raw, root, registry_roots)
     return canonical_transitive_local_lock(name, version, raw, root)
 
 def bytes_push_array(out: mutable darray[u8]&, value: darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
@@ -1508,15 +1756,19 @@ def valid_dependency_object(raw: darray[u8]&, object_start: usize, object_end: u
     has_version: bool = object_has_direct_key(raw, object_start, object_end, version_key)
     has_git: bool = object_has_direct_key(raw, object_start, object_end, git_key)
     has_rev: bool = object_has_direct_key(raw, object_start, object_end, rev_key)
-    # Git and registry sources are intentionally not accepted by the local
-    # resolver yet. Rejecting their fields avoids treating an unsupported
-    # remote declaration as a successfully resolved empty graph.
-    return false if has_git or has_rev or has_registry or has_version
     return false if has_path and (has_registry or has_version)
     if has_path:
         path: mutable darray[u8] = []
         return false if not object_string_value(raw, object_start, object_end, "path", &path)
         return valid_dependency_path(path)
+    if has_registry or has_version:
+        return false if has_git or has_rev or not has_registry or not has_version
+        registry: mutable darray[u8] = []
+        requirement: mutable darray[u8] = []
+        return false if not object_string_value(raw, object_start, object_end, "registry", &registry) or not object_string_value(raw, object_start, object_end, "version", &requirement)
+        return false if not bytes_equal_view(registry, "primary")
+        parsed_requirement: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
+        return SemVer::parse_requirement(requirement, &parsed_requirement)
     return false
 
 def valid_optional_package_strings(raw: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
