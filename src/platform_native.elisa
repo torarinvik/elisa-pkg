@@ -331,8 +331,8 @@ module PlatformNative:
             return directory if directory < 0
             result: i64 = native_mkdirat(directory, leaf_name, mode.i64())
             errno_value: i64 = current_errno()
-            _ = native_close(directory)
-            return 0 if result == 0 else negative_value(errno_value)
+            return close_result(directory, 0) if result == 0
+            return close_error(directory, negative_value(errno_value))
 
         # Flushing the containing directory completes the durability contract
         # for an atomic file replacement. The caller never receives the raw
@@ -346,8 +346,8 @@ module PlatformNative:
             return directory if directory < 0
             result: i64 = native_fsync(directory)
             errno_value: i64 = current_errno()
-            _ = native_close(directory)
-            return 0 if result == 0 else negative_value(errno_value)
+            return close_result(directory, 0) if result == 0
+            return close_error(directory, negative_value(errno_value))
 
         def access(path: cstr, mode: i64) -> i64:
             return -22 if mode != 0 and mode != 1
@@ -360,19 +360,14 @@ module PlatformNative:
                 raw: mutable void& = (&stat[0]).cast[mutable void&] can Unsafe.PointerCast
                 if native_fstat(fd, raw) != 0:
                     errno_value: i64 = current_errno()
-                    _ = native_close(fd)
-                    return negative_value(errno_value)
+                    return close_error(fd, negative_value(errno_value))
                 mode_bits: u64 = read_u16(stat, stat_mode_offset)
                 if (mode_bits & 61440.u64()) != regular_mode:
-                    _ = native_close(fd)
-                    return -21
+                    return close_error(fd, -21)
                 if (mode_bits & 73.u64()) == 0:
-                    _ = native_close(fd)
-                    return -13
-                _ = native_close(fd)
-                return 0
-            _ = native_close(fd)
-            return 0
+                    return close_error(fd, -13)
+                return close_result(fd, 0)
+            return close_result(fd, 0)
 
         def chmod(path: cstr, mode: u16) -> i64:
             parent: mutable darray[u8] = []
@@ -389,9 +384,8 @@ module PlatformNative:
             return close_two_error(directory, fd, -21) if not regular_fd(fd)
             result: i64 = native_fchmod(fd, mode.i64())
             errno_value: i64 = current_errno()
-            _ = native_close(fd)
-            _ = native_close(directory)
-            return 0 if result == 0 else negative_value(errno_value)
+            return close_two_result(fd, directory, 0) if result == 0
+            return close_two_error(fd, directory, negative_value(errno_value))
 
         def unlink(path: cstr) -> i64:
             return unlink_kind(path, 0)
@@ -410,8 +404,8 @@ module PlatformNative:
             return directory if directory < 0
             result: i64 = native_fchdir(directory)
             errno_value: i64 = current_errno()
-            _ = native_close(directory)
-            return 0 if result == 0 else negative_value(errno_value)
+            return close_result(directory, 0) if result == 0
+            return close_error(directory, negative_value(errno_value))
 
         def realpath(path: cstr, resolved: mutable darray[u8]&) -> cstr? can[Unsafe.PointerCast]:
             return null if resolved.count == 0 or resolved.count > 4096.usize()
@@ -1073,6 +1067,10 @@ module PlatformNative:
             return -5 if native_close(fd) != 0
             return errno_value
 
+        def close_result(fd: i64, result: i64) -> i64:
+            return -5 if native_close(fd) != 0
+            return result
+
         def unlink_kind(path: cstr, flags: i64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             parent: mutable darray[u8] = []
             leaf: mutable darray[u8] = []
@@ -1141,6 +1139,12 @@ module PlatformNative:
             right_status: i64 = native_close(right)
             return -5 if left_status != 0 or right_status != 0
             return errno_value
+
+        def close_two_result(left: i64, right: i64, result: i64) -> i64:
+            left_status: i64 = native_close(left)
+            right_status: i64 = native_close(right)
+            return -5 if left_status != 0 or right_status != 0
+            return result
 
         def read_u16(value: darray[u8]&, offset: usize) -> u64:
             return value[offset].u64() + value[offset + 1.usize()].u64() * 256.u64()
