@@ -68,7 +68,8 @@ The local executor starts compiler and application children through `/usr/bin/en
 
 Compiler children have a ten-minute monotonic deadline; `run` and `test`
 children have a two-minute deadline. Each child enters a private process group,
-and a timeout kills the group before the temporary artifact is removed. This
+and refuses to execute if that group cannot be established. A timeout then kills
+the group before the temporary artifact is removed. This
 limits hangs and descendant-process leaks, but it does not replace a sandbox or
 prevent a trusted child from consuming resources until the deadline.
 
