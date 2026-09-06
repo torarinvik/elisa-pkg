@@ -295,6 +295,16 @@ mkdir -p "$CASE"
   "$BIN" check-manifest >/dev/null
   "$BIN" resolve >/dev/null
   grep -F '"name":"nested-util"' elisapkg.lock >/dev/null
+  (cd "$ROOT" && "$BIN" update local-util --manifest-path "$CASE" >/dev/null)
+  (cd "$ROOT" && "$BIN" remove local-util --manifest-path "$CASE" >/dev/null)
+  if grep -F '"local-util"' elisapkg.json >/dev/null; then
+    echo "manifest-path remove left the dependency declared" >&2
+    exit 1
+  fi
+  (cd "$ROOT" && "$BIN" add local-util --path local-util --manifest-path "$CASE" >/dev/null)
+  grep -F '"local-util"' elisapkg.json >/dev/null
+  "$BIN" resolve >/dev/null
+  grep -F '"name":"nested-util"' elisapkg.lock >/dev/null
   "$BIN" cache verify | grep -F 'manifest digests verified' >/dev/null
   "$BIN" cache gc --dry-run | grep -F 'nothing would be collected' >/dev/null
   if "$BIN" cache gc >/dev/null 2>&1; then
