@@ -427,6 +427,13 @@ mkdir -p "$CASE"
   cd "$CASE"
   "$BIN" init . >/dev/null
   "$BIN" check-manifest --manifest-path "$CASE/elisapkg.json" >/dev/null
+  printf '%s\n' '{}' > settings.json
+  if "$BIN" check-manifest --manifest-path "$CASE/settings.json" >/dev/null 2>&1; then
+    echo "non-manifest file path was accepted" >&2
+    exit 1
+  else
+    test "$?" -eq 2
+  fi
   mkdir -p local-util/src nested-util/src
   printf '%s\n' 'def main() -> i64:' '    return 0' > local-util/src/main.elisa
   printf '%s\n' 'def main() -> i64:' '    return 0' > nested-util/src/main.elisa
