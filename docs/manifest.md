@@ -1,6 +1,6 @@
 # `elisapkg.json` schema version 1
 
-The package manifest is a UTF-8 JSON object. Its schema version is the integer `1`; writers emit canonical two-space JSON with LF line endings. The package manager rejects NUL bytes, missing required members, invalid package names, invalid SemVer versions, duplicate required keys, unsupported build scripts/plugins, and entries larger than 1 MiB.
+The package manifest is a UTF-8 JSON object. Its schema version is the integer `1`; writers emit canonical two-space JSON with LF line endings. The package manager rejects NUL bytes, escaped object-key spellings, missing required members, invalid package names, invalid SemVer versions, duplicate required keys, unsupported build scripts/plugins, and entries larger than 1 MiB.
 
 The minimum package is:
 
