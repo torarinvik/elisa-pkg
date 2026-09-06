@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Review regressions: independent fixtures, bounded subprocesses, real CLI."""
+import json
 import os
 import subprocess
 import tempfile
@@ -239,6 +240,12 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
     conflict_init = subprocess.run([BIN, 'init', work / 'conflict', '--lib', '--bin'], capture_output=True, timeout=120, check=False)
     assert conflict_init.returncode == 2, conflict_init
     run([BIN, 'resolve'], cwd=project, stdout=subprocess.DEVNULL)
+    check_manifest_json = subprocess.run([BIN, 'check-manifest', '--json'], cwd=project, capture_output=True, text=True, timeout=120, check=True)
+    assert json.loads(check_manifest_json.stdout) == {'schema-version': 1, 'valid': True, 'manifest': 'elisapkg.json'}
+    resolved_json = subprocess.run([BIN, 'resolve', '--json'], cwd=project, capture_output=True, text=True, timeout=120, check=True)
+    assert json.loads(resolved_json.stdout) == {'schema-version': 1, 'resolved': True, 'package': {'name': 'app', 'version': '0.1.0'}}
+    tree_json = subprocess.run([BIN, 'tree', '--json'], cwd=project, capture_output=True, text=True, timeout=120, check=True)
+    assert json.loads(tree_json.stdout) == {'schema-version': 1, 'packages': [{'name': 'app', 'version': '0.1.0'}]}
     for command in [['resolve', 'unexpected'], ['check-manifest', 'unexpected']]:
         result = subprocess.run([BIN, *command], cwd=project, capture_output=True, timeout=120, check=False)
         assert result.returncode == 2, (command, result)
@@ -276,6 +283,8 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
         '"dependencies":{"external":{"path":"../external"}}}\n')
     run([BIN, 'resolve'], cwd=parent, stdout=subprocess.DEVNULL)
     assert '"name":"external"' in (parent / 'elisapkg.lock').read_text()
+    why_json = subprocess.run([BIN, 'why', 'external', '--json'], cwd=parent, capture_output=True, text=True, timeout=120, check=True)
+    assert json.loads(why_json.stdout) == {'schema-version': 1, 'root': 'parent', 'package': 'external'}
 
     collision_root = work / 'collision-root'
     collision_dep = work / 'collision-dep'

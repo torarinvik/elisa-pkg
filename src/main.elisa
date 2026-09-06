@@ -56,12 +56,6 @@ module Cli:
                 false return if left[index] != right[index]
             return true
 
-        def bytes_copy(value: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
-            out: mutable darray[u8] = []
-            for index in 0..<value.count |out, value|:
-                out.push(value[index])
-            return out
-
         def bytes_equal_view(left: darray[u8]&, right: cstr) -> bool:
             length: usize = Platform::pkg_strlen(right)
             false return if left.count != length
@@ -2677,10 +2671,12 @@ module Cli:
             return true
 
         def run_check(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            _ = options
             if not load_package(start):
                 write_error("error: invalid or missing elisapkg.json (schema-version, package.name, package.version, and targets are required)\n")
                 return EXIT_USAGE
+            if options.json:
+                write_ok("{\"schema-version\":1,\"valid\":true,\"manifest\":\"elisapkg.json\"}\n")
+                return EXIT_OK
             write_ok("manifest valid: ")
             write_ok("elisapkg.json")
             write_ok("\n")
@@ -2701,6 +2697,41 @@ module Cli:
                     write_ok("\n")
                     found <- found + 1.usize()
             return found > 0.usize()
+
+        def print_lock_packages_json(raw: darray[u8]&) -> bool can[Console.Write, Memory.Allocate, Abort.Panic]:
+            found: mutable usize = 0.usize()
+            write_ok("{\"schema-version\":1,\"packages\":[")
+            for index in 0..<raw.count |raw, found|:
+                continue if raw[index] != 123
+                object_end: usize = json_object_end(raw, index)
+                continue if object_end <= index
+                package_name: mutable darray[u8] = []
+                package_version: mutable darray[u8] = []
+                if object_string_value(raw, index, object_end, "name", &package_name) and object_string_value(raw, index, object_end, "version", &package_version):
+                    write_ok(",") if found > 0.usize()
+                    write_ok("{\"name\":\"")
+                    write_bytes(1, &package_name)
+                    write_ok("\",\"version\":\"")
+                    write_bytes(1, &package_version)
+                    write_ok("\"}")
+                    found <- found + 1.usize()
+            return false if found == 0.usize()
+            write_ok("]}\n")
+            return true
+
+        def write_resolved_text(name: cstr, version: cstr, options: Model::CommandOptions) -> void can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            if options.json:
+                write_ok("{\"schema-version\":1,\"resolved\":true,\"package\":{\"name\":\"")
+                write_text(1, name)
+                write_ok("\",\"version\":\"")
+                write_text(1, version)
+                write_ok("\"}}\n")
+                return
+            write_ok("resolved ")
+            write_text(1, name)
+            write_ok(" ")
+            write_text(1, version)
+            write_ok("\n")
 
         def lock_contains_package(raw: darray[u8]&, wanted: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
             for index in 0..<raw.count |raw, wanted|:
@@ -2823,7 +2854,7 @@ module Cli:
                 return false if not emitted_contains_slice(seen, registry_roots[index].package, 0, registry_roots[index].package.count)
             return true
 
-        def run_why(argc: i64, slots: mutable cstr&&, start: darray[u8]&) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+        def run_why(argc: i64, slots: mutable cstr&&, start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return EXIT_USAGE if argc < 3
             wanted: mutable darray[u8] = []
             bytes_push_cstr(&wanted, slots[2].cast[cstr])
@@ -2840,6 +2871,13 @@ module Cli:
             return EXIT_RESOLVE if not read_cstr_into("elisapkg.lock", &lock)
             return EXIT_RESOLVE if not lock_matches_manifest(raw, lock, root_name, root_version, start)
             return EXIT_RESOLVE if not lock_contains_package(lock, wanted)
+            if options.json:
+                write_ok("{\"schema-version\":1,\"root\":\"")
+                write_bytes(1, &root_name)
+                write_ok("\",\"package\":\"")
+                write_bytes(1, &wanted)
+                write_ok("\"}\n")
+                return EXIT_OK
             write_bytes(1, &root_name)
             write_ok(" -> ")
             write_bytes(1, &wanted)
@@ -2858,6 +2896,26 @@ module Cli:
             name: mutable darray[u8] = []
             version: mutable darray[u8] = []
             return EXIT_USAGE if not validate_manifest(raw, &name, &version)
+            # Keep output identity in owned buffers. The resolver walks and
+            # normalizes graph records; preserving these copies prevents an
+            # implementation detail of that traversal from emptying the
+            # caller's manifest fields before the success envelope is emitted.
+            resolved_name: mutable darray[u8] = []
+            resolved_version: mutable darray[u8] = []
+            for index in 0..<name.count |resolved_name, name|:
+                resolved_name.push(name[index])
+            for index in 0..<version.count |resolved_version, version|:
+                resolved_version.push(version[index])
+            resolved_name_storage: mutable darray[u8] = []
+            resolved_version_storage: mutable darray[u8] = []
+            for index in 0..<resolved_name.count |resolved_name_storage, resolved_name|:
+                resolved_name_storage.push(resolved_name[index])
+            for index in 0..<resolved_version.count |resolved_version_storage, resolved_version|:
+                resolved_version_storage.push(resolved_version[index])
+            resolved_name_storage.push(0)
+            resolved_version_storage.push(0)
+            resolved_name_text: cstr = (&resolved_name_storage[0]).cast[cstr] can Unsafe.PointerCast
+            resolved_version_text: cstr = (&resolved_version_storage[0]).cast[cstr] can Unsafe.PointerCast
             preferred_lock: mutable darray[u8] = []
             lock_state: i64 = Platform::pkg_package_file_size("elisapkg.lock")
             if lock_state >= 0:
@@ -2879,11 +2937,7 @@ module Cli:
                 return EXIT_RESOLVE if lock_state == -2
                 if lock_version_is(preferred_lock, 3):
                     return EXIT_RESOLVE if not lock_matches_manifest(raw, preferred_lock, name, version, start)
-                    write_ok("resolved ")
-                    write_bytes(1, &name)
-                    write_ok(" ")
-                    write_bytes(1, &version)
-                    write_ok("\n")
+                    write_resolved_text(resolved_name_text, resolved_version_text, options)
                     return EXIT_OK
                 registry_roots: mutable darray[Solver::Constraint] = []
                 has_local_dependency: mutable bool = false
@@ -2891,11 +2945,7 @@ module Cli:
                 return EXIT_RESOLVE if registry_roots.count > 0.usize()
                 local_expected: darray[u8] = canonical_transitive_local_lock(name, version, raw, start)
                 return EXIT_RESOLVE if local_expected.count == 0.usize() or not bytes_equal(local_expected, preferred_lock)
-                write_ok("resolved ")
-                write_bytes(1, &name)
-                write_ok(" ")
-                write_bytes(1, &version)
-                write_ok("\n")
+                write_resolved_text(resolved_name_text, resolved_version_text, options)
                 return EXIT_OK
             # Offline resolution may validate and replay an existing lock, but it must
             # never consult a provider or refresh signed metadata. A registry graph
@@ -2908,11 +2958,7 @@ module Cli:
                 if offline_registry_roots.count > 0.usize():
                     return EXIT_RESOLVE if lock_state == -2
                     return EXIT_RESOLVE if not lock_matches_manifest(raw, preferred_lock, name, version, start)
-                    write_ok("resolved ")
-                    write_bytes(1, &name)
-                    write_ok(" ")
-                    write_bytes(1, &version)
-                    write_ok("\n")
+                    write_resolved_text(resolved_name_text, resolved_version_text, options)
                     return EXIT_OK
             lock: darray[u8] = canonical_lock_for_manifest_with_options(name, version, raw, start, options, preferred_lock)
             if lock.count == 1.usize() and lock[0] > 0 and lock[0] < 32:
@@ -2948,14 +2994,10 @@ module Cli:
                 return EXIT_RESOLVE if not read_cstr_into("elisapkg.lock", &existing)
                 return EXIT_RESOLVE if not bytes_equal(existing, lock)
             return EXIT_RESOLVE if not (options.locked or options.frozen) and not write_cstr_file("elisapkg.lock", &lock)
-            write_ok("resolved ")
-            write_bytes(1, &name)
-            write_ok(" ")
-            write_bytes(1, &version)
-            write_ok("\n")
+            write_resolved_text(resolved_name_text, resolved_version_text, options)
             return EXIT_OK
 
-        def run_tree(start: darray[u8]&) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+        def run_tree(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             if not project_manifest_exists():
                 write_error("error: could not find elisapkg.json in the current directory\n")
                 return EXIT_RESOLVE
@@ -2970,6 +3012,9 @@ module Cli:
             lock.resize(1048577)
             return EXIT_RESOLVE if not read_cstr_into("elisapkg.lock", &lock)
             return EXIT_RESOLVE if not lock_matches_manifest(raw, lock, name, version, start)
+            if options.json:
+                return EXIT_OK if print_lock_packages_json(lock)
+                return EXIT_RESOLVE
             return EXIT_RESOLVE if not print_lock_packages(lock)
             return EXIT_OK
 
@@ -4726,9 +4771,9 @@ module Cli:
             if cstr_equal(command, "resolve"):
                 return run_resolve(&start, options)
             if cstr_equal(command, "tree"):
-                return run_tree(&start)
+                return run_tree(&start, options)
             if cstr_equal(command, "why"):
-                return run_why(effective_argc, effective_slots, &start)
+                return run_why(effective_argc, effective_slots, &start, options)
             if cstr_equal(command, "metadata"):
                 return run_metadata(&start, options)
             if cstr_equal(command, "doctor"):
