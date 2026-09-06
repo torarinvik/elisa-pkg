@@ -1,4 +1,4 @@
-# `elisapkg.lock` schema version 2
+# `elisapkg.lock` schemas version 2 and 3
 
 The lockfile records the exact resolution policy and selected package bytes. It is generated but intended to be committed. `--locked` and `--frozen` never edit it; a missing or byte-different lock is an error. Normal `resolve` writes the file only after validation succeeds.
 
@@ -12,6 +12,14 @@ The first local release emits:
   "packages": []
 }
 ```
+
+Registry-only graphs use lockfile version 3 and the resolver identifier
+`elisapkg-registry-v1`. Each selected record includes the canonical registry
+identity, exact package/version, archive filename, byte size, archive SHA-256,
+and metadata SHA-256. The resolver verifies the signed metadata and archive
+before emitting these records; the lockfile remains untrusted input and is
+revalidated against the configured registry during `resolve --locked` or
+`fetch`.
 
 Lock replacement uses an exclusive `mkstemp` file in the project directory, writes all bytes with short-write handling, calls `fsync`, closes the descriptor, and atomically renames the temporary file into place. A failed write or durability step removes the temporary file and leaves the previous lock untouched. The temporary file is created with owner-only permissions while it is in flight.
 

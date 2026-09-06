@@ -1,9 +1,13 @@
 # Local authenticated registry fixture
 
-`elisapkg fetch PACKAGE REQUIREMENT` reads a deterministic file-backed registry
+`elisapkg fetch PACKAGE VERSION` reads a deterministic file-backed registry
 when `ELISAPKG_REGISTRY_DIR` is set. This provider is the transport-neutral
 boundary for future network transports: all metadata is read with bounded Elisa
-FFI file operations and verified before an archive path is returned.
+FFI file operations and verified before archive bytes are returned. The exact
+archive is then rechecked and published to the project content-addressed cache
+at `.elisapkg/cache/sha256/<first-two-hex>/<digest>`. Existing entries are
+rehash-verified; corrupt entries are quarantined before replacement. No cache
+pathname is treated as proof of authenticity.
 
 The directory must be an absolute, symlink-free path. Its layout is:
 
@@ -45,3 +49,12 @@ against the host wall clock. A detached signature or trust root that is missing,
 malformed, unavailable, or invalid fails closed. The Ed25519 provider is the
 small FFI seam in `src/platform_native.elisa`; signature policy remains in
 `src/trust.elisa` and `src/registry.elisa`.
+
+The archive reader verifies the strict deterministic ustar subset again at the
+cache boundary. `Archive::extract_ustar_archive` can extract only into a private,
+empty staging directory; it rejects links, unsafe path components, duplicate
+case-folded names, nonzero metadata fields, oversized files, and malformed
+checksums, and uses descriptor-relative no-follow operations for every parent.
+Network/TLS transport, persistent trust-state rollback counters, and publisher
+authorization are still disabled until their independent security review gates
+are complete.

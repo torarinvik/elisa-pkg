@@ -30,7 +30,7 @@ present and executable.
 | regular file read/write | Elisa plus direct libc FFI | Elisa probe and regression suite | Shared hostile directories need handle-based mutation |
 | no-follow source read | `openat`/`O_NOFOLLOW` through the private Elisa platform module | Elisa platform probe | Explicit `..` path dependencies remain user-owned inputs |
 | sorted regular-file walk | bounded `opendir`/`readdir` traversal through the private Elisa platform module | package reproducibility tests | Extraction accepts regular files and creates only parent directories |
-| atomic file replacement | `mkstemp` + `fsync` + rename | lockfile fixtures | Directory fsync is platform-dependent |
+| atomic file replacement | `mkstemp` + file fsync + rename + parent-directory fsync | lockfile fixtures | Filesystem durability guarantees still depend on the host filesystem |
 | exclusive publication | hard-link from fsynced temp | install fixtures | Prefix lock is a mkdir lock, not a kernel lease |
 | process execution | argv array through `env -i`, private process groups, monotonic deadlines, and resource profiles | compiler environment fixture and native timeout seam | No OS sandbox; signalled child processes return 130 |
 | semantic checking | mandatory stage1 gate | invalid-source fixture | Supported toolchain must still be pinned for release |
@@ -38,8 +38,8 @@ present and executable.
 | JSON grammar | bounded iterative validator | manifest and regression fixtures | No decoded value tree or source locations |
 | deterministic graph solver | bounded in-memory backtracking module | solver fixture in `scripts/regression_test.py` | CLI still resolves local paths through its existing graph walker |
 | TLS, registry transport | disabled | fail-closed command tests | Requires reviewed transport adapter |
-| signed metadata | disabled | fail-closed trust policy | Requires protocol/provider review and trust-state persistence |
-| archive extraction | staged primitive only | descriptor-relative no-follow ustar extraction with exclusive regular-file creation | Remote acquisition remains disabled; callers must provide a private empty staging directory |
+| signed metadata | file-backed `primary` fixture provider | Ed25519, expiry, identity, archive, and transitive graph fixtures | Requires persistent trust-state, publisher authorization, and protocol review before network use |
+| archive extraction | bounded staged primitive | descriptor-relative no-follow ustar extraction with exclusive regular-file creation and directory fsync | Callers must provide a private empty staging directory |
 
 Unsupported hosts and missing capabilities must produce an actionable error;
 they must not silently fall back to an unreviewed shell or network path.
