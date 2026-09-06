@@ -90,7 +90,9 @@ Every successfully packaged archive is hard-linked into the local
 verification. `cache verify` rehashes both the visible archive and its receipt
 backing blob; a missing or corrupted blob is a security failure. A subsequent
 package operation moves a corrupted active blob to the quarantine directory
-before publishing a replacement. Shared leases, destructive garbage collection,
+before publishing a replacement. The move uses exclusive hard-link publication
+and fails closed if the deterministic quarantine record already exists, preserving
+the first failure for forensic review. Shared leases, destructive garbage collection,
 and remote cache exchange remain disabled until their concurrency policy is
 implemented. Fixture: package receipt and corrupted-blob cases in
 `scripts/test.sh`.

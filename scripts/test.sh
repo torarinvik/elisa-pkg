@@ -602,6 +602,17 @@ PY
   fi
   "$BIN" package >/dev/null
   test -n "$(find .elisapkg/cache/quarantine -type f | head -n 1)"
+  QUARANTINE_BLOB="$(find .elisapkg/cache/quarantine -type f | head -n 1)"
+  QUARANTINE_DIGEST="$(shasum -a 256 "$QUARANTINE_BLOB" | awk '{print $1}')"
+  printf '%s' junk >> "$PACKAGE_BLOB"
+  if "$BIN" package >/dev/null 2>&1; then
+    echo "cache packaging overwrote an existing quarantine record" >&2
+    exit 1
+  else
+    test "$?" -eq 7
+  fi
+  test "$QUARANTINE_DIGEST" = "$(shasum -a 256 "$QUARANTINE_BLOB" | awk '{print $1}')"
+  cp .elisapkg/package.tar "$PACKAGE_BLOB"
   cmp package.tar.good .elisapkg/package.tar >/dev/null
   cmp package.receipt.good .elisapkg/package.receipt >/dev/null
   tar -tf .elisapkg/package.tar | grep -F 'elisapkg.json' >/dev/null

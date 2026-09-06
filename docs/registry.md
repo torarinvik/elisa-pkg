@@ -8,7 +8,9 @@ boundary for future network transports: all metadata is read with bounded Elisa
 FFI file operations and verified before archive bytes are returned. The exact
 archive is then rechecked and published to the project content-addressed cache
 at `.elisapkg/cache/sha256/<first-two-hex>/<digest>`. Existing entries are
-rehash-verified; corrupt entries are quarantined before replacement. No cache
+rehash-verified; corrupt entries are quarantined before replacement. Quarantine
+uses an exclusive hard-link publication, so an existing evidence record causes a
+fail-closed error rather than being replaced. No cache
 pathname is treated as proof of authenticity.
 
 Each verified registry archive also gets an immutable receipt beside the cache blob at
