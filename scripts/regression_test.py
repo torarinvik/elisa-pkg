@@ -7,7 +7,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BIN = ROOT / 'build/elisapkg'
-COMPILER = Path(os.environ['ELISA_COMPILER_ROOT']) / 'scripts/elisac_stage1.sh'
+compiler_root = os.environ.get('ELISA_COMPILER_ROOT')
+if not compiler_root:
+    raise SystemExit('error: set ELISA_COMPILER_ROOT to an Elisa compiler checkout')
+COMPILER = Path(compiler_root) / 'scripts/elisac_stage1.sh'
 
 
 def run(args, **kwargs):
