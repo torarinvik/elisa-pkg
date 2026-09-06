@@ -94,3 +94,12 @@ before publishing a replacement. Shared leases, destructive garbage collection,
 and remote cache exchange remain disabled until their concurrency policy is
 implemented. Fixture: package receipt and corrupted-blob cases in
 `scripts/test.sh`.
+
+## D-011: registry verification before use
+
+The local registry fixture uses a detached Ed25519 signature over the exact
+metadata bytes. The trust root is a separate 32-byte file; metadata binds the
+registry path, package, selected SemVer, archive relative path, byte size, and
+SHA-256 digest. The resolver validates the archive as deterministic ustar and
+recomputes its digest before returning success. A network transport, publisher
+delegation, and persisted rollback state remain separate release gates.
