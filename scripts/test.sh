@@ -150,6 +150,33 @@ ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_COMPILER_ROOT/build/runtime/elisa
   "$ELISA_COMPILER_ROOT/scripts/elisac_stage1.sh" -emit exe -o "$CRYPTO_BIN" "$CRYPTO_PROBE"
 "$CRYPTO_BIN"
 
+# The registry adapter must fail closed when no explicit source root is
+# configured. This also compiles the full provider graph as a standalone
+# module, keeping its public/private boundary independent of the CLI.
+REGISTRY_PROBE="$ROOT/build/registry-probe-$$.elisa"
+REGISTRY_BIN="$ROOT/build/registry-probe-$$"
+cat > "$REGISTRY_PROBE" <<EOF
+include "$ROOT/src/registry.elisa"
+
+def main() -> i64:
+    package: mutable darray[u8] = [101, 120, 97, 109, 112, 108, 101]
+    requirement: mutable darray[u8] = [49, 46, 48, 46, 48]
+    selected: mutable darray[u8] = []
+    archive: mutable darray[u8] = []
+    digest: mutable darray[u8] = []
+    metadata: mutable darray[u8] = []
+    size: mutable u64 = 0
+    previous: Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
+    status: Registry::ResultCode = Registry::resolve(package, requirement, previous, &selected, &archive, &digest, &size, &metadata)
+    return 1 if status != Registry::ResultCode.NotConfigured
+    return 0
+EOF
+ELISA_STAGE1_BIN="${ELISA_STAGE1_BIN:-$ELISA_COMPILER_ROOT/bin/elisac-stage1}" \
+ELISA_ALLOW_STALE_STAGE1="${ELISA_ALLOW_STALE_STAGE1:-0}" \
+ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_COMPILER_ROOT/build/runtime/elisacore_runtime.o}" \
+  "$ELISA_COMPILER_ROOT/scripts/elisac_stage1.sh" -emit exe -o "$REGISTRY_BIN" "$REGISTRY_PROBE"
+env -u ELISAPKG_REGISTRY_DIR "$REGISTRY_BIN"
+
 # Verify the in-language SHA-256 implementation against the two canonical
 # FIPS vectors used by the package-integrity path.
 HASH_PROBE="$ROOT/build/hash-probe-$$.elisa"
