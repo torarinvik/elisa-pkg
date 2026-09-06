@@ -808,6 +808,19 @@ PY
   cp recovered.manifest elisapkg.json
   "$BIN" check-manifest >/dev/null
   test ! -e .elisapkg/transaction.state
+  cp recovered.manifest .elisapkg/transaction.manifest
+  cp elisapkg.lock .elisapkg/transaction.lock
+  printf '%s\n' 'prepared-lock' > .elisapkg/transaction.state
+  printf '%s\n' '{"external":"lock-edit"}' > elisapkg.lock
+  if "$BIN" check-manifest >/dev/null 2>&1; then
+    echo "transaction recovery overwrote an external lockfile edit" >&2
+    exit 1
+  else
+    test "$?" -eq 5
+  fi
+  cp .elisapkg/transaction.lock elisapkg.lock
+  "$BIN" check-manifest >/dev/null
+  test ! -e .elisapkg/transaction.state
   printf '%s\n' 'unrecognized-state' > .elisapkg/transaction.state
   if "$BIN" check-manifest >/dev/null 2>&1; then
     echo "unrecognized transaction state was accepted" >&2
