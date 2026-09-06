@@ -512,6 +512,18 @@ PY
   test -x .elisapkg/build/app
   mv src/main.elisa.good src/main.elisa
   "$BIN" run -- >/dev/null
+  mkdir -p src/nested
+  printf '%s\n' nested > src/nested/deep.elisa
+  cp elisapkg.json elisapkg.include.good
+  sed 's#src/\*\*#src/*#' elisapkg.include.good > elisapkg.json
+  "$BIN" package --list > package-files-glob.txt
+  grep -F 'src/helper.elisa' package-files-glob.txt >/dev/null
+  if grep -F 'src/nested/deep.elisa' package-files-glob.txt >/dev/null; then
+    echo "single-star include crossed a path separator" >&2
+    exit 1
+  fi
+  mv elisapkg.include.good elisapkg.json
+  rm -rf src/nested package-files-glob.txt
   "$BIN" package --list >/dev/null
   "$BIN" package >/dev/null
   cp .elisapkg/package.tar package.tar.good
