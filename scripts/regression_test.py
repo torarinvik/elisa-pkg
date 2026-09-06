@@ -19,16 +19,10 @@ def run(args, **kwargs):
 
 with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as directory:
     work = Path(directory)
-    lines = [f'include "{ROOT}/src/platform.elisa"',
-             f'include "{ROOT}/src/model.elisa"',
-             f'include "{ROOT}/src/semver.elisa"',
-             f'include "{ROOT}/src/json.elisa"',
-             f'include "{ROOT}/src/archive.elisa"',
+    lines = [f'include "{ROOT}/src/registry.elisa"',
              f'include "{ROOT}/src/manifest.elisa"',
              f'include "{ROOT}/src/cache.elisa"',
-             f'include "{ROOT}/src/resolve.elisa"',
-             f'include "{ROOT}/src/trust.elisa"',
-             f'include "{ROOT}/src/solver.elisa"', 'def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:']
+             'def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:']
     lines.extend([
         '    platform_buffer: mutable darray[u8] = []',
         '    platform_size: i64 = Platform::pkg_package_file_size("src/main.elisa")',
@@ -72,6 +66,11 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
         check(f'not SemVer::parse_requirement({data(value)}, &req)')
     left, right = data('1.0.0-alpha.1'), data('1.0.0-alpha.2')
     check(f'SemVer::compare_text({left}, {right}) == -1')
+    lines.extend([
+        '    exact_requirement: mutable darray[u8] = []',
+        '    Registry::exact_requirement(Model::Version{major: 1, minor: 2, patch: 3, prerelease: false}, &exact_requirement)',
+    ])
+    check('exact_requirement.count == 5.usize() and exact_requirement[0] == 49 and exact_requirement[1] == 46 and exact_requirement[2] == 50 and exact_requirement[3] == 46 and exact_requirement[4] == 51')
     lines.append('    selected: mutable darray[u8] = [120]')
     catalog, requirement = data('1.0.0\nbroken\n'), data('^1.0.0')
     check(f'not Resolve::select_highest_version({catalog}, {requirement}, &selected)')

@@ -34,6 +34,18 @@ module Registry:
             TrustStateMalformed
             ClockRollback
 
+        # Render a selected stable version as the exact solver requirement used
+        # when replaying registry lock preferences. Keeping this formatter in
+        # the provider namespace prevents cache paths or CLI-only formatting
+        # helpers from leaking into resolver constraints.
+        def exact_requirement(version: Model::Version, out: mutable darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
+            out.resize(0)
+            registry_append_decimal(out, version.major)
+            out.push(46)
+            registry_append_decimal(out, version.minor)
+            out.push(46)
+            registry_append_decimal(out, version.patch)
+
         # Decode dependency constraints from already authenticated metadata.
         # The output is kept separate from metadata records because the current
         # stage1 compiler cannot safely move recursive darray fields nested in a
@@ -87,6 +99,14 @@ module Registry:
         # or restoring a project cannot reset rollback protection.
         def record_trusted(package: darray[u8]&, version: darray[u8]&, digest: darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             return trust_state_record(package, version, digest)
+
+        # Check an identity against previously persisted trust evidence without
+        # refreshing the state or advancing its durable clock. Offline and
+        # frozen builds use this read-only boundary after validating a cache
+        # receipt; they must never turn a local cache hit into a new trust
+        # decision.
+        def verify_trusted(package: darray[u8]&, version: darray[u8]&, digest: darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return trust_state_verify(package, version, digest)
 
         # Resolve one package and verify its detached metadata. The regular
         # entry also verifies the selected archive before exposing success.
@@ -205,6 +225,29 @@ module Registry:
 
     private:
         const max_dependencies: usize = 4096
+
+        def registry_append_decimal(out: mutable darray[u8]&, value: u64) -> void can[Memory.Allocate, Abort.Panic]:
+            start: usize = out.count
+            out.resize(start + 20.usize())
+            number: mutable u64 = value
+            cursor: mutable usize = start
+            if number == 0:
+                out[cursor] <- 48
+                cursor <- cursor + 1.usize()
+            else:
+                while number > 0 |out, number, cursor|:
+                    out[cursor] <- 48 + (number % 10).u8()
+                    cursor <- cursor + 1.usize()
+                    number <- number / 10
+                left: mutable usize = start
+                right: mutable usize = cursor
+                while left < right and right - left > 1.usize() |out, left, right|:
+                    right <- right - 1.usize()
+                    temporary: u8 = out[left]
+                    out[left] <- out[right]
+                    out[right] <- temporary
+                    left <- left + 1.usize()
+            out.resize(cursor)
 
         def registry_push_text(out: mutable darray[u8]&, value: cstr) -> void can[Memory.Allocate, Abort.Panic]:
             length: usize = Platform::pkg_strlen(value)
@@ -968,6 +1011,48 @@ module Registry:
             return trust_state_finish(lock_path, ResultCode.TrustStateUnavailable) if not trust_state_write(state_path, state)
             return trust_state_finish(lock_path, ResultCode.Ok)
 
+        def trust_state_verify(package: darray[u8]&, version: darray[u8]&, digest: darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return ResultCode.InvalidConfiguration if not registry_valid_name(package) or not Archive::is_safe_entry(version) or not valid_digest(digest)
+            parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
+            return ResultCode.InvalidConfiguration if not SemVer::parse(version, &parsed) or parsed.prerelease
+            root: mutable darray[u8] = []
+            value_ref: u8&? = Platform::pkg_getenv("ELISAPKG_REGISTRY_DIR")
+            if value_ref is configured_root_value:
+                value: cstr = configured_root_value.cast[cstr]
+                length: usize = Platform::pkg_strlen(value)
+                return ResultCode.InvalidConfiguration if length == 0 or length > 4096
+                for index in 0..<length |root, value|:
+                    root.push(value[index].u8())
+            state_path: mutable darray[u8] = []
+            return ResultCode.TrustStateUnavailable if not trust_state_path(root, &state_path)
+            state: mutable darray[u8] = []
+            read_status: ResultCode = trust_state_read(state_path, &state)
+            return read_status if read_status != ResultCode.Ok
+            observed_clock: mutable u64 = 0
+            clock_missing: mutable bool = false
+            clock_path: mutable darray[u8] = []
+            for index in 0..<state_path.count |clock_path, state_path|:
+                clock_path.push(state_path[index])
+            registry_push_text(&clock_path, ".clock")
+            clock_status: ResultCode = trust_clock_read(clock_path, &observed_clock, &clock_missing)
+            return clock_status if clock_status != ResultCode.Ok
+            return ResultCode.TrustStateUnavailable if clock_missing and state.count > 23.usize()
+            now: i64 = Platform::pkg_wall_clock_seconds()
+            return ResultCode.TrustStateUnavailable if now < 0
+            return ResultCode.ClockRollback if observed_clock > now.u64()
+            previous_version: mutable darray[u8] = []
+            previous_digest: mutable darray[u8] = []
+            find_status: ResultCode = trust_state_find(state, package, &previous_version, &previous_digest) if state.count > 0 else ResultCode.Ok
+            return find_status if find_status != ResultCode.Ok
+            return ResultCode.TrustStateUnavailable if previous_version.count == 0.usize()
+            previous: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
+            return ResultCode.TrustStateMalformed if not SemVer::parse(previous_version, &previous)
+            return ResultCode.RollbackDetected if SemVer::compare(parsed, previous) < 0
+            return ResultCode.DigestMismatch if SemVer::compare(parsed, previous) == 0 and not bytes_equal(previous_digest, digest)
+            return ResultCode.TrustStateUnavailable if SemVer::compare(parsed, previous) > 0
+            return ResultCode.TrustStateUnavailable if not bytes_equal(previous_digest, digest)
+            return ResultCode.Ok
+
         def trust_clock_read(path: darray[u8]&, out: mutable u64&, missing: mutable bool&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out <- 0
             missing <- false
@@ -1001,18 +1086,27 @@ module Registry:
             return ResultCode.Ok
 
         def trust_clock_append_decimal(out: mutable darray[u8]&, value: u64) -> void can[Memory.Allocate, Abort.Panic]:
-            digits: mutable darray[u8] = []
+            start: usize = out.count
+            out.resize(start + 20.usize())
             number: mutable u64 = value
+            cursor: mutable usize = start
             if number == 0:
-                out.push(48)
-                return
-            while number > 0 |digits, number|:
-                digits.push(48 + (number % 10).u8())
-                number <- number / 10
-            index: mutable usize = digits.count
-            while index > 0 |out, digits, index|:
-                index <- index - 1.usize()
-                out.push(digits[index])
+                out[cursor] <- 48
+                cursor <- cursor + 1.usize()
+            else:
+                while number > 0 |out, number, cursor|:
+                    out[cursor] <- 48 + (number % 10).u8()
+                    cursor <- cursor + 1.usize()
+                    number <- number / 10
+                left: mutable usize = start
+                right: mutable usize = cursor
+                while left < right and right - left > 1.usize() |out, left, right|:
+                    right <- right - 1.usize()
+                    temporary: u8 = out[left]
+                    out[left] <- out[right]
+                    out[right] <- temporary
+                    left <- left + 1.usize()
+            out.resize(cursor)
 
         def trust_clock_write(path: darray[u8]&, value: u64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             encoded: mutable darray[u8] = []

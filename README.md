@@ -54,6 +54,12 @@ replacement.
 
 Project commands accept `--manifest-path PATH`; PATH may name the project directory or its `elisapkg.json`, including dependency mutations such as `add`, `remove`, and `update`. Local path resolution walks the dependency graph transitively, sorts package records by canonical name, normalizes relative paths, records SHA-256 manifest and first-target source digests, and rejects conflicting duplicate package identities. Target paths are resolved with `realpath` and must remain below their package root, including when a symlink is present. `build` selects the first target by default or a named target with `--bin NAME`, `--lib NAME`, or `--test NAME`; executable and test artifacts use the target name under `.elisapkg/build/`, while libraries use the same name with an `.o` suffix. Build receipts and cache validation bind the target kind and artifact name, while `run --bin NAME` and `install --local --bin NAME` reject library targets before attempting execution or publication. `test --test NAME` selects a named test target. `clean` removes known build artifacts plus `.elisapkg/package.tar`, `.elisapkg/package.receipt`, and empty build directories. Registry dependency declarations are syntax-checked locally, including exact, caret, tilde, and comparison SemVer ranges. Registry-only graphs use the signed local `primary` provider described in [`docs/registry.md`](docs/registry.md), produce lockfile version 3, and can be cached with `fetch PACKAGE VERSION`; mixed local/registry graphs and network transport remain fail-closed.
 
+Fetched registry blobs have immutable receipts beside their content-addressed cache
+objects. The receipt binds the lock selection to the archive and authenticated metadata
+digests, size, and expiry. `build --offline` and `build --frozen` validate that receipt,
+the archive, and the persisted trust record without reading registry metadata or changing
+the lockfile; missing or forged evidence fails closed.
+
 After archive verification, each signed registry selection is recorded in a
 user-owned trust-state file outside the project. The default location is
 `$HOME/.local/share/elisapkg/trust/<sha256-of-registry-root>.state`; set

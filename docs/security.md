@@ -47,6 +47,13 @@ sizes, no links/devices/special modes, no absolute or traversal paths, no
 duplicate or case-colliding names, and a private empty staging directory. Cache
 pathnames and receipts are never treated as proof of verification.
 
+Registry cache entries carry a separate immutable verification receipt. Its fields bind
+the exact lock selection to the archive name, size, archive digest, authenticated
+metadata digest, and expiry. Frozen or offline builds validate that receipt, the
+content-addressed archive, and the existing user-owned trust record without loading
+registry metadata or mutating the lockfile. Missing, malformed, mismatched, expired, or
+untrusted evidence is a security failure; a cache pathname alone is never evidence.
+
 Manifest bytes must be valid UTF-8 before field interpretation. The local
 target validator rejects absolute, parent, dot-prefixed, and
 backslash path forms, then canonicalizes both the package root and each target

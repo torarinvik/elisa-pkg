@@ -21,6 +21,12 @@ before emitting these records; the lockfile remains untrusted input and is
 revalidated against the configured registry during `resolve --locked` or
 `fetch`.
 
+After a registry archive is fetched, the content-addressed cache stores an immutable
+receipt beside the blob. The receipt repeats the exact package, version, archive,
+sizes, archive and metadata digests, and expiry. `build --offline` and `build --frozen`
+use only this receipt, the verified archive, and a pre-existing trust-state record; they
+fail closed when any evidence is absent or changed and never rewrite the lockfile.
+
 Lock replacement uses an exclusive `mkstemp` file in the project directory, writes all bytes with short-write handling, calls `fsync`, closes the descriptor, and atomically renames the temporary file into place. A failed write or durability step removes the temporary file and leaves the previous lock untouched. The temporary file is created with owner-only permissions while it is in flight.
 
 Dependency edits also journal the original manifest and, when present, the

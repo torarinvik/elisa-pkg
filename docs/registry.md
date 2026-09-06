@@ -11,6 +11,14 @@ at `.elisapkg/cache/sha256/<first-two-hex>/<digest>`. Existing entries are
 rehash-verified; corrupt entries are quarantined before replacement. No cache
 pathname is treated as proof of authenticity.
 
+Each verified registry archive also gets an immutable receipt beside the cache blob at
+`<digest>.receipt`. The receipt binds the primary registry, package and exact version,
+archive filename and size, archive digest, authenticated metadata digest, and metadata
+expiry. It is created with exclusive publication and read back byte-for-byte. A warm
+`build --offline` or `build --frozen` accepts a registry artifact only when the lockfile,
+receipt, archive bytes, expiry, and previously persisted trust-state record all agree;
+it does not read registry metadata, contact a provider, or rewrite the lockfile.
+
 The directory must be an absolute, symlink-free path. Its layout is:
 
 ```text
