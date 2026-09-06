@@ -23,7 +23,9 @@ or unavailable state is a security error. The default path is
 `$HOME/.local/share/elisapkg/trust/<sha256-of-registry-root>.state`, with
 `ELISAPKG_TRUST_STATE` available for an explicit absolute path. Network
 operations still remain disabled until transport and publisher delegation are
-reviewed.
+reviewed. A sibling `.clock` file records the greatest observed wall-clock
+timestamp through the same atomic publication path; malformed values and clock
+rollback fail closed before expiry or trust-state updates.
 
 State-directory creation and atomic file publication use descriptor-anchored
 `mkdirat`/`openat`/`renameat`/`linkat` traversal. Reads, temporary files,

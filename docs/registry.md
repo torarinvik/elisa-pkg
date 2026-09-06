@@ -75,4 +75,10 @@ history is monotonic: a lower version is rejected, and a same-version digest
 change is rejected. History is independent of the project lockfile, so
 restoring or deleting a project cannot reset rollback protection. A stale lock
 directory is left for manual recovery and causes a fail-closed trust-state
-error rather than being removed automatically.
+error rather than being removed automatically. Beside the state file, elisapkg
+durably records the greatest observed wall-clock value in `<state>.clock` using
+the same exclusive temporary-file, `fsync`, atomic-rename, and parent-directory
+`fsync` sequence. A malformed clock or a later observation below that value is
+rejected before trust history can advance, protecting expiry checks from a
+wall-clock rollback. Older installations without a clock sidecar start at
+zero and create it on their next verified selection.

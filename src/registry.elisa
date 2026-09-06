@@ -32,6 +32,7 @@ module Registry:
             ResourceLimit
             TrustStateUnavailable
             TrustStateMalformed
+            ClockRollback
 
         # Decode dependency constraints from already authenticated metadata.
         # The output is kept separate from metadata records because the current
@@ -199,6 +200,7 @@ module Registry:
             return "registry metadata exceeds the configured resource limit" if code == ResultCode.ResourceLimit
             return "registry trust state is unavailable" if code == ResultCode.TrustStateUnavailable
             return "registry trust state is malformed" if code == ResultCode.TrustStateMalformed
+            return "registry trust clock moved backwards" if code == ResultCode.ClockRollback
             return "unknown registry result"
 
     private:
@@ -907,6 +909,7 @@ module Registry:
             return ResultCode.NotConfigured if not configured_root(&root)
             state_path: mutable darray[u8] = []
             return ResultCode.TrustStateUnavailable if not trust_state_path(root, &state_path)
+            return ResultCode.TrustStateUnavailable if state_path.count > 4090.usize()
             lock_path: mutable darray[u8] = []
             for index in 0..<state_path.count |lock_path, state_path|:
                 lock_path.push(state_path[index])
@@ -919,6 +922,15 @@ module Registry:
             state: mutable darray[u8] = []
             read_status: ResultCode = trust_state_read(state_path, &state)
             return trust_state_finish(lock_path, read_status) if read_status != ResultCode.Ok
+            observed_clock: mutable u64 = 0
+            clock_path_start: usize = state_path.count
+            registry_push_text(&state_path, ".clock")
+            clock_status: ResultCode = trust_clock_read(state_path, &observed_clock)
+            state_path.resize(clock_path_start)
+            return trust_state_finish(lock_path, clock_status) if clock_status != ResultCode.Ok
+            now: i64 = Platform::pkg_wall_clock_seconds()
+            return trust_state_finish(lock_path, ResultCode.TrustStateUnavailable) if now < 0
+            return trust_state_finish(lock_path, ResultCode.ClockRollback) if observed_clock > now.u64()
             previous_version: mutable darray[u8] = []
             previous_digest: mutable darray[u8] = []
             find_status: ResultCode = trust_state_find(state, package, &previous_version, &previous_digest) if state.count > 0 else ResultCode.Ok
@@ -928,11 +940,23 @@ module Registry:
                 return trust_state_finish(lock_path, ResultCode.TrustStateMalformed) if not SemVer::parse(previous_version, &previous)
                 return trust_state_finish(lock_path, ResultCode.RollbackDetected) if SemVer::compare(parsed, previous) < 0
                 return trust_state_finish(lock_path, ResultCode.DigestMismatch) if SemVer::compare(parsed, previous) == 0 and not bytes_equal(previous_digest, digest)
-                return trust_state_finish(lock_path, ResultCode.Ok) if SemVer::compare(parsed, previous) == 0
+                if SemVer::compare(parsed, previous) == 0:
+                    registry_push_text(&state_path, ".clock")
+                    clock_written: bool = trust_clock_write(state_path, now.u64())
+                    state_path.resize(clock_path_start)
+                    return trust_state_finish(lock_path, ResultCode.TrustStateUnavailable) if not clock_written
+                    return trust_state_finish(lock_path, ResultCode.Ok)
             if state.count == 0:
                 registry_push_text(&state, "elisapkg-trust-state:1\n")
             record_size: usize = package.count + version.count + digest.count + 3.usize()
             return trust_state_finish(lock_path, ResultCode.TrustStateUnavailable) if record_size > 1048576.usize() or state.count > 1048576.usize() - record_size
+            # Advance the durable clock before adding a package record. If the
+            # record write fails after this point, the stricter clock still
+            # prevents an older timestamp from being accepted later.
+            registry_push_text(&state_path, ".clock")
+            clock_written: bool = trust_clock_write(state_path, now.u64())
+            state_path.resize(clock_path_start)
+            return trust_state_finish(lock_path, ResultCode.TrustStateUnavailable) if not clock_written
             registry_push_array(&state, package)
             state.push(32)
             registry_push_array(&state, version)
@@ -941,6 +965,56 @@ module Registry:
             state.push(10)
             return trust_state_finish(lock_path, ResultCode.TrustStateUnavailable) if not trust_state_write(state_path, state)
             return trust_state_finish(lock_path, ResultCode.Ok)
+
+        def trust_clock_read(path: darray[u8]&, out: mutable u64&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            out <- 0
+            loaded: mutable darray[u8] = []
+            if not read_file(path, 64.usize(), &loaded):
+                path_c: mutable darray[u8] = []
+                path_with_nul(path, &path_c)
+                path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
+                return ResultCode.Ok if Platform::pkg_package_file_size(path_name) == -2
+                return ResultCode.TrustStateUnavailable
+            return ResultCode.TrustStateMalformed if loaded.count < 8.usize() or loaded.count > 64.usize()
+            prefix: cstr = "clock:"
+            prefix_length: usize = Platform::pkg_strlen(prefix)
+            return ResultCode.TrustStateMalformed if loaded.count <= prefix_length + 1.usize()
+            for index in 0..<prefix_length |loaded, prefix|:
+                return ResultCode.TrustStateMalformed if loaded[index] != prefix[index].u8()
+            return ResultCode.TrustStateMalformed if loaded[loaded.count - 1.usize()] != 10
+            value: mutable u64 = 0
+            cursor: mutable usize = prefix_length
+            finish: usize = loaded.count - 1.usize()
+            return ResultCode.TrustStateMalformed if cursor == finish
+            while cursor < finish:
+                return ResultCode.TrustStateMalformed if loaded[cursor] < 48 or loaded[cursor] > 57
+                digit: u64 = (loaded[cursor] - 48).u64()
+                return ResultCode.TrustStateMalformed if value > (18446744073709551615.u64() - digit) / 10.u64()
+                value <- value * 10.u64() + digit
+                cursor <- cursor + 1.usize()
+            out <- value
+            return ResultCode.Ok
+
+        def trust_clock_append_decimal(out: mutable darray[u8]&, value: u64) -> void can[Memory.Allocate, Abort.Panic]:
+            digits: mutable darray[u8] = []
+            number: mutable u64 = value
+            if number == 0:
+                out.push(48)
+                return
+            while number > 0 |digits, number|:
+                digits.push(48 + (number % 10).u8())
+                number <- number / 10
+            index: mutable usize = digits.count
+            while index > 0 |out, digits, index|:
+                index <- index - 1.usize()
+                out.push(digits[index])
+
+        def trust_clock_write(path: darray[u8]&, value: u64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            encoded: mutable darray[u8] = []
+            registry_push_text(&encoded, "clock:")
+            trust_clock_append_decimal(&encoded, value)
+            encoded.push(10)
+            return trust_state_write(path, encoded)
 
         def metadata_root_object(raw: darray[u8]&) -> bool:
             first: mutable usize = 0

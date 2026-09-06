@@ -229,6 +229,13 @@ ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_COMPILER_ROOT/build/runtime/elisa
   "$ELISA_COMPILER_ROOT/scripts/elisac_stage1.sh" -emit exe -o "$TRUST_STATE_REPEAT_BIN" "$TRUST_STATE_REPEAT_PROBE"
 ELISAPKG_REGISTRY_DIR="$ROOT" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_REPEAT_BIN"
 test -s "$TRUST_STATE_FILE"
+test -s "$TRUST_STATE_FILE.clock"
+printf 'clock:18446744073709551615\n' > "$TRUST_STATE_FILE.clock"
+if ELISAPKG_REGISTRY_DIR="$ROOT" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
+  echo "trust-state clock rollback was accepted" >&2
+  exit 1
+fi
+rm -f "$TRUST_STATE_FILE.clock"
 mkdir "$TRUST_STATE_FILE.lock"
 if ELISAPKG_REGISTRY_DIR="$ROOT" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
   echo "trust-state lock was ignored" >&2

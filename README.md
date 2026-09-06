@@ -60,7 +60,9 @@ user-owned trust-state file outside the project. The default location is
 `ELISAPKG_TRUST_STATE` to an absolute path for an isolated location. Updates
 use an exclusive lock and durable atomic replacement. A lower version or a
 same-version digest change is rejected even if the project lockfile is deleted
-or restored.
+or restored. The adjacent `.clock` sidecar durably records the greatest wall
+clock value observed for the registry; malformed values and clock rollback are
+rejected before a signed selection can update trust state.
 
 `package --list` previews the validated file set. `package` writes a bounded,
 deterministic ustar archive to `.elisapkg/package.tar`, with sorted regular
