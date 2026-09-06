@@ -1,7 +1,9 @@
 # Local authenticated registry fixture
 
 `elisapkg fetch PACKAGE VERSION` reads a deterministic file-backed registry
-when `ELISAPKG_REGISTRY_DIR` is set. This provider is the transport-neutral
+when `ELISAPKG_REGISTRY_DIR` is set. `elisapkg fetch` with no package arguments
+walks every registry record in a validated lockfile v3 and verifies/caches the
+exact locked bytes. This provider is the transport-neutral
 boundary for future network transports: all metadata is read with bounded Elisa
 FFI file operations and verified before archive bytes are returned. The exact
 archive is then rechecked and published to the project content-addressed cache
