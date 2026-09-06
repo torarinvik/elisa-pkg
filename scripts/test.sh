@@ -349,6 +349,35 @@ ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_COMPILER_ROOT/build/runtime/elisa
 test -f "$ARCHIVE_EXTRACT_DIR/src/main.elisa"
 test "$(cat "$ARCHIVE_EXTRACT_DIR/src/main.elisa")" = abc
 
+# Read-only graph inspection must not refresh a registry or depend on its
+# current availability. A structurally valid v3 lock with matching local root
+# digests is enough for tree/why to operate while the provider is unset.
+READONLY_REGISTRY_CASE="$ROOT/build/readonly-registry-$$"
+mkdir -p "$READONLY_REGISTRY_CASE/src"
+printf '%s\n' 'def main() -> i64:' '    return 0' > "$READONLY_REGISTRY_CASE/src/main.elisa"
+printf '%s\n' '{"schema-version":1,"package":{"name":"readonly-app","version":"0.1.0"},"targets":[{"name":"app","kind":"bin","entry":"src/main.elisa"}],"dependencies":{"dep":{"version":"1.0.0","registry":"primary"}}}' > "$READONLY_REGISTRY_CASE/elisapkg.json"
+readonly_manifest_digest="$(shasum -a 256 "$READONLY_REGISTRY_CASE/elisapkg.json" | awk '{print $1}')"
+readonly_source_digest="$(shasum -a 256 "$READONLY_REGISTRY_CASE/src/main.elisa" | awk '{print $1}')"
+readonly_zero_digest="$(printf '%064d' 0)"
+cat > "$READONLY_REGISTRY_CASE/elisapkg.lock" <<EOF
+{
+  "lock-version": 3,
+  "resolver": "elisapkg-registry-v1",
+  "package": {
+    "name": "readonly-app",
+    "version": "0.1.0",
+    "manifest-digest": "sha256:$readonly_manifest_digest",
+    "source-digest": "sha256:$readonly_source_digest"
+  },
+  "packages": [{"name":"dep","version":"1.0.0","source":{"type":"registry","registry":"primary","archive":"dep.tar"},"archive-size":1,"archive-digest":"sha256:$readonly_zero_digest","metadata-digest":"sha256:$readonly_zero_digest"}]
+}
+EOF
+(
+  cd "$READONLY_REGISTRY_CASE"
+  env -u ELISAPKG_REGISTRY_DIR -u ELISAPKG_TRUST_STATE "$BIN" tree | grep -F 'dep 1.0.0' >/dev/null
+  env -u ELISAPKG_REGISTRY_DIR -u ELISAPKG_TRUST_STATE "$BIN" why dep | grep -F 'readonly-app -> dep' >/dev/null
+)
+
 CASE="$ROOT/build/test-package-$(date +%s%N)"
 mkdir -p "$CASE"
 (
