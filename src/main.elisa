@@ -2577,8 +2577,16 @@ def object_sha256_equals(raw: darray[u8]&, object_start: usize, object_end: usiz
         return false if (byte < 48 or byte > 57) and (byte < 97 or byte > 102) or byte != expected[index]
     return true
 
-def fetch_registry_lock(manifest: darray[u8]&, lock: darray[u8]&, root_name: darray[u8]&, root_version: darray[u8]&) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+def fetch_registry_lock(manifest: darray[u8]&, lock: darray[u8]&, root_name: darray[u8]&, root_version: darray[u8]&, start: darray[u8]&) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
     return EXIT_RESOLVE if not Json::valid_document(lock) or not Json::unique_object_keys(lock) or not lock_version_is(lock, 3)
+    # A lockfile is a graph contract, not merely a list of independently
+    # authenticated archives. Recompute the canonical graph from the signed
+    # registry metadata and compare bytes before any cache mutation. This
+    # rejects duplicate, omitted, reordered, or otherwise hand-edited records
+    # that could make fetch operate on a graph different from resolution.
+    expected_lock: darray[u8] = canonical_lock_for_manifest(root_name, root_version, manifest, start)
+    return EXIT_SECURITY if expected_lock.count == 0.usize()
+    return EXIT_RESOLVE if not bytes_equal(expected_lock, lock)
     lock_end: usize = json_object_end(lock, 0)
     return EXIT_RESOLVE if lock_end >= lock.count or not valid_direct_field_set(lock, 0, lock_end, 3)
     resolver: mutable darray[u8] = []
@@ -2775,7 +2783,7 @@ def run_fetch(argc: i64, slots: mutable cstr&&, start: darray[u8]&, options: Mod
     lock.resize(1048577)
     return EXIT_RESOLVE if not read_cstr_into("elisapkg.lock", &lock)
     if lock_version_is(lock, 3):
-        return fetch_registry_lock(raw, lock, name, version)
+        return fetch_registry_lock(raw, lock, name, version, start)
     expected: darray[u8] = canonical_lock_for_manifest(name, version, raw, start)
     return EXIT_RESOLVE if expected.count == 0.usize() or not bytes_equal(expected, lock)
     write_ok("verified local locked sources\n")
@@ -3438,7 +3446,7 @@ def run_build(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Con
     lock_raw.resize(1048577)
     return EXIT_BUILD if not read_cstr_into("elisapkg.lock", &lock_raw)
     if lock_version_is(lock_raw, 3):
-        fetch_status: i64 = fetch_registry_lock(manifest_raw, lock_raw, root_name, root_version)
+        fetch_status: i64 = fetch_registry_lock(manifest_raw, lock_raw, root_name, root_version, start)
         return fetch_status if fetch_status != EXIT_OK
     lock_digest_bytes: mutable darray[u8] = []
     lock_digest: mutable darray[u8] = []
