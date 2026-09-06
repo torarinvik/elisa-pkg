@@ -962,6 +962,11 @@ if (cd "$BAD" && "$BIN" check-manifest >/dev/null 2>&1); then
   echo "trailing include comma was accepted" >&2
   exit 1
 fi
+printf '%s\n' '{"schema-version":1,"package":{"name":"bad","version":"1.0.0"},"targets":[{"name":"bad","kind":"bin","entry":"src/main.elisa"}],"include":["src/../secret"],"dependencies":{}}' > "$BAD/elisapkg.json"
+if (cd "$BAD" && "$BIN" check-manifest >/dev/null 2>&1); then
+  echo "unsafe include path was accepted" >&2
+  exit 1
+fi
 python3 - "$BAD/elisapkg.json" <<'PY'
 import sys
 path = sys.argv[1]
