@@ -3217,6 +3217,44 @@ def run_update(argc: i64, slots: mutable cstr&&) -> i64 can[Console.Write, Memor
     write_ok("updated local dependency lock\n")
     return EXIT_OK
 
+def remove_target_outputs(raw: darray[u8]&, build_dir: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    targets_start: usize = json_key_value_offset(raw, "targets")
+    return false if targets_start >= raw.count or raw[targets_start] != 91
+    targets_end: usize = json_array_end(raw, targets_start)
+    return false if targets_end <= targets_start
+    cursor: mutable usize = targets_start + 1.usize()
+    while cursor < targets_end:
+        while cursor < targets_end and (raw[cursor] == 32 or raw[cursor] == 9 or raw[cursor] == 10 or raw[cursor] == 13 or raw[cursor] == 44):
+            cursor <- cursor + 1.usize()
+        break if cursor >= targets_end
+        return false if raw[cursor] != 123
+        object_end: usize = json_object_end(raw, cursor)
+        return false if object_end <= cursor or object_end >= targets_end
+        target_name: mutable darray[u8] = []
+        target_kind: mutable darray[u8] = []
+        return false if not object_string_value(raw, cursor, object_end, "name", &target_name) or not object_string_value(raw, cursor, object_end, "kind", &target_kind)
+        artifact_leaf_storage: mutable darray[u8] = []
+        for index in 0..<target_name.count |artifact_leaf_storage, target_name|:
+            artifact_leaf_storage.push(target_name[index])
+        if bytes_equal_view(target_kind, "lib"):
+            bytes_push_view(&artifact_leaf_storage, ".o")
+        artifact_leaf_storage.push(0)
+        artifact_leaf: cstr = (&artifact_leaf_storage[0]).cast[cstr] can Unsafe.PointerCast
+        artifact: mutable darray[u8] = []
+        path_join_into(build_dir, artifact_leaf, &artifact)
+        return false if not remove_known_file(&artifact)
+        receipt_leaf_storage: mutable darray[u8] = []
+        for index in 0..<target_name.count |receipt_leaf_storage, target_name|:
+            receipt_leaf_storage.push(target_name[index])
+        bytes_push_view(&receipt_leaf_storage, ".receipt")
+        receipt_leaf_storage.push(0)
+        receipt_leaf: cstr = (&receipt_leaf_storage[0]).cast[cstr] can Unsafe.PointerCast
+        receipt: mutable darray[u8] = []
+        path_join_into(build_dir, receipt_leaf, &receipt)
+        return false if not remove_known_file(&receipt)
+        cursor <- object_end + 1.usize()
+    return true
+
 def run_clean() -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
     root: mutable darray[u8] = [46]
     state: mutable darray[u8] = []
@@ -3234,6 +3272,12 @@ def run_clean() -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.P
     path_join_into(build_dir, "receipt", &receipt)
     path_join_into(state, "package.tar", &package_archive)
     path_join_into(state, "package.receipt", &package_receipt)
+    manifest_raw: mutable darray[u8] = []
+    manifest_raw.resize(1048577)
+    if read_cstr_into("elisapkg.json", &manifest_raw):
+        return EXIT_BUILD if not remove_target_outputs(manifest_raw, &build_dir)
+    # Remove legacy single-target names left by older receipts as well as the
+    # manifest-declared target outputs.
     return EXIT_BUILD if not remove_known_file(&artifact)
     return EXIT_BUILD if not remove_known_file(&library_artifact)
     return EXIT_BUILD if not remove_known_file(&receipt)
@@ -3619,7 +3663,13 @@ def run_build(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Con
     artifact_label: mutable darray[u8] = []
     bytes_push_cstr(&artifact_label, artifact_leaf)
     path_join_into(build_dir, artifact_leaf, &artifact)
-    path_join_into(build_dir, "receipt", &receipt_path)
+    receipt_leaf_storage: mutable darray[u8] = []
+    for index in 0..<target_name.count |receipt_leaf_storage, target_name|:
+        receipt_leaf_storage.push(target_name[index])
+    bytes_push_view(&receipt_leaf_storage, ".receipt")
+    receipt_leaf_storage.push(0)
+    receipt_leaf: cstr = (&receipt_leaf_storage[0]).cast[cstr] can Unsafe.PointerCast
+    path_join_into(build_dir, receipt_leaf, &receipt_path)
     return EXIT_BUILD if not make_directory(&build_dir)
     compiler: mutable cstr = "elisac-stage1"
     if Platform::pkg_getenv("ELISAPKG_COMPILER") is configured:
