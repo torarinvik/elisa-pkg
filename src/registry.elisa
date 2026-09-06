@@ -52,7 +52,7 @@ module Registry:
             return ResultCode.InvalidConfiguration if not valid_registry_root(root)
             path: mutable darray[u8] = []
             return ResultCode.InvalidConfiguration if not join_path_leaf(root, package, "index", &path)
-            return ResultCode.MissingIndex if not read_file(path, out)
+            return ResultCode.MissingIndex if not read_file(path, 1048576.usize(), out)
             return ResultCode.MalformedMetadata if out.count == 0 or out.count > 1048576
             return ResultCode.Ok
 
@@ -73,7 +73,7 @@ module Registry:
             path.push(47)
             for index in 0..<archive.count |path, archive|:
                 path.push(archive[index])
-            return ResultCode.ArchiveMissing if not read_file(path, out)
+            return ResultCode.ArchiveMissing if not read_file(path, 67108864.usize(), out)
             return ResultCode.DigestMismatch if out.count.u64() != expected_size
             return ResultCode.MalformedMetadata if not Archive::verify_ustar_archive(out)
             digest_bytes: mutable darray[u8] = []
@@ -105,7 +105,7 @@ module Registry:
             index_path: mutable darray[u8] = []
             return ResultCode.InvalidConfiguration if not join_path_leaf(root, package, "index", &index_path)
             index: mutable darray[u8] = []
-            return ResultCode.MissingIndex if not read_file(index_path, &index)
+            return ResultCode.MissingIndex if not read_file(index_path, 1048576.usize(), &index)
             selected: mutable darray[u8] = []
             return ResultCode.NoMatchingVersion if not Resolve::select_highest_version(index, requirement, &selected)
             metadata_path: mutable darray[u8] = []
@@ -125,7 +125,7 @@ module Registry:
             metadata_path.push(111)
             metadata_path.push(110)
             metadata: mutable darray[u8] = []
-            return ResultCode.MalformedMetadata if not read_file(metadata_path, &metadata)
+            return ResultCode.MalformedMetadata if not read_file(metadata_path, 1048576.usize(), &metadata)
             return ResultCode.MalformedMetadata if not Json::valid_document(metadata) or not Json::unique_object_keys(metadata) or not metadata_root_object(metadata)
             return ResultCode.MalformedMetadata if not metadata_allowed_fields(metadata)
             return ResultCode.MalformedMetadata if not metadata_identity(metadata, root, package, selected, archive_out, digest_out, archive_size_out)
@@ -133,12 +133,12 @@ module Registry:
             signature_path: mutable darray[u8] = []
             return ResultCode.InvalidConfiguration if not sibling_path(metadata_path, "metadata.sig", &signature_path)
             signature: mutable darray[u8] = []
-            return ResultCode.MissingSignature if not read_file(signature_path, &signature)
+            return ResultCode.MissingSignature if not read_file(signature_path, 64.usize(), &signature)
             key_path: mutable darray[u8] = []
             trust_root_status: ResultCode = configured_trust_root(&key_path)
             return trust_root_status if trust_root_status != ResultCode.Ok
             public_key: mutable darray[u8] = []
-            return ResultCode.MissingTrustRoot if not read_file(key_path, &public_key)
+            return ResultCode.MissingTrustRoot if not read_file(key_path, 32.usize(), &public_key)
             trust_status: Trust::VerificationCode = Trust::verify_detached("ed25519", public_key, metadata, signature)
             return ResultCode.InvalidSignature if trust_status != Trust::VerificationCode.Valid
             expires: mutable u64 = 0
@@ -156,7 +156,7 @@ module Registry:
             return ResultCode.ArchiveMissing if actual_size < 0
             return ResultCode.DigestMismatch if actual_size.u64() != archive_size_out
             archive_bytes: mutable darray[u8] = []
-            return ResultCode.ArchiveMissing if not read_file(archive_path, &archive_bytes)
+            return ResultCode.ArchiveMissing if not read_file(archive_path, 67108864.usize(), &archive_bytes)
             return ResultCode.MalformedMetadata if not Archive::verify_ustar_archive(archive_bytes)
             actual_digest_bytes: mutable darray[u8] = []
             actual_digest: mutable darray[u8] = []
@@ -492,7 +492,7 @@ module Registry:
                 out.push(path[index])
             out.push(0)
 
-        def read_file(path: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+        def read_file(path: darray[u8]&, maximum: usize, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             path_c: mutable darray[u8] = []
             path_with_nul(path, &path_c)
             path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
@@ -508,7 +508,7 @@ module Registry:
             for index in 0..<path.count |path, canonical|:
                 return false if path[index] != canonical[index].u8()
             size: i64 = Platform::pkg_package_file_size(path_name)
-            return false if size < 0 or size > 67108864
+            return false if size < 0 or size > maximum or size > 67108864
             out.resize(size.usize() + 1.usize())
             raw: mutable u8& = (&out[0]).cast[mutable u8&] can Unsafe.PointerCast
             read: i64 = Platform::pkg_read_package_file(path_name, raw, out.count)
@@ -770,7 +770,7 @@ module Registry:
             path_with_nul(path, &path_c)
             path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
             loaded: mutable darray[u8] = []
-            if not read_file(path, &loaded):
+            if not read_file(path, 1048576.usize(), &loaded):
                 # Only an actual missing file is an empty trust history. An
                 # unreadable file, directory, symlink, or other filesystem
                 # failure must not reset rollback protection.
