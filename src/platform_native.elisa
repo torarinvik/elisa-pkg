@@ -1195,6 +1195,13 @@ module PlatformNative:
             raw: mutable void& = (&stat[0]).cast[mutable void&] can Unsafe.PointerCast
             return native_fstat(fd, raw) == 0 and (read_u16(stat, stat_mode_offset) & 61440.u64()) == regular_mode
 
+        def expected_non_file_errno(value: i64) -> bool:
+            # ENOTDIR/EISDIR cover ordinary files and directories. ELOOP is
+            # returned when the descriptor-relative no-follow walker reaches a
+            # symlink. These are explicit skips; every other probe failure is
+            # an inaccessible package input and must abort collection.
+            return value == 20 or value == 21 or value == 40
+
         def limit_bytes(value: i64) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
             out: mutable darray[u8] = []
             out.resize(16)
@@ -1282,8 +1289,12 @@ module PlatformNative:
                             return directory_failure(stream) if not collect_directory(child_name, out, depth + 1.usize())
                         else:
                             file_probe: i64 = open_package_file(child_name)
-                            continue if file_probe < 0
-                            return directory_failure(stream) if native_close(file_probe) != 0
+                            if file_probe < 0:
+                                return directory_failure(stream) if not expected_non_file_errno(-file_probe)
+                                continue
+                            regular: bool = regular_fd(file_probe)
+                            close_status: i64 = native_close(file_probe)
+                            return directory_failure(stream) if not regular or close_status != 0
                             continue if skip_file(child_name)
                             return directory_failure(stream) if out.count + child_length + 1.usize() > 16777216.usize()
                             for index in 0..<child_length |out, child_name|:

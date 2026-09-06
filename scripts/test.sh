@@ -512,6 +512,14 @@ PY
   test -x .elisapkg/build/app
   mv src/main.elisa.good src/main.elisa
   "$BIN" run -- >/dev/null
+  if command -v mkfifo >/dev/null 2>&1; then
+    mkfifo src/package-pipe
+    if "$BIN" package --list >/dev/null 2>&1; then
+      echo "package listing accepted a non-regular file" >&2
+      exit 1
+    fi
+    rm -f src/package-pipe
+  fi
   mkdir -p src/nested
   printf '%s\n' nested > src/nested/deep.elisa
   cp elisapkg.json elisapkg.include.good
