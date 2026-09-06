@@ -1963,7 +1963,9 @@ def canonical_registry_lock(name: darray[u8]&, version: darray[u8]&, raw: darray
         return [] if final_status != Registry::ResultCode.Ok
         if persist_trust:
             trust_status: Registry::ResultCode = Registry::record_trusted(candidate.package, selected_text, digest)
-            return [] if trust_status != Registry::ResultCode.Ok
+            if trust_status != Registry::ResultCode.Ok:
+                out.push(trust_status.u8() + 1.u8())
+                return out
         metadata_digest_bytes: mutable darray[u8] = []
         metadata_digest: mutable darray[u8] = []
         return [] if Integrity::sha256(metadata, &metadata_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(metadata_digest_bytes, &metadata_digest)
@@ -2612,6 +2614,30 @@ def run_resolve(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[C
         preferred_lock.resize(1048577)
         _ = read_cstr_into("elisapkg.lock", &preferred_lock)
     lock: darray[u8] = canonical_lock_for_manifest_with_options(name, version, raw, start, options, preferred_lock)
+    if lock.count == 1.usize() and lock[0] > 0 and lock[0] < 32:
+        code: mutable Registry::ResultCode = Registry::ResultCode.TrustStateMalformed
+        # The sentinel stores the enum value plus one so an empty lock remains
+        # reserved for ordinary resolution failure.
+        code <- Registry::ResultCode.NotConfigured if lock[0] == 2
+        code <- Registry::ResultCode.InvalidConfiguration if lock[0] == 3
+        code <- Registry::ResultCode.MissingIndex if lock[0] == 4
+        code <- Registry::ResultCode.NoMatchingVersion if lock[0] == 5
+        code <- Registry::ResultCode.MalformedMetadata if lock[0] == 6
+        code <- Registry::ResultCode.MissingSignature if lock[0] == 7
+        code <- Registry::ResultCode.MissingTrustRoot if lock[0] == 8
+        code <- Registry::ResultCode.InvalidSignature if lock[0] == 9
+        code <- Registry::ResultCode.ExpiredMetadata if lock[0] == 10
+        code <- Registry::ResultCode.RollbackDetected if lock[0] == 11
+        code <- Registry::ResultCode.DigestMismatch if lock[0] == 12
+        code <- Registry::ResultCode.ArchiveMissing if lock[0] == 13
+        code <- Registry::ResultCode.ResourceLimit if lock[0] == 14
+        code <- Registry::ResultCode.TrustStateUnavailable if lock[0] == 15
+        code <- Registry::ResultCode.TrustStateMalformed if lock[0] == 16
+        write_error("error: ")
+        write_error(Registry::result_message(code))
+        write_error(" while recording registry trust state\n")
+        return EXIT_SECURITY
+
     return EXIT_RESOLVE if lock.count == 0.usize()
     if options.locked or options.frozen:
         return EXIT_RESOLVE if not cstr_file_exists("elisapkg.lock")

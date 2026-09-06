@@ -39,7 +39,7 @@ present and executable.
 | JSON grammar | bounded iterative validator | manifest and regression fixtures | No decoded value tree or source locations |
 | deterministic graph solver | bounded in-memory backtracking module | solver fixture in `scripts/regression_test.py` | CLI still resolves local paths through its existing graph walker |
 | TLS, registry transport | disabled | fail-closed command tests | Requires reviewed transport adapter |
-| signed metadata | file-backed `primary` fixture provider | Ed25519, expiry, identity, archive, and transitive graph fixtures | Requires persistent trust-state, publisher authorization, and protocol review before network use |
+| signed metadata | file-backed `primary` fixture provider | Ed25519, expiry, identity, archive, transitive graph, and persistent trust-state fixtures | Requires publisher authorization and protocol review before network use |
 | archive extraction | bounded staged primitive | descriptor-relative no-follow ustar extraction with exclusive regular-file creation and directory fsync | Callers must provide a private empty staging directory |
 
 Unsupported hosts and missing capabilities must produce an actionable error;
