@@ -617,7 +617,10 @@ mkdir -p "$LIB_CASE"
   test ! -e .elisapkg/build/app.o
 )
 
-BAD="$ROOT/build/invalid-package"
+# Keep this hostile-path fixture isolated per invocation. A previous interrupted
+# run may leave its symlink probes behind, and reusing the directory would make
+# the next test fail before exercising the package manager.
+BAD="$ROOT/build/invalid-package-$$"
 mkdir -p "$BAD/src"
 printf '%s\n' 'def main() -> i64:' '    return 0' > "$BAD/src/main.elisa"
 printf '%s\n' '{"schema-version":1,"package":{"name":"Bad_Name","version":"1.0.0"},"targets":[],"dependencies":{}}' > "$BAD/elisapkg.json"
