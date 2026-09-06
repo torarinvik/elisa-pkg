@@ -940,6 +940,11 @@ if (cd "$BAD" && "$BIN" check-manifest >/dev/null 2>&1); then
   echo "unsupported target kind was accepted" >&2
   exit 1
 fi
+printf '%s\n' '{"schema-version":1,"package":{"name":"good","version":"1.0.0"},"targets":[{"name":"target","kind":"bin","entry":"src/main.elisa"},1],"dependencies":{}}' > "$BAD/elisapkg.json"
+if (cd "$BAD" && "$BIN" check-manifest >/dev/null 2>&1); then
+  echo "scalar target array member was accepted" >&2
+  exit 1
+fi
 printf '%s\n' '{"schema-version":1,"package":{"name":"good","version":"1.0.0"},"targets":[{"name":"target","kind":"bin","entry":"src/main.elisa"}],"dependencies":{"foo":{"version":"^1.0.0","registry":"primary"}}}' > "$BAD/elisapkg.json"
 if ! (cd "$BAD" && "$BIN" check-manifest >/dev/null 2>&1); then
   echo "supported primary registry dependency was rejected" >&2
