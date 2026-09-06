@@ -219,6 +219,8 @@ ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_COMPILER_ROOT/build/runtime/elisa
 # published, so checksum and type-field regressions must fail closed.
 ARCHIVE_PROBE="$ROOT/build/archive-probe-$$.elisa"
 ARCHIVE_BIN="$ROOT/build/archive-probe-$$"
+ARCHIVE_EXTRACT_DIR="$ROOT/build/archive-extract-$$"
+mkdir -p "$ARCHIVE_EXTRACT_DIR"
 cat > "$ARCHIVE_PROBE" <<EOF
 include "$ROOT/src/archive.elisa"
 
@@ -229,6 +231,12 @@ def append_bytes(out: mutable darray[u8]&, value: darray[u8]&) -> void:
 def append_zeroes(out: mutable darray[u8]&, count: usize) -> void:
     for _index in 0..<count |out|:
         out.push(0)
+
+def append_text(out: mutable darray[u8]&, value: cstr) -> void:
+    index: mutable usize = 0
+    while value[index].u8() != 0:
+        out.push(value[index].u8())
+        index <- index + 1
 
 def main() -> i64:
     name: mutable darray[u8] = [115, 114, 99, 47, 109, 97, 105, 110, 46, 101, 108, 105, 115, 97]
@@ -242,6 +250,9 @@ def main() -> i64:
     append_zeroes(&valid, 509)
     append_zeroes(&valid, 1024)
     return 2 if not Archive::verify_ustar_archive(valid)
+    destination: mutable darray[u8] = []
+    append_text(&destination, "$ARCHIVE_EXTRACT_DIR")
+    return 5 if not Archive::extract_ustar_archive(valid, destination)
     valid[156] <- 50
     return 3 if Archive::verify_ustar_archive(valid)
     upper_name: mutable darray[u8] = [83, 82, 67, 47, 77, 65, 73, 78, 46, 69, 76, 73, 83, 65]
@@ -266,6 +277,8 @@ ELISA_ALLOW_STALE_STAGE1="${ELISA_ALLOW_STALE_STAGE1:-0}" \
 ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_COMPILER_ROOT/build/runtime/elisacore_runtime.o}" \
   "$ELISA_COMPILER_ROOT/scripts/elisac_stage1.sh" -emit exe -o "$ARCHIVE_BIN" "$ARCHIVE_PROBE"
 "$ARCHIVE_BIN"
+test -f "$ARCHIVE_EXTRACT_DIR/src/main.elisa"
+test "$(cat "$ARCHIVE_EXTRACT_DIR/src/main.elisa")" = abc
 
 CASE="$ROOT/build/test-package-$(date +%s%N)"
 mkdir -p "$CASE"
