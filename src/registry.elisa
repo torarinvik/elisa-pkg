@@ -87,12 +87,19 @@ module Registry:
         def record_trusted(package: darray[u8]&, version: darray[u8]&, digest: darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             return trust_state_record(package, version, digest)
 
-        # Resolve one package from the configured local registry and verify its
-        # detached Ed25519 metadata before returning any artifact path. The
-        # returned archive path is relative to the registry root and has passed
-        # Archive's traversal checks; callers must still verify the archive
-        # digest before publication or extraction.
+        # Resolve one package and verify its detached metadata. The regular
+        # entry also verifies the selected archive before exposing success.
         def resolve(package: darray[u8]&, requirement: darray[u8]&, previous_version: Model::Version, version_out: mutable darray[u8]&, archive_out: mutable darray[u8]&, digest_out: mutable darray[u8]&, archive_size_out: mutable u64&, metadata_out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return resolve_internal(package, requirement, previous_version, version_out, archive_out, digest_out, archive_size_out, metadata_out, true)
+
+        # Candidate enumeration authenticates metadata without reading every
+        # archive. This keeps a large signed index from forcing unbounded
+        # archive I/O before the solver knows which versions are selected.
+        def resolve_metadata(package: darray[u8]&, requirement: darray[u8]&, previous_version: Model::Version, version_out: mutable darray[u8]&, archive_out: mutable darray[u8]&, digest_out: mutable darray[u8]&, archive_size_out: mutable u64&, metadata_out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return resolve_internal(package, requirement, previous_version, version_out, archive_out, digest_out, archive_size_out, metadata_out, false)
+
+    private:
+        def resolve_internal(package: darray[u8]&, requirement: darray[u8]&, previous_version: Model::Version, version_out: mutable darray[u8]&, archive_out: mutable darray[u8]&, digest_out: mutable darray[u8]&, archive_size_out: mutable u64&, metadata_out: mutable darray[u8]&, verify_archive: bool) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             version_out.resize(0)
             archive_out.resize(0)
             digest_out.resize(0)
@@ -144,6 +151,12 @@ module Registry:
             expires: mutable u64 = 0
             now: i64 = Platform::pkg_wall_clock_seconds()
             return ResultCode.ExpiredMetadata if now < 0 or not metadata_integer(metadata, "expires", &expires) or not expiry_is_future(expires, now.u64())
+            if not verify_archive:
+                for index in 0..<selected.count |version_out, selected|:
+                    version_out.push(selected[index])
+                for index in 0..<metadata.count |metadata_out, metadata|:
+                    metadata_out.push(metadata[index])
+                return ResultCode.Ok
             archive_path: mutable darray[u8] = []
             return ResultCode.InvalidConfiguration if not join_path_version(root, package, selected, &archive_path)
             archive_path.push(47)
@@ -168,6 +181,7 @@ module Registry:
             archive_out.resize(archive_out.count)
             return ResultCode.Ok
 
+    public:
         def result_message(code: ResultCode) -> cstr:
             return "ok" if code == ResultCode.Ok
             return "registry is not configured" if code == ResultCode.NotConfigured
