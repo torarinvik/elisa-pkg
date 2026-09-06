@@ -123,6 +123,11 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
     check('Trust::precheck_algorithm(algorithm_name) == Trust::VerificationCode.Valid')
     check(f'Trust::precheck_key_material("ed25519", {data("short")}, {trust_signature}) == Trust::VerificationCode.MalformedKey')
     check(f'Trust::precheck_key_material("ed25519", {trust_key}, {data("short")}) == Trust::VerificationCode.MalformedSignature')
+    verify_package = data('acme')
+    verify_version = data('1.0.0')
+    verify_digest = data('a' * 64)
+    lines.append(f'    trust_status: Registry::ResultCode = Registry::verify_trusted({verify_package}, {verify_version}, {verify_digest})')
+    check('trust_status == Registry::ResultCode.TrustStateUnavailable')
     cache_digest = data('a' * 64)
     cache_path: str = 'cache_path'
     lines.append(f'    {cache_path}: mutable darray[u8] = []')
@@ -221,7 +226,11 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
     source.write_text('\n'.join(lines) + '\n')
     (ROOT / 'build/review-probe.elisa').write_text(source.read_text())
     run([COMPILER, '-emit', 'exe', '-o', work / 'probe', source])
-    run([work / 'probe'])
+    empty_home = work / 'empty-home'
+    empty_home.mkdir()
+    probe_environment = dict(os.environ, ELISAPKG_REGISTRY_DIR=str(work / 'missing-registry'), HOME=str(empty_home))
+    run([work / 'probe'], env=probe_environment)
+    assert not (empty_home / '.local').exists(), 'read-only trust verification created user state directories'
 
     run([BIN, 'init', work / 'project'], stdout=subprocess.DEVNULL)
     project = work / 'project'
