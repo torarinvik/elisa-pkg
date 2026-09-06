@@ -128,6 +128,28 @@ ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_COMPILER_ROOT/build/runtime/elisa
   "$ELISA_COMPILER_ROOT/scripts/elisac_stage1.sh" -emit exe -o "$TRUST_BIN" "$TRUST_PROBE"
 "$TRUST_BIN"
 
+# The provider path is exercised with a fixed Ed25519 vector. A valid detached
+# signature must pass, while a one-byte mutation must fail closed.
+CRYPTO_PROBE="$ROOT/build/crypto-probe-$$.elisa"
+CRYPTO_BIN="$ROOT/build/crypto-probe-$$"
+cat > "$CRYPTO_PROBE" <<EOF
+include "$ROOT/src/trust.elisa"
+
+def main() -> i64:
+    public_key: mutable darray[u8] = [210,215,81,194,128,33,126,204,53,156,34,244,6,136,131,235,211,40,218,212,248,228,62,102,227,40,136,58,31,197,139,182]
+    message: mutable darray[u8] = [115,105,103,110,101,100,32,109,101,115,115,97,103,101]
+    signature: mutable darray[u8] = [56,127,124,128,177,193,186,187,254,246,65,194,183,136,113,123,176,137,87,75,172,103,193,38,147,182,192,39,141,37,36,99,91,152,227,12,212,208,239,177,87,48,112,226,96,86,5,98,91,112,95,218,34,97,244,169,23,44,233,89,231,84,107,14]
+    return 1 if Trust::verify_detached("ed25519", public_key, message, signature) != Trust::VerificationCode.Valid
+    signature[0] <- signature[0] + 1
+    return 2 if Trust::verify_detached("ed25519", public_key, message, signature) == Trust::VerificationCode.Valid
+    return 0
+EOF
+ELISA_STAGE1_BIN="${ELISA_STAGE1_BIN:-$ELISA_COMPILER_ROOT/bin/elisac-stage1}" \
+ELISA_ALLOW_STALE_STAGE1="${ELISA_ALLOW_STALE_STAGE1:-0}" \
+ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_COMPILER_ROOT/build/runtime/elisacore_runtime.o}" \
+  "$ELISA_COMPILER_ROOT/scripts/elisac_stage1.sh" -emit exe -o "$CRYPTO_BIN" "$CRYPTO_PROBE"
+"$CRYPTO_BIN"
+
 # Verify the in-language SHA-256 implementation against the two canonical
 # FIPS vectors used by the package-integrity path.
 HASH_PROBE="$ROOT/build/hash-probe-$$.elisa"
