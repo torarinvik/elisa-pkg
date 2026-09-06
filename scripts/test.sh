@@ -240,6 +240,11 @@ if ELISAPKG_REGISTRY_DIR="$ROOT" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUS
   echo "malformed trust state was accepted" >&2
   exit 1
 fi
+printf 'elisapkg-trust-state:1\napp 1.0.0 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' > "$TRUST_STATE_FILE"
+if ELISAPKG_REGISTRY_DIR="$ROOT" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
+  echo "truncated trust state was accepted" >&2
+  exit 1
+fi
 
 # Verify the in-language SHA-256 implementation against the two canonical
 # FIPS vectors used by the package-integrity path.
