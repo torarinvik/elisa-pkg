@@ -29,7 +29,10 @@ the highest version satisfying the requested exact, caret, tilde, or comparison
 requirement.
 
 `metadata.json` is signed byte-for-byte as stored, including its final newline
-if present. It must be a unique-key JSON object containing:
+if present. It must be a unique-key JSON object containing only the documented
+root fields (plus the optional dependency map); unknown protocol fields are
+rejected before signature use. Dependency objects likewise accept only
+`registry` and `version`.
 
 ```json
 {
@@ -46,7 +49,9 @@ if present. It must be a unique-key JSON object containing:
 ```
 
 The registry identity, package, version, archive name, byte size, and SHA-256
-digest are all compared with the selected path and bytes. Expiry is checked
+digest are all compared with the selected path and bytes. Every registry file
+must also resolve through `realpath` to the exact requested path; symlinked
+metadata, trust roots, indexes, and archives are refused. Expiry is checked
 against the host wall clock. A detached signature or trust root that is missing,
 malformed, unavailable, or invalid fails closed. The Ed25519 provider is the
 small FFI seam in `src/platform_native.elisa`; signature policy remains in
