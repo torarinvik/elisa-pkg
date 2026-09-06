@@ -21,6 +21,7 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
              f'include "{ROOT}/src/semver.elisa"',
              f'include "{ROOT}/src/json.elisa"',
              f'include "{ROOT}/src/archive.elisa"',
+             f'include "{ROOT}/src/manifest.elisa"',
              f'include "{ROOT}/src/cache.elisa"',
              f'include "{ROOT}/src/resolve.elisa"',
              f'include "{ROOT}/src/trust.elisa"',
@@ -75,6 +76,8 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
     for value in ['../a', 'a/../b', 'a\x00b', 'a\nb', 'a/', 'C:/a', 'a:b']:
         check(f'not Archive::is_safe_entry({data(value)})')
     check(f'Archive::is_safe_entry({data("a..b")})')
+    check(f'not Manifest::is_safe_relative_entry({data(".hidden/main.elisa")})')
+    check(f'Manifest::is_safe_relative_entry({data("src/main.elisa")})')
     name = data('source.elisa')
     lines.extend([f'    header: darray[u8] = Archive::tar_file_header({name}, 1)',
                   '    archive: mutable darray[u8] = []', '    archive.resize(2048)',
