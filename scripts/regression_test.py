@@ -36,6 +36,7 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
         '    return 802 if Platform::pkg_is_directory("../") != 0',
         '    return 803 if Platform::pkg_read_package_file("src/main.elisa", platform_raw, platform_buffer.count) <= 0',
         '    return 804 if Platform::pkg_access("src/main.elisa", 0) != 0',
+        '    return 805 if Platform::pkg_access(".", 0) == 0',
     ])
     number = 0
 
