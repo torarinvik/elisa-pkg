@@ -1,0 +1,327 @@
+# Authenticated, deterministic registry provider.
+#
+# The provider is intentionally file-backed for the first vertical slice. A
+# future HTTP transport may feed the same metadata bytes into this module, but
+# it must preserve the exact verification and path rules below. Network code,
+# credentials, and archive extraction stay outside this namespace.
+
+module Registry:
+    public:
+        const enum ResultCode of u8:
+            Ok
+            NotConfigured
+            InvalidConfiguration
+            MissingIndex
+            NoMatchingVersion
+            MalformedMetadata
+            MissingSignature
+            MissingTrustRoot
+            InvalidSignature
+            ExpiredMetadata
+            RollbackDetected
+            DigestMismatch
+            ArchiveMissing
+
+        # Resolve one package from the configured local registry and verify its
+        # detached Ed25519 metadata before returning any artifact path. The
+        # returned archive path is relative to the registry root and has passed
+        # Archive's traversal checks; callers must still verify the archive
+        # digest before publication or extraction.
+        def resolve(package: darray[u8]&, requirement: darray[u8]&, previous_version: u64, version_out: mutable darray[u8]&, archive_out: mutable darray[u8]&, digest_out: mutable darray[u8]&, archive_size_out: mutable u64&, metadata_out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            version_out.resize(0)
+            archive_out.resize(0)
+            digest_out.resize(0)
+            metadata_out.resize(0)
+            archive_size_out <- 0
+            return ResultCode.InvalidConfiguration if not valid_package_path(package)
+            root: mutable darray[u8] = []
+            return ResultCode.NotConfigured if not configured_root(&root)
+            return ResultCode.InvalidConfiguration if not valid_registry_root(root)
+            index_path: mutable darray[u8] = []
+            return ResultCode.InvalidConfiguration if not join_path_leaf(root, package, "index", &index_path)
+            index: mutable darray[u8] = []
+            return ResultCode.MissingIndex if not read_file(index_path, &index)
+            selected: mutable darray[u8] = []
+            return ResultCode.NoMatchingVersion if not Resolve::select_highest_version(index, requirement, &selected)
+            metadata_path: mutable darray[u8] = []
+            return ResultCode.InvalidConfiguration if not join_path_version(root, package, selected, &metadata_path)
+            metadata_path.push(47)
+            metadata_path.push(109)
+            metadata_path.push(101)
+            metadata_path.push(116)
+            metadata_path.push(97)
+            metadata_path.push(100)
+            metadata_path.push(97)
+            metadata_path.push(116)
+            metadata_path.push(97)
+            metadata_path.push(46)
+            metadata_path.push(106)
+            metadata_path.push(115)
+            metadata_path.push(111)
+            metadata_path.push(110)
+            metadata: mutable darray[u8] = []
+            return ResultCode.MalformedMetadata if not read_file(metadata_path, &metadata)
+            return ResultCode.MalformedMetadata if not Json::valid_document(metadata) or not Json::unique_object_keys(metadata)
+            return ResultCode.MalformedMetadata if not metadata_identity(metadata, root, package, selected, archive_out, digest_out, archive_size_out)
+            return ResultCode.RollbackDetected if selected_version_below(selected, previous_version)
+            signature_path: mutable darray[u8] = []
+            return ResultCode.InvalidConfiguration if not sibling_path(metadata_path, "metadata.sig", &signature_path)
+            signature: mutable darray[u8] = []
+            return ResultCode.MissingSignature if not read_file(signature_path, &signature)
+            key_path: mutable darray[u8] = []
+            empty_package: mutable darray[u8] = []
+            return ResultCode.InvalidConfiguration if not join_path_leaf(root, empty_package, "root.ed25519", &key_path)
+            public_key: mutable darray[u8] = []
+            return ResultCode.MissingTrustRoot if not read_file(key_path, &public_key)
+            trust_status: Trust::VerificationCode = Trust::verify_detached("ed25519", public_key, metadata, signature)
+            return ResultCode.InvalidSignature if trust_status != Trust::VerificationCode.Valid
+            expires: mutable u64 = 0
+            now: i64 = Platform::pkg_wall_clock_seconds()
+            return ResultCode.ExpiredMetadata if now < 0 or not metadata_integer(metadata, "expires", &expires) or not expiry_is_future(expires, now.u64())
+            archive_path: mutable darray[u8] = []
+            return ResultCode.InvalidConfiguration if not join_path_version(root, package, selected, &archive_path)
+            archive_path.push(47)
+            for index in 0..<archive_out.count |archive_path, archive_out|:
+                archive_path.push(archive_out[index])
+            archive_c: mutable darray[u8] = []
+            path_with_nul(archive_path, &archive_c)
+            archive_name: cstr = (&archive_c[0]).cast[cstr] can Unsafe.PointerCast
+            actual_size: i64 = Platform::pkg_package_file_size(archive_name)
+            return ResultCode.ArchiveMissing if actual_size < 0
+            return ResultCode.DigestMismatch if actual_size.u64() != archive_size_out
+            archive_bytes: mutable darray[u8] = []
+            return ResultCode.ArchiveMissing if not read_file(archive_path, &archive_bytes)
+            actual_digest_bytes: mutable darray[u8] = []
+            actual_digest: mutable darray[u8] = []
+            return ResultCode.DigestMismatch if Integrity::sha256(archive_bytes, &actual_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(actual_digest_bytes, &actual_digest) or not bytes_equal(actual_digest, digest_out)
+            for index in 0..<selected.count |version_out, selected|:
+                version_out.push(selected[index])
+            for index in 0..<metadata.count |metadata_out, metadata|:
+                metadata_out.push(metadata[index])
+            archive_out.resize(archive_out.count)
+            return ResultCode.Ok
+
+        def result_message(code: ResultCode) -> cstr:
+            return "ok" if code == ResultCode.Ok
+            return "registry is not configured" if code == ResultCode.NotConfigured
+            return "registry configuration is invalid" if code == ResultCode.InvalidConfiguration
+            return "registry index is missing or unreadable" if code == ResultCode.MissingIndex
+            return "no registry version satisfies the requirement" if code == ResultCode.NoMatchingVersion
+            return "registry metadata is malformed" if code == ResultCode.MalformedMetadata
+            return "registry metadata signature is missing" if code == ResultCode.MissingSignature
+            return "registry trust root is missing" if code == ResultCode.MissingTrustRoot
+            return "registry metadata signature is invalid" if code == ResultCode.InvalidSignature
+            return "registry metadata is expired" if code == ResultCode.ExpiredMetadata
+            return "registry metadata rollback detected" if code == ResultCode.RollbackDetected
+            return "registry archive digest does not match metadata" if code == ResultCode.DigestMismatch
+            return "registry archive is missing or unreadable" if code == ResultCode.ArchiveMissing
+            return "unknown registry result"
+
+    private:
+        def configured_root(out: mutable darray[u8]&) -> bool:
+            value_ref: u8&? = Platform::pkg_getenv("ELISAPKG_REGISTRY_DIR")
+            if value_ref is configured:
+                value: cstr = configured.cast[cstr]
+                length: usize = Platform::pkg_strlen(value)
+                return false if length == 0 or length > 4096
+                for index in 0..<length |out, value|:
+                    out.push(value[index].u8())
+                return true
+            return false
+
+        def valid_registry_root(root: darray[u8]&) -> bool:
+            return false if root.count == 0 or root[0] != 47 or root.count > 4096 or root[root.count - 1] == 47 and root.count > 1
+            segment_start: mutable usize = 1
+            for index in 1..<(root.count + 1) |root, segment_start|:
+                if index == root.count or root[index] == 47:
+                    return false if index == segment_start
+                    return false if index - segment_start == 2 and root[segment_start] == 46 and root[segment_start + 1] == 46
+                    segment_start <- index + 1
+                else:
+                    return false if root[index] < 32 or root[index] == 127 or root[index] == 0
+            return true
+
+        def valid_package_path(package: darray[u8]&) -> bool:
+            return false if package.count == 0 or package.count > 256 or not Archive::is_safe_entry(package)
+            return false if package[package.count - 1] == 47
+            return true
+
+        def join_path_leaf(root: darray[u8]&, package: darray[u8]&, leaf: cstr, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            return false if root.count == 0 or not valid_registry_root(root)
+            for index in 0..<root.count |out, root|:
+                out.push(root[index])
+            if package.count > 0:
+                out.push(47)
+                for index in 0..<package.count |out, package|:
+                    out.push(package[index])
+            leaf_length: usize = Platform::pkg_strlen(leaf)
+            if leaf_length > 0:
+                out.push(47)
+                for index in 0..<leaf_length |out, leaf|:
+                    out.push(leaf[index].u8())
+            return out.count <= 4096
+
+        def join_path_version(root: darray[u8]&, package: darray[u8]&, version: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            return false if version.count == 0 or not Archive::is_safe_entry(version)
+            for index in 0..<root.count |out, root|:
+                out.push(root[index])
+            out.push(47)
+            for index in 0..<package.count |out, package|:
+                out.push(package[index])
+            out.push(47)
+            for index in 0..<version.count |out, version|:
+                out.push(version[index])
+            return out.count <= 4096
+
+        def sibling_path(path: darray[u8]&, leaf: cstr, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            cursor: mutable usize = path.count
+            while cursor > 0 and path[cursor - 1] != 47:
+                cursor <- cursor - 1
+            return false if cursor == 0
+            for index in 0..<cursor |out, path|:
+                out.push(path[index])
+            leaf_length: usize = Platform::pkg_strlen(leaf)
+            for index in 0..<leaf_length |out, leaf|:
+                out.push(leaf[index].u8())
+            return out.count <= 4096
+
+        def path_with_nul(path: darray[u8]&, out: mutable darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
+            for index in 0..<path.count |out, path|:
+                out.push(path[index])
+            out.push(0)
+
+        def read_file(path: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            path_c: mutable darray[u8] = []
+            path_with_nul(path, &path_c)
+            path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
+            size: i64 = Platform::pkg_package_file_size(path_name)
+            return false if size < 0 or size > 67108864
+            out.resize(size.usize() + 1.usize())
+            raw: mutable u8& = (&out[0]).cast[mutable u8&] can Unsafe.PointerCast
+            read: i64 = Platform::pkg_read_package_file(path_name, raw, out.count)
+            return false if read < 0 or read != size
+            out.resize(read.usize())
+            return true
+
+        def metadata_identity(raw: darray[u8]&, root: darray[u8]&, package: darray[u8]&, version: darray[u8]&, archive_out: mutable darray[u8]&, digest_out: mutable darray[u8]&, size_out: mutable u64&) -> bool can[Memory.Allocate, Abort.Panic]:
+            schema: mutable u64 = 0
+            return false if not metadata_integer(raw, "schema-version", &schema) or schema != 1
+            registry: mutable darray[u8] = []
+            algorithm: mutable darray[u8] = []
+            package_value: mutable darray[u8] = []
+            version_value: mutable darray[u8] = []
+            return false if not metadata_string(raw, "registry", &registry) or not metadata_string(raw, "algorithm", &algorithm) or not metadata_string(raw, "package", &package_value) or not metadata_string(raw, "version", &version_value)
+            return false if not bytes_equal(registry, root) or not bytes_equal(package_value, package) or not bytes_equal(version_value, version)
+            return false if algorithm.count != 7 or algorithm[0] != 101 or algorithm[1] != 100 or algorithm[2] != 50 or algorithm[3] != 53 or algorithm[4] != 53 or algorithm[5] != 49 or algorithm[6] != 57
+            return false if not metadata_string(raw, "archive", archive_out) or not Archive::is_safe_entry(archive_out)
+            return false if not metadata_string(raw, "archive-digest", digest_out) or not valid_digest(digest_out)
+            return false if not metadata_integer(raw, "archive-size", size_out)
+            return size_out <= 67108864
+
+        def metadata_string(raw: darray[u8]&, wanted: cstr, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            key_length: usize = Platform::pkg_strlen(wanted)
+            in_string: mutable bool = false
+            escaped: mutable bool = false
+            braces: mutable i64 = 0
+            start: mutable usize = 0
+            for index in 0..<raw.count |raw, in_string, escaped, braces, start|:
+                byte: u8 = raw[index]
+                if not in_string:
+                    if byte == 123:
+                        braces <- braces + 1
+                    elif byte == 125:
+                        braces <- braces - 1
+                    elif byte == 34:
+                        in_string <- true
+                        start <- index + 1
+                elif escaped:
+                    escaped <- false
+                elif byte == 92:
+                    escaped <- true
+                elif byte == 34:
+                    after: mutable usize = index + 1
+                    while after < raw.count and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
+                        after <- after + 1
+                    if braces == 1 and after < raw.count and raw[after] == 58 and index - start == key_length:
+                        matched: mutable bool = true
+                        for key_index in 0..<key_length |raw, wanted, start, matched|:
+                            matched <- false if raw[start + key_index] != wanted[key_index].u8()
+                        if matched:
+                            after <- after + 1
+                            while after < raw.count and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
+                                after <- after + 1
+                            return false if after >= raw.count or raw[after] != 34
+                            after <- after + 1
+                            out.resize(0)
+                            while after < raw.count and raw[after] != 34:
+                                return false if raw[after] < 32 or raw[after] == 92
+                                out.push(raw[after])
+                                after <- after + 1
+                            return after < raw.count
+                    in_string <- false
+            return false
+
+        def metadata_integer(raw: darray[u8]&, wanted: cstr, out: mutable u64&) -> bool can[Memory.Allocate, Abort.Panic]:
+            key_length: usize = Platform::pkg_strlen(wanted)
+            in_string: mutable bool = false
+            escaped: mutable bool = false
+            braces: mutable i64 = 0
+            start: mutable usize = 0
+            for index in 0..<raw.count |raw, in_string, escaped, braces, start|:
+                byte: u8 = raw[index]
+                if not in_string:
+                    if byte == 123:
+                        braces <- braces + 1
+                    elif byte == 125:
+                        braces <- braces - 1
+                    elif byte == 34:
+                        in_string <- true
+                        start <- index + 1
+                elif escaped:
+                    escaped <- false
+                elif byte == 92:
+                    escaped <- true
+                elif byte == 34:
+                    after: mutable usize = index + 1
+                    while after < raw.count and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
+                        after <- after + 1
+                    if braces == 1 and after < raw.count and raw[after] == 58 and index - start == key_length:
+                        matched: mutable bool = true
+                        for key_index in 0..<key_length |raw, wanted, start, matched|:
+                            matched <- false if raw[start + key_index] != wanted[key_index].u8()
+                        if matched:
+                            after <- after + 1
+                            while after < raw.count and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
+                                after <- after + 1
+                            return false if after >= raw.count or raw[after] < 48 or raw[after] > 57
+                            value: mutable u64 = 0
+                            while after < raw.count and raw[after] >= 48 and raw[after] <= 57:
+                                digit: u64 = (raw[after] - 48).u64()
+                                return false if value > 1844674407370955161 or value == 1844674407370955161 and digit > 5
+                                value <- value * 10 + digit
+                                after <- after + 1
+                            return false if after < raw.count and raw[after] != 32 and raw[after] != 9 and raw[after] != 10 and raw[after] != 13 and raw[after] != 44 and raw[after] != 125
+                            out <- value
+                            return true
+                    in_string <- false
+            return false
+
+        def selected_version_below(version: darray[u8]&, previous: u64) -> bool:
+            parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
+            return false if not SemVer::parse(version, &parsed)
+            return parsed.major < previous
+
+        def expiry_is_future(expires: u64, now: u64) -> bool:
+            return expires > now
+
+        def valid_digest(value: darray[u8]&) -> bool:
+            return false if value.count != 64
+            for index in 0..<value.count |value|:
+                return false if (value[index] < 48 or value[index] > 57) and (value[index] < 97 or value[index] > 102)
+            return true
+
+        def bytes_equal(left: darray[u8]&, right: darray[u8]&) -> bool:
+            return false if left.count != right.count
+            for index in 0..<left.count |left, right|:
+                return false if left[index] != right[index]
+            return true

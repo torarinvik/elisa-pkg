@@ -1,19 +1,22 @@
 # Security release gates
 
-Remote source acquisition is disabled in the current binary. `elisapkg fetch`
-verifies local path sources against the lockfile; remote fetches, `publish`, and
-remote `install NAME` fail with security status 5 until a trusted source provider
-is configured. `install --local` is a separate, offline path
+Network source acquisition is disabled in the current binary. `elisapkg fetch`
+verifies local path sources against the lockfile. When `ELISAPKG_REGISTRY_DIR`
+is configured, `fetch PACKAGE REQUIREMENT` also verifies detached Ed25519
+metadata, expiry, archive size, and archive digest for a local registry
+artifact. Remote fetches, `publish`, and remote `install NAME` fail with
+security status 5 until transport and publisher authorization are configured.
+`install --local` is a separate, offline path
 that only publishes the current package's verified build output under the
 user-selected prefix. This is an intentional fail-closed boundary, not a
 temporary insecure mode.
 
 Before enabling remote packages, the implementation must use an established signed-metadata protocol and an audited cryptographic provider. The client must bootstrap a trusted root out of band, validate threshold-signed role metadata and namespace delegation, bind identity/version/registry/archive digest and size together, enforce expiry and monotonic rollback protection, and persist trusted metadata versions atomically. The Elisa `Trust` module already exposes fail-closed prechecks for those bindings, publisher attestation, thresholds, revocation, and clock rollback; these prechecks never substitute for cryptographic verification. Publisher authorization must cover the exact deterministic archive bytes. Unknown algorithms, missing thresholds, stale or replayed metadata, invalid signatures, revoked keys, and unauthorized namespaces are hard failures.
 
-The `Trust` module now exposes metadata prechecks for expiry, rollback,
-namespace, and algorithm policy. They are deliberately not signature
-verification; the production policy still rejects every remote operation until
-the reviewed provider and trust-state persistence are implemented.
+The `Trust` module exposes metadata prechecks for expiry, rollback, namespace,
+and algorithm policy plus an exact-byte detached Ed25519 verification gate. The
+default production policy still rejects network operations until transport,
+publisher delegation, and persistent trust state are implemented.
 
 State-directory creation and atomic file publication use descriptor-anchored
 `mkdirat`/`openat`/`renameat`/`linkat` traversal. Reads, temporary files,

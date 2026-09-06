@@ -1,9 +1,10 @@
 # Signed-metadata and publisher-verification contracts.
 #
-# This module deliberately models the gate without pretending to verify a
-# signature. The production policy keeps remote acquisition disabled until an
-# established protocol implementation and audited cryptographic provider are
-# wired behind this contract.
+# This module owns the trust decision independently of transport. The default
+# policy keeps network acquisition disabled; configured local registries still
+# require the same detached-signature and binding checks.
+
+include "./platform.elisa"
 
 module Trust:
     public:
@@ -38,9 +39,8 @@ module Trust:
         def is_hard_failure(code: VerificationCode) -> bool:
             return code != VerificationCode.Valid
 
-        # These preflight checks are intentionally separate from signature
-        # verification. They reject policy-invalid metadata before a future
-        # provider is asked to consume it, but Valid here never means signed.
+        # These preflight checks reject policy-invalid metadata before the
+        # provider consumes it. They do not replace cryptographic verification.
         def precheck_metadata(previous_version: u64, candidate_version: u64, now: u64, expires: u64) -> VerificationCode:
             return VerificationCode.MissingMetadata if candidate_version == 0
             return VerificationCode.RollbackDetected if candidate_version < previous_version
@@ -51,16 +51,24 @@ module Trust:
             return VerificationCode.Valid if algorithm == "ed25519"
             return VerificationCode.UnknownAlgorithm
 
-        # Ed25519 verification is supplied by a reviewed provider at the
-        # remote-support boundary. These shape checks run before that provider
-        # and reject ambiguous key material; Valid here still does not mean the
-        # signature has been cryptographically verified.
+        # Shape checks run before the provider and reject ambiguous key material.
         def precheck_key_material(algorithm: cstr, public_key: darray[u8]&, signature: darray[u8]&) -> VerificationCode:
             algorithm_status: VerificationCode = precheck_algorithm(algorithm)
             return algorithm_status if algorithm_status != VerificationCode.Valid
             return VerificationCode.MalformedKey if public_key.count != 32.usize()
             return VerificationCode.MalformedSignature if signature.count != 64.usize()
             return VerificationCode.Valid
+
+        # Verify the exact metadata bytes supplied by the registry. The FFI
+        # provider receives no parsed fields and no private material, so a
+        # caller cannot accidentally verify one representation and consume
+        # another. Every non-zero provider result is a hard invalid-signature
+        # decision; provider unavailability never becomes an allow decision.
+        def verify_detached(algorithm: cstr, public_key: darray[u8]&, message: darray[u8]&, signature: darray[u8]&) -> VerificationCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            shape: VerificationCode = precheck_key_material(algorithm, public_key, signature)
+            return shape if shape != VerificationCode.Valid
+            return VerificationCode.Valid if Platform::pkg_verify_ed25519(public_key, message, signature) == 0
+            return VerificationCode.InvalidSignature
 
         def precheck_namespace(package: darray[u8]&, namespace: darray[u8]&) -> VerificationCode:
             return VerificationCode.UnauthorizedNamespace if not trust_valid_namespace_path(package) or not trust_valid_namespace_path(namespace)
@@ -115,7 +123,7 @@ module Trust:
     private:
         # These values are intentionally not exposed as an implicit production
         # algorithm. Protocol selection and crypto-provider review remain M0 gates.
-        const protocol_selection: cstr = "pending reviewed TUF-compatible implementation"
+        const protocol_selection: cstr = "detached Ed25519 metadata over a file-backed registry"
 
         def trust_valid_namespace_path(value: darray[u8]&) -> bool:
             return false if value.count == 0.usize() or value.count > 256.usize()

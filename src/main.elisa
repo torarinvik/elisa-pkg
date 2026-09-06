@@ -15,6 +15,8 @@ include "./semver.elisa"
 include "./integrity.elisa"
 include "./json.elisa"
 include "./cache.elisa"
+include "./resolve.elisa"
+include "./registry.elisa"
 
 const EXIT_OK: i64 = 0
 const EXIT_USAGE: i64 = 2
@@ -1723,7 +1725,7 @@ def project_manifest_exists() -> bool:
     return current
 
 def usage() -> void can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-    write_ok("elisapkg — Elisa Packaging System\n\nUsage: elisapkg <command> [options]\n\nCommands:\n  init [PATH] [--bin|--lib]    create a package\n  check-manifest              validate elisapkg.json\n  add NAME --path PATH        add a verified local path dependency\n  remove NAME                 remove a declared local dependency\n  update [NAME]               recompute the local dependency lock\n  resolve [--locked|--offline]\n                              validate and write elisapkg.lock\n  tree                        show the resolved package graph\n  metadata --json             print normalized package metadata\n  doctor                      report toolchain and trust capabilities\n  build                       compile the package entry point\n  run -- ARGS                 build and run\n  test                        build and run the declared test target\n  clean                       remove known local build/package outputs\n  fetch                       verify locked sources\n  cache verify                inspect cached verification records\n  cache gc --dry-run          preview unreachable cache entries\n  package [--list]            create or preview the deterministic archive\n  install --local             install the current built binary into the user prefix\n  uninstall --local NAME      remove a receipt-owned local binary\n\nModes: --locked  --offline  --frozen  --json  --verbose\n")
+    write_ok("elisapkg — Elisa Packaging System\n\nUsage: elisapkg <command> [options]\n\nCommands:\n  init [PATH] [--bin|--lib]    create a package\n  check-manifest              validate elisapkg.json\n  add NAME --path PATH        add a verified local path dependency\n  remove NAME                 remove a declared local dependency\n  update [NAME]               recompute the local dependency lock\n  resolve [--locked|--offline]\n                              validate and write elisapkg.lock\n  tree                        show the resolved package graph\n  metadata --json             print normalized package metadata\n  doctor                      report toolchain and trust capabilities\n  build                       compile the package entry point\n  run -- ARGS                 build and run\n  test                        build and run the declared test target\n  clean                       remove known local build/package outputs\n  fetch [PACKAGE REQUIREMENT] verify locked sources or a signed local registry artifact\n  cache verify                inspect cached verification records\n  cache gc --dry-run          preview unreachable cache entries\n  package [--list]            create or preview the deterministic archive\n  install --local             install the current built binary into the user prefix\n  uninstall --local NAME      remove a receipt-owned local binary\n\nModes: --locked  --offline  --frozen  --json  --verbose\n")
     write_ok("remote publish/install/uninstall are trust-gated; use install --local for a receipt-backed local binary\n")
 
 def current_directory_into(out: mutable darray[u8]&) -> void can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -2011,7 +2013,39 @@ def run_test(argc: i64, slots: mutable cstr&&, start: darray[u8]&, options: Mode
     return status if status != EXIT_OK
     return run_program(argc, slots)
 
-def run_fetch(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+def run_fetch(argc: i64, slots: mutable cstr&&, start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    if argc > 2:
+        return EXIT_USAGE if argc > 4
+        package: mutable darray[u8] = []
+        requirement: mutable darray[u8] = []
+        bytes_push_cstr(&package, slots[2].cast[cstr])
+        if argc == 4:
+            bytes_push_cstr(&requirement, slots[3].cast[cstr])
+        else:
+            write_error("error: fetch PACKAGE requires an exact SemVer requirement\\n")
+            return EXIT_USAGE
+        selected: mutable darray[u8] = []
+        archive: mutable darray[u8] = []
+        digest: mutable darray[u8] = []
+        metadata: mutable darray[u8] = []
+        archive_size: mutable u64 = 0
+        registry_status: Registry::ResultCode = Registry::resolve(package, requirement, 0, &selected, &archive, &digest, &archive_size, &metadata)
+        if registry_status != Registry::ResultCode.Ok:
+            write_error("error: ")
+            write_error(Registry::result_message(registry_status))
+            write_error("\\n")
+            return EXIT_SECURITY if registry_status == Registry::ResultCode.InvalidSignature or registry_status == Registry::ResultCode.MissingTrustRoot
+            return EXIT_RESOLVE
+        write_ok("verified registry artifact ")
+        write_bytes(1, &package)
+        write_ok(" ")
+        write_bytes(1, &selected)
+        write_ok(" sha256:")
+        write_bytes(1, &digest)
+        write_ok("\\n")
+        _ = start
+        _ = options
+        return EXIT_OK
     _ = options
     if not project_manifest_exists():
         write_error("error: could not find elisapkg.json in the current directory\n")
@@ -2962,7 +2996,7 @@ def cli_main(argc: i64, argv: mutable void&) -> i64 can[Console.Write, Memory.Al
         options.json <- true if flag == "--json"
         options.verbose <- true if flag == "--verbose"
         is_positional: bool = flag[0].u8() != 45
-        positional_allowed: bool = (command == "why" and index == 2) or (command == "install" and index == 2) or (command == "uninstall" and (index == 2 or (index == 3 and slots[2].cast[cstr] == "--local"))) or (command == "cache" and index == 2) or index == manifest_value_index
+        positional_allowed: bool = (command == "why" and index == 2) or (command == "install" and index == 2) or (command == "uninstall" and (index == 2 or (index == 3 and slots[2].cast[cstr] == "--local"))) or (command == "cache" and index == 2) or (command == "fetch" and (index == 2 or index == 3)) or index == manifest_value_index
         recognized: bool = is_positional and positional_allowed
         recognized <- true if not is_positional and (flag == "--locked" or flag == "--offline" or flag == "--frozen" or flag == "--json" or flag == "--verbose" or flag == "--manifest-path" or (flag == "--list" and command == "package") or (flag == "--dry-run" and command == "cache") or (command == "install" and flag == "--local") or (command == "uninstall" and flag == "--local"))
         flags_ok <- false if not recognized
@@ -2982,7 +3016,7 @@ def cli_main(argc: i64, argv: mutable void&) -> i64 can[Console.Write, Memory.Al
     if command == "doctor":
         return run_doctor()
     if command == "fetch":
-        return run_fetch(&start, options)
+        return run_fetch(argc, slots, &start, options)
     if command == "publish":
         return run_publish()
     if command == "install":
