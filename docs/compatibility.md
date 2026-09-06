@@ -33,6 +33,7 @@ present and executable.
 | atomic file replacement | `mkstemp` + file fsync + rename + parent-directory fsync | lockfile fixtures | Filesystem durability guarantees still depend on the host filesystem |
 | exclusive publication | hard-link from fsynced temp | install fixtures | Prefix lock is a mkdir lock, not a kernel lease |
 | process execution | argv array through `env -i`, private process groups, monotonic deadlines, and resource profiles | compiler environment fixture and native timeout seam | No OS sandbox; signalled child processes return 130 |
+| native target artifacts | `bin`/`test` targets use `-emit exe`; `lib` targets use `-emit obj` through the same structured adapter | library-target fixture in `scripts/test.sh` | Dependency compile/link planning and named multi-target selection remain future adapter work |
 | semantic checking | mandatory stage1 gate | invalid-source fixture | Supported toolchain must still be pinned for release |
 | SHA-256 | in-language implementation | FIPS known-answer fixture | Digest is not publisher authentication |
 | JSON grammar | bounded iterative validator | manifest and regression fixtures | No decoded value tree or source locations |

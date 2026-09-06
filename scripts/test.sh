@@ -578,6 +578,35 @@ PY
   python3 -c 'import os; os.unlink(".elisapkg/transaction.state")'
 )
 
+# Library targets emit a regular object with the same atomic receipt/cache
+# handling as binaries. They must never be accidentally executed or installed
+# through the local binary path, and clean must remove the object output too.
+LIB_CASE="$ROOT/build/library-target-$$"
+LIB_PREFIX="$LIB_CASE/prefix"
+mkdir -p "$LIB_CASE"
+"$BIN" init "$LIB_CASE" --lib >/dev/null
+(
+  cd "$LIB_CASE"
+  "$BIN" build >/dev/null
+  test -f .elisapkg/build/app.o
+  test ! -e .elisapkg/build/app
+  "$BIN" build | grep -F '(cached)' >/dev/null
+  if "$BIN" run -- >/dev/null 2>&1; then
+    echo "library target was executed as a binary" >&2
+    exit 1
+  else
+    test "$?" -eq 6
+  fi
+  if ELISAPKG_INSTALL_PREFIX="$LIB_PREFIX" "$BIN" install --local >/dev/null 2>&1; then
+    echo "library target was installed as a binary" >&2
+    exit 1
+  else
+    test "$?" -eq 7
+  fi
+  "$BIN" clean >/dev/null
+  test ! -e .elisapkg/build/app.o
+)
+
 BAD="$ROOT/build/invalid-package"
 mkdir -p "$BAD/src"
 printf '%s\n' 'def main() -> i64:' '    return 0' > "$BAD/src/main.elisa"
