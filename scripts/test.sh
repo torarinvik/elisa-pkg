@@ -756,6 +756,12 @@ mkdir -p "$LIB_CASE"
   else
     test "$?" -eq 7
   fi
+  if ELISAPKG_INSTALL_PREFIX="$LIB_PREFIX" "$BIN" install --local unexpected >/dev/null 2>&1; then
+    echo "install accepted an unexpected positional argument" >&2
+    exit 1
+  else
+    test "$?" -eq 2
+  fi
   "$BIN" clean >/dev/null
   test ! -e .elisapkg/build/app.o
 )
