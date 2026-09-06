@@ -12,7 +12,7 @@ if [[ -n "${ELISA_COMPILER_ROOT:-}" ]]; then
 fi
 export ELISA_ALLOW_STALE_STAGE1="${ELISA_ALLOW_STALE_STAGE1:-0}"
 "$BIN" --version | grep -F 'elisapkg 0.1.0' >/dev/null
-"$BIN" doctor | grep -F 'remote metadata signatures: unavailable' >/dev/null
+"$BIN" doctor | grep -F 'local Ed25519 provider available' >/dev/null
 
 # Exercise the pure SemVer requirement module independently of the CLI. This
 # keeps parser/range regressions visible without requiring a registry fixture.
