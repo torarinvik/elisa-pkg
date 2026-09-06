@@ -64,8 +64,6 @@ extern native_fclose(stream: heap void&) -> int
 extern native_fread(buffer: mutable void&, size: usize, count: usize, stream: void&) -> usize
 @link_name("fwrite")
 extern native_fwrite(buffer: void&, size: usize, count: usize, stream: void&) -> usize
-@link_name("opendir")
-extern native_opendir(path: cstr) -> mutable heap void&?
 @link_name("fdopendir")
 extern native_fdopendir(fd: i64) -> mutable heap void&?
 @link_name("readdir")
@@ -1101,7 +1099,15 @@ module PlatformNative:
 
         def collect_directory(path: cstr, out: mutable darray[u8]&, depth: usize) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return false if depth > 64.usize()
-            directory: mutable heap void&? = native_opendir(path)
+            # Resolve the directory through the descriptor-relative no-follow
+            # walker before enumeration. Opening `path` with `opendir` here
+            # would re-follow a swapped symlink after the caller's probe.
+            directory_fd: i64 = open_directory_path(path)
+            return false if directory_fd < 0
+            duplicate: i64 = native_dup(directory_fd)
+            return false if duplicate < 0
+            directory: mutable heap void&? = native_fdopendir(duplicate)
+            _ = native_close(directory_fd)
             if directory is stream:
                 while true |stream, out, path, depth|:
                     entry: mutable heap void&? = native_readdir(stream)
