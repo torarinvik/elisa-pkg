@@ -455,6 +455,12 @@ EOF
   env -u ELISAPKG_REGISTRY_DIR -u ELISAPKG_TRUST_STATE "$BIN" why dep | grep -F 'readonly-app -> dep' >/dev/null
   env -u ELISAPKG_REGISTRY_DIR -u ELISAPKG_TRUST_STATE "$BIN" resolve --frozen >/dev/null
   ELISAPKG_REGISTRY_DIR="$READONLY_REGISTRY_CASE/provider-does-not-exist" env -u ELISAPKG_TRUST_STATE "$BIN" resolve --offline >/dev/null
+  if ELISAPKG_REGISTRY_DIR="$READONLY_REGISTRY_CASE/provider-does-not-exist" env -u ELISAPKG_TRUST_STATE "$BIN" fetch --offline >/dev/null 2>&1; then
+    echo "offline fetch accepted a lock without cached metadata and signature evidence" >&2
+    exit 1
+  else
+    test "$?" -eq 5
+  fi
   cp elisapkg.lock elisapkg.lock.valid
   python3 - "$READONLY_REGISTRY_CASE/elisapkg.lock" <<'PY'
 from pathlib import Path
