@@ -34,7 +34,7 @@ signature and dependency edges against the lock, then verify the archive and the
 pre-existing trust-state record. Missing, changed, expired, or untrusted evidence
 fails closed and the lockfile is never rewritten.
 
-Lock replacement uses an exclusive `mkstemp` file in the project directory, writes all bytes with short-write handling, calls `fsync`, closes the descriptor, and atomically renames the temporary file into place. A failed write or durability step removes the temporary file and leaves the previous lock untouched. The temporary file is created with owner-only permissions while it is in flight.
+Lock replacement uses an exclusive `mkstemp` file in the project directory, writes all bytes with short-write handling, calls `fsync`, closes the descriptor, and atomically renames the temporary file into place. A failed write or durability step leaves the previous lock untouched; the owner-only temporary evidence is retained for a later recovery or cleanup pass instead of unlinking a pathname that could have been replaced concurrently.
 
 Dependency edits also journal the original manifest and, when present, the
 original lock under `.elisapkg/transaction.*`. A state marker is advanced only

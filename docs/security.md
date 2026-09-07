@@ -126,8 +126,9 @@ recheck them before unlinking immutable entries.
 
 Review corrections: archive, manifest, lockfile, receipt, and artifact reads
 use descriptor-relative no-follow opens for all components, including absolute
-paths anchored at `/`; atomic writes and cleanup use the same parent-handle
-boundary, detect I/O errors, and reject special files.
+paths anchored at `/`; atomic writes and failure cleanup detect I/O errors and
+avoid deleting destination pathnames after a concurrent replacement, while
+rejecting special files.
 Archive validation
 also checks zero data padding and file/directory conflicts. Frozen resolution
 performs no lockfile replacement. Build receipt v7 reuses only when the
