@@ -136,6 +136,12 @@ complete sanitized source tree, selected target, manifest, compiler settings,
 compiler/stage1/runtime content identities, and artifact digest all match. The
 source-tree digest is checked again immediately before artifact publication so
 source changes during compilation cannot be recorded as the old input identity.
+Package publication applies the same boundary around archive creation: it
+revalidates the lock and source digest after resolution, checks the digest again
+after reading the selected files, and aborts if the tree changed during that
+window. This catches mixed archives caused by ordinary concurrent edits; a
+hostile shared directory still requires the handle-based filesystem work noted
+below.
 An
 unavailable toolchain identity disables reuse rather than silently trusting a
 stale artifact.

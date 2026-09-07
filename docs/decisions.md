@@ -50,8 +50,11 @@ remote source by itself.
 Package archives contain bounded regular files with normalized metadata. Source
 reads use descriptor-relative no-follow opens for every component. Archive
 headers, checksums, padding, path collisions, and end markers are verified
-again before publication. Fixture: archive corruption and native symlink tests
-in `scripts/regression_test.py`.
+again before publication. `package` revalidates the lock and captures the
+complete sanitized source-tree digest before reading files, then compares a
+second digest before publishing the archive. A mutation during that read window
+fails packaging instead of producing a mixed source release. Fixture: archive
+corruption and native symlink tests in `scripts/regression_test.py`.
 
 ## D-007: build reuse
 
