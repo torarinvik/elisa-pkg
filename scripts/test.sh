@@ -883,6 +883,12 @@ PY
   mv "$PREFIX/share/elisapkg/receipts/app.good" "$PREFIX/share/elisapkg/receipts/app"
   ELISAPKG_INSTALL_PREFIX="$PREFIX" "$BIN" uninstall --local app >/dev/null
   test ! -e "$PREFIX/bin/app"
+  TRAILING_HOME="$CASE/trailing-home"
+  mkdir -p "$TRAILING_HOME"
+  env -u ELISAPKG_INSTALL_PREFIX HOME="$TRAILING_HOME/" "$BIN" install --local >/dev/null
+  test -x "$TRAILING_HOME/.local/bin/app"
+  env -u ELISAPKG_INSTALL_PREFIX HOME="$TRAILING_HOME/" "$BIN" uninstall --local app >/dev/null
+  test ! -e "$TRAILING_HOME/.local/bin/app"
   PROBE="$CASE/compiler-env-probe.sh"
   DUMP="$CASE/compiler-env.dump"
   printf '%s\n' '#!/bin/sh' "/usr/bin/env > '$DUMP'" 'exit 127' > "$PROBE"
