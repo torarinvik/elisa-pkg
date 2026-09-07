@@ -430,9 +430,9 @@ module PlatformNative:
             return null
 
         def collect_files(root: cstr, output: mutable u8&, capacity: usize) -> i64 can[Memory.Allocate, Unsafe.PointerCast]:
-            return -22 if not cstr_equal(root, ".") or capacity == 0.usize()
+            return -22 if native_strlen(root) == 0.usize() or native_strlen(root) > 4096.usize() or capacity == 0.usize()
             paths: mutable darray[u8] = []
-            if not collect_directory(".", &paths, 0.usize()):
+            if not collect_directory(root, root, &paths, 0.usize()):
                 return -5
             rows: mutable darray[darray[u8]] = []
             cursor: mutable usize = 0.usize()
@@ -1304,7 +1304,7 @@ module PlatformNative:
                 out <- out + (value[offset + index].u64() << (index * 8.usize()))
             return out.i64()
 
-        def collect_directory(path: cstr, out: mutable darray[u8]&, depth: usize) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+        def collect_directory(root: cstr, path: cstr, out: mutable darray[u8]&, depth: usize) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return false if depth > 64.usize()
             # Resolve the directory through the descriptor-relative no-follow
             # walker before enumeration. Opening `path` with `opendir` here
@@ -1349,8 +1349,8 @@ module PlatformNative:
                         directory_probe: i64 = open_directory_path(child_name)
                         if directory_probe >= 0:
                             return directory_failure(stream) if native_close(directory_probe) != 0
-                            continue if skip_directory(child_name)
-                            return directory_failure(stream) if not collect_directory(child_name, out, depth + 1.usize())
+                            continue if skip_directory_under(root, child_name)
+                            return directory_failure(stream) if not collect_directory(root, child_name, out, depth + 1.usize())
                         else:
                             file_probe: i64 = open_package_file(child_name)
                             if file_probe < 0:
@@ -1377,6 +1377,20 @@ module PlatformNative:
 
         def path_length(path: cstr) -> usize:
             return native_strlen(path)
+
+        def skip_directory_under(root: cstr, path: cstr) -> bool:
+            # Ignore policy directories relative to the package root. When a
+            # dependency root is canonicalized to an absolute path, an ancestor
+            # checkout directory named `build` must not hide the package's own
+            # source tree.
+            return skip_directory(path) if cstr_equal(root, ".")
+            root_length: usize = native_strlen(root)
+            path_length_value: usize = native_strlen(path)
+            return skip_directory(path) if root_length == 0 or path_length_value <= root_length or path[root_length].u8() != 47
+            for index in 0..<root_length |root, path|:
+                return false if root[index].u8() != path[index].u8()
+            relative: cstr = (&path[root_length + 1.usize()]).cast[cstr] can Unsafe.PointerCast
+            return skip_directory(relative)
 
         def path_less(left: darray[u8]&, right: darray[u8]&) -> bool:
             limit: usize = left.count if left.count < right.count else right.count

@@ -1691,19 +1691,8 @@ module Cli:
             root_digest: mutable darray[u8] = []
             return [] if Integrity::sha256(raw, &root_digest_bytes) != Integrity::DigestCode.Ok
             return [] if not Integrity::hex_digest(root_digest_bytes, &root_digest)
-            root_entry: mutable darray[u8] = []
-            return [] if not first_target_entry(raw, &root_entry)
-            root_entry_c: mutable darray[u8] = []
-            path_with_nul_into(&root_entry, &root_entry_c)
-            root_entry_name: cstr = (&root_entry_c[0]).cast[cstr] can Unsafe.PointerCast
-            root_source_path: mutable darray[u8] = []
-            path_join_into(root, root_entry_name, &root_source_path)
-            root_source: mutable darray[u8] = []
-            return [] if not read_package_file_into(&root_source_path, &root_source)
-            root_source_digest_bytes: mutable darray[u8] = []
             root_source_digest: mutable darray[u8] = []
-            return [] if Integrity::sha256(root_source, &root_source_digest_bytes) != Integrity::DigestCode.Ok
-            return [] if not Integrity::hex_digest(root_source_digest_bytes, &root_source_digest)
+            return [] if not source_tree_digest_at(root, &root_source_digest)
             bytes_push_view(&out, "{\n  \"lock-version\": 2,\n  \"resolver\": \"elisapkg-v2\",\n  \"package\": {\n    \"name\": \"")
             bytes_push_array(&out, name)
             bytes_push_view(&out, "\",\n    \"version\": \"")
@@ -1762,19 +1751,8 @@ module Cli:
                 path_join_into(&selected_path, "elisapkg.json", &selected_manifest_path)
                 selected_manifest: mutable darray[u8] = []
                 return [] if not read_package_file_into(&selected_manifest_path, &selected_manifest)
-                selected_entry: mutable darray[u8] = []
-                return [] if not first_target_entry(selected_manifest, &selected_entry)
-                selected_entry_c: mutable darray[u8] = []
-                path_with_nul_into(&selected_entry, &selected_entry_c)
-                selected_entry_name: cstr = (&selected_entry_c[0]).cast[cstr] can Unsafe.PointerCast
-                selected_source_path: mutable darray[u8] = []
-                path_join_into(selected_path, selected_entry_name, &selected_source_path)
-                selected_source: mutable darray[u8] = []
-                return [] if not read_package_file_into(&selected_source_path, &selected_source)
-                selected_source_digest_bytes: mutable darray[u8] = []
                 selected_source_digest: mutable darray[u8] = []
-                return [] if Integrity::sha256(selected_source, &selected_source_digest_bytes) != Integrity::DigestCode.Ok
-                return [] if not Integrity::hex_digest(selected_source_digest_bytes, &selected_source_digest)
+                return [] if not source_tree_digest_at(selected_path, &selected_source_digest)
                 selected_digest: mutable darray[u8] = []
                 selected_digest_bytes: mutable darray[u8] = []
                 return [] if Integrity::sha256(selected_manifest, &selected_digest_bytes) != Integrity::DigestCode.Ok
@@ -1943,17 +1921,8 @@ module Cli:
             root_digest_bytes: mutable darray[u8] = []
             root_digest: mutable darray[u8] = []
             return [] if Integrity::sha256(raw, &root_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(root_digest_bytes, &root_digest)
-            root_entry: mutable darray[u8] = []
-            return [] if not first_target_entry(raw, &root_entry)
-            root_entry_path: mutable darray[u8] = []
-            path_join_into(root, "", &root_entry_path)
-            for index in 0..<root_entry.count |root_entry_path, root_entry|:
-                root_entry_path.push(root_entry[index])
-            root_source: mutable darray[u8] = []
-            return [] if not read_package_file_into(&root_entry_path, &root_source)
-            root_source_digest_bytes: mutable darray[u8] = []
             root_source_digest: mutable darray[u8] = []
-            return [] if Integrity::sha256(root_source, &root_source_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(root_source_digest_bytes, &root_source_digest)
+            return [] if not source_tree_digest_at(root, &root_source_digest)
 
             candidates: mutable darray[Solver::Candidate] = []
             package_queue: mutable darray[u8] = []
@@ -2836,17 +2805,8 @@ module Cli:
             manifest_digest: mutable darray[u8] = []
             return false if Integrity::sha256(manifest, &manifest_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(manifest_digest_bytes, &manifest_digest)
             return false if not object_sha256_equals(lock, package_start, package_end, "manifest-digest", manifest_digest)
-            root_entry: mutable darray[u8] = []
-            return false if not first_target_entry(manifest, &root_entry)
-            root_entry_path: mutable darray[u8] = []
-            path_join_into(start, "", &root_entry_path)
-            for index in 0..<root_entry.count |root_entry_path, root_entry|:
-                root_entry_path.push(root_entry[index])
-            root_source: mutable darray[u8] = []
-            return false if not read_package_file_into(&root_entry_path, &root_source)
-            source_digest_bytes: mutable darray[u8] = []
             source_digest: mutable darray[u8] = []
-            return false if Integrity::sha256(root_source, &source_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(source_digest_bytes, &source_digest)
+            return false if not source_tree_digest_at(start, &source_digest)
             return false if not object_sha256_equals(lock, package_start, package_end, "source-digest", source_digest)
             packages_start: usize = json_key_value_offset(lock, "packages")
             packages_end: usize = json_array_end(lock, packages_start)
@@ -4140,19 +4100,38 @@ module Cli:
             return true if bytes_ends_with_view(leaf, ".env") or bytes_count(leaf, ".pem") > 0.usize() or bytes_count(leaf, ".key") > 0.usize()
             return false
 
-        def source_tree_digest_into(out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+        def source_tree_digest_at(root: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             # Build inputs are the complete sanitized source tree, not only the
             # selected entry file. The native walker returns a deterministic,
             # NUL-separated list and excludes build state, VCS data, and credential
-            # names before any file is opened. Hash each path with its content digest
-            # so a source rename, addition, deletion, or mutation cannot leave a stale
-            # artifact looking reusable.
+            # names before any file is opened. Hash each logical path with its
+            # content digest so a source rename, addition, deletion, or mutation
+            # cannot leave a stale lock or artifact looking reusable. Dependency
+            # roots are stripped from the fingerprint so the same package remains
+            # portable when its containing checkout moves.
             out.resize(0)
+            return false if root.count == 0.usize() or root.count > 4096.usize()
+            root_c: mutable darray[u8] = []
+            root_c.resize(root.count + 1.usize())
+            for index in 0..<root.count |root_c, root, index|:
+                root_c[index] <- root[index]
+            root_c[root.count] <- 0
+            root_name: cstr = (&root_c[0]).cast[cstr] can Unsafe.PointerCast
+            resolved_root: mutable darray[u8] = []
+            resolved_root.resize(4096)
+            root_real_name: mutable cstr = ""
+            if Platform::pkg_realpath(root_name, &resolved_root) is canonical_root:
+                root_real_name <- canonical_root
+            else:
+                return false
+            root_real_length: usize = Platform::pkg_strlen(root_real_name)
+            return false if root_real_length == 0.usize() or root_real_length >= 4096.usize()
             buffer: mutable darray[u8] = []
             buffer.resize(16777216)
             buffer_raw: mutable u8& = (&buffer[0]).cast[mutable u8&] can Unsafe.PointerCast
-            collected: i64 = Platform::pkg_collect_files(".", buffer_raw, buffer.count)
+            collected: i64 = Platform::pkg_collect_files(root_real_name, buffer_raw, buffer.count)
             return false if collected < 0
+            root_prefix: usize = root_real_length + 1.usize()
             fingerprint: mutable darray[u8] = []
             cursor: mutable usize = 0.usize()
             while cursor < collected.usize():
@@ -4162,12 +4141,22 @@ module Cli:
                     cursor <- cursor + 1.usize()
                 return false if cursor >= collected.usize() or path.count == 0.usize()
                 cursor <- cursor + 1.usize()
+                return false if path.count <= root_prefix or path[root_real_length] != 47
+                for index in 0..<root_real_length |path, root_real_name|:
+                    return false if path[index] != root_real_name[index].u8()
+                logical_path: mutable darray[u8] = []
+                for index in root_prefix..<path.count |logical_path, path|:
+                    logical_path.push(path[index])
+                # These files are represented by dedicated lock/manifest
+                # digests. Including the lock itself would make its source
+                # fingerprint self-referential and impossible to stabilize.
+                continue if bytes_equal_view(logical_path, "elisapkg.json") or bytes_equal_view(logical_path, "elisapkg.lock")
                 content: mutable darray[u8] = []
                 return false if not read_package_file_into(&path, &content)
                 digest_bytes: mutable darray[u8] = []
                 return false if Integrity::sha256(content, &digest_bytes) != Integrity::DigestCode.Ok
-                for index in 0..<path.count |fingerprint, path|:
-                    fingerprint.push(path[index])
+                for index in 0..<logical_path.count |fingerprint, logical_path|:
+                    fingerprint.push(logical_path[index])
                 fingerprint.push(0)
                 for index in 0..<digest_bytes.count |fingerprint, digest_bytes|:
                     fingerprint.push(digest_bytes[index])
@@ -4179,6 +4168,10 @@ module Cli:
             for index in 0..<digest_hex.count |out, digest_hex|:
                 out.push(digest_hex[index])
             return true
+
+        def source_tree_digest_into(out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            root: mutable darray[u8] = [46]
+            return source_tree_digest_at(root, out)
 
         def collect_package_paths(raw: darray[u8]&, target: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out.resize(0)

@@ -42,8 +42,10 @@ resolution error while a shared diamond dependency remains valid.
 
 The root package record and each local record carry `manifest-digest`, a SHA-256
 digest of the exact validated manifest bytes, and `source-digest`, a SHA-256
-digest of its first validated target entry. They detect root and dependency
-manifest/source drift in frozen resolution; complete source-tree and archive
-digests remain a separate release gate and are not implied by these fields.
+digest of the complete sanitized source tree under that package root. The tree
+fingerprint sorts logical relative paths and combines each path with its raw
+SHA-256 content digest; manifest and lock bytes have dedicated fields and are
+excluded from this fingerprint to avoid a self-reference. These fields detect
+root and dependency source drift in frozen resolution.
 
 Canonical bytes are UTF-8, two-space indentation, LF endings, deterministic member ordering, sorted package and edge arrays, and exactly one terminal newline. The resolver version is part of the format so changing candidate ordering or trust policy cannot silently reuse an old result.

@@ -55,7 +55,7 @@ in `scripts/regression_test.py`.
 
 ## D-007: build reuse
 
-Receipt version 6 fingerprints the complete sanitized source tree, selected
+Receipt version 7 fingerprints the complete sanitized source tree, selected
 target source and kind, manifest bytes, resolved-lock bytes, compiler
 configuration, content identities for the selected compiler/stage1/runtime
 inputs, artifact name, and output artifact. A matching receipt and verified

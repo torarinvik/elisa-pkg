@@ -127,7 +127,7 @@ paths anchored at `/`; atomic writes and cleanup use the same parent-handle
 boundary, detect I/O errors, and reject special files.
 Archive validation
 also checks zero data padding and file/directory conflicts. Frozen resolution
-performs no lockfile replacement. Build receipt v6 reuses only when the
+performs no lockfile replacement. Build receipt v7 reuses only when the
 complete sanitized source tree, selected target, manifest, compiler settings,
 compiler/stage1/runtime content identities, and artifact digest all match. An
 unavailable toolchain identity disables reuse rather than silently trusting a

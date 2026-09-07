@@ -387,7 +387,19 @@ mkdir -p "$READONLY_REGISTRY_CASE/src"
 printf '%s\n' 'def main() -> i64:' '    return 0' > "$READONLY_REGISTRY_CASE/src/main.elisa"
 printf '%s\n' '{"schema-version":1,"package":{"name":"readonly-app","version":"0.1.0"},"targets":[{"name":"app","kind":"bin","entry":"src/main.elisa"}],"dependencies":{"dep":{"version":"1.0.0","registry":"primary"}}}' > "$READONLY_REGISTRY_CASE/elisapkg.json"
 readonly_manifest_digest="$(shasum -a 256 "$READONLY_REGISTRY_CASE/elisapkg.json" | awk '{print $1}')"
-readonly_source_digest="$(shasum -a 256 "$READONLY_REGISTRY_CASE/src/main.elisa" | awk '{print $1}')"
+# The registry lock binds the root's complete sanitized source tree. Manifest
+# and lock bytes have dedicated fields, so the source fingerprint contains the
+# logical source path and its raw SHA-256 content digest only.
+readonly_source_digest="$(python3 - "$READONLY_REGISTRY_CASE/src/main.elisa" <<'PY'
+import hashlib
+import sys
+
+source_path = sys.argv[1]
+content_digest = hashlib.sha256(open(source_path, 'rb').read()).digest()
+fingerprint = b'src/main.elisa\0' + content_digest + b'\0'
+print(hashlib.sha256(fingerprint).hexdigest())
+PY
+)"
 readonly_zero_digest="$(printf '%064d' 0)"
 cat > "$READONLY_REGISTRY_CASE/elisapkg.lock" <<EOF
 {
@@ -582,6 +594,23 @@ mkdir -p "$CASE"
       ;;
   esac
   mv local-util/src/main.elisa.good local-util/src/main.elisa
+  printf '%s\n' 'non-target dependency mutation must invalidate the receipt' > local-util/src/helper.elisa
+  dependency_helper_rebuild_output="$("$BIN" build)"
+  case "$dependency_helper_rebuild_output" in
+    *"(cached)"*)
+      echo "changed non-target dependency source was accepted from the cache" >&2
+      exit 1
+      ;;
+  esac
+  dependency_helper_cached_output="$("$BIN" build)"
+  case "$dependency_helper_cached_output" in
+    *"(cached)"*) ;;
+    *)
+      echo "unchanged dependency source tree was not reused" >&2
+      exit 1
+      ;;
+  esac
+  rm -f local-util/src/helper.elisa
   python3 - <<'PY'
 path = ".elisapkg/build/app"
 with open(path, "r+b") as handle:
@@ -651,8 +680,8 @@ PY
   rm -rf src/deep.elisa src/nested package-files-glob.txt package-files-glob-double-star.txt
   "$BIN" package --list >/dev/null
   "$BIN" package >/dev/null
-  cp .elisapkg/package.tar package.tar.good
-  cp .elisapkg/package.receipt package.receipt.good
+  cp .elisapkg/package.tar .elisapkg/package.tar.good
+  cp .elisapkg/package.receipt .elisapkg/package.receipt.good
   test -s .elisapkg/package.receipt
   "$BIN" cache verify | grep -F 'package archive and receipt verified' >/dev/null
   mv .elisapkg/package.tar .elisapkg/package.tar.real
@@ -688,8 +717,8 @@ PY
   fi
   test "$QUARANTINE_DIGEST" = "$(shasum -a 256 "$QUARANTINE_BLOB" | awk '{print $1}')"
   cp .elisapkg/package.tar "$PACKAGE_BLOB"
-  cmp package.tar.good .elisapkg/package.tar >/dev/null
-  cmp package.receipt.good .elisapkg/package.receipt >/dev/null
+  cmp .elisapkg/package.tar.good .elisapkg/package.tar >/dev/null
+  cmp .elisapkg/package.receipt.good .elisapkg/package.receipt >/dev/null
   tar -tf .elisapkg/package.tar | grep -F 'elisapkg.json' >/dev/null
   if tar -tf .elisapkg/package.tar | grep -E 'IMPLEMENTATION_PLAN|\.elisapkg/|\.env|\.pem|\.key' >/dev/null; then
     echo "package archive included a forbidden path" >&2
