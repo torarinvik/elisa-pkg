@@ -296,7 +296,11 @@ module Cli:
                 return false
             return Platform::pkg_fsync_parent(path_name) == 0
 
-        def write_cstr_file_noclobber(path_name: cstr, value: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+        # Return zero when this call publishes the destination, -17 when an
+        # existing destination wins the exclusive link, and another negative
+        # value for an I/O or durability failure. Callers that tolerate a
+        # concurrent writer must distinguish EEXIST from failed publication.
+        def write_cstr_file_noclobber_status(path_name: cstr, value: darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             # Link the fsynced temporary into place so an existing destination can
             # never be replaced by a rename race. The temporary is removed after the
             # link, leaving one durable directory entry for the caller to own.
@@ -305,33 +309,36 @@ module Cli:
             bytes_push_view(&template, ".tmp.XXXXXX")
             template.push(0)
             fd: i64 = Platform::pkg_mkstemp(&template)
-            return false if fd < 0
+            return -5 if fd < 0
             temp_name: cstr = (&template[0]).cast[cstr] can Unsafe.PointerCast
             if not write_fd_all(fd, value) or Platform::pkg_fsync(fd) != 0:
                 _ = Platform::pkg_close(fd)
-                return false
+                return -5
             if Platform::pkg_close(fd) != 0:
-                return false
-            linked: bool = Platform::pkg_link(temp_name, path_name) == 0
-            if not linked:
+                return -5
+            link_status: i64 = Platform::pkg_link(temp_name, path_name)
+            if link_status != 0:
                 # Keep the exclusive temporary for recovery. Unlinking this
                 # pathname after the descriptor is closed could remove a
                 # replacement installed by another actor.
-                return false
+                return link_status
             unlink_status: i64 = Platform::pkg_unlink(temp_name)
             if unlink_status != 0:
                 # The destination link is already published. Do not remove it
                 # by pathname after a cleanup failure: another actor may have
                 # replaced that name while the temporary link was being
                 # retired. Leave the evidence for a later recovery pass.
-                return false
+                return -5
             if Platform::pkg_fsync_parent(path_name) != 0:
                 # The link is visible, but its directory durability is unknown.
                 # Removing the destination by pathname could delete a concurrent
                 # replacement, so report the durability failure and leave the
                 # published evidence for recovery instead.
-                return false
-            return true
+                return -5
+            return 0
+
+        def write_cstr_file_noclobber(path_name: cstr, value: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            return write_cstr_file_noclobber_status(path_name, value) == 0
 
         def cache_store_verified_bytes(digest: darray[u8]&, content: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             # Cache publication is content-addressed and immutable. Verify the bytes
@@ -364,8 +371,9 @@ module Cli:
                 path_with_nul_into(&quarantine_path, &quarantine_name)
                 quarantine_c: cstr = (&quarantine_name[0]).cast[cstr] can Unsafe.PointerCast
                 return false if not quarantine_invalid_cache_blob(blob_c, quarantine_c)
-            return true if write_cstr_file_noclobber(blob_c, content) and Cache::verify_blob(digest)
-            return Cache::verify_blob(digest)
+            publication_status: i64 = write_cstr_file_noclobber_status(blob_c, content)
+            return Cache::verify_blob(digest) if publication_status == 0 or publication_status == -17
+            return false
 
         def cache_store_verified_blob(digest: darray[u8]&, content: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             return false if not Archive::verify_ustar_archive(content)
@@ -3322,10 +3330,12 @@ module Cli:
                 existing: mutable darray[u8] = []
                 return false if not read_package_file_into(&path, &existing)
                 return bytes_equal(existing, receipt)
-            if not write_cstr_file_noclobber(path_name, receipt):
+            publication_status: i64 = write_cstr_file_noclobber_status(path_name, receipt)
+            if publication_status != 0:
                 # Another verified fetch may have won the exclusive publication race.
                 # Accept that result only when the durable receipt bytes are identical;
                 # malformed, unreadable, or conflicting evidence still fails closed.
+                return false if publication_status != -17
                 return false if not cstr_file_exists(path_name)
                 existing: mutable darray[u8] = []
                 return false if not read_package_file_into(&path, &existing)
