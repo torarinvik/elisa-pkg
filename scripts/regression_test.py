@@ -78,7 +78,7 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
     catalog, requirement = data('1.0.0\nbroken\n'), data('^1.0.0')
     check(f'not Resolve::select_highest_version({catalog}, {requirement}, &selected)')
     check('selected.count == 0.usize()')
-    for value in ['../a', 'a/../b', 'a\x00b', 'a\nb', 'a/', 'C:/a', 'a:b', 'café']:
+    for value in ['../a', 'a/../b', 'a\x00b', 'a\nb', 'a/', 'C:/a', 'a:b', 'a\x7fb', 'café']:
         check(f'not Archive::is_safe_entry({data(value)})')
     check(f'Archive::is_safe_entry({data("a..b")})')
     check(f'not Manifest::is_safe_relative_entry({data(".hidden/main.elisa")})')
