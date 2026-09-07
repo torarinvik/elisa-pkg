@@ -289,6 +289,14 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
     (external / 'elisapkg.json').write_text(
         '{"schema-version":1,"package":{"name":"external","version":"0.1.0"},'
         '"targets":[{"name":"external","kind":"lib","entry":"src/main.elisa"}],'
+        '"dependencies":{"nested-util":{"path":"../nested-util"}}}\n')
+    nested = work / 'nested-util'
+    nested.mkdir()
+    (nested / 'src').mkdir()
+    (nested / 'src/main.elisa').write_text('def main() -> i64:\n    return 0\n')
+    (nested / 'elisapkg.json').write_text(
+        '{"schema-version":1,"package":{"name":"nested-util","version":"0.2.0"},'
+        '"targets":[{"name":"nested-util","kind":"lib","entry":"src/main.elisa"}],'
         '"dependencies":{}}\n')
     parent = work / 'parent'
     run([BIN, 'init', parent], stdout=subprocess.DEVNULL)
@@ -301,6 +309,10 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
     assert '"name":"external"' in (parent / 'elisapkg.lock').read_text()
     why_json = subprocess.run([BIN, 'why', 'external', '--json'], cwd=parent, capture_output=True, text=True, timeout=120, check=True)
     assert json.loads(why_json.stdout) == {'schema-version': 1, 'root': 'parent', 'package': 'external'}
+    root_why = subprocess.run([BIN, 'why', 'parent'], cwd=parent, capture_output=True, timeout=120, check=False)
+    assert root_why.returncode == 3, root_why
+    transitive_why = subprocess.run([BIN, 'why', 'nested-util'], cwd=parent, capture_output=True, timeout=120, check=False)
+    assert transitive_why.returncode == 3, transitive_why
 
     collision_root = work / 'collision-root'
     collision_dep = work / 'collision-dep'
