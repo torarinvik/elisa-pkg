@@ -469,6 +469,25 @@ PY
     test "$?" -eq 3
   fi
   mv elisapkg.lock.valid elisapkg.lock
+  cp elisapkg.lock elisapkg.lock.valid
+  python3 - "$READONLY_REGISTRY_CASE/elisapkg.lock" <<'PY'
+from pathlib import Path
+import sys
+
+lock_path = Path(sys.argv[1])
+text = lock_path.read_text()
+marker = '"name":"dep","version":"1.0.0"'
+if marker not in text:
+    raise SystemExit('registry version fixture marker missing')
+lock_path.write_text(text.replace(marker, '"name":"dep","version":"2.0.0"', 1))
+PY
+  if env -u ELISAPKG_REGISTRY_DIR -u ELISAPKG_TRUST_STATE "$BIN" resolve --frozen >/dev/null 2>&1; then
+    echo "frozen registry resolution accepted an out-of-range dependency version" >&2
+    exit 1
+  else
+    test "$?" -eq 3
+  fi
+  mv elisapkg.lock.valid elisapkg.lock
   if ELISAPKG_REGISTRY_DIR="$READONLY_REGISTRY_CASE/provider-does-not-exist" env -u ELISAPKG_TRUST_STATE "$BIN" fetch --offline dep 1.0.0 >/dev/null 2>&1; then
     echo "offline package-specific fetch unexpectedly reached a provider" >&2
     exit 1

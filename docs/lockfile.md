@@ -21,6 +21,10 @@ before emitting these records; the lockfile remains untrusted input and is
 revalidated against the configured registry during `resolve --locked` or
 `fetch`.
 
+Offline and frozen validation also checks every direct registry requirement
+against its locked SemVer. A structurally valid record with an out-of-range
+version is rejected before cached bytes are used.
+
 After a registry archive is fetched, the content-addressed cache stores an immutable
 receipt beside the blob. The receipt repeats the exact package, version, archive,
 sizes, archive and metadata digests, and expiry. `build --offline` and `build --frozen`

@@ -2789,6 +2789,41 @@ module Cli:
                 return false if (byte < 48 or byte > 57) and (byte < 97 or byte > 102)
             return true
 
+        def registry_lock_satisfies_roots(lock: darray[u8]&, packages_start: usize, packages_end: usize, roots: darray[Solver::Constraint]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            # A registry lock is still project input. Check every direct
+            # manifest requirement against the exact version recorded in the
+            # lock before offline/frozen callers trust cached bytes. The online
+            # path recomputes the whole lock from authenticated metadata; this
+            # check closes the corresponding offline gap without a provider.
+            for root_index in 0..<roots.count |lock, packages_start, packages_end, roots, root_index|:
+                requirement: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
+                return false if not SemVer::parse_requirement(roots[root_index].requirement, &requirement)
+                cursor: mutable usize = packages_start + 1.usize()
+                found: mutable bool = false
+                while cursor < packages_end |lock, packages_start, packages_end, roots, root_index, cursor, found|:
+                    while cursor < packages_end and (lock[cursor] == 32 or lock[cursor] == 9 or lock[cursor] == 10 or lock[cursor] == 13) |lock, cursor|:
+                        cursor <- cursor + 1.usize()
+                    break if cursor == packages_end
+                    return false if lock[cursor] != 123
+                    record_end: usize = json_object_end(lock, cursor)
+                    return false if record_end <= cursor or record_end >= packages_end
+                    package: mutable darray[u8] = []
+                    version_text: mutable darray[u8] = []
+                    return false if not object_string_value(lock, cursor, record_end, "name", &package) or not object_string_value(lock, cursor, record_end, "version", &version_text)
+                    if bytes_equal(package, roots[root_index].package):
+                        return false if found
+                        parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
+                        return false if not SemVer::parse(version_text, &parsed) or parsed.prerelease or not SemVer::matches(requirement, parsed)
+                        found <- true
+                    cursor <- record_end + 1.usize()
+                    while cursor < packages_end and (lock[cursor] == 32 or lock[cursor] == 9 or lock[cursor] == 10 or lock[cursor] == 13) |lock, cursor|:
+                        cursor <- cursor + 1.usize()
+                    if cursor < packages_end:
+                        return false if lock[cursor] != 44
+                        cursor <- cursor + 1.usize()
+                return false if not found
+            return true
+
         def lock_matches_manifest(manifest: darray[u8]&, lock: darray[u8]&, name: darray[u8]&, version: darray[u8]&, start: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             # Local locks can be compared with the deterministic resolver. Registry
             # locks are already authenticated artifacts; inspection commands must
@@ -2882,7 +2917,7 @@ module Cli:
             # of any dependency named by the manifest itself.
             for index in 0..<registry_roots.count |registry_roots, seen|:
                 return false if not emitted_contains_slice(seen, registry_roots[index].package, 0, registry_roots[index].package.count)
-            return true
+            return registry_lock_satisfies_roots(lock, packages_start, packages_end, registry_roots)
 
         def run_why(argc: i64, slots: mutable cstr&&, start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return EXIT_USAGE if argc < 3
