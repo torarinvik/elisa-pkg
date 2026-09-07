@@ -1075,9 +1075,9 @@ module Cli:
                         key: mutable darray[u8] = []
                         for key_index in string_start..<index |key, raw|:
                             key.push(raw[key_index])
-                        known: bool = bytes_equal_view(key, "schema-version") or bytes_equal_view(key, "package") or bytes_equal_view(key, "targets") or bytes_equal_view(key, "dependencies") or bytes_equal_view(key, "dev-dependencies") or bytes_equal_view(key, "include") or bytes_equal_view(key, "name") or bytes_equal_view(key, "version") or bytes_equal_view(key, "description") or bytes_equal_view(key, "license") or bytes_equal_view(key, "elisa") or bytes_equal_view(key, "kind") or bytes_equal_view(key, "entry") or bytes_equal_view(key, "registry") or bytes_equal_view(key, "path") or bytes_equal_view(key, "git") or bytes_equal_view(key, "rev")
+                        known: bool = bytes_equal_view(key, "schema-version") or bytes_equal_view(key, "package") or bytes_equal_view(key, "targets") or bytes_equal_view(key, "dependencies") or bytes_equal_view(key, "dev-dependencies") or bytes_equal_view(key, "include") or bytes_equal_view(key, "exclude") or bytes_equal_view(key, "name") or bytes_equal_view(key, "version") or bytes_equal_view(key, "description") or bytes_equal_view(key, "license") or bytes_equal_view(key, "elisa") or bytes_equal_view(key, "kind") or bytes_equal_view(key, "entry") or bytes_equal_view(key, "registry") or bytes_equal_view(key, "path") or bytes_equal_view(key, "git") or bytes_equal_view(key, "rev")
                         if braces == 1 and brackets == 0:
-                            top_level_known: bool = bytes_equal_view(key, "schema-version") or bytes_equal_view(key, "package") or bytes_equal_view(key, "targets") or bytes_equal_view(key, "dependencies") or bytes_equal_view(key, "dev-dependencies") or bytes_equal_view(key, "include")
+                            top_level_known: bool = bytes_equal_view(key, "schema-version") or bytes_equal_view(key, "package") or bytes_equal_view(key, "targets") or bytes_equal_view(key, "dependencies") or bytes_equal_view(key, "dev-dependencies") or bytes_equal_view(key, "include") or bytes_equal_view(key, "exclude")
                             return false if not top_level_known
                         known <- true if dependency_depth > 0 and braces == dependency_depth and valid_package_name(key)
                         return false if not known
@@ -1221,7 +1221,7 @@ module Cli:
             return false if not json_key_value_is_one(raw, "schema-version")
             return false if json_top_key_count(raw, "package") != 1.usize()
             return false if not valid_optional_package_strings(raw)
-            return false if not valid_include_array(raw)
+            return false if not valid_include_array(raw) or not valid_exclude_array(raw)
             return false if json_key_count(raw, "name") < 1.usize()
             return false if json_top_key_count(raw, "targets") != 1.usize()
             return false if json_key_count(raw, "entry") < 1.usize()
@@ -2261,36 +2261,42 @@ module Cli:
             return false if object_has_direct_key(raw, package_start, package_end, elisa_key) and not object_string_value(raw, package_start, package_end, "elisa", &elisa_value)
             return true
 
-        def valid_include_array(raw: darray[u8]&) -> bool:
-            include_start: usize = json_key_value_offset(raw, "include")
-            return true if include_start >= raw.count
-            return false if raw[include_start] != 91
-            include_end: usize = json_array_end(raw, include_start)
-            return false if include_end <= include_start
-            cursor: mutable usize = include_start + 1.usize()
+        def valid_pattern_array(raw: darray[u8]&, key: cstr) -> bool:
+            pattern_start: usize = json_key_value_offset(raw, key)
+            return true if pattern_start >= raw.count
+            return false if raw[pattern_start] != 91
+            pattern_end: usize = json_array_end(raw, pattern_start)
+            return false if pattern_end <= pattern_start
+            cursor: mutable usize = pattern_start + 1.usize()
             pattern_count: mutable usize = 0.usize()
-            while cursor < include_end |raw, cursor, pattern_count|:
-                while cursor < include_end and (raw[cursor] == 32 or raw[cursor] == 9 or raw[cursor] == 10 or raw[cursor] == 13) |raw, cursor|:
+            while cursor < pattern_end |raw, cursor, pattern_count|:
+                while cursor < pattern_end and (raw[cursor] == 32 or raw[cursor] == 9 or raw[cursor] == 10 or raw[cursor] == 13) |raw, cursor|:
                     cursor <- cursor + 1.usize()
-                return true if cursor == include_end
+                return true if cursor == pattern_end
                 return false if pattern_count >= 4096.usize()
                 return false if raw[cursor] != 34
                 cursor <- cursor + 1.usize()
                 pattern: mutable darray[u8] = []
-                while cursor < include_end and raw[cursor] != 34 |raw, cursor, pattern|:
+                while cursor < pattern_end and raw[cursor] != 34 |raw, cursor, pattern|:
                     return false if raw[cursor] == 92 or raw[cursor] < 32 or raw[cursor] == 127
                     return false if pattern.count >= 4096.usize()
                     pattern.push(raw[cursor])
                     cursor <- cursor + 1.usize()
-                return false if cursor >= include_end or not valid_publish_pattern(pattern)
+                return false if cursor >= pattern_end or not valid_publish_pattern(pattern)
                 pattern_count <- pattern_count + 1.usize()
                 cursor <- cursor + 1.usize()
-                while cursor < include_end and (raw[cursor] == 32 or raw[cursor] == 9 or raw[cursor] == 10 or raw[cursor] == 13) |raw, cursor|:
+                while cursor < pattern_end and (raw[cursor] == 32 or raw[cursor] == 9 or raw[cursor] == 10 or raw[cursor] == 13) |raw, cursor|:
                     cursor <- cursor + 1.usize()
-                return true if cursor == include_end
+                return true if cursor == pattern_end
                 return false if raw[cursor] != 44
                 cursor <- cursor + 1.usize()
             return false
+
+        def valid_include_array(raw: darray[u8]&) -> bool:
+            return valid_pattern_array(raw, "include")
+
+        def valid_exclude_array(raw: darray[u8]&) -> bool:
+            return valid_pattern_array(raw, "exclude")
 
         def valid_dependency_map(raw: darray[u8]&, wanted: cstr) -> bool can[Memory.Allocate, Abort.Panic]:
             dependency_start: usize = json_key_value_offset(raw, wanted)
@@ -4059,30 +4065,37 @@ module Cli:
                 return false if index > 0.usize() and pattern[index - 1.usize()] == 47 and pattern[index] == 47
             return true
 
-        def include_allows_path(raw: darray[u8]&, path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            include_start: usize = json_key_value_offset(raw, "include")
-            return true if include_start >= raw.count
-            include_end: usize = json_array_end(raw, include_start)
-            return false if include_end <= include_start or raw[include_start] != 91
-            cursor: mutable usize = include_start + 1.usize()
-            while cursor < include_end:
-                while cursor < include_end and (raw[cursor] == 32 or raw[cursor] == 9 or raw[cursor] == 10 or raw[cursor] == 13) |raw, cursor|:
+        def pattern_array_matches_path(raw: darray[u8]&, key: cstr, path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            pattern_start: usize = json_key_value_offset(raw, key)
+            return false if pattern_start >= raw.count
+            pattern_end: usize = json_array_end(raw, pattern_start)
+            return false if pattern_end <= pattern_start or raw[pattern_start] != 91
+            cursor: mutable usize = pattern_start + 1.usize()
+            while cursor < pattern_end:
+                while cursor < pattern_end and (raw[cursor] == 32 or raw[cursor] == 9 or raw[cursor] == 10 or raw[cursor] == 13) |raw, cursor|:
                     cursor <- cursor + 1.usize()
-                return false if cursor >= include_end or raw[cursor] != 34
+                return false if cursor >= pattern_end or raw[cursor] != 34
                 cursor <- cursor + 1.usize()
                 pattern: mutable darray[u8] = []
-                while cursor < include_end and raw[cursor] != 34 |raw, cursor, pattern|:
+                while cursor < pattern_end and raw[cursor] != 34 |raw, cursor, pattern|:
                     return false if raw[cursor] == 92 or raw[cursor] < 32 or raw[cursor] == 127
                     pattern.push(raw[cursor])
                     cursor <- cursor + 1.usize()
-                return false if cursor >= include_end or not valid_publish_pattern(pattern)
+                return false if cursor >= pattern_end or not valid_publish_pattern(pattern)
                 return true if archive_glob_matches(pattern, path)
                 cursor <- cursor + 1.usize()
-                while cursor < include_end and (raw[cursor] == 32 or raw[cursor] == 9 or raw[cursor] == 10 or raw[cursor] == 13) |raw, cursor|:
+                while cursor < pattern_end and (raw[cursor] == 32 or raw[cursor] == 9 or raw[cursor] == 10 or raw[cursor] == 13) |raw, cursor|:
                     cursor <- cursor + 1.usize()
-                return false if cursor >= include_end or raw[cursor] != 44
+                return false if cursor >= pattern_end or raw[cursor] != 44
                 cursor <- cursor + 1.usize()
             return false
+
+        def include_allows_path(raw: darray[u8]&, path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            return true if json_key_value_offset(raw, "include") >= raw.count
+            return pattern_array_matches_path(raw, "include", path)
+
+        def exclude_allows_path(raw: darray[u8]&, path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            return pattern_array_matches_path(raw, "exclude", path)
 
         def publish_path_forbidden(path: darray[u8]&) -> bool:
             return true if path.count == 0.usize() or not Archive::is_safe_entry(path)
@@ -4192,7 +4205,9 @@ module Cli:
                 cursor <- cursor + 1.usize()
                 return false if path.count == 0.usize() or publish_path_forbidden(path)
                 required: bool = bytes_equal_view(path, "elisapkg.json") or bytes_equal_view(path, "elisapkg.lock")
-                if required or include_allows_path(raw, path):
+                include_selected: mutable bool = required or include_allows_path(raw, path)
+                include_selected <- false if include_selected and not required and exclude_allows_path(raw, path)
+                if include_selected:
                     for index in 0..<path.count |out, path|:
                         out.push(path[index])
                     out.push(0)

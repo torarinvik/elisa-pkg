@@ -679,6 +679,25 @@ PY
   mv elisapkg.include.good elisapkg.json
   rm -rf src/deep.elisa src/nested package-files-glob.txt package-files-glob-double-star.txt
   "$BIN" package --list >/dev/null
+  cp elisapkg.json elisapkg.exclude.good
+  python3 - <<'PY'
+from pathlib import Path
+
+path = Path('elisapkg.json')
+text = path.read_text()
+needle = '  "include": ["src/**", "elisapkg.json", "LICENSE", "README.md"]'
+replacement = needle + ',\n  "exclude": ["src/helper.elisa"]'
+if needle not in text:
+    raise SystemExit('exclude fixture manifest shape missing')
+path.write_text(text.replace(needle, replacement, 1))
+PY
+  "$BIN" package --list > package-files-exclude.txt
+  if grep -F 'src/helper.elisa' package-files-exclude.txt >/dev/null; then
+    echo "exclude pattern did not remove a selected source" >&2
+    exit 1
+  fi
+  mv elisapkg.exclude.good elisapkg.json
+  rm -f package-files-exclude.txt
   "$BIN" package >/dev/null
   cp .elisapkg/package.tar .elisapkg/package.tar.good
   cp .elisapkg/package.receipt .elisapkg/package.receipt.good
