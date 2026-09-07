@@ -13,10 +13,12 @@ uses an exclusive hard-link publication, so an existing evidence record causes a
 fail-closed error rather than being replaced. No cache
 pathname is treated as proof of authenticity.
 
-Each verified registry archive also gets an immutable receipt beside the cache blob at
-`<digest>.receipt`. The receipt binds the primary registry, package and exact version,
-archive filename and size, archive digest, authenticated metadata digest, and metadata
-expiry. It is created with exclusive publication and read back byte-for-byte. The
+Each verified registry archive also gets an immutable receipt in the archive digest
+directory at `<archive-digest>.<metadata-digest>.receipt`. Including both digests
+prevents two authenticated package/version records that share archive bytes from
+colliding. The receipt binds the primary registry, package and exact version, archive
+filename and size, archive digest, authenticated metadata digest, and metadata expiry.
+It is created with exclusive publication and read back byte-for-byte. The
 signed metadata bytes are cached at the metadata digest's content-addressed blob path,
 and its raw detached signature is stored in a sibling `.sig` file with no-clobber
 semantics. A warm `build --offline` or `build --frozen` accepts a registry artifact

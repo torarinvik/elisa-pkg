@@ -26,7 +26,7 @@ against its locked SemVer. A structurally valid record with an out-of-range
 version is rejected before cached bytes are used.
 
 After a registry archive is fetched, the content-addressed cache stores an immutable
-receipt beside the blob. The exact signed metadata bytes are cached under their
+receipt beside the blob, keyed by both archive and metadata digest. The exact signed metadata bytes are cached under their
 metadata digest, with the detached signature stored beside that snapshot. The receipt
 repeats the exact package, version, archive, sizes, archive and metadata digests, and
 expiry. `build --offline` and `build --frozen` re-hash the snapshot, verify its
