@@ -2023,13 +2023,37 @@ module Cli:
             for index in 0..<roots.count |roots, solve_constraints|:
                 solve_constraints.push(roots[index])
             append_registry_lock_preferences(preferred_lock, unlock, candidates, &solve_constraints)
-            solve_status: mutable Solver::SolveCode = Solver::solve(candidates, solve_constraints, &selected_indexes)
+            solve_status: mutable Solver::SolveCode = Solver::SolveCode.Malformed
+            conflict: mutable Solver::Conflict = Solver::Conflict{package: [], first_requirement: [], second_requirement: []}
+            if persist_trust:
+                solve_status <- Solver::solve_with_conflict(candidates, solve_constraints, &selected_indexes, &conflict)
+            else:
+                solve_status <- Solver::solve(candidates, solve_constraints, &selected_indexes)
             # A stale locked choice must not make an otherwise solvable graph appear
             # unsatisfiable. Retry without preferences when a pinned candidate no
             # longer satisfies the current manifest or its transitive metadata.
             if solve_status == Solver::SolveCode.Unsatisfiable and solve_constraints.count > roots.count:
                 selected_indexes.resize(0)
-                solve_status <- Solver::solve(candidates, roots, &selected_indexes)
+                if persist_trust:
+                    solve_status <- Solver::solve_with_conflict(candidates, roots, &selected_indexes, &conflict)
+                else:
+                    solve_status <- Solver::solve(candidates, roots, &selected_indexes)
+            if solve_status == Solver::SolveCode.Unsatisfiable and persist_trust:
+                # A one-byte status sentinel is reserved for ordinary provider
+                # failures. Include three NUL-delimited, already validated
+                # fields after the new status so `run_resolve` can report the
+                # deterministic package/range pair without making this function
+                # return a second mutable record.
+                out.push(Registry::ResultCode.Unsatisfiable.u8() + 1.u8())
+                for byte_index in 0..<conflict.package.count |out, conflict|:
+                    out.push(conflict.package[byte_index])
+                out.push(0)
+                for byte_index in 0..<conflict.first_requirement.count |out, conflict|:
+                    out.push(conflict.first_requirement[byte_index])
+                out.push(0)
+                for byte_index in 0..<conflict.second_requirement.count |out, conflict|:
+                    out.push(conflict.second_requirement[byte_index])
+                return out
             return [] if solve_status != Solver::SolveCode.Solved
             bytes_push_view(&out, "{\n  \"lock-version\": 3,\n  \"resolver\": \"elisapkg-registry-v1\",\n  \"package\": {\n    \"name\": \"")
             bytes_push_array(&out, name)
@@ -2733,6 +2757,37 @@ module Cli:
             write_text(1, version)
             write_ok("\n")
 
+        def registry_conflict_field(raw: darray[u8]&, wanted: usize, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            out.resize(0)
+            cursor: mutable usize = 1.usize()
+            current: mutable usize = 0.usize()
+            while cursor < raw.count |raw, cursor, current, out|:
+                finish: mutable usize = cursor
+                while finish < raw.count and raw[finish] != 0 |raw, finish|:
+                    finish <- finish + 1.usize()
+                return false if finish == raw.count
+                if current == wanted:
+                    for index in cursor..<finish |raw, out|:
+                        out.push(raw[index])
+                    return true
+                current <- current + 1.usize()
+                cursor <- finish + 1.usize()
+            return false
+
+        def write_registry_conflict(raw: darray[u8]&) -> void can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            package: mutable darray[u8] = []
+            first_requirement: mutable darray[u8] = []
+            second_requirement: mutable darray[u8] = []
+            return if not registry_conflict_field(raw, 0, &package) or not registry_conflict_field(raw, 1, &first_requirement) or not registry_conflict_field(raw, 2, &second_requirement)
+            return if package.count == 0.usize() or first_requirement.count == 0.usize() or second_requirement.count == 0.usize()
+            write_error(" (package ")
+            write_bytes(2, &package)
+            write_error("; requirements ")
+            write_bytes(2, &first_requirement)
+            write_error(" and ")
+            write_bytes(2, &second_requirement)
+            write_error(")")
+
         def lock_contains_package(raw: darray[u8]&, wanted: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
             for index in 0..<raw.count |raw, wanted|:
                 continue if raw[index] != 123
@@ -2961,7 +3016,7 @@ module Cli:
                     write_resolved_text(resolved_name_text, resolved_version_text, options)
                     return EXIT_OK
             lock: darray[u8] = canonical_lock_for_manifest_with_options(name, version, raw, start, options, preferred_lock)
-            if lock.count == 1.usize() and lock[0] > 0 and lock[0] < 32:
+            if lock.count > 0.usize() and lock[0] > 0 and lock[0] < 32:
                 code: mutable Registry::ResultCode = Registry::ResultCode.TrustStateMalformed
                 # The sentinel stores the enum value plus one so an empty lock remains
                 # reserved for ordinary resolution failure.
@@ -2981,8 +3036,13 @@ module Cli:
                 code <- Registry::ResultCode.TrustStateUnavailable if lock[0] == 15
                 code <- Registry::ResultCode.TrustStateMalformed if lock[0] == 16
                 code <- Registry::ResultCode.ClockRollback if lock[0] == 17
+                code <- Registry::ResultCode.Unsatisfiable if lock[0] == 18
                 write_error("error: ")
                 write_error(Registry::result_message(code))
+                if code == Registry::ResultCode.Unsatisfiable:
+                    write_registry_conflict(lock)
+                    write_error("\n")
+                    return EXIT_RESOLVE
                 write_error(" while recording registry trust state\n")
                 return EXIT_SECURITY
 

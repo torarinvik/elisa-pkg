@@ -131,6 +131,7 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
     verify_digest = data('a' * 64)
     lines.append(f'    trust_status: Registry::ResultCode = Registry::verify_trusted({verify_package}, {verify_version}, {verify_digest})')
     check('trust_status == Registry::ResultCode.TrustStateUnavailable')
+    check('Platform::pkg_strlen(Registry::result_message(Registry::ResultCode.Unsatisfiable)) > 0.usize()')
     cache_digest = data('a' * 64)
     cache_path: str = 'cache_path'
     lines.append(f'    {cache_path}: mutable darray[u8] = []')
