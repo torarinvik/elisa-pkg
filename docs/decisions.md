@@ -58,8 +58,10 @@ in `scripts/regression_test.py`.
 Receipt version 7 fingerprints the complete sanitized source tree, selected
 target source and kind, manifest bytes, resolved-lock bytes, compiler
 configuration, content identities for the selected compiler/stage1/runtime
-inputs, artifact name, and output artifact. A matching receipt and verified
-artifact may be reused only when all three toolchain identities were captured.
+inputs, artifact name, and output artifact. The source-tree digest is rechecked
+before publication so a concurrent source mutation cannot be paired with the
+pre-build receipt. A matching receipt and verified artifact may be reused only
+when all three toolchain identities were captured.
 If an identity cannot be resolved or read, the build still proceeds but cache
 reuse is disabled for that invocation. A failed child or invalid output never
 replaces the last known-good artifact.

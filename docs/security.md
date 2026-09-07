@@ -133,7 +133,10 @@ Archive validation
 also checks zero data padding and file/directory conflicts. Frozen resolution
 performs no lockfile replacement. Build receipt v7 reuses only when the
 complete sanitized source tree, selected target, manifest, compiler settings,
-compiler/stage1/runtime content identities, and artifact digest all match. An
+compiler/stage1/runtime content identities, and artifact digest all match. The
+source-tree digest is checked again immediately before artifact publication so
+source changes during compilation cannot be recorded as the old input identity.
+An
 unavailable toolchain identity disables reuse rather than silently trusting a
 stale artifact.
 
