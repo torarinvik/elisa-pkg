@@ -4043,33 +4043,53 @@ module Cli:
             return EXIT_USAGE
 
         def archive_glob_matches(pattern: darray[u8]&, path: darray[u8]&) -> bool:
+            # Keep matching bounded by the manifest and path limits. Two
+            # boolean rows avoid recursive backtracking and give `**/` the
+            # conventional zero-directory behavior (`src/**/main` matches both
+            # `src/main` and `src/nested/main`).
+            current: mutable darray[bool] = []
+            current.resize(path.count + 1.usize())
+            current[0] <- true
             pattern_index: mutable usize = 0.usize()
-            path_index: mutable usize = 0.usize()
-            star_index: mutable usize = 18446744073709551615.usize()
-            star_path: mutable usize = 0.usize()
-            star_crosses_separator: mutable bool = false
-            while path_index < path.count:
-                if pattern_index < pattern.count and pattern[pattern_index] == path[path_index]:
-                    pattern_index <- pattern_index + 1.usize()
-                    path_index <- path_index + 1.usize()
-                elif pattern_index < pattern.count and pattern[pattern_index] == 42:
-                    star_index <- pattern_index
-                    star_crosses_separator <- pattern_index + 1.usize() < pattern.count and pattern[pattern_index + 1.usize()] == 42
+            while pattern_index < pattern.count:
+                if pattern[pattern_index] == 42:
+                    star_start: usize = pattern_index
                     while pattern_index < pattern.count and pattern[pattern_index] == 42:
                         pattern_index <- pattern_index + 1.usize()
-                    star_path <- path_index
-                elif star_index != 18446744073709551615.usize():
-                    return false if not star_crosses_separator and path[path_index] == 47
-                    pattern_index <- star_index
-                    while pattern_index < pattern.count and pattern[pattern_index] == 42:
+                    crosses_separator: bool = pattern_index - star_start > 1.usize()
+                    next: mutable darray[bool] = []
+                    next.resize(path.count + 1.usize())
+                    if crosses_separator and pattern_index < pattern.count and pattern[pattern_index] == 47:
+                        # `**/` consumes zero or more complete components. The
+                        # slash is part of this token, so the zero-component
+                        # transition skips it entirely.
+                        reachable: mutable bool = false
+                        for path_index in 0..=path.count |current, next, reachable, path|:
+                            reachable <- true if current[path_index]
+                            next[path_index] <- true if current[path_index]
+                            if path_index < path.count and path[path_index] == 47:
+                                next[path_index + 1.usize()] <- true if reachable
                         pattern_index <- pattern_index + 1.usize()
-                    star_path <- star_path + 1.usize()
-                    path_index <- star_path
-                else:
-                    return false
-            while pattern_index < pattern.count and pattern[pattern_index] == 42:
+                    elif crosses_separator:
+                        reachable: mutable bool = false
+                        for path_index in 0..=path.count |current, next, reachable|:
+                            reachable <- true if current[path_index]
+                            next[path_index] <- reachable
+                    else:
+                        reachable: mutable bool = false
+                        for path_index in 0..=path.count |current, next, reachable|:
+                            reachable <- false if path_index > 0.usize() and path[path_index - 1.usize()] == 47
+                            reachable <- true if current[path_index]
+                            next[path_index] <- reachable
+                    current <- next
+                    continue
+                next: mutable darray[bool] = []
+                next.resize(path.count + 1.usize())
+                for path_index in 0..<path.count |current, next, pattern, pattern_index, path|:
+                    next[path_index + 1.usize()] <- current[path_index] and pattern[pattern_index] == path[path_index]
+                current <- next
                 pattern_index <- pattern_index + 1.usize()
-            return pattern_index == pattern.count
+            return current[path.count]
 
         def valid_publish_pattern(pattern: darray[u8]&) -> bool:
             return false if pattern.count == 0.usize() or pattern.count > 4096.usize() or pattern[0] == 47 or pattern[0] == 92

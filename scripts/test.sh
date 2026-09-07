@@ -633,6 +633,7 @@ PY
     rm -f src/package-pipe
   fi
   mkdir -p src/nested
+  printf '%s\n' root > src/deep.elisa
   printf '%s\n' nested > src/nested/deep.elisa
   cp elisapkg.json elisapkg.include.good
   sed 's#src/\*\*#src/*#' elisapkg.include.good > elisapkg.json
@@ -642,8 +643,12 @@ PY
     echo "single-star include crossed a path separator" >&2
     exit 1
   fi
+  sed 's#src/\*\*#src/**/deep.elisa", "src/main.elisa#' elisapkg.include.good > elisapkg.json
+  "$BIN" package --list > package-files-glob-double-star.txt
+  grep -F 'src/deep.elisa' package-files-glob-double-star.txt >/dev/null
+  grep -F 'src/nested/deep.elisa' package-files-glob-double-star.txt >/dev/null
   mv elisapkg.include.good elisapkg.json
-  rm -rf src/nested package-files-glob.txt
+  rm -rf src/deep.elisa src/nested package-files-glob.txt package-files-glob-double-star.txt
   "$BIN" package --list >/dev/null
   "$BIN" package >/dev/null
   cp .elisapkg/package.tar package.tar.good
