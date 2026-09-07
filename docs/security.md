@@ -49,10 +49,13 @@ pathnames and receipts are never treated as proof of verification.
 
 Registry cache entries carry a separate immutable verification receipt. Its fields bind
 the exact lock selection to the archive name, size, archive digest, authenticated
-metadata digest, and expiry. Frozen or offline builds validate that receipt, the
-content-addressed archive, and the existing user-owned trust record without loading
-registry metadata or mutating the lockfile. Missing, malformed, mismatched, expired, or
-untrusted evidence is a security failure; a cache pathname alone is never evidence.
+metadata digest, and expiry. The exact signed metadata bytes and detached signature
+are cached by metadata digest. Frozen or offline builds re-hash and signature-verify
+that snapshot, validate its dependency edges against the lock, then validate the
+receipt, content-addressed archive, and existing user-owned trust record without
+contacting a provider or mutating the lockfile. Missing, malformed, mismatched,
+expired, or untrusted evidence is a security failure; a cache pathname alone is never
+evidence.
 
 Manifest bytes must be valid UTF-8 before field interpretation. The local
 target validator rejects absolute, parent, dot-prefixed, and

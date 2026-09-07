@@ -331,12 +331,11 @@ module Cli:
                 return false
             return true
 
-        def cache_store_verified_blob(digest: darray[u8]&, content: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+        def cache_store_verified_bytes(digest: darray[u8]&, content: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             # Cache publication is content-addressed and immutable. Verify the bytes
             # before creating any cache entry, then revalidate the final pathname after
             # the exclusive link so a concurrent writer or replacement cannot turn a
             # successful fetch into an unverified cache hit.
-            return false if not Archive::verify_ustar_archive(content)
             digest_bytes: mutable darray[u8] = []
             actual: mutable darray[u8] = []
             return false if Integrity::sha256(content, &digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(digest_bytes, &actual) or not bytes_equal(actual, digest)
@@ -366,6 +365,10 @@ module Cli:
             return true if write_cstr_file_noclobber(blob_c, content) and Cache::verify_blob(digest)
             return Cache::verify_blob(digest)
 
+        def cache_store_verified_blob(digest: darray[u8]&, content: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            return false if not Archive::verify_ustar_archive(content)
+            return cache_store_verified_bytes(digest, content)
+
         def cache_read_verified_blob(digest: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out.resize(0)
             return false if not Cache::verify_blob(digest)
@@ -373,6 +376,13 @@ module Cli:
             return false if not Cache::blob_path(digest, &path)
             loaded: mutable darray[u8] = []
             return false if not read_package_file_into(&path, &loaded)
+            # Verify the bytes after the read as well. A writable cache pathname
+            # may be replaced between the preflight stat/hash and the open; the
+            # consumer must never receive bytes that were not checked against the
+            # requested digest.
+            digest_bytes: mutable darray[u8] = []
+            actual: mutable darray[u8] = []
+            return false if Integrity::sha256(loaded, &digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(digest_bytes, &actual) or not bytes_equal(actual, digest)
             for index in 0..<loaded.count |out, loaded|:
                 out.push(loaded[index])
             return true
@@ -2819,39 +2829,41 @@ module Cli:
                 return false if (byte < 48 or byte > 57) and (byte < 97 or byte > 102)
             return true
 
+        def registry_lock_satisfies_constraint(lock: darray[u8]&, packages_start: usize, packages_end: usize, wanted: Solver::Constraint) -> bool can[Memory.Allocate, Abort.Panic]:
+            requirement: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
+            return false if not SemVer::parse_requirement(wanted.requirement, &requirement)
+            cursor: mutable usize = packages_start + 1.usize()
+            found: mutable bool = false
+            while cursor < packages_end |lock, packages_start, packages_end, wanted, cursor, found|:
+                while cursor < packages_end and (lock[cursor] == 32 or lock[cursor] == 9 or lock[cursor] == 10 or lock[cursor] == 13) |lock, cursor|:
+                    cursor <- cursor + 1.usize()
+                break if cursor == packages_end
+                return false if lock[cursor] != 123
+                record_end: usize = json_object_end(lock, cursor)
+                return false if record_end <= cursor or record_end >= packages_end
+                package: mutable darray[u8] = []
+                version_text: mutable darray[u8] = []
+                return false if not object_string_value(lock, cursor, record_end, "name", &package) or not object_string_value(lock, cursor, record_end, "version", &version_text)
+                if bytes_equal(package, wanted.package):
+                    return false if found
+                    parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
+                    return false if not SemVer::parse(version_text, &parsed) or parsed.prerelease or not SemVer::matches(requirement, parsed)
+                    found <- true
+                cursor <- record_end + 1.usize()
+                while cursor < packages_end and (lock[cursor] == 32 or lock[cursor] == 9 or lock[cursor] == 10 or lock[cursor] == 13) |lock, cursor|:
+                    cursor <- cursor + 1.usize()
+                if cursor < packages_end:
+                    return false if lock[cursor] != 44
+                    cursor <- cursor + 1.usize()
+            return found
+
         def registry_lock_satisfies_roots(lock: darray[u8]&, packages_start: usize, packages_end: usize, roots: darray[Solver::Constraint]&) -> bool can[Memory.Allocate, Abort.Panic]:
             # A registry lock is still project input. Check every direct
             # manifest requirement against the exact version recorded in the
-            # lock before offline/frozen callers trust cached bytes. The online
-            # path recomputes the whole lock from authenticated metadata; this
-            # check closes the corresponding offline gap without a provider.
+            # lock before offline/frozen callers trust cached bytes. The same
+            # helper is used for dependency edges restored from signed metadata.
             for root_index in 0..<roots.count |lock, packages_start, packages_end, roots, root_index|:
-                requirement: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
-                return false if not SemVer::parse_requirement(roots[root_index].requirement, &requirement)
-                cursor: mutable usize = packages_start + 1.usize()
-                found: mutable bool = false
-                while cursor < packages_end |lock, packages_start, packages_end, roots, root_index, cursor, found|:
-                    while cursor < packages_end and (lock[cursor] == 32 or lock[cursor] == 9 or lock[cursor] == 10 or lock[cursor] == 13) |lock, cursor|:
-                        cursor <- cursor + 1.usize()
-                    break if cursor == packages_end
-                    return false if lock[cursor] != 123
-                    record_end: usize = json_object_end(lock, cursor)
-                    return false if record_end <= cursor or record_end >= packages_end
-                    package: mutable darray[u8] = []
-                    version_text: mutable darray[u8] = []
-                    return false if not object_string_value(lock, cursor, record_end, "name", &package) or not object_string_value(lock, cursor, record_end, "version", &version_text)
-                    if bytes_equal(package, roots[root_index].package):
-                        return false if found
-                        parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-                        return false if not SemVer::parse(version_text, &parsed) or parsed.prerelease or not SemVer::matches(requirement, parsed)
-                        found <- true
-                    cursor <- record_end + 1.usize()
-                    while cursor < packages_end and (lock[cursor] == 32 or lock[cursor] == 9 or lock[cursor] == 10 or lock[cursor] == 13) |lock, cursor|:
-                        cursor <- cursor + 1.usize()
-                    if cursor < packages_end:
-                        return false if lock[cursor] != 44
-                        cursor <- cursor + 1.usize()
-                return false if not found
+                return false if not registry_lock_satisfies_constraint(lock, packages_start, packages_end, roots[root_index])
             return true
 
         def lock_matches_manifest(manifest: darray[u8]&, lock: darray[u8]&, name: darray[u8]&, version: darray[u8]&, start: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -3221,6 +3233,47 @@ module Cli:
             out.push(116)
             return true
 
+        def registry_cache_signature_path(metadata_digest: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            out.resize(0)
+            return false if metadata_digest.count != 64.usize()
+            for index in 0..<metadata_digest.count |metadata_digest|:
+                byte: u8 = metadata_digest[index]
+                return false if (byte < 48 or byte > 57) and (byte < 97 or byte > 102)
+            return false if not Cache::blob_path(metadata_digest, &out)
+            bytes_push_view(&out, ".sig")
+            return out.count <= 4096.usize()
+
+        def registry_cache_store_metadata(metadata_digest: darray[u8]&, metadata: darray[u8]&, signature: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            return false if metadata.count == 0.usize() or metadata.count > 1048576.usize() or signature.count != 64.usize()
+            return false if not cache_store_verified_bytes(metadata_digest, metadata)
+            signature_path: mutable darray[u8] = []
+            return false if not registry_cache_signature_path(metadata_digest, &signature_path)
+            parent: mutable darray[u8] = []
+            bytes_push_view(&parent, ".elisapkg/cache/sha256/")
+            parent.push(metadata_digest[0])
+            parent.push(metadata_digest[1])
+            return false if not make_directory(&parent)
+            signature_c: mutable darray[u8] = []
+            path_with_nul_into(&signature_path, &signature_c)
+            signature_name: cstr = (&signature_c[0]).cast[cstr] can Unsafe.PointerCast
+            if cstr_file_exists(signature_name):
+                existing: mutable darray[u8] = []
+                return false if not read_package_file_into(&signature_path, &existing)
+                return bytes_equal(existing, signature)
+            return false if not write_cstr_file_noclobber(signature_name, signature)
+            existing: mutable darray[u8] = []
+            return false if not read_package_file_into(&signature_path, &existing)
+            return bytes_equal(existing, signature)
+
+        def registry_cache_read_metadata(metadata_digest: darray[u8]&, metadata_out: mutable darray[u8]&, signature_out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            metadata_out.resize(0)
+            signature_out.resize(0)
+            return false if not cache_read_verified_blob(metadata_digest, &metadata_out)
+            signature_path: mutable darray[u8] = []
+            return false if not registry_cache_signature_path(metadata_digest, &signature_path)
+            return false if not read_package_file_into(&signature_path, &signature_out) or signature_out.count != 64.usize()
+            return true
+
         def registry_cache_store_receipt(package: darray[u8]&, version: darray[u8]&, archive: darray[u8]&, archive_size: u64, digest: darray[u8]&, metadata_digest: darray[u8]&, expires: u64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             path: mutable darray[u8] = []
             return false if not registry_cache_receipt_path(digest, &path)
@@ -3350,6 +3403,18 @@ module Cli:
                     write_bytes(2, &package)
                     write_error("\n")
                     return EXIT_SECURITY
+                cached_metadata: mutable darray[u8] = []
+                cached_signature: mutable darray[u8] = []
+                return EXIT_SECURITY if not registry_cache_read_metadata(metadata_digest, &cached_metadata, &cached_signature)
+                resolved_archive: mutable darray[u8] = []
+                resolved_digest: mutable darray[u8] = []
+                resolved_size: mutable u64 = 0
+                metadata_expires: mutable u64 = 0
+                metadata_dependencies: mutable darray[Solver::Constraint] = []
+                metadata_status: Registry::ResultCode = Registry::verify_metadata_snapshot(package, version_text, metadata_digest, cached_metadata, cached_signature, &resolved_archive, &resolved_digest, &resolved_size, &metadata_expires, &metadata_dependencies)
+                return EXIT_SECURITY if metadata_status != Registry::ResultCode.Ok or not bytes_equal(resolved_archive, archive) or not bytes_equal(resolved_digest, digest) or resolved_size != archive_size or metadata_expires != expires
+                for dependency_index in 0..<metadata_dependencies.count |lock, packages_start, packages_end, metadata_dependencies, dependency_index|:
+                    return EXIT_SECURITY if not registry_lock_satisfies_constraint(lock, packages_start, packages_end, metadata_dependencies[dependency_index])
                 archive_bytes: mutable darray[u8] = []
                 return EXIT_SECURITY if not cache_read_verified_blob(digest, &archive_bytes) or archive_bytes.count.u64() != archive_size or not Archive::verify_ustar_archive(archive_bytes)
                 write_ok("verified cached registry artifact ")
@@ -3468,6 +3533,16 @@ module Cli:
                     return EXIT_SECURITY
                 metadata_expires: mutable u64 = 0
                 return EXIT_SECURITY if not object_unsigned_value(metadata, 0, json_object_end(metadata, 0), "expires", &metadata_expires)
+                metadata_signature: mutable darray[u8] = []
+                signature_status: Registry::ResultCode = Registry::read_signature(package, selected, &metadata_signature)
+                return EXIT_SECURITY if signature_status != Registry::ResultCode.Ok
+                snapshot_archive: mutable darray[u8] = []
+                snapshot_digest: mutable darray[u8] = []
+                snapshot_size: mutable u64 = 0
+                snapshot_expires: mutable u64 = 0
+                snapshot_dependencies: mutable darray[Solver::Constraint] = []
+                snapshot_status: Registry::ResultCode = Registry::verify_metadata_snapshot(package, selected, metadata_digest, metadata, metadata_signature, &snapshot_archive, &snapshot_digest, &snapshot_size, &snapshot_expires, &snapshot_dependencies)
+                return EXIT_SECURITY if snapshot_status != Registry::ResultCode.Ok or snapshot_expires != metadata_expires or not registry_cache_store_metadata(metadata_digest, metadata, metadata_signature)
                 archive_bytes: mutable darray[u8] = []
                 archive_status: Registry::ResultCode = Registry::read_archive(package, version_text, archive, digest, archive_size, &archive_bytes)
                 if archive_status != Registry::ResultCode.Ok:
@@ -3578,6 +3653,16 @@ module Cli:
                 metadata_digest: mutable darray[u8] = []
                 metadata_expires: mutable u64 = 0
                 return EXIT_SECURITY if Integrity::sha256(metadata, &metadata_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(metadata_digest_bytes, &metadata_digest) or not object_unsigned_value(metadata, 0, json_object_end(metadata, 0), "expires", &metadata_expires)
+                metadata_signature: mutable darray[u8] = []
+                signature_status: Registry::ResultCode = Registry::read_signature(package, selected, &metadata_signature)
+                return EXIT_SECURITY if signature_status != Registry::ResultCode.Ok
+                snapshot_archive: mutable darray[u8] = []
+                snapshot_digest: mutable darray[u8] = []
+                snapshot_size: mutable u64 = 0
+                snapshot_expires: mutable u64 = 0
+                snapshot_dependencies: mutable darray[Solver::Constraint] = []
+                snapshot_status: Registry::ResultCode = Registry::verify_metadata_snapshot(package, selected, metadata_digest, metadata, metadata_signature, &snapshot_archive, &snapshot_digest, &snapshot_size, &snapshot_expires, &snapshot_dependencies)
+                return EXIT_SECURITY if snapshot_status != Registry::ResultCode.Ok or snapshot_expires != metadata_expires or not registry_cache_store_metadata(metadata_digest, metadata, metadata_signature)
                 return EXIT_SECURITY if not registry_cache_store_receipt(package, selected, archive, archive_size, digest, metadata_digest, metadata_expires)
                 write_ok("verified registry artifact ")
                 write_bytes(1, &package)

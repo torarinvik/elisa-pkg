@@ -120,6 +120,65 @@ module Registry:
         def resolve_metadata(package: darray[u8]&, requirement: darray[u8]&, previous_version: Model::Version, version_out: mutable darray[u8]&, archive_out: mutable darray[u8]&, digest_out: mutable darray[u8]&, archive_size_out: mutable u64&, metadata_out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return resolve_internal(package, requirement, previous_version, version_out, archive_out, digest_out, archive_size_out, metadata_out, false)
 
+        # Read the detached signature that authenticated one immutable metadata
+        # record. This is used only after an online fetch has verified the record,
+        # so the signature can be carried into the content-addressed offline cache.
+        def read_signature(package: darray[u8]&, version: darray[u8]&, out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            out.resize(0)
+            return ResultCode.InvalidConfiguration if not valid_package_path(package) or not Archive::is_safe_entry(version)
+            root: mutable darray[u8] = []
+            return ResultCode.NotConfigured if not configured_root(&root)
+            return ResultCode.InvalidConfiguration if not valid_registry_root(root)
+            metadata_path: mutable darray[u8] = []
+            return ResultCode.InvalidConfiguration if not join_path_version(root, package, version, &metadata_path)
+            metadata_path.push(47)
+            metadata_path.push(109)
+            metadata_path.push(101)
+            metadata_path.push(116)
+            metadata_path.push(97)
+            metadata_path.push(100)
+            metadata_path.push(97)
+            metadata_path.push(116)
+            metadata_path.push(97)
+            metadata_path.push(46)
+            metadata_path.push(115)
+            metadata_path.push(105)
+            metadata_path.push(103)
+            return ResultCode.MissingSignature if not read_file(metadata_path, 64.usize(), out)
+            return ResultCode.MissingSignature if out.count != 64.usize()
+            return ResultCode.Ok
+
+        # Verify a metadata snapshot restored from the offline cache. The cache
+        # supplies exact bytes and the detached signature; this function repeats
+        # the same identity, digest, trust-root, expiry, and dependency checks as
+        # the live provider before exposing any fields to lock validation.
+        def verify_metadata_snapshot(package: darray[u8]&, version: darray[u8]&, expected_metadata_digest: darray[u8]&, metadata: darray[u8]&, signature: darray[u8]&, archive_out: mutable darray[u8]&, digest_out: mutable darray[u8]&, archive_size_out: mutable u64&, expires_out: mutable u64&, dependencies_out: mutable darray[Solver::Constraint]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            archive_out.resize(0)
+            digest_out.resize(0)
+            archive_size_out <- 0
+            expires_out <- 0
+            dependencies_out.resize(0)
+            return ResultCode.InvalidConfiguration if not valid_package_path(package) or not Archive::is_safe_entry(version) or not valid_digest(expected_metadata_digest)
+            return ResultCode.MalformedMetadata if metadata.count == 0.usize() or metadata.count > 1048576.usize() or not Json::valid_document(metadata) or not Json::unique_object_keys(metadata) or not metadata_root_object(metadata) or not metadata_allowed_fields(metadata)
+            root: mutable darray[u8] = []
+            return ResultCode.NotConfigured if not configured_root(&root)
+            return ResultCode.InvalidConfiguration if not valid_registry_root(root)
+            return ResultCode.MalformedMetadata if not metadata_identity(metadata, root, package, version, &archive_out, &digest_out, &archive_size_out)
+            metadata_digest_bytes: mutable darray[u8] = []
+            metadata_digest: mutable darray[u8] = []
+            return ResultCode.DigestMismatch if Integrity::sha256(metadata, &metadata_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(metadata_digest_bytes, &metadata_digest) or not bytes_equal(metadata_digest, expected_metadata_digest)
+            key_path: mutable darray[u8] = []
+            trust_root_status: ResultCode = configured_trust_root(&key_path)
+            return trust_root_status if trust_root_status != ResultCode.Ok
+            public_key: mutable darray[u8] = []
+            return ResultCode.MissingTrustRoot if not read_file(key_path, 32.usize(), &public_key) or public_key.count != 32.usize()
+            trust_status: Trust::VerificationCode = Trust::verify_detached("ed25519", public_key, metadata, signature)
+            return ResultCode.InvalidSignature if trust_status != Trust::VerificationCode.Valid
+            now: i64 = Platform::pkg_wall_clock_seconds()
+            return ResultCode.ExpiredMetadata if now < 0 or not metadata_integer(metadata, "expires", &expires_out) or not expiry_is_future(expires_out, now.u64())
+            return ResultCode.MalformedMetadata if not metadata_dependencies(metadata, &dependencies_out)
+            return ResultCode.Ok
+
     private:
         def resolve_internal(package: darray[u8]&, requirement: darray[u8]&, previous_version: Model::Version, version_out: mutable darray[u8]&, archive_out: mutable darray[u8]&, digest_out: mutable darray[u8]&, archive_size_out: mutable u64&, metadata_out: mutable darray[u8]&, verify_archive: bool) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             version_out.resize(0)
