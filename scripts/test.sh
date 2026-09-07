@@ -296,6 +296,20 @@ if ELISAPKG_REGISTRY_DIR="$ROOT" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUS
   exit 1
 fi
 
+# The default HOME-derived trust path must reject control bytes and normalize a
+# trailing separator. This exercises the same path helper used when no explicit
+# ELISAPKG_TRUST_STATE override is configured.
+DEFAULT_TRUST_HOME="$ROOT/build/default-trust-home-$$"
+mkdir -p "$DEFAULT_TRUST_HOME"
+env -u ELISAPKG_TRUST_STATE HOME="$DEFAULT_TRUST_HOME/" ELISAPKG_REGISTRY_DIR="$ROOT" "$TRUST_STATE_BIN"
+test -n "$(find "$DEFAULT_TRUST_HOME/.local/share/elisapkg/trust" -name '*.state' -type f -print -quit)"
+BAD_TRUST_HOME="$ROOT/build/bad-trust-home-$$"
+BAD_TRUST_HOME="$BAD_TRUST_HOME"$'\n'x
+if env -u ELISAPKG_TRUST_STATE HOME="$BAD_TRUST_HOME" ELISAPKG_REGISTRY_DIR="$ROOT" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
+  echo "control-byte HOME was accepted for trust state" >&2
+  exit 1
+fi
+
 # Verify the in-language SHA-256 implementation against the two canonical
 # FIPS vectors used by the package-integrity path.
 HASH_PROBE="$ROOT/build/hash-probe-$$.elisa"

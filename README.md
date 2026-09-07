@@ -73,6 +73,9 @@ or restored. The adjacent `.clock` sidecar durably records the greatest wall
 clock value observed for the registry; malformed values and clock rollback are
 rejected before a signed selection can update trust state. Removing it after a
 record exists fails closed rather than resetting that floor.
+The derived `HOME` path is accepted only when it is absolute and contains no
+control bytes or backslashes; trailing separators are normalized, and malformed
+environment input fails closed before any trust-state directory is created.
 
 `package --list` previews the validated file set. `package` writes a bounded,
 deterministic ustar archive to `.elisapkg/package.tar`, with sorted regular

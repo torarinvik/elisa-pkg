@@ -28,6 +28,11 @@ timestamp through the same atomic publication path; malformed values and clock
 rollback fail closed before expiry or trust-state updates. Removing the sidecar
 after trust history exists is also an unavailable-state error, so deletion
 cannot reset the rollback floor.
+When the default location is used, `HOME` is treated as untrusted input: it
+must be absolute, bounded, and free of control bytes and backslashes. Trailing
+separators are collapsed (while preserving `/`), so equivalent spellings cannot
+select different state paths. Invalid `HOME` values fail closed before any
+trust-state directory is created.
 
 State-directory creation and atomic file publication use descriptor-anchored
 `mkdirat`/`openat`/`renameat`/`linkat` traversal. Reads, temporary files,

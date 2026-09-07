@@ -521,6 +521,22 @@ module Registry:
                 previous_hyphen <- byte == 45
             return true
 
+        # HOME is an input boundary, even though it is normally populated by
+        # the login environment. Reject control bytes and backslashes before
+        # using it to derive durable trust-state paths, and collapse trailing
+        # separators so `/home/user` and `/home/user/` cannot select different
+        # path spellings. Keep `/` itself as the root path.
+        def safe_home_length(home: cstr) -> usize:
+            length: usize = Platform::pkg_strlen(home)
+            return 0 if length == 0 or length > 3800 or home[0].u8() != 47
+            normalized: mutable usize = length
+            while normalized > 1 and home[normalized - 1].u8() == 47:
+                normalized <- normalized - 1.usize()
+            for index in 0..<normalized |home, normalized|:
+                byte: u8 = home[index].u8()
+                return 0 if byte < 32 or byte == 127 or byte == 92
+            return normalized
+
         def configured_root(out: mutable darray[u8]&) -> bool:
             out.resize(0)
             value_ref: u8&? = Platform::pkg_getenv("ELISAPKG_REGISTRY_DIR")
@@ -837,98 +853,111 @@ module Registry:
             return Platform::pkg_is_directory(path_name) == 1 if created == -17
             return false
 
-        def trust_state_path(root: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            out.resize(0)
+        def trust_state_path(root: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             override: u8&? = Platform::pkg_getenv("ELISAPKG_TRUST_STATE")
             if override is configured:
                 value: cstr = configured.cast[cstr]
                 length: usize = Platform::pkg_strlen(value)
-                return false if length == 0 or length > 4096 or value[0].u8() != 47
-                for index in 0..<length |out, value|:
+                return [] if length == 0 or length > 4096 or value[0].u8() != 47
+                resolved: mutable darray[u8] = []
+                for index in 0..<length |resolved, value|:
                     byte: u8 = value[index].u8()
-                    return false if byte == 0 or byte < 32 or byte == 127 or byte == 92
-                    out.push(byte)
-                return out[out.count - 1.usize()] != 47
+                    return [] if byte == 0 or byte < 32 or byte == 127 or byte == 92
+                    resolved.push(byte)
+                return [] if resolved[resolved.count - 1.usize()] == 47
+                return resolved
             home_ref: u8&? = Platform::pkg_getenv("HOME")
             if home_ref is home_value:
                 home: cstr = home_value.cast[cstr]
-                resolved: mutable darray[u8] = []
-                return false if not trust_state_path_for_home(root, home, &resolved)
-                for index in 0..<resolved.count |out, resolved|:
-                    out.push(resolved[index])
-                return true
-            return false
+                return trust_state_path_for_home(root, home)
+            return []
 
-        def trust_state_path_for_home(root: darray[u8]&, home: cstr, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            home_length: usize = Platform::pkg_strlen(home)
-            return false if home_length == 0 or home_length > 3800 or home[0].u8() != 47
+        def trust_state_path_for_home(root: darray[u8]&, home: cstr) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            home_length: usize = safe_home_length(home)
+            return [] if home_length == 0
             root_digest_bytes: mutable darray[u8] = []
             root_digest: mutable darray[u8] = []
-            return false if Integrity::sha256(root, &root_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(root_digest_bytes, &root_digest)
+            return [] if Integrity::sha256(root, &root_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(root_digest_bytes, &root_digest)
             base: mutable darray[u8] = []
             for index in 0..<home_length |base, home|:
                 base.push(home[index].u8())
-            registry_push_text(&base, "/.local/share/elisapkg/trust")
+            if home_length > 1.usize():
+                registry_push_text(&base, "/.local/share/elisapkg/trust")
+            else:
+                registry_push_text(&base, ".local/share/elisapkg/trust")
             parent: mutable darray[u8] = []
             for index in 0..<home_length |parent, home|:
                 parent.push(home[index].u8())
-            registry_push_text(&parent, "/.local")
-            return false if not trust_state_directory(&parent)
+            if home_length > 1.usize():
+                registry_push_text(&parent, "/.local")
+            else:
+                registry_push_text(&parent, ".local")
+            # Build the final path in a local buffer before calling filesystem
+            # helpers. The stage1 ABI can invalidate a caller-owned darray after
+            # nested FFI calls; returning this completed value lets the caller's
+            # arena own the path and keeps its cursor and allocation metadata valid.
+            resolved_path: mutable darray[u8] = []
+            for index in 0..<base.count |resolved_path, base|:
+                resolved_path.push(base[index])
+            resolved_path.push(47)
+            for index in 0..<root_digest.count |resolved_path, root_digest|:
+                resolved_path.push(root_digest[index])
+            registry_push_text(&resolved_path, ".state")
+            return [] if not trust_state_directory(&parent)
             parent.resize(home_length)
-            registry_push_text(&parent, "/.local/share")
-            return false if not trust_state_directory(&parent)
+            if home_length > 1.usize():
+                registry_push_text(&parent, "/.local/share")
+            else:
+                registry_push_text(&parent, ".local/share")
+            return [] if not trust_state_directory(&parent)
             parent.resize(home_length)
-            registry_push_text(&parent, "/.local/share/elisapkg")
-            return false if not trust_state_directory(&parent)
-            return false if not trust_state_directory(&base)
-            for index in 0..<base.count |out, base|:
-                out.push(base[index])
-            out.push(47)
-            for index in 0..<root_digest.count |out, root_digest|:
-                out.push(root_digest[index])
-            registry_push_text(&out, ".state")
-            return out.count <= 4096
+            if home_length > 1.usize():
+                registry_push_text(&parent, "/.local/share/elisapkg")
+            else:
+                registry_push_text(&parent, ".local/share/elisapkg")
+            return [] if not trust_state_directory(&parent)
+            return [] if not trust_state_directory(&base)
+            return [] if resolved_path.count > 4096
+            return resolved_path
 
-        def trust_state_path_readonly(root: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            out.resize(0)
+        def trust_state_path_readonly(root: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             override: u8&? = Platform::pkg_getenv("ELISAPKG_TRUST_STATE")
             if override is configured:
                 value: cstr = configured.cast[cstr]
                 length: usize = Platform::pkg_strlen(value)
-                return false if length == 0 or length > 4096 or value[0].u8() != 47
-                for index in 0..<length |out, value|:
+                return [] if length == 0 or length > 4096 or value[0].u8() != 47
+                resolved: mutable darray[u8] = []
+                for index in 0..<length |resolved, value|:
                     byte: u8 = value[index].u8()
-                    return false if byte == 0 or byte < 32 or byte == 127 or byte == 92
-                    out.push(byte)
-                return out[out.count - 1.usize()] != 47
+                    return [] if byte == 0 or byte < 32 or byte == 127 or byte == 92
+                    resolved.push(byte)
+                return [] if resolved[resolved.count - 1.usize()] == 47
+                return resolved
             home_ref: u8&? = Platform::pkg_getenv("HOME")
             if home_ref is home_value:
                 home: cstr = home_value.cast[cstr]
-                resolved: mutable darray[u8] = []
-                return false if not trust_state_path_for_home_readonly(root, home, &resolved)
-                for index in 0..<resolved.count |out, resolved|:
-                    out.push(resolved[index])
-                return true
-            return false
+                return trust_state_path_for_home_readonly(root, home)
+            return []
 
-        def trust_state_path_for_home_readonly(root: darray[u8]&, home: cstr, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            home_length: usize = Platform::pkg_strlen(home)
-            return false if home_length == 0 or home_length > 3800 or home[0].u8() != 47
+        def trust_state_path_for_home_readonly(root: darray[u8]&, home: cstr) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            home_length: usize = safe_home_length(home)
+            return [] if home_length == 0
             root_digest_bytes: mutable darray[u8] = []
             root_digest: mutable darray[u8] = []
-            return false if Integrity::sha256(root, &root_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(root_digest_bytes, &root_digest)
+            return [] if Integrity::sha256(root, &root_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(root_digest_bytes, &root_digest)
             resolved: mutable darray[u8] = []
             for index in 0..<home_length |resolved, home|:
                 resolved.push(home[index].u8())
-            registry_push_text(&resolved, "/.local/share/elisapkg/trust")
+            if home_length > 1.usize():
+                registry_push_text(&resolved, "/.local/share/elisapkg/trust")
+            else:
+                registry_push_text(&resolved, ".local/share/elisapkg/trust")
             resolved.push(47)
             for index in 0..<root_digest.count |resolved, root_digest|:
                 resolved.push(root_digest[index])
             registry_push_text(&resolved, ".state")
-            return false if resolved.count > 4096
-            for index in 0..<resolved.count |out, resolved|:
-                out.push(resolved[index])
-            return true
+            return [] if resolved.count > 4096
+            return resolved
 
         def trust_state_read(path: darray[u8]&, out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out.resize(0)
@@ -1057,8 +1086,8 @@ module Registry:
             return ResultCode.InvalidConfiguration if not SemVer::parse(version, &parsed) or parsed.prerelease
             root: mutable darray[u8] = []
             return ResultCode.NotConfigured if not configured_root(&root)
-            state_path: mutable darray[u8] = []
-            return ResultCode.TrustStateUnavailable if not trust_state_path(root, &state_path)
+            state_path: mutable darray[u8] = trust_state_path(root)
+            return ResultCode.TrustStateUnavailable if state_path.count == 0
             return ResultCode.TrustStateUnavailable if state_path.count > 4090.usize()
             lock_path: mutable darray[u8] = []
             for index in 0..<state_path.count |lock_path, state_path|:
@@ -1130,8 +1159,8 @@ module Registry:
                 return ResultCode.InvalidConfiguration if length == 0 or length > 4096
                 for index in 0..<length |root, value|:
                     root.push(value[index].u8())
-            state_path: mutable darray[u8] = []
-            return ResultCode.TrustStateUnavailable if not trust_state_path_readonly(root, &state_path)
+            state_path: mutable darray[u8] = trust_state_path_readonly(root)
+            return ResultCode.TrustStateUnavailable if state_path.count == 0
             state: mutable darray[u8] = []
             read_status: ResultCode = trust_state_read(state_path, &state)
             return read_status if read_status != ResultCode.Ok
