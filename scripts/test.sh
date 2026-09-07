@@ -21,6 +21,15 @@ python3 "$ROOT/scripts/ffi_boundary_test.py"
 QUIET_FIXTURE="$ROOT/build/quiet-fixture-$$"
 mkdir "$QUIET_FIXTURE"
 "$BIN" init "$QUIET_FIXTURE" >/dev/null
+INIT_MODE_FIXTURE="$ROOT/build/init-output-modes-$$"
+init_quiet_output="$("$BIN" init "$INIT_MODE_FIXTURE" --quiet 2>/dev/null)"
+test -z "$init_quiet_output"
+if "$BIN" init "$ROOT/build/init-color-invalid-$$" --color invalid >/dev/null 2>&1; then
+  echo 'init accepted an invalid color mode' >&2
+  exit 1
+else
+  test "$?" -eq 2
+fi
 quiet_output="$(cd "$QUIET_FIXTURE" && "$BIN" check-manifest --quiet 2>/dev/null)"
 test -z "$quiet_output"
 (
@@ -514,12 +523,21 @@ mkdir -p "$CASE"
   printf '%s\n' 'def main() -> i64:' '    return 0' > nested-util/src/main.elisa
   printf '%s\n' '{"schema-version":1,"package":{"name":"nested-util","version":"0.4.0"},"targets":[{"name":"nested-util","kind":"lib","entry":"src/main.elisa"}],"dependencies":{}}' > nested-util/elisapkg.json
   printf '%s\n' '{"schema-version":1,"package":{"name":"local-util","version":"1.2.3"},"targets":[{"name":"local-util","kind":"lib","entry":"src/main.elisa"}],"dependencies":{"nested-util":{"path":"../nested-util"}}}' > local-util/elisapkg.json
-  "$BIN" add local-util --path local-util >/dev/null
+  if "$BIN" add local-util --path local-util --color invalid >/dev/null 2>&1; then
+    echo 'dependency mutation accepted an invalid color mode' >&2
+    exit 1
+  else
+    test "$?" -eq 2
+  fi
+  add_quiet_output="$("$BIN" add local-util --path local-util --quiet 2>/dev/null)"
+  test -z "$add_quiet_output"
   "$BIN" check-manifest >/dev/null
   "$BIN" resolve >/dev/null
   grep -F '"name":"nested-util"' elisapkg.lock >/dev/null
-  (cd "$ROOT" && "$BIN" update local-util --manifest-path "$CASE" >/dev/null)
-  (cd "$ROOT" && "$BIN" remove local-util --manifest-path "$CASE" >/dev/null)
+  update_quiet_output="$(cd "$ROOT" && "$BIN" update local-util --manifest-path "$CASE" --quiet 2>/dev/null)"
+  test -z "$update_quiet_output"
+  remove_quiet_output="$(cd "$ROOT" && "$BIN" remove local-util --manifest-path "$CASE" --quiet 2>/dev/null)"
+  test -z "$remove_quiet_output"
   if grep -F '"local-util"' elisapkg.json >/dev/null; then
     echo "manifest-path remove left the dependency declared" >&2
     exit 1

@@ -2546,6 +2546,36 @@ module Cli:
                     parent.push(path[index])
             return change_directory(&parent)
 
+        # `init` and dependency mutations have command-specific positional
+        # grammars, so they are dispatched before the common parser below.
+        # Strip the output-only global modes first so those commands still
+        # honor the same quiet/color contract as every other command without
+        # accidentally accepting flags intended for a different operation.
+        def compact_output_modes(argc: i64, slots: mutable cstr&&, out: mutable darray[cstr]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            out.resize(0)
+            return -1 if argc < 2
+            out.push(slots[0].cast[cstr])
+            out.push(slots[1].cast[cstr])
+            color_seen: mutable bool = false
+            index: mutable i64 = 2
+            while index < argc |slots, out, color_seen, index|:
+                argument: cstr = slots[index].cast[cstr]
+                if cstr_equal(argument, "--quiet"):
+                    cli_quiet <- true
+                    index <- index + 1
+                    continue
+                if cstr_equal(argument, "--color"):
+                    return -1 if color_seen or index + 1 >= argc
+                    color_value: cstr = slots[index + 1].cast[cstr]
+                    return -1 if not cstr_equal(color_value, "auto") and not cstr_equal(color_value, "always") and not cstr_equal(color_value, "never")
+                    color_seen <- true
+                    index <- index + 2
+                    continue
+                out.push(argument)
+                index <- index + 1
+            out.push(null)
+            return out.count.i64() - 1
+
         def run_init(argc: i64, slots: mutable cstr&&) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             root: mutable darray[u8] = [46]
             target_kind: mutable cstr = "bin"
@@ -4826,11 +4856,23 @@ module Cli:
             out.push(slots[1].cast[cstr])
             index: mutable i64 = 2
             separator_seen: mutable bool = false
-            while index < argc |slots, out, index, separator_seen|:
+            color_seen: mutable bool = false
+            while index < argc |slots, out, index, separator_seen, color_seen|:
                 if cstr_equal(slots[index].cast[cstr], "--"):
                     separator_seen <- true
                     out.push(slots[index].cast[cstr])
                     index <- index + 1
+                    continue
+                if not separator_seen and cstr_equal(slots[index].cast[cstr], "--quiet"):
+                    cli_quiet <- true
+                    index <- index + 1
+                    continue
+                if not separator_seen and cstr_equal(slots[index].cast[cstr], "--color"):
+                    return -1 if color_seen or index + 1 >= argc
+                    color_value: cstr = slots[index + 1].cast[cstr]
+                    return -1 if not cstr_equal(color_value, "auto") and not cstr_equal(color_value, "always") and not cstr_equal(color_value, "never")
+                    color_seen <- true
+                    index <- index + 2
                     continue
                 if not separator_seen and cstr_equal(slots[index].cast[cstr], "--manifest-path"):
                     index <- index + 2
@@ -4857,7 +4899,10 @@ module Cli:
                 write_ok("elisapkg 0.1.0\n")
                 return EXIT_OK
             if cstr_equal(command, "init"):
-                return run_init(argc, slots)
+                init_slots: mutable darray[cstr] = []
+                init_argc: i64 = compact_output_modes(argc, slots, &init_slots)
+                return EXIT_USAGE if init_argc < 0
+                return run_init(init_argc, (&init_slots[0]).cast[mutable cstr&&] can Unsafe.PointerCast)
             manifest_path: mutable darray[u8] = []
             has_manifest_path: mutable bool = false
             scan_index: mutable i64 = 2
@@ -4879,12 +4924,16 @@ module Cli:
             compacted: mutable darray[cstr] = []
             if has_manifest_path:
                 effective_argc <- compact_manifest_args(argc, slots, &compacted)
-                return EXIT_USAGE if effective_argc == 0
+                return EXIT_USAGE if effective_argc <= 0
                 effective_slots <- (&compacted[0]).cast[mutable cstr&&] can Unsafe.PointerCast
             if cstr_equal(command, "add") or cstr_equal(command, "remove") or cstr_equal(command, "update"):
-                return run_add(effective_argc, effective_slots) if cstr_equal(command, "add")
-                return run_remove(effective_argc, effective_slots) if cstr_equal(command, "remove")
-                return run_update(effective_argc, effective_slots)
+                mutation_slots: mutable darray[cstr] = []
+                mutation_argc: i64 = compact_manifest_args(argc, slots, &mutation_slots)
+                return EXIT_USAGE if mutation_argc < 0
+                mutation_effective_slots: mutable cstr&& = (&mutation_slots[0]).cast[mutable cstr&&] can Unsafe.PointerCast
+                return run_add(mutation_argc, mutation_effective_slots) if cstr_equal(command, "add")
+                return run_remove(mutation_argc, mutation_effective_slots) if cstr_equal(command, "remove")
+                return run_update(mutation_argc, mutation_effective_slots)
             return EXIT_SECURITY if not transaction_recover()
             # `.` means the process working directory and keeps path operations on a
             # non-empty, well-defined byte buffer.
