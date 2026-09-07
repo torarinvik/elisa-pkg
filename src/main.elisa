@@ -34,6 +34,11 @@ module Cli:
         const MAX_TARGETS: usize = 4096
 
         const O_READ: cstr = "rb"
+        # Output policy is process-local state set once by the CLI parser. Keep
+        # it out of domain records so command APIs remain deterministic values;
+        # only the final human-output sink consults these switches.
+        global mutable cli_quiet: bool = false
+        global mutable cli_json_output: bool = false
         # ---------- byte and output helpers ---------------------------------------------------
 
         def bytes_push_view(out: mutable darray[u8]&, value: cstr) -> void can[Memory.Allocate, Abort.Panic]:
@@ -132,6 +137,7 @@ module Cli:
             return true
 
         def write_bytes(fd: i64, value: darray[u8]&) -> void can[Console.Write, Unsafe.PointerCast]:
+            return if fd == 1 and cli_quiet and not cli_json_output
             offset: mutable usize = 0.usize()
             while offset < value.count |value, offset|:
                 raw: void& = (&value[offset]).cast[void&] can Unsafe.PointerCast
@@ -140,6 +146,7 @@ module Cli:
                 offset <- offset + wrote.usize()
 
         def write_text(fd: i64, value: cstr) -> void can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return if fd == 1 and cli_quiet and not cli_json_output
             buffer: mutable darray[u8] = []
             bytes_push_view(&buffer, value)
             write_bytes(fd, &buffer)
@@ -148,6 +155,7 @@ module Cli:
             write_text(2, value)
 
         def write_ok(value: cstr) -> void can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return if cli_quiet and not cli_json_output
             write_text(1, value)
 
         # ---------- path and file primitives --------------------------------------------------
@@ -2495,7 +2503,7 @@ module Cli:
             return current
 
         def usage() -> void can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            write_ok("elisapkg — Elisa Packaging System\n\nUsage: elisapkg <command> [options]\n\nCommands:\n  init [PATH] [--bin|--lib]    create a package\n  check-manifest              validate elisapkg.json\n  add NAME --path PATH        add a verified local path dependency\n  add NAME --version RANGE --registry primary\n                              add a signed registry dependency\n  remove NAME                 remove a declared dependency\n  update [NAME]               recompute the dependency lock\n  resolve [--locked|--offline]\n                              validate and write elisapkg.lock\n  tree                        show the resolved package graph\n  metadata --json             print normalized package metadata\n  doctor                      report toolchain and trust capabilities\n  build [--bin NAME|--lib NAME|--test NAME]\n                              compile a selected target\n                              --profile debug|release\n  run [--bin NAME] [--profile debug|release] -- ARGS\n                              build and run a binary target\n  test [--test NAME]          build and run a selected test target\n  clean                       remove known local build/package outputs\n  fetch [PACKAGE REQUIREMENT] verify locked sources or a signed local registry artifact\n  cache verify                inspect cached verification records\n  cache gc --dry-run          preview unreachable cache entries\n  package [--list]            create or preview the deterministic archive\n  install --local             install the current built binary into the user prefix\n  uninstall --local NAME      remove a receipt-owned local binary\n\nModes: --locked  --offline  --frozen  --json  --verbose\n")
+            write_ok("elisapkg — Elisa Packaging System\n\nUsage: elisapkg <command> [options]\n\nCommands:\n  init [PATH] [--bin|--lib]    create a package\n  check-manifest              validate elisapkg.json\n  add NAME --path PATH        add a verified local path dependency\n  add NAME --version RANGE --registry primary\n                              add a signed registry dependency\n  remove NAME                 remove a declared dependency\n  update [NAME]               recompute the dependency lock\n  resolve [--locked|--offline]\n                              validate and write elisapkg.lock\n  tree                        show the resolved package graph\n  metadata --json             print normalized package metadata\n  doctor                      report toolchain and trust capabilities\n  build [--bin NAME|--lib NAME|--test NAME]\n                              compile a selected target\n                              --profile debug|release\n  run [--bin NAME] [--profile debug|release] -- ARGS\n                              build and run a binary target\n  test [--test NAME]          build and run a selected test target\n  clean                       remove known local build/package outputs\n  fetch [PACKAGE REQUIREMENT] verify locked sources or a signed local registry artifact\n  cache verify                inspect cached verification records\n  cache gc --dry-run          preview unreachable cache entries\n  package [--list]            create or preview the deterministic archive\n  install --local             install the current built binary into the user prefix\n  uninstall --local NAME      remove a receipt-owned local binary\n\nModes: --locked  --offline  --frozen  --json  --verbose  --quiet  --color auto|always|never\n")
             write_ok("  why NAME                    show the root edge for a locked package\n")
             write_ok("remote publish/install/uninstall are trust-gated; use install --local for a receipt-backed local binary\n")
 
@@ -4801,6 +4809,8 @@ module Cli:
 
         def cli_main(argc: i64, argv: mutable void&) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             slots: mutable cstr&& = argv.cast[mutable cstr&&]
+            cli_quiet <- false
+            cli_json_output <- false
             if argc <= 1:
                 usage()
                 return EXIT_USAGE
@@ -4849,6 +4859,7 @@ module Cli:
             positional_count: mutable i64 = 0
             separator_seen: mutable bool = false
             profile_seen: mutable bool = false
+            color_seen: mutable bool = false
             index: mutable i64 = 2
             while index < effective_argc |effective_slots, options, flags_ok, positional_count, separator_seen, profile_seen, index|:
                 flag: cstr = effective_slots[index].cast[cstr]
@@ -4890,11 +4901,21 @@ module Cli:
                 options.frozen <- true if cstr_equal(flag, "--frozen")
                 options.json <- true if cstr_equal(flag, "--json")
                 options.verbose <- true if cstr_equal(flag, "--verbose")
+                cli_quiet <- true if cstr_equal(flag, "--quiet")
+                if cstr_equal(flag, "--color"):
+                    flags_ok <- false if color_seen or index + 1 >= effective_argc
+                    if flags_ok:
+                        color_value: cstr = effective_slots[index + 1].cast[cstr]
+                        flags_ok <- false if not cstr_equal(color_value, "auto") and not cstr_equal(color_value, "always") and not cstr_equal(color_value, "never")
+                        color_seen <- true if flags_ok
+                    index <- index + 2
+                    continue
                 flag_length: usize = Platform::pkg_strlen(flag)
                 is_positional: bool = flag_length > 0.usize() and flag[0].u8() != 45
                 positional_allowed: bool = (cstr_equal(command, "why") and positional_count == 0) or (cstr_equal(command, "install") and positional_count == 0) or (cstr_equal(command, "uninstall") and positional_count == 0) or (cstr_equal(command, "cache") and positional_count == 0) or (cstr_equal(command, "fetch") and positional_count < 2)
                 recognized: bool = is_positional and positional_allowed
-                recognized <- true if not is_positional and (cstr_equal(flag, "--locked") or cstr_equal(flag, "--offline") or cstr_equal(flag, "--frozen") or cstr_equal(flag, "--json") or cstr_equal(flag, "--verbose") or (cstr_equal(flag, "--list") and cstr_equal(command, "package")) or (cstr_equal(flag, "--dry-run") and cstr_equal(command, "cache")) or (cstr_equal(command, "install") and cstr_equal(flag, "--local")) or (cstr_equal(command, "uninstall") and cstr_equal(flag, "--local")))
+                recognized <- true if not is_positional and (cstr_equal(flag, "--locked") or cstr_equal(flag, "--offline") or cstr_equal(flag, "--frozen") or cstr_equal(flag, "--json") or cstr_equal(flag, "--verbose") or cstr_equal(flag, "--quiet") or (cstr_equal(flag, "--list") and cstr_equal(command, "package")) or (cstr_equal(flag, "--dry-run") and cstr_equal(command, "cache")) or (cstr_equal(command, "install") and cstr_equal(flag, "--local")) or (cstr_equal(command, "uninstall") and cstr_equal(flag, "--local")))
+                cli_json_output <- true if options.json
                 flags_ok <- false if not recognized
                 positional_count <- positional_count + 1 if recognized and is_positional
                 index <- index + 1

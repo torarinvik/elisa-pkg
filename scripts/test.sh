@@ -15,6 +15,32 @@ export ELISA_ALLOW_STALE_STAGE1="${ELISA_ALLOW_STALE_STAGE1:-0}"
 "$BIN" doctor | grep -F 'local Ed25519 provider available' >/dev/null
 python3 "$ROOT/scripts/ffi_boundary_test.py"
 
+# Global output modes are strict: quiet suppresses human success text without
+# hiding JSON results, and color values are validated even though the current
+# renderer intentionally emits no ANSI escapes.
+QUIET_FIXTURE="$ROOT/build/quiet-fixture-$$"
+mkdir "$QUIET_FIXTURE"
+"$BIN" init "$QUIET_FIXTURE" >/dev/null
+quiet_output="$(cd "$QUIET_FIXTURE" && "$BIN" check-manifest --quiet 2>/dev/null)"
+test -z "$quiet_output"
+(
+  cd "$QUIET_FIXTURE"
+  "$BIN" resolve >/dev/null
+)
+quiet_tree="$(cd "$QUIET_FIXTURE" && "$BIN" tree --quiet 2>/dev/null)"
+test -z "$quiet_tree"
+(
+  cd "$QUIET_FIXTURE"
+  "$BIN" check-manifest --color always >/dev/null
+  "$BIN" check-manifest --color never >/dev/null
+)
+if (cd "$QUIET_FIXTURE" && "$BIN" check-manifest --color invalid >/dev/null 2>&1); then
+  echo 'invalid color mode was accepted' >&2
+  exit 1
+fi
+json_quiet="$(cd "$QUIET_FIXTURE" && "$BIN" check-manifest --json --quiet)"
+test "$json_quiet" = '{"schema-version":1,"valid":true,"manifest":"elisapkg.json"}'
+
 # Exercise the pure SemVer requirement module independently of the CLI. This
 # keeps parser/range regressions visible without requiring a registry fixture.
 SEMVER_PROBE="$ROOT/build/semver-probe-$$.elisa"
