@@ -250,6 +250,7 @@ module PlatformNative:
             return root if root < 0
             return close_error(root, -directory_not_empty_error) if not directory_empty(root)
             seen: mutable darray[u8] = []
+            created_directories: mutable darray[u8] = []
             cursor: mutable usize = 0.usize()
             entries: mutable usize = 0.usize()
             result: mutable i64 = -22
@@ -258,41 +259,41 @@ module PlatformNative:
                     if cursor + 1024.usize() == archive.count and entries > 0.usize() and archive_block_zero(archive, cursor + 512.usize()):
                         result <- 0
                     break
-                return extraction_failure(root, seen, -22) if cursor + 1024.usize() > archive.count
-                return extraction_failure(root, seen, -22) if not archive_header_shape(archive, cursor)
+                return extraction_failure(root, seen, created_directories, -22) if cursor + 1024.usize() > archive.count
+                return extraction_failure(root, seen, created_directories, -22) if not archive_header_shape(archive, cursor)
                 name: mutable darray[u8] = []
                 for index in 0..<100 |archive, cursor, name|:
                     break if archive[cursor + index] == 0
                     name.push(archive[cursor + index])
-                return extraction_failure(root, seen, -22) if name.count == 0 or name.count >= 100 or not archive_entry_safe(name) or archive_name_seen(seen, name)
-                return extraction_failure(root, seen, -22) if not archive_metadata_zero(archive, cursor, name.count)
+                return extraction_failure(root, seen, created_directories, -22) if name.count == 0 or name.count >= 100 or not archive_entry_safe(name) or archive_name_seen(seen, name)
+                return extraction_failure(root, seen, created_directories, -22) if not archive_metadata_zero(archive, cursor, name.count)
                 mode: mutable usize = 0.usize()
                 uid: mutable usize = 0.usize()
                 gid: mutable usize = 0.usize()
                 size: mutable usize = 0.usize()
                 mtime: mutable usize = 0.usize()
                 stored_checksum: mutable usize = 0.usize()
-                return extraction_failure(root, seen, -22) if not parse_octal_raw(archive, cursor + 100.usize(), 8.usize(), &mode) or not parse_octal_raw(archive, cursor + 108.usize(), 8.usize(), &uid) or not parse_octal_raw(archive, cursor + 116.usize(), 8.usize(), &gid) or not parse_octal_raw(archive, cursor + 124.usize(), 12.usize(), &size) or not parse_octal_raw(archive, cursor + 136.usize(), 12.usize(), &mtime) or not parse_octal_raw(archive, cursor + 148.usize(), 8.usize(), &stored_checksum)
-                return extraction_failure(root, seen, -22) if mode != 420.usize() or uid != 0.usize() or gid != 0.usize() or mtime != 0.usize() or size > 67108864.usize() - 1024.usize()
+                return extraction_failure(root, seen, created_directories, -22) if not parse_octal_raw(archive, cursor + 100.usize(), 8.usize(), &mode) or not parse_octal_raw(archive, cursor + 108.usize(), 8.usize(), &uid) or not parse_octal_raw(archive, cursor + 116.usize(), 8.usize(), &gid) or not parse_octal_raw(archive, cursor + 124.usize(), 12.usize(), &size) or not parse_octal_raw(archive, cursor + 136.usize(), 12.usize(), &mtime) or not parse_octal_raw(archive, cursor + 148.usize(), 8.usize(), &stored_checksum)
+                return extraction_failure(root, seen, created_directories, -22) if mode != 420.usize() or uid != 0.usize() or gid != 0.usize() or mtime != 0.usize() or size > 67108864.usize() - 1024.usize()
                 checksum: mutable usize = 0.usize()
                 for index in 0..<512 |archive, cursor, checksum|:
                     checksum <- checksum + (32.usize() if index >= 148.usize() and index < 156.usize() else archive[cursor + index].usize())
-                return extraction_failure(root, seen, -22) if checksum != stored_checksum
+                return extraction_failure(root, seen, created_directories, -22) if checksum != stored_checksum
                 data_start: usize = cursor + 512.usize()
-                return extraction_failure(root, seen, -22) if size > archive.count - data_start
+                return extraction_failure(root, seen, created_directories, -22) if size > archive.count - data_start
                 data_end: usize = data_start + size
                 padding: usize = (512.usize() - (size % 512.usize())) % 512.usize()
-                return extraction_failure(root, seen, -22) if padding > archive.count - data_end or not archive_range_zero(archive, data_end, padding)
+                return extraction_failure(root, seen, created_directories, -22) if padding > archive.count - data_end or not archive_range_zero(archive, data_end, padding)
                 parent_copy: mutable darray[u8] = []
                 leaf_offset: mutable usize = 0.usize()
-                parent: i64 = archive_open_parent(root, name, &parent_copy, &leaf_offset)
-                return extraction_failure(root, seen, -22) if parent < 0
+                parent: i64 = archive_open_parent(root, name, &parent_copy, &leaf_offset, true, &created_directories)
+                return extraction_failure(root, seen, created_directories, -22) if parent < 0
                 leaf: cstr = (&parent_copy[leaf_offset]).cast[cstr] can Unsafe.PointerCast
                 file: i64 = native_openat(parent, leaf, flags_write_create_exclusive(), 420)
                 if file < 0:
                     file_errno: i64 = negative_errno()
                     parent_close_status: i64 = native_close(parent)
-                    return extraction_failure(root, seen, -5 if parent_close_status != 0 else file_errno)
+                    return extraction_failure(root, seen, created_directories, -5 if parent_close_status != 0 else file_errno)
                 for index in 0..<name.count |seen, name|:
                     seen.push(name[index])
                 seen.push(0)
@@ -315,10 +316,10 @@ module PlatformNative:
                 if write_failed or sync_status != 0 or close_status != 0 or directory_sync != 0:
                     _ = native_unlinkat(parent, leaf, 0)
                     _ = native_close(parent)
-                    return extraction_failure(root, seen, -5)
-                return extraction_failure(root, seen, -5) if native_close(parent) != 0
+                    return extraction_failure(root, seen, created_directories, -5)
+                return extraction_failure(root, seen, created_directories, -5) if native_close(parent) != 0
                 entries <- entries + 1.usize()
-                return extraction_failure(root, seen, -22) if entries > 4096.usize()
+                return extraction_failure(root, seen, created_directories, -22) if entries > 4096.usize()
                 cursor <- data_end + padding
             if result == 0:
                 result <- -5 if native_fsync(root) != 0
@@ -924,7 +925,7 @@ module PlatformNative:
                 cursor <- end + 1.usize()
             return false
 
-        def archive_open_parent(root: i64, name: darray[u8]&, copy_out: mutable darray[u8]&, leaf_offset: mutable usize&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+        def archive_open_parent(root: i64, name: darray[u8]&, copy_out: mutable darray[u8]&, leaf_offset: mutable usize&, create_missing: bool, created_directories: mutable darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             copy_out.resize(0)
             for index in 0..<name.count |copy_out, name|:
                 copy_out.push(name[index])
@@ -944,11 +945,19 @@ module PlatformNative:
                 copy_out[finish] <- 0
                 part: cstr = (&copy_out[start]).cast[cstr] can Unsafe.PointerCast
                 next: mutable i64 = native_openat(directory, part, flags_directory() + flag_no_follow)
-                if next < 0 and current_errno() == 2:
-                    if native_mkdirat(directory, part, 493) != 0 and current_errno() != 17:
+                created: mutable bool = false
+                if next < 0 and current_errno() == 2 and create_missing:
+                    mkdir_status: i64 = native_mkdirat(directory, part, 493)
+                    mkdir_errno: i64 = current_errno()
+                    if mkdir_status != 0 and mkdir_errno != 17:
                         return close_error(directory, negative_errno())
+                    created <- mkdir_status == 0
                     next <- native_openat(directory, part, flags_directory() + flag_no_follow)
                 return close_error(directory, negative_errno()) if next < 0
+                if created:
+                    for index in 0..<finish |created_directories, name|:
+                        created_directories.push(name[index])
+                    created_directories.push(0)
                 if native_fsync(directory) != 0:
                     errno_value: i64 = negative_errno()
                     return close_two_error(directory, next, errno_value)
@@ -957,9 +966,12 @@ module PlatformNative:
                 start <- finish + 1.usize()
             return directory
 
-        def extraction_failure(root: i64, seen: darray[u8]&, errno_value: i64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            cleanup_ok: bool = cleanup_archive_files(root, seen)
-            return -5 if not cleanup_ok or native_close(root) != 0
+        def extraction_failure(root: i64, seen: darray[u8]&, created_directories: darray[u8]&, errno_value: i64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            cleanup_ok: mutable bool = cleanup_archive_files(root, seen)
+            cleanup_ok <- cleanup_archive_directories(root, created_directories) and cleanup_ok
+            sync_status: i64 = native_fsync(root)
+            close_status: i64 = native_close(root)
+            return -5 if not cleanup_ok or sync_status != 0 or close_status != 0
             return errno_value
 
         def cleanup_archive_files(root: i64, seen: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -974,7 +986,8 @@ module PlatformNative:
                     name.push(seen[index])
                 copy: mutable darray[u8] = []
                 leaf_offset: mutable usize = 0.usize()
-                parent: i64 = archive_open_parent(root, name, &copy, &leaf_offset)
+                empty_directories: mutable darray[u8] = []
+                parent: i64 = archive_open_parent(root, name, &copy, &leaf_offset, false, &empty_directories)
                 if parent >= 0:
                     leaf: cstr = (&copy[leaf_offset]).cast[cstr] can Unsafe.PointerCast
                     removed: i64 = native_unlinkat(parent, leaf, 0)
@@ -983,6 +996,40 @@ module PlatformNative:
                 else:
                     cleanup_ok <- false
                 cursor <- end + 1.usize()
+            return cleanup_ok
+
+        def cleanup_archive_directories(root: i64, created_directories: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            offsets: mutable darray[usize] = []
+            cursor: mutable usize = 0.usize()
+            while cursor < created_directories.count:
+                offsets.push(cursor)
+                finish: mutable usize = cursor
+                while finish < created_directories.count and created_directories[finish] != 0 |created_directories, finish|:
+                    finish <- finish + 1.usize()
+                return false if finish == created_directories.count
+                cursor <- finish + 1.usize()
+            cleanup_ok: mutable bool = true
+            for step in 0..<offsets.count |offsets, created_directories, root, cleanup_ok, step|:
+                record: usize = offsets[offsets.count - 1.usize() - step]
+                finish: mutable usize = record
+                while finish < created_directories.count and created_directories[finish] != 0 |created_directories, finish|:
+                    finish <- finish + 1.usize()
+                name: mutable darray[u8] = []
+                for index in record..<finish |name, created_directories|:
+                    name.push(created_directories[index])
+                copy: mutable darray[u8] = []
+                leaf_offset: mutable usize = 0.usize()
+                empty_directories: mutable darray[u8] = []
+                parent: i64 = archive_open_parent(root, name, &copy, &leaf_offset, false, &empty_directories)
+                if parent == -2:
+                    continue
+                if parent < 0:
+                    cleanup_ok <- false
+                    continue
+                leaf: cstr = (&copy[leaf_offset]).cast[cstr] can Unsafe.PointerCast
+                removed: i64 = native_unlinkat(parent, leaf, at_remove_directory)
+                cleanup_ok <- false if removed != 0 and current_errno() != 2
+                cleanup_ok <- false if native_close(parent) != 0
             return cleanup_ok
 
         const regular_mode: u64 = 32768

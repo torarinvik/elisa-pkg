@@ -305,6 +305,7 @@ ARCHIVE_PROBE="$ROOT/build/archive-probe-$$.elisa"
 ARCHIVE_BIN="$ROOT/build/archive-probe-$$"
 ARCHIVE_EXTRACT_DIR="$ROOT/build/archive-extract-$$"
 mkdir -p "$ARCHIVE_EXTRACT_DIR"
+mkdir -p "$ARCHIVE_EXTRACT_DIR-partial"
 cat > "$ARCHIVE_PROBE" <<EOF
 include "$ROOT/src/archive.elisa"
 
@@ -354,6 +355,19 @@ def main() -> i64:
     append_zeroes(&duplicate, 509)
     append_zeroes(&duplicate, 1024)
     return 4 if Archive::verify_ustar_archive(duplicate)
+    nested_name: mutable darray[u8] = [110, 101, 115, 116, 101, 100, 47, 102, 105, 108, 101]
+    nested_header: darray[u8] = Archive::tar_file_header(nested_name, 3)
+    partial: mutable darray[u8] = []
+    append_bytes(&partial, nested_header)
+    partial.push(97)
+    partial.push(98)
+    partial.push(99)
+    append_zeroes(&partial, 509)
+    partial.push(1)
+    append_zeroes(&partial, 511)
+    partial_destination: mutable darray[u8] = []
+    append_text(&partial_destination, "$ARCHIVE_EXTRACT_DIR-partial")
+    return 6 if Archive::extract_ustar_archive(partial, partial_destination)
     return 0
 EOF
 ELISA_STAGE1_BIN="${ELISA_STAGE1_BIN:-$ELISA_COMPILER_ROOT/bin/elisac-stage1}" \
@@ -363,6 +377,7 @@ ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_COMPILER_ROOT/build/runtime/elisa
 "$ARCHIVE_BIN"
 test -f "$ARCHIVE_EXTRACT_DIR/src/main.elisa"
 test "$(cat "$ARCHIVE_EXTRACT_DIR/src/main.elisa")" = abc
+test -z "$(find "$ARCHIVE_EXTRACT_DIR-partial" -mindepth 1 -print -quit)"
 
 # Read-only graph inspection must not refresh a registry or depend on its
 # current availability. A structurally valid v3 lock with matching local root
