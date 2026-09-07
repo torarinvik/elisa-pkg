@@ -176,6 +176,11 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
     lines.append('    solver_result <- Solver::solve(solver_candidates, solver_roots, &solver_selected)')
     check('solver_result == Solver::SolveCode.Unsatisfiable')
     lines.extend([
+        '    solver_conflict: mutable Solver::Conflict = Solver::Conflict{package: [], first_requirement: [], second_requirement: []}',
+        '    solver_conflict_result: Solver::SolveCode = Solver::solve_with_conflict(solver_candidates, solver_roots, &solver_selected, &solver_conflict)',
+    ])
+    check('solver_conflict_result == Solver::SolveCode.Unsatisfiable and solver_conflict.package.count == 1.usize() and solver_conflict.first_requirement.count == solver_requirement.count and solver_conflict.second_requirement.count == solver_requirement.count')
+    lines.extend([
         '    solver_extra_name: mutable darray[u8] = [98]',
         '    solver_extra_candidates: mutable darray[Solver::Candidate] = []',
         '    solver_extra_candidates.push(Solver::Candidate{package: solver_name, version: Model::Version{major: 1, minor: 0, patch: 0, prerelease: false}, dependencies: solver_dependencies, yanked: false})',
@@ -207,6 +212,16 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
     ])
     check('solver_result == Solver::SolveCode.Solved')
     check('solver_selected_two.count == 2.usize() and solver_selected_two[0] == 0.usize() and solver_selected_two[1] == 2.usize()')
+    lines.extend([
+        '    solver_candidates_two[2].yanked <- true',
+        '    solver_result <- Solver::solve(solver_candidates_two, solver_roots_two, &solver_selected_two)',
+    ])
+    check('solver_result == Solver::SolveCode.Unsatisfiable')
+    lines.extend([
+        '    solver_conflict_two: mutable Solver::Conflict = Solver::Conflict{package: [], first_requirement: [], second_requirement: []}',
+        '    solver_conflict_two_result: Solver::SolveCode = Solver::solve_with_conflict(solver_candidates_two, solver_roots_two, &solver_selected_two, &solver_conflict_two)',
+    ])
+    check('solver_conflict_two_result == Solver::SolveCode.Unsatisfiable and solver_conflict_two.package.count == solver_a_name.count and solver_conflict_two.first_requirement.count == solver_a_req_one.count and solver_conflict_two.second_requirement.count == solver_a_req_two.count')
     lines.extend([
         '    cycle_a_name: mutable darray[u8] = [99]',
         '    cycle_b_name: mutable darray[u8] = [100]',

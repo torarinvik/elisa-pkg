@@ -20,6 +20,11 @@ module Solver:
             package: mutable darray[u8]
             requirement: mutable darray[u8]
 
+        struct Conflict:
+            package: mutable darray[u8]
+            first_requirement: mutable darray[u8]
+            second_requirement: mutable darray[u8]
+
         struct Candidate:
             package: mutable darray[u8]
             version: mutable Model::Version
@@ -82,6 +87,61 @@ module Solver:
                 selected.push(assigned[slot].usize()) if assigned[slot] >= 0
             return SolveCode.Solved
 
+        # Solve while retaining a bounded, deterministic explanation for an
+        # unsatisfiable graph. The original `solve` API remains unchanged for
+        # callers that only need a status; this companion records the first
+        # package whose requirements have no common candidate. A repeated
+        # requirement in both fields means that one range has no candidates at
+        # all. The explanation is diagnostic data only and never affects the
+        # selected graph or candidate ordering.
+        def solve_with_conflict(candidates: darray[Candidate]&, roots: darray[Constraint]&, selected: mutable darray[usize]&, conflict: mutable Conflict&) -> SolveCode can[Memory.Allocate, Abort.Panic]:
+            conflict.package.resize(0)
+            conflict.first_requirement.resize(0)
+            conflict.second_requirement.resize(0)
+            result: SolveCode = solve(candidates, roots, selected)
+            return result if result != SolveCode.Unsatisfiable
+            # Keep this write path in the public entry point. The Elisa
+            # compiler currently has an unsafe lowering edge for passing a
+            # mutable struct containing three darrays through another helper;
+            # direct field writes preserve the ownership of every output
+            # buffer and keep diagnostics fail-closed.
+            constraints: mutable darray[Constraint] = []
+            for index in 0..<roots.count |constraints, roots|:
+                constraints.push(roots[index])
+            for candidate_index in 0..<candidates.count |constraints, candidates, candidate_index|:
+                for dependency_index in 0..<candidates[candidate_index].dependencies.count |constraints, candidates, candidate_index|:
+                    return result if constraints.count >= max_constraints
+                    constraints.push(candidates[candidate_index].dependencies[dependency_index])
+            for first in 0..<constraints.count |constraints, candidates, conflict|:
+                if not solver_requirement_has_candidate(candidates, constraints[first]):
+                    conflict.package.resize(0)
+                    conflict.first_requirement.resize(0)
+                    conflict.second_requirement.resize(0)
+                    for byte_index in 0..<constraints[first].package.count |constraints, conflict, first|:
+                        conflict.package.push(constraints[first].package[byte_index])
+                    for byte_index in 0..<constraints[first].requirement.count |constraints, conflict, first|:
+                        conflict.first_requirement.push(constraints[first].requirement[byte_index])
+                        conflict.second_requirement.push(constraints[first].requirement[byte_index])
+                    return result
+            for first in 0..<constraints.count |constraints, candidates, conflict|:
+                comparisons: mutable usize = 0.usize()
+                for second in first + 1.usize()..<constraints.count |constraints, candidates, first, second, comparisons, conflict|:
+                    continue if not solver_equal(constraints[first].package, constraints[second].package)
+                    comparisons <- comparisons + 1.usize()
+                    continue if comparisons > 128.usize()
+                    if not solver_requirement_pair_has_candidate(candidates, constraints[first], constraints[second]):
+                        conflict.package.resize(0)
+                        conflict.first_requirement.resize(0)
+                        conflict.second_requirement.resize(0)
+                        for byte_index in 0..<constraints[first].package.count |constraints, conflict, first|:
+                            conflict.package.push(constraints[first].package[byte_index])
+                        for byte_index in 0..<constraints[first].requirement.count |constraints, conflict, first|:
+                            conflict.first_requirement.push(constraints[first].requirement[byte_index])
+                        for byte_index in 0..<constraints[second].requirement.count |constraints, conflict, second|:
+                            conflict.second_requirement.push(constraints[second].requirement[byte_index])
+                        return result
+            return result
+
     private:
         const max_decisions: usize = 16384
         const max_constraints: usize = 16384
@@ -130,6 +190,23 @@ module Solver:
                 constraints.resize(constraint_mark)
                 assigned[best_slot] <- -1
             return SolveCode.Unsatisfiable
+
+        def solver_requirement_has_candidate(candidates: darray[Candidate]&, constraint: Constraint) -> bool:
+            for candidate_index in 0..<candidates.count |candidates, constraint|:
+                candidate: Candidate = candidates[candidate_index]
+                continue if candidate.yanked or not solver_equal(candidate.package, constraint.package)
+                parsed: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
+                return true if SemVer::parse_requirement(constraint.requirement, &parsed) and SemVer::matches(parsed, candidate.version)
+            return false
+
+        def solver_requirement_pair_has_candidate(candidates: darray[Candidate]&, first: Constraint, second: Constraint) -> bool:
+            for candidate_index in 0..<candidates.count |candidates, first, second|:
+                candidate: Candidate = candidates[candidate_index]
+                continue if candidate.yanked or not solver_equal(candidate.package, first.package)
+                first_parsed: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
+                second_parsed: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
+                return true if SemVer::parse_requirement(first.requirement, &first_parsed) and SemVer::parse_requirement(second.requirement, &second_parsed) and SemVer::matches(first_parsed, candidate.version) and SemVer::matches(second_parsed, candidate.version)
+            return false
 
         def solver_candidate_satisfies(candidate: Candidate, slot_candidate: usize, constraints: darray[Constraint]&, package_slots: darray[usize]&, candidates: darray[Candidate]&) -> bool:
             for index in 0..<constraints.count |candidate, slot_candidate, constraints, package_slots, candidates|:
