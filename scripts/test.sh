@@ -355,6 +355,7 @@ ARCHIVE_BIN="$ROOT/build/archive-probe-$$"
 ARCHIVE_EXTRACT_DIR="$ROOT/build/archive-extract-$$"
 mkdir -p "$ARCHIVE_EXTRACT_DIR"
 mkdir -p "$ARCHIVE_EXTRACT_DIR-partial"
+mkdir -p "$ARCHIVE_EXTRACT_DIR-end"
 cat > "$ARCHIVE_PROBE" <<EOF
 include "$ROOT/src/archive.elisa"
 
@@ -417,6 +418,11 @@ def main() -> i64:
     partial_destination: mutable darray[u8] = []
     append_text(&partial_destination, "$ARCHIVE_EXTRACT_DIR-partial")
     return 6 if Archive::extract_ustar_archive(partial, partial_destination)
+    # A single zero end block used to bypass rollback after writing files.
+    partial[1024] <- 0
+    end_destination: mutable darray[u8] = []
+    append_text(&end_destination, "$ARCHIVE_EXTRACT_DIR-end")
+    return 7 if Archive::extract_ustar_archive(partial, end_destination)
     return 0
 EOF
 ELISA_STAGE1_BIN="${ELISA_STAGE1_BIN:-$ELISA_COMPILER_ROOT/bin/elisac-stage1}" \
@@ -427,6 +433,7 @@ ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_COMPILER_ROOT/build/runtime/elisa
 test -f "$ARCHIVE_EXTRACT_DIR/src/main.elisa"
 test "$(cat "$ARCHIVE_EXTRACT_DIR/src/main.elisa")" = abc
 test -z "$(find "$ARCHIVE_EXTRACT_DIR-partial" -mindepth 1 -print -quit)"
+test -z "$(find "$ARCHIVE_EXTRACT_DIR-end" -mindepth 1 -print -quit)"
 
 # Read-only graph inspection must not refresh a registry or depend on its
 # current availability. A structurally valid v3 lock with matching local root
