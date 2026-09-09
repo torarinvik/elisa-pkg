@@ -43,6 +43,7 @@ executable must be explicitly present and executable.
 | TLS, registry transport | disabled | fail-closed command tests | Requires reviewed transport adapter |
 | signed metadata | file-backed `primary` fixture provider | Ed25519, expiry, identity, archive, transitive graph, and persistent trust-state fixtures | Requires publisher authorization and protocol review before network use |
 | archive extraction | bounded staged primitive | descriptor-relative no-follow ustar extraction with exclusive regular-file creation and directory fsync | Callers must provide a private empty staging directory |
+| local publish preflight | `publish --dry-run` validates and hashes deterministic archive bytes in memory | human/JSON output and repeated-archive regression fixtures | Authenticated upload and publisher signatures remain disabled |
 
 Unsupported hosts and missing capabilities must produce an actionable error;
 they must not silently fall back to an unreviewed shell or network path.
