@@ -24,6 +24,8 @@ rename. Lower versions and same-version digest changes fail closed; malformed
 or unavailable state is a security error. The default path is
 `$HOME/.local/share/elisapkg/trust/<sha256-of-registry-root>.state`, with
 `ELISAPKG_TRUST_STATE` available for an explicit absolute path. Network
+Override paths must use canonical non-empty components; `.` and `..` are
+rejected before any state directory is opened.
 operations still remain disabled until transport and publisher delegation are
 reviewed. A sibling `.clock` file records the greatest observed wall-clock
 timestamp through the same atomic publication path; malformed values and clock
