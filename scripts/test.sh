@@ -309,6 +309,11 @@ if env -u ELISAPKG_TRUST_STATE HOME="$BAD_TRUST_HOME" ELISAPKG_REGISTRY_DIR="$RO
   echo "control-byte HOME was accepted for trust state" >&2
   exit 1
 fi
+BAD_TRUST_HOME_PARENT="$ROOT/build/home-parent-$$/../escape"
+if env -u ELISAPKG_TRUST_STATE HOME="$BAD_TRUST_HOME_PARENT" ELISAPKG_REGISTRY_DIR="$ROOT" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
+  echo "parent traversal HOME was accepted for trust state" >&2
+  exit 1
+fi
 if ELISAPKG_TRUST_STATE="$ROOT/build/trust-state-parent-$$/../escape.state" ELISAPKG_REGISTRY_DIR="$ROOT" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
   echo "parent traversal trust-state override was accepted" >&2
   exit 1
