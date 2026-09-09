@@ -214,6 +214,10 @@ ELISA_ALLOW_STALE_STAGE1="${ELISA_ALLOW_STALE_STAGE1:-0}" \
 ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_COMPILER_ROOT/build/runtime/elisacore_runtime.o}" \
   "$ELISA_COMPILER_ROOT/scripts/elisac_stage1.sh" -emit exe -o "$REGISTRY_BIN" "$REGISTRY_PROBE"
 env -u ELISAPKG_REGISTRY_DIR "$REGISTRY_BIN"
+if ELISAPKG_REGISTRY_DIR="$ROOT" ELISAPKG_REGISTRY_TRUST_ROOT="$ROOT/../escape.key" "$REGISTRY_BIN" >/dev/null 2>&1; then
+  echo "trust-root traversal override was accepted" >&2
+  exit 1
+fi
 
 # Persistent trust state is outside the project lockfile. Verify monotonic
 # versions, same-version digest pinning, durable re-entry, and fail-closed
