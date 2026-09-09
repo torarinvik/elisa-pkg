@@ -4,8 +4,10 @@ Network source acquisition is disabled in the current binary. `elisapkg fetch`
 verifies local path sources against the lockfile. When `ELISAPKG_REGISTRY_DIR`
 is configured, `fetch PACKAGE REQUIREMENT` also verifies detached Ed25519
 metadata, expiry, archive size, and archive digest for a local registry
-artifact. Remote fetches, `publish`, and remote `install NAME` fail with
+artifact. Remote fetches, real `publish`, and remote `install NAME` fail with
 security status 5 until transport and publisher authorization are configured.
+`publish --dry-run` is a local validation-only preflight and does not cross that
+trust boundary.
 `install --local` is a separate, offline path
 that only publishes the current package's verified build output under the
 user-selected prefix. This is an intentional fail-closed boundary, not a
