@@ -89,6 +89,12 @@ archive. The archive digest is recorded in `.elisapkg/package.receipt` together
 with the manifest and lock digests;
 signing is still required before any remote publication.
 
+`publish --dry-run` performs the release preflight without writing an archive
+or contacting a registry: it requires a valid frozen lockfile, rechecks the
+complete source-tree digest, and validates the selected package file set.
+Successful preflight does not publish bytes or bypass signing and publisher
+authorization requirements.
+
 `install --local` is the deliberately narrow local deployment path. It resolves
 the local graph, builds the current binary, and writes it to
 `$ELISAPKG_INSTALL_PREFIX/bin/<package-name>` (or `$HOME/.local/bin` when the
