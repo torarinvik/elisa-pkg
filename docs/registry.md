@@ -13,6 +13,12 @@ uses an exclusive hard-link publication, so an existing evidence record causes a
 fail-closed error rather than being replaced. No cache
 pathname is treated as proof of authenticity.
 
+`elisapkg publish --dry-run` is the local release preflight for packages that
+will later be published through an authenticated registry. It validates the
+frozen lockfile and source snapshot, generates and verifies the deterministic
+archive twice in memory, and reports its size and digest; it never writes an
+archive or contacts this provider.
+
 Each verified registry archive also gets an immutable receipt in the archive digest
 directory at `<archive-digest>.<metadata-digest>.receipt`. Including both digests
 prevents two authenticated package/version records that share archive bytes from
