@@ -3721,6 +3721,35 @@ module Cli:
             write_ok("verified local locked sources\n")
             return EXIT_OK
 
+        def run_publish_dry_run(start: darray[u8]&) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            # Validate the exact local release inputs without writing an archive
+            # or contacting a registry. Publication itself remains trust-gated,
+            # but callers still need a useful preflight command.
+            if not project_manifest_exists():
+                write_error("error: could not find elisapkg.json in the current directory\n")
+                return EXIT_USAGE
+            raw: mutable darray[u8] = []
+            raw.resize(1048577)
+            return EXIT_USAGE if not read_cstr_into("elisapkg.json", &raw)
+            package_name: mutable darray[u8] = []
+            package_version: mutable darray[u8] = []
+            return EXIT_RESOLVE if not validate_manifest_at(raw, start, &package_name, &package_version)
+            lock_options: Model::CommandOptions = Model::CommandOptions{locked: true, offline: true, frozen: true, json: false, verbose: false, profile: "debug", target_name: "", target_kind: "", update_name: ""}
+            return EXIT_RESOLVE if run_resolve(start, lock_options) != EXIT_OK
+            lock: mutable darray[u8] = []
+            lock.resize(1048577)
+            return EXIT_SECURITY if not read_cstr_into("elisapkg.lock", &lock)
+            return EXIT_SECURITY if not lock_matches_manifest(raw, lock, package_name, package_version, start)
+            source_digest: mutable darray[u8] = []
+            return EXIT_SECURITY if not source_tree_digest_into(&source_digest)
+            entry: mutable darray[u8] = []
+            return EXIT_USAGE if not first_target_entry(raw, &entry)
+            paths: mutable darray[u8] = []
+            return EXIT_USAGE if not collect_package_paths(raw, entry, &paths)
+            write_ok("publish dry-run: manifest, lockfile, source tree, and package file selection are valid\n")
+            write_error("note: signing and authenticated publication are still required\n")
+            return EXIT_OK
+
         def run_publish() -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             write_error(Security::publish_message())
             return Security::publish_status()
@@ -5138,7 +5167,7 @@ module Cli:
                 is_positional: bool = flag_length > 0.usize() and flag[0].u8() != 45
                 positional_allowed: bool = (cstr_equal(command, "why") and positional_count == 0) or (cstr_equal(command, "install") and positional_count == 0) or (cstr_equal(command, "uninstall") and positional_count == 0) or (cstr_equal(command, "cache") and positional_count == 0) or (cstr_equal(command, "fetch") and positional_count < 2)
                 recognized: bool = is_positional and positional_allowed
-                recognized <- true if not is_positional and (cstr_equal(flag, "--locked") or cstr_equal(flag, "--offline") or cstr_equal(flag, "--frozen") or cstr_equal(flag, "--json") or cstr_equal(flag, "--verbose") or cstr_equal(flag, "--quiet") or (cstr_equal(flag, "--list") and cstr_equal(command, "package")) or (cstr_equal(flag, "--dry-run") and cstr_equal(command, "cache")) or (cstr_equal(command, "install") and cstr_equal(flag, "--local")) or (cstr_equal(command, "uninstall") and cstr_equal(flag, "--local")))
+                recognized <- true if not is_positional and (cstr_equal(flag, "--locked") or cstr_equal(flag, "--offline") or cstr_equal(flag, "--frozen") or cstr_equal(flag, "--json") or cstr_equal(flag, "--verbose") or cstr_equal(flag, "--quiet") or (cstr_equal(flag, "--list") and cstr_equal(command, "package")) or (cstr_equal(flag, "--dry-run") and (cstr_equal(command, "cache") or cstr_equal(command, "publish"))) or (cstr_equal(command, "install") and cstr_equal(flag, "--local")) or (cstr_equal(command, "uninstall") and cstr_equal(flag, "--local")))
                 cli_json_output <- true if options.json
                 flags_ok <- false if not recognized
                 positional_count <- positional_count + 1 if recognized and is_positional
@@ -5165,6 +5194,7 @@ module Cli:
             if cstr_equal(command, "fetch"):
                 return run_fetch(effective_argc, effective_slots, &start, options)
             if cstr_equal(command, "publish"):
+                return run_publish_dry_run(start) if effective_argc == 3 and cstr_equal(effective_slots[2].cast[cstr], "--dry-run")
                 return run_publish()
             if cstr_equal(command, "install"):
                 return run_install(effective_argc, effective_slots, &start, options)

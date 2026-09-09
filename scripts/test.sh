@@ -987,6 +987,7 @@ PY
   else
     test "$?" -eq 5
   fi
+  "$BIN" publish --dry-run | grep -F 'publish dry-run: manifest, lockfile, source tree, and package file selection are valid' >/dev/null
   if "$BIN" install app >/dev/null 2>&1; then
     echo "remote install unexpectedly succeeded" >&2
     exit 1
