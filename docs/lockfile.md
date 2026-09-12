@@ -17,9 +17,11 @@ Registry-only graphs use lockfile version 3 and the resolver identifier
 `elisapkg-registry-v1`. Each selected record includes the canonical registry
 identity, exact package/version, archive filename, byte size, archive SHA-256,
 and metadata SHA-256. The resolver verifies the signed metadata and archive
-before emitting these records; the lockfile remains untrusted input and is
-revalidated against the configured registry during `resolve --locked` or
-`fetch`.
+before emitting these records. The lockfile remains untrusted input. `resolve`
+with `--locked` or `--frozen` validates its structure, root fingerprints, and
+direct version constraints without contacting a registry. `fetch` and online
+`build` revalidate registry records against freshly authenticated metadata;
+offline and frozen builds require matching cached signature and archive evidence.
 
 Offline and frozen validation also checks every direct registry requirement
 against its locked SemVer. A structurally valid record with an out-of-range

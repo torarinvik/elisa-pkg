@@ -4673,6 +4673,15 @@ module Cli:
             lock_raw: mutable darray[u8] = []
             lock_raw.resize(1048577)
             return EXIT_BUILD if not read_cstr_into("elisapkg.lock", &lock_raw)
+            # Resolution reads the manifest again and may replace the lock. Bind
+            # both results to the exact manifest snapshot used above to select the
+            # target and compute its receipt, before trusting registry evidence or
+            # starting the compiler.
+            manifest_after_resolve: mutable darray[u8] = []
+            manifest_after_resolve.resize(1048577)
+            return EXIT_BUILD if not read_cstr_into("elisapkg.json", &manifest_after_resolve)
+            return EXIT_BUILD if not bytes_equal(manifest_after_resolve, manifest_raw)
+            return EXIT_BUILD if not lock_matches_manifest(manifest_raw, lock_raw, root_name, root_version, start)
             if lock_version_is(lock_raw, 3):
                 fetch_status: i64 = fetch_registry_lock_offline(manifest_raw, lock_raw, root_name, root_version, start) if options.offline or options.frozen else fetch_registry_lock(manifest_raw, lock_raw, root_name, root_version, start)
                 return fetch_status if fetch_status != EXIT_OK
@@ -4988,9 +4997,22 @@ module Cli:
             # Do not publish an artifact whose compiler input tree changed while
             # the child was running. The receipt records the pre-build digest;
             # rechecking immediately before publication keeps that identity bound
-            # to the bytes that were actually presented to the compiler.
+            # to the inputs that were presented to the compiler. Revalidate the
+            # exact manifest and lock too: local lock validation recomputes every
+            # transitive dependency source digest, including paths outside the root.
+            manifest_after_build: mutable darray[u8] = []
+            manifest_after_build.resize(1048577)
+            lock_after_build: mutable darray[u8] = []
+            lock_after_build.resize(1048577)
+            if not read_cstr_into("elisapkg.json", &manifest_after_build) or not read_cstr_into("elisapkg.lock", &lock_after_build):
+                _ = Platform::pkg_unlink(temp_name)
+                return EXIT_BUILD
+            if not bytes_equal(manifest_after_build, manifest_raw) or not bytes_equal(lock_after_build, lock_raw) or not lock_matches_manifest(manifest_raw, lock_raw, root_name, root_version, start):
+                _ = Platform::pkg_unlink(temp_name)
+                return EXIT_BUILD
             post_source_tree_digest: mutable darray[u8] = []
             if not source_tree_digest_into(&post_source_tree_digest) or not bytes_equal(post_source_tree_digest, source_tree_digest):
+                _ = Platform::pkg_unlink(temp_name)
                 return EXIT_BUILD
             if Platform::pkg_rename(temp_name, artifact_name) != 0:
                 _ = Platform::pkg_unlink(temp_name)

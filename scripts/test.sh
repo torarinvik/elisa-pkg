@@ -779,6 +779,29 @@ mkdir -p "$CASE"
       exit 1
       ;;
   esac
+  cp elisapkg.json elisapkg.build-good
+  INPUT_MUTATING_WRAPPER="$CASE/manifest-mutating-compiler.sh"
+  printf '%s\n' '#!/bin/sh' "printf '\\n' >> '$CASE/elisapkg.json'" "exec '$ELISA_COMPILER_ROOT/scripts/elisac_stage1.sh' \"\$@\"" > "$INPUT_MUTATING_WRAPPER"
+  chmod +x "$INPUT_MUTATING_WRAPPER"
+  if ELISAPKG_COMPILER="$INPUT_MUTATING_WRAPPER" "$BIN" build >/dev/null 2>&1; then
+    echo "build published an artifact after its manifest changed during compilation" >&2
+    exit 1
+  else
+    test "$?" -eq 6
+  fi
+  mv elisapkg.build-good elisapkg.json
+  cp local-util/src/main.elisa local-util/src/main.build-good
+  INPUT_MUTATING_WRAPPER="$CASE/dependency-mutating-compiler.sh"
+  printf '%s\n' '#!/bin/sh' "printf '%s\\n' 'def main() -> i64:' '    return 9' > '$CASE/local-util/src/main.elisa'" "exec '$ELISA_COMPILER_ROOT/scripts/elisac_stage1.sh' \"\$@\"" > "$INPUT_MUTATING_WRAPPER"
+  chmod +x "$INPUT_MUTATING_WRAPPER"
+  if ELISAPKG_COMPILER="$INPUT_MUTATING_WRAPPER" "$BIN" build >/dev/null 2>&1; then
+    echo "build published an artifact after a locked local dependency changed during compilation" >&2
+    exit 1
+  else
+    test "$?" -eq 6
+  fi
+  mv local-util/src/main.build-good local-util/src/main.elisa
+  test -z "$(find .elisapkg/build -name 'app.tmp.*' -print -quit)"
   rm -f local-util/src/helper.elisa
   python3 - <<'PY'
 path = ".elisapkg/build/app"
