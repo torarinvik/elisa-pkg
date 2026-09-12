@@ -144,6 +144,13 @@ destinations, records the artifact SHA-256 digest, and only uninstalls when the
 receipt, package name, path, and current bytes all match. A changed executable
 or receipt is left in place for manual recovery.
 
+The mkdir lock is not released automatically when the process exits. An
+interruption can leave that lock permanently, and interruption between binary
+and receipt publication can leave an executable without its ownership receipt.
+The client fails closed; it does not guess whether a lock or partial artifact is
+stale. Replace this protocol with a persistent kernel lock and identity-checked
+recovery before treating local install as crash-safe.
+
 The local package writer emits only regular files in sorted ustar order with
 zero timestamps and normalized ownership, with a maximum of 512 selected files
 per archive. A shared `PackagePathPolicy` rejects
