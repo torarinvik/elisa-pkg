@@ -19,7 +19,8 @@ from typing import Optional
 
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = ROOT / "scripts" / "fixtures"
-REQUIRE_SANDBOX = os.environ.get("ELISAPKG_REQUIRE_SANDBOX_TESTS") == "1"
+CI_ENABLED = os.environ.get("CI", "").strip().lower() in {"1", "true", "yes"}
+REQUIRE_SANDBOX = os.environ.get("ELISAPKG_REQUIRE_SANDBOX_TESTS") == "1" or CI_ENABLED
 
 
 def unavailable(reason: str) -> int:
