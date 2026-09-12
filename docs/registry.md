@@ -46,10 +46,14 @@ Set `ELISAPKG_REGISTRY_TRUST_ROOT` to an independently provisioned absolute
 file containing exactly 32 raw Ed25519 public-key bytes. The key must not be
 stored under the mutable registry directory. The key and every directory above
 it must be owned by root or the effective user and must not be group- or
-world-writable; symlinks and shared writable directories are rejected. Reads
-use one no-follow descriptor, so the bytes verified are the bytes from the
-checked file. Persisted trust-state and clock files follow the same ownership,
-permission, and descriptor rules. `metadata.sig` is exactly 64 raw Ed25519
+world-writable; symlinks and shared writable directories are rejected. The
+configured key path is compared with the registry path lexically and, when the
+paths exist, by canonical identity as well. Reads use one no-follow descriptor,
+so the bytes verified are the bytes from the checked file. Persisted trust-state
+and clock files follow the same ownership, permission, and descriptor rules.
+On macOS, trusted directory descriptors also reject extended ACL allow entries
+and unknown ACL tags while permitting deny-only entries; Linux ACL grants are
+not inspected. `metadata.sig` is exactly 64 raw Ed25519
 signature bytes. `index` is a
 newline-separated list of unique, complete SemVer versions. The resolver picks
 the highest version satisfying the requested exact, caret, tilde, or comparison
@@ -102,10 +106,13 @@ change is rejected. History is independent of the project lockfile, so
 restoring or deleting a project cannot reset rollback protection. A stale lock
 directory is left for manual recovery and causes a fail-closed trust-state
 error rather than being removed automatically. Beside the state file, elisapkg
-durably records the greatest observed wall-clock value in `<state>.clock` using
-the same exclusive temporary-file, `fsync`, atomic-rename, and parent-directory
-`fsync` sequence. A malformed clock or a later observation below that value is
+durably records the greatest observed wall-clock value and the SHA-256 of the
+exact state bytes in `<state>.clock`, using the same exclusive temporary-file,
+`fsync`, atomic-rename, and parent-directory `fsync` sequence. Both recording
+and read-only verification compare the state digest before using its version
+history. A missing or restored state file with the retained clock therefore
+fails closed. A malformed clock or a later observation below its value is also
 rejected before trust history can advance, protecting expiry checks from a
-wall-clock rollback. Older installations without a clock sidecar start at
-zero and create it on their next verified selection; once records exist, a
-missing sidecar is treated as unavailable state rather than a reset.
+wall-clock rollback. A clock without a state digest is malformed and is not
+migrated automatically. Restoring the state and clock together remains outside
+this user-owned local storage check's protection.

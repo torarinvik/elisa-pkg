@@ -137,8 +137,10 @@ directories and rechecks the final `bin` and receipt directory chains. Uninstall
 requires both existing chains to pass the same check before it reads or removes
 files. Every checked directory must be owned by root or the effective user and
 must not have group or other write bits; symlinks are rejected by the
-descriptor-relative walker. The check does not inspect ACL grants and does not
+descriptor-relative walker. On macOS it rejects extended ACL allow entries and
+unknown tags while accepting deny-only entries; Linux ACL grants remain
+unchecked. The check does not
 prevent same-UID pathname races, so handle-relative identity-checked removal
 remains a release gate for hostile shared directories. Fixtures cover writable
-prefixes and ancestors, symlinked components, and writable binary or receipt
-directories in `scripts/test.sh`.
+prefixes and ancestors, symlinked components, writable binary or receipt
+directories, and macOS ACL cases in `scripts/test.sh`.

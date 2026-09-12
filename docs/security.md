@@ -18,12 +18,14 @@ directories. Existing path components must be real directories owned by root or
 the effective user and must have no group or other write bits. Installation
 then rechecks the completed `bin` and receipt directory chains; uninstall checks
 both existing chains before opening its transaction lock or reading files. This
-reduces cross-user replacement risk for ordinary mode-bit-controlled paths, but
-the check does not inspect ACL grants or prevent pathname races by another
-process with the same user ID. Handle-relative identity-checked removal remains
-required before hostile shared prefixes can be supported.
+reduces cross-user replacement risk. On macOS, every opened directory is also
+checked for extended ACLs: deny-only entries are accepted, while allow entries
+and unknown tags fail closed. Linux ACL grants are not inspected. Neither mode
+nor ACL checks prevent pathname races by another process with the same user ID;
+handle-relative identity-checked removal remains required before hostile shared
+prefixes can be supported.
 
-Before enabling remote packages, the implementation must use an established signed-metadata protocol and an audited cryptographic provider. The client must bootstrap a trusted root out of band, validate threshold-signed role metadata and namespace delegation, bind identity/version/registry/archive digest and size together, enforce expiry and monotonic rollback protection, and persist trusted metadata versions atomically. The local fixture takes this first step by requiring `ELISAPKG_REGISTRY_TRUST_ROOT` to point to an independently provisioned 32-byte key outside `ELISAPKG_REGISTRY_DIR`; registry contents cannot select their own trust root. The key and persisted trust files are opened once through descriptor-relative, no-follow paths. Every directory in those paths and each file must be owned by root or the effective user and must not be group- or world-writable. Symlinks and shared writable directories such as `/tmp` are rejected. The Elisa `Trust` module already exposes fail-closed prechecks for those bindings, publisher attestation, thresholds, revocation, and clock rollback; these prechecks never substitute for cryptographic verification. Publisher authorization must cover the exact deterministic archive bytes. Unknown algorithms, missing thresholds, stale or replayed metadata, invalid signatures, revoked keys, and unauthorized namespaces are hard failures.
+Before enabling remote packages, the implementation must use an established signed-metadata protocol and an audited cryptographic provider. The client must bootstrap a trusted root out of band, validate threshold-signed role metadata and namespace delegation, bind identity/version/registry/archive digest and size together, enforce expiry and monotonic rollback protection, and persist trusted metadata versions atomically. The local fixture takes this first step by requiring `ELISAPKG_REGISTRY_TRUST_ROOT` to point to an independently provisioned 32-byte key outside `ELISAPKG_REGISTRY_DIR`; registry contents cannot select their own trust root. The configured key path is checked against both the configured registry path and their canonical identities when available. The key and persisted trust files are opened once through descriptor-relative, no-follow paths. Every directory in those paths and each file must be owned by root or the effective user and must not be group- or world-writable. Symlinks and shared writable directories such as `/tmp` are rejected. On macOS, directory checks also reject extended ACL allow entries and unknown ACL tags; deny-only entries are accepted. Linux ACL grants are not inspected. The Elisa `Trust` module already exposes fail-closed prechecks for those bindings, publisher attestation, thresholds, revocation, and clock rollback; these prechecks never substitute for cryptographic verification. Publisher authorization must cover the exact deterministic archive bytes. Unknown algorithms, missing thresholds, stale or replayed metadata, invalid signatures, revoked keys, and unauthorized namespaces are hard failures.
 
 The `Trust` module exposes metadata prechecks for expiry, rollback, namespace,
 and algorithm policy plus an exact-byte detached Ed25519 verification gate.
@@ -33,15 +35,18 @@ exclusive lock directory and publish the complete state with a durable atomic
 rename. Lower versions and same-version digest changes fail closed; malformed
 or unavailable state is a security error. The default path is
 `$HOME/.local/share/elisapkg/trust/<sha256-of-registry-root>.state`, with
-`ELISAPKG_TRUST_STATE` available for an explicit absolute path. Network
-Override paths must use canonical non-empty components; `.` and `..` are
-rejected before any state directory is opened.
-operations still remain disabled until transport and publisher delegation are
-reviewed. A sibling `.clock` file records the greatest observed wall-clock
-timestamp through the same atomic publication path; malformed values and clock
-rollback fail closed before expiry or trust-state updates. Removing the sidecar
-after trust history exists is also an unavailable-state error, so deletion
-cannot reset the rollback floor.
+`ELISAPKG_TRUST_STATE` available for an explicit absolute path. Override paths
+must use canonical non-empty components; `.` and `..` are rejected before any
+state directory is opened. Network operations remain disabled until transport
+and publisher delegation are reviewed. The sibling `.clock` file stores both
+the greatest observed wall-clock timestamp and the SHA-256 of the exact state
+bytes. Recording and read-only verification compare that digest before using
+history, so a missing or restored state file with a retained newer clock fails
+closed. The sidecar is written before changed state bytes; a crash between the
+two atomic writes also fails closed. A legacy clock without a state digest is
+malformed and is not migrated automatically. Restoring both user-owned files
+together remains outside this local check's protection because they are not
+anchored in hardware-backed monotonic storage.
 When the default location is used, `HOME` is treated as untrusted input: it
 must be absolute, bounded, and free of control bytes and backslashes. Trailing
 separators are collapsed (while preserving `/`), so equivalent spellings cannot
@@ -187,7 +192,8 @@ state for the local registry fixture, but do not supply the planned remote
 transport or publisher delegation. The current Seatbelt profile applies only
 to compiler children on macOS; output execution and project mutation are not
 sandboxed. Project mutation assumes a trusted, user-owned directory. Local
-installation enforces the root/effective-user ownership and no-group/other-write
-precondition on its directory chain, but it does not inspect ACLs or stop a
-same-UID process from racing pathnames. Handle-relative identity-checked removal
-remains required before hostile shared installation directories are supported.
+installation enforces root/effective-user ownership and no-group/other-write
+permissions on its directory chain. macOS also rejects extended ACL allow
+entries and unknown tags, while Linux ACLs and same-UID pathname races remain
+outside this check. Handle-relative identity-checked removal remains required
+before hostile shared installation directories are supported.

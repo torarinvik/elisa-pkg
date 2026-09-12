@@ -68,6 +68,15 @@ static elif ELISA_TARGET_OS_FREEBSD:
 static else:
     @link_name("__error")
     extern native_errno() -> mutable i32&
+static if ELISA_TARGET_OS_MACOS:
+    @link_name("acl_get_fd_np")
+    extern native_acl_get_fd_np(fd: i32, kind: i32) -> u8&?
+    @link_name("acl_get_entry")
+    extern native_acl_get_entry(acl: u8&, entry_id: i32, entry_out: mutable void&) -> i32
+    @link_name("acl_get_tag_type")
+    extern native_acl_get_tag_type(entry: u8&, tag: mutable i32&) -> i32
+    @link_name("acl_free")
+    extern native_acl_free(value: void&) -> i32
 @link_name("fdopen")
 extern native_fdopen(fd: i64, mode: cstr) -> mutable heap void&?
 @link_name("ferror")
@@ -1422,7 +1431,40 @@ module PlatformNative:
             return trusted_fd(fd, expected_uid, regular_mode)
 
         def trusted_directory_fd(fd: i64, expected_uid: u64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            return trusted_fd(fd, expected_uid, directory_mode)
+            return trusted_fd(fd, expected_uid, directory_mode) and trusted_acl_fd(fd)
+
+        def trusted_acl_fd(fd: i64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            static if ELISA_TARGET_OS_MACOS:
+                native_errno()[0] <- 0
+                if native_acl_get_fd_np(fd.i32(), 256) is acl:
+                    entry_slot: mutable darray[u8&?] = [null]
+                    entry_out: mutable void& = (&entry_slot[0]).cast[mutable void&] can Unsafe.PointerCast
+                    entry_id: mutable i32 = 0
+                    safe: mutable bool = true
+                    while safe:
+                        native_errno()[0] <- 0
+                        entry_status: i32 = native_acl_get_entry(acl, entry_id, entry_out)
+                        if entry_status == 0:
+                            entry_id <- -1
+                            if entry_slot[0] is entry:
+                                tag: mutable i32 = 0
+                                if native_acl_get_tag_type(entry, &tag) != 0 or tag != 2:
+                                    # ACL_EXTENDED_DENY is the only extended
+                                    # ACE accepted. Any allow or unknown tag
+                                    # could grant mutation outside mode bits.
+                                    safe <- false
+                            else:
+                                safe <- false
+                        else:
+                            end_errno: i64 = current_errno()
+                            if entry_id == -1 and end_errno == 22:
+                                break
+                            safe <- false
+                    acl_value: void& = acl.cast[void&] can Unsafe.PointerCast
+                    return native_acl_free(acl_value) == 0 and safe
+                return current_errno() == 2
+            static else:
+                return true
 
         def open_trusted_directory(path: cstr, expected_uid: u64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             length: usize = native_strlen(path)

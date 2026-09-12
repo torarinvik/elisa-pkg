@@ -72,7 +72,11 @@ same-version digest change is rejected even if the project lockfile is deleted
 or restored. The adjacent `.clock` sidecar durably records the greatest wall
 clock value observed for the registry; malformed values and clock rollback are
 rejected before a signed selection can update trust state. Removing it after a
-record exists fails closed rather than resetting that floor.
+record exists fails closed rather than resetting that floor. The sidecar also
+stores the SHA-256 of the exact state bytes; a restored or missing state file
+with the newer sidecar fails closed during both recording and offline
+verification. Restoring both user-owned files together is outside this local
+rollback check's protection.
 The derived `HOME` path is accepted only when it is absolute and contains no
 control bytes or backslashes; trailing separators are normalized, and malformed
 environment input fails closed before any trust-state directory is created.
@@ -106,9 +110,11 @@ unchanged receipt-owned binary; modified files and malformed receipts are
 refused. Before installation or removal, the prefix and its existing directory
 chain must contain only real directories owned by root or the effective user,
 with no group or other write bits; shared writable locations such as `/tmp` are
-refused. This owner and mode check does not inspect ACL grants or stop another
-process running as the same user from racing pathnames. Remote `install NAME`
-remains trust-gated with the other network operations.
+refused. On macOS, the check permits deny-only extended ACLs but rejects allow
+ACEs and unknown ACL entries even when mode bits look safe. Linux ACL grants
+are not inspected, and no platform check prevents pathname races by another
+process running as the same user. Remote `install NAME` remains trust-gated
+with the other network operations.
 
 ## Security posture
 

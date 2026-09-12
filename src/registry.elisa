@@ -168,7 +168,7 @@ module Registry:
             metadata_digest: mutable darray[u8] = []
             return ResultCode.DigestMismatch if Integrity::sha256(metadata, &metadata_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(metadata_digest_bytes, &metadata_digest) or not bytes_equal(metadata_digest, expected_metadata_digest)
             key_path: mutable darray[u8] = []
-            trust_root_status: ResultCode = configured_trust_root(&key_path)
+            trust_root_status: ResultCode = configured_trust_root(root, &key_path)
             return trust_root_status if trust_root_status != ResultCode.Ok
             public_key: mutable darray[u8] = []
             return ResultCode.MissingTrustRoot if read_trusted_file(key_path, 32.usize(), &public_key) != 32
@@ -190,6 +190,9 @@ module Registry:
             root: mutable darray[u8] = []
             return ResultCode.NotConfigured if not configured_root(&root)
             return ResultCode.InvalidConfiguration if not valid_registry_root(root)
+            key_path: mutable darray[u8] = []
+            trust_root_status: ResultCode = configured_trust_root(root, &key_path)
+            return trust_root_status if trust_root_status != ResultCode.Ok
             index_path: mutable darray[u8] = []
             return ResultCode.InvalidConfiguration if not join_path_leaf(root, package, "index", &index_path)
             index: mutable darray[u8] = []
@@ -222,9 +225,6 @@ module Registry:
             return ResultCode.InvalidConfiguration if not sibling_path(metadata_path, "metadata.sig", &signature_path)
             signature: mutable darray[u8] = []
             return ResultCode.MissingSignature if not read_file(signature_path, 64.usize(), &signature)
-            key_path: mutable darray[u8] = []
-            trust_root_status: ResultCode = configured_trust_root(&key_path)
-            return trust_root_status if trust_root_status != ResultCode.Ok
             public_key: mutable darray[u8] = []
             return ResultCode.MissingTrustRoot if read_trusted_file(key_path, 32.usize(), &public_key) != 32
             trust_status: Trust::VerificationCode = Trust::verify_detached("ed25519", public_key, metadata, signature)
@@ -555,7 +555,7 @@ module Registry:
                 return true
             return false
 
-        def configured_trust_root(out: mutable darray[u8]&) -> ResultCode:
+        def configured_trust_root(registry_root: darray[u8]&, out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             # Trust material is configured out of band. Keeping the key next
             # to mutable registry metadata would let a registry replacement
             # replace its own verification root as well.
@@ -576,8 +576,36 @@ module Registry:
                         segment_length: usize = index - segment_start
                         return ResultCode.InvalidConfiguration if segment_length == 0.usize() or segment_length == 1.usize() and value[segment_start].u8() == 46 or segment_length == 2.usize() and value[segment_start].u8() == 46 and value[segment_start + 1.usize()].u8() == 46
                         segment_start <- index + 1.usize()
+                return ResultCode.InvalidConfiguration if path_is_same_or_beneath(out, registry_root)
+                canonical_registry: mutable darray[u8] = []
+                canonical_trust: mutable darray[u8] = []
+                if canonical_path(registry_root, &canonical_registry) and canonical_path(out, &canonical_trust):
+                    return ResultCode.InvalidConfiguration if path_is_same_or_beneath(canonical_trust, canonical_registry)
                 return ResultCode.Ok
             return ResultCode.MissingTrustRoot
+
+        def path_is_same_or_beneath(candidate: darray[u8]&, parent: darray[u8]&) -> bool:
+            return false if parent.count == 0 or candidate.count < parent.count
+            for index in 0..<parent.count |candidate, parent|:
+                return false if candidate[index] != parent[index]
+            return true if candidate.count == parent.count
+            return true if parent.count == 1 and parent[0] == 47
+            return candidate[parent.count] == 47
+
+        def canonical_path(path: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            out.resize(0)
+            path_c: mutable darray[u8] = []
+            path_with_nul(path, &path_c)
+            path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
+            resolved: mutable darray[u8] = []
+            resolved.resize(4096)
+            if Platform::pkg_realpath(path_name, &resolved) is canonical:
+                length: usize = Platform::pkg_strlen(canonical)
+                return false if length == 0 or length > 4096
+                for index in 0..<length |out, canonical|:
+                    out.push(canonical[index].u8())
+                return true
+            return false
 
         def valid_registry_root(root: darray[u8]&) -> bool:
             return false if root.count == 0 or root[0] != 47 or root.count > 4096 or root[root.count - 1] == 47 and root.count > 1
@@ -1189,12 +1217,16 @@ module Registry:
             return trust_state_finish(lock_path, read_status) if read_status != ResultCode.Ok
             observed_clock: mutable u64 = 0
             clock_missing: mutable bool = false
+            observed_state_digest: mutable darray[u8] = []
             clock_path_start: usize = state_path.count
             registry_push_text(&state_path, ".clock")
-            clock_status: ResultCode = trust_clock_read(state_path, &observed_clock, &clock_missing)
+            clock_status: ResultCode = trust_clock_read(state_path, &observed_clock, &observed_state_digest, &clock_missing)
             state_path.resize(clock_path_start)
             return trust_state_finish(lock_path, clock_status) if clock_status != ResultCode.Ok
             return trust_state_finish(lock_path, ResultCode.TrustStateUnavailable) if clock_missing and state.count > 23.usize()
+            current_state_digest: mutable darray[u8] = []
+            return trust_state_finish(lock_path, ResultCode.TrustStateUnavailable) if not trust_state_digest(state, &current_state_digest)
+            return trust_state_finish(lock_path, ResultCode.TrustStateUnavailable) if not clock_missing and not bytes_equal(observed_state_digest, current_state_digest)
             now: i64 = Platform::pkg_wall_clock_seconds()
             return trust_state_finish(lock_path, ResultCode.TrustStateUnavailable) if now < 0
             return trust_state_finish(lock_path, ResultCode.ClockRollback) if observed_clock > now.u64()
@@ -1209,7 +1241,7 @@ module Registry:
                 return trust_state_finish(lock_path, ResultCode.DigestMismatch) if SemVer::compare(parsed, previous) == 0 and not bytes_equal(previous_digest, digest)
                 if SemVer::compare(parsed, previous) == 0:
                     registry_push_text(&state_path, ".clock")
-                    clock_written: bool = trust_clock_write(state_path, now.u64())
+                    clock_written: bool = trust_clock_write(state_path, now.u64(), current_state_digest)
                     state_path.resize(clock_path_start)
                     return trust_state_finish(lock_path, ResultCode.TrustStateUnavailable) if not clock_written
                     return trust_state_finish(lock_path, ResultCode.Ok)
@@ -1217,19 +1249,21 @@ module Registry:
                 registry_push_text(&state, "elisapkg-trust-state:1\n")
             record_size: usize = package.count + version.count + digest.count + 3.usize()
             return trust_state_finish(lock_path, ResultCode.TrustStateUnavailable) if record_size > 1048576.usize() or state.count > 1048576.usize() - record_size
-            # Advance the durable clock before adding a package record. If the
-            # record write fails after this point, the stricter clock still
-            # prevents an older timestamp from being accepted later.
-            registry_push_text(&state_path, ".clock")
-            clock_written: bool = trust_clock_write(state_path, now.u64())
-            state_path.resize(clock_path_start)
-            return trust_state_finish(lock_path, ResultCode.TrustStateUnavailable) if not clock_written
             registry_push_array(&state, package)
             state.push(32)
             registry_push_array(&state, version)
             state.push(32)
             registry_push_array(&state, digest)
             state.push(10)
+            updated_state_digest: mutable darray[u8] = []
+            return trust_state_finish(lock_path, ResultCode.TrustStateUnavailable) if not trust_state_digest(state, &updated_state_digest)
+            # Bind the proposed state bytes into the sidecar before publishing
+            # the state. A crash between these atomic writes leaves a mismatch,
+            # which fails closed instead of accepting either history.
+            registry_push_text(&state_path, ".clock")
+            clock_written: bool = trust_clock_write(state_path, now.u64(), updated_state_digest)
+            state_path.resize(clock_path_start)
+            return trust_state_finish(lock_path, ResultCode.TrustStateUnavailable) if not clock_written
             return trust_state_finish(lock_path, ResultCode.TrustStateUnavailable) if not trust_state_write(state_path, state)
             return trust_state_finish(lock_path, ResultCode.Ok)
 
@@ -1252,13 +1286,17 @@ module Registry:
             return read_status if read_status != ResultCode.Ok
             observed_clock: mutable u64 = 0
             clock_missing: mutable bool = false
+            observed_state_digest: mutable darray[u8] = []
             clock_path: mutable darray[u8] = []
             for index in 0..<state_path.count |clock_path, state_path|:
                 clock_path.push(state_path[index])
             registry_push_text(&clock_path, ".clock")
-            clock_status: ResultCode = trust_clock_read(clock_path, &observed_clock, &clock_missing)
+            clock_status: ResultCode = trust_clock_read(clock_path, &observed_clock, &observed_state_digest, &clock_missing)
             return clock_status if clock_status != ResultCode.Ok
             return ResultCode.TrustStateUnavailable if clock_missing and state.count > 23.usize()
+            current_state_digest: mutable darray[u8] = []
+            return ResultCode.TrustStateUnavailable if not trust_state_digest(state, &current_state_digest)
+            return ResultCode.TrustStateUnavailable if not clock_missing and not bytes_equal(observed_state_digest, current_state_digest)
             now: i64 = Platform::pkg_wall_clock_seconds()
             return ResultCode.TrustStateUnavailable if now < 0
             return ResultCode.ClockRollback if observed_clock > now.u64()
@@ -1275,35 +1313,52 @@ module Registry:
             return ResultCode.TrustStateUnavailable if not bytes_equal(previous_digest, digest)
             return ResultCode.Ok
 
-        def trust_clock_read(path: darray[u8]&, out: mutable u64&, missing: mutable bool&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+        def trust_clock_read(path: darray[u8]&, out: mutable u64&, state_digest: mutable darray[u8]&, missing: mutable bool&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out <- 0
+            state_digest.resize(0)
             missing <- false
             loaded: mutable darray[u8] = []
-            read_status: i64 = read_trusted_file(path, 64.usize(), &loaded)
+            read_status: i64 = read_trusted_file(path, 128.usize(), &loaded)
             if read_status < 0:
                 if read_status == -2:
                     missing <- true
                     return ResultCode.Ok
                 return ResultCode.TrustStateUnavailable
-            return ResultCode.TrustStateMalformed if loaded.count < 8.usize() or loaded.count > 64.usize()
+            return ResultCode.TrustStateMalformed if loaded.count < 86.usize() or loaded.count > 105.usize()
             prefix: cstr = "clock:"
             prefix_length: usize = Platform::pkg_strlen(prefix)
             return ResultCode.TrustStateMalformed if loaded.count <= prefix_length + 1.usize()
             for index in 0..<prefix_length |loaded, prefix|:
                 return ResultCode.TrustStateMalformed if loaded[index] != prefix[index].u8()
-            return ResultCode.TrustStateMalformed if loaded[loaded.count - 1.usize()] != 10
             value: mutable u64 = 0
             cursor: mutable usize = prefix_length
-            finish: usize = loaded.count - 1.usize()
-            return ResultCode.TrustStateMalformed if cursor == finish
-            while cursor < finish:
+            while cursor < loaded.count and loaded[cursor] != 10:
                 return ResultCode.TrustStateMalformed if loaded[cursor] < 48 or loaded[cursor] > 57
                 digit: u64 = (loaded[cursor] - 48).u64()
                 return ResultCode.TrustStateMalformed if value > (18446744073709551615.u64() - digit) / 10.u64()
                 value <- value * 10.u64() + digit
                 cursor <- cursor + 1.usize()
+            return ResultCode.TrustStateMalformed if cursor == prefix_length or cursor >= loaded.count
+            cursor <- cursor + 1.usize()
+            hash_prefix: cstr = "state-sha256:"
+            hash_prefix_length: usize = Platform::pkg_strlen(hash_prefix)
+            return ResultCode.TrustStateMalformed if loaded.count != cursor + hash_prefix_length + 65.usize()
+            for index in 0..<hash_prefix_length |loaded, hash_prefix|:
+                return ResultCode.TrustStateMalformed if loaded[cursor + index] != hash_prefix[index].u8()
+            cursor <- cursor + hash_prefix_length
+            for index in 0..<64.usize() |loaded, state_digest, cursor|:
+                byte: u8 = loaded[cursor + index]
+                return ResultCode.TrustStateMalformed if (byte < 48 or byte > 57) and (byte < 97 or byte > 102)
+                state_digest.push(byte)
+            return ResultCode.TrustStateMalformed if loaded[loaded.count - 1.usize()] != 10
             out <- value
             return ResultCode.Ok
+
+        def trust_state_digest(state: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            digest_bytes: mutable darray[u8] = []
+            out.resize(0)
+            return false if Integrity::sha256(state, &digest_bytes) != Integrity::DigestCode.Ok
+            return Integrity::hex_digest(digest_bytes, out)
 
         def trust_clock_append_decimal(out: mutable darray[u8]&, value: u64) -> void can[Memory.Allocate, Abort.Panic]:
             start: usize = out.count
@@ -1328,10 +1383,14 @@ module Registry:
                     left <- left + 1.usize()
             out.resize(cursor)
 
-        def trust_clock_write(path: darray[u8]&, value: u64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+        def trust_clock_write(path: darray[u8]&, value: u64, state_digest: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            return false if not valid_digest(state_digest)
             encoded: mutable darray[u8] = []
             registry_push_text(&encoded, "clock:")
             trust_clock_append_decimal(&encoded, value)
+            encoded.push(10)
+            registry_push_text(&encoded, "state-sha256:")
+            registry_push_array(&encoded, state_digest)
             encoded.push(10)
             return trust_state_write(path, encoded)
 
