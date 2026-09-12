@@ -38,10 +38,13 @@ fails closed and the lockfile is never rewritten.
 
 Lock replacement uses an exclusive `mkstemp` file in the project directory, writes all bytes with short-write handling, calls `fsync`, closes the descriptor, and atomically renames the temporary file into place. A failed write or durability step leaves the previous lock untouched; the owner-only temporary evidence is retained for a later recovery or cleanup pass instead of unlinking a pathname that could have been replaced concurrently.
 
-Dependency edits also journal the original manifest and, when present, the
-original lock under `.elisapkg/transaction.*`. A state marker is advanced only
-after each replacement; startup recovery restores the original pair for an
-unfinished transaction and removes the journal after a completed one.
+Dependency edits and normal lockfile refreshes journal the original manifest
+and, when present, the original lock under `.elisapkg/transaction.*`. New lock
+bytes are staged before the lockfile is atomically replaced. Startup recovery
+claims the exclusive guard before replaying a stale journal and removes the
+journal after a completed transaction. An existing guard blocks recovery, so a
+second process cannot restore the old pair during a live edit. A leftover guard
+after interruption remains fail-closed and requires explicit operator recovery.
 
 Registry entries will add the registry identity, exact version, immutable source descriptor, archive size and SHA-256 digest, authenticated metadata version, signer/delegation identity, and normalized dependency edges. Absolute paths, credentials, host-specific temporary locations, and mutable branch names do not belong in a published lockfile.
 

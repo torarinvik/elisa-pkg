@@ -19,6 +19,7 @@ export ELISA_ALLOW_STALE_STAGE1="${ELISA_ALLOW_STALE_STAGE1:-0}"
 "$BIN" doctor | grep -F 'local Ed25519 provider available' >/dev/null
 python3 "$ROOT/scripts/ffi_boundary_test.py"
 python3 "$ROOT/scripts/ffi_fifo_regression.py"
+python3 "$ROOT/scripts/transaction_guard_regression.py"
 python3 "$ROOT/scripts/sandbox_policy_test.py"
 
 # Global output modes are strict: quiet suppresses human success text without
@@ -1957,6 +1958,18 @@ PY
   printf '%s\n' '{}' > .elisapkg/transaction.new-manifest
   printf '%s\n' 'manifest-replaced' > .elisapkg/transaction.state
   cp .elisapkg/transaction.new-manifest elisapkg.json
+  mkdir .elisapkg/transaction.guard
+  if "$BIN" check-manifest >/dev/null 2>&1; then
+    echo "transaction recovery modified a journal while its guard was held" >&2
+    exit 1
+  else
+    test "$?" -eq 5
+  fi
+  cmp .elisapkg/transaction.new-manifest elisapkg.json >/dev/null
+  cmp .elisapkg/transaction.lock elisapkg.lock >/dev/null
+  test -f .elisapkg/transaction.state
+  test -d .elisapkg/transaction.guard
+  rmdir .elisapkg/transaction.guard
   "$BIN" check-manifest >/dev/null
   cmp recovered.manifest elisapkg.json >/dev/null
   test ! -e .elisapkg/transaction.state

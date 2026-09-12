@@ -594,7 +594,7 @@ module Cli:
             return false if not remove_empty_directory(&guard)
             return true
 
-        def transaction_begin(original_manifest: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+        def transaction_begin_with_lock(original_manifest: darray[u8]&, expected_lock_state: i64, expected_lock: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             state_root: mutable darray[u8] = []
             bytes_push_view(&state_root, ".elisapkg")
             return false if not make_directory(&state_root)
@@ -611,6 +611,26 @@ module Cli:
             if transaction_state != -2:
                 _ = remove_empty_directory(&guard)
                 return false
+            # The caller prepared its edit before taking the guard. Another
+            # transaction may have committed in that interval, so compare the
+            # live manifest again while holding the exclusive guard instead of
+            # overwriting a newer dependency edit from a stale snapshot.
+            current_manifest: mutable darray[u8] = []
+            current_manifest.resize(1048577)
+            if not read_cstr_into("elisapkg.json", &current_manifest) or not bytes_equal(current_manifest, original_manifest):
+                _ = remove_empty_directory(&guard)
+                return false
+            if expected_lock_state != -3:
+                current_lock_state: i64 = Platform::pkg_package_file_size("elisapkg.lock")
+                if current_lock_state != expected_lock_state:
+                    _ = remove_empty_directory(&guard)
+                    return false
+                if current_lock_state >= 0:
+                    current_lock: mutable darray[u8] = []
+                    current_lock.resize(1048577)
+                    if not read_cstr_into("elisapkg.lock", &current_lock) or not bytes_equal(current_lock, expected_lock):
+                        _ = remove_empty_directory(&guard)
+                        return false
             if not write_cstr_file(".elisapkg/transaction.manifest", original_manifest):
                 _ = transaction_cleanup()
                 return false
@@ -633,6 +653,10 @@ module Cli:
                 return false
             return true
 
+        def transaction_begin(original_manifest: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            no_expected_lock: mutable darray[u8] = []
+            return transaction_begin_with_lock(original_manifest, -3, no_expected_lock)
+
         def transaction_mark_manifest() -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             new_manifest: mutable darray[u8] = []
             new_manifest.resize(1048577)
@@ -643,11 +667,21 @@ module Cli:
             return write_cstr_file(".elisapkg/transaction.state", &state)
 
         def transaction_mark_lock() -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            staged_state: i64 = Platform::pkg_package_file_size(".elisapkg/transaction.new-lock")
+            return false if staged_state < 0 and staged_state != -2
+            if staged_state >= 0:
+                staged_lock: mutable darray[u8] = []
+                staged_lock.resize(1048577)
+                return false if not read_cstr_into(".elisapkg/transaction.new-lock", &staged_lock)
+                current_lock: mutable darray[u8] = []
+                current_lock.resize(1048577)
+                return false if not read_cstr_into("elisapkg.lock", &current_lock)
+                return bytes_equal(staged_lock, current_lock)
             if cstr_file_exists("elisapkg.lock"):
-                new_lock: mutable darray[u8] = []
-                new_lock.resize(1048577)
-                return false if not read_cstr_into("elisapkg.lock", &new_lock)
-                return write_cstr_file(".elisapkg/transaction.new-lock", &new_lock)
+                current_lock: mutable darray[u8] = []
+                current_lock.resize(1048577)
+                return false if not read_cstr_into("elisapkg.lock", &current_lock)
+                return write_cstr_file(".elisapkg/transaction.new-lock", &current_lock)
             missing: mutable darray[u8] = []
             bytes_push_view(&missing, "missing\n")
             return write_cstr_file(".elisapkg/transaction.new-lock-missing", &missing)
@@ -700,7 +734,7 @@ module Cli:
                 elif not original_lock_present or not bytes_equal(current_lock, original_lock):
                     write_error("error: transaction recovery found an external lockfile edit; recovery files were retained\n")
                     return false
-            elif original_lock_present or new_lock_state >= 0:
+            elif original_lock_present:
                 write_error("error: transaction recovery found an external lockfile edit; recovery files were retained\n")
                 return false
             return false if not write_cstr_file("elisapkg.json", &original_manifest)
@@ -710,17 +744,43 @@ module Cli:
                 return false if not remove_cstr_file("elisapkg.lock")
             return transaction_cleanup()
 
+        def transaction_guard_absent() -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            guard: mutable darray[u8] = []
+            bytes_push_view(&guard, ".elisapkg/transaction.guard")
+            guard_c: mutable darray[u8] = []
+            path_with_nul_into(&guard, &guard_c)
+            guard_name: cstr = (&guard_c[0]).cast[cstr] can Unsafe.PointerCast
+            guard_state: i64 = Platform::pkg_package_file_size(guard_name)
+            return true if guard_state == -2
+            write_error("error: package edit is active or interrupted; wait for it to finish or follow the transaction recovery instructions\n")
+            return false
+
         def transaction_recover() -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
-            transaction_state: i64 = Platform::pkg_package_file_size(".elisapkg/transaction.state")
+            transaction_state: mutable i64 = Platform::pkg_package_file_size(".elisapkg/transaction.state")
             if transaction_state == -2:
-                guard: mutable darray[u8] = []
-                bytes_push_view(&guard, ".elisapkg/transaction.guard")
-                guard_c: mutable darray[u8] = []
-                path_with_nul_into(&guard, &guard_c)
-                guard_name: cstr = (&guard_c[0]).cast[cstr] can Unsafe.PointerCast
-                guard_state: i64 = Platform::pkg_package_file_size(guard_name)
-                return true if guard_state == -2
+                return transaction_guard_absent()
+            return false if transaction_state < 0
+            # A state file without a guard is a stale journal. Claim the guard
+            # before reading or replaying it so only one recovery process can
+            # own the files, and no new edit can start while recovery runs.
+            return false if not transaction_guard_absent()
+            state_root: mutable darray[u8] = []
+            bytes_push_view(&state_root, ".elisapkg")
+            return false if not make_directory(&state_root)
+            guard: mutable darray[u8] = []
+            bytes_push_view(&guard, ".elisapkg/transaction.guard")
+            guard_c: mutable darray[u8] = []
+            path_with_nul_into(&guard, &guard_c)
+            guard_name: cstr = (&guard_c[0]).cast[cstr] can Unsafe.PointerCast
+            if Platform::pkg_mkdir(guard_name, 448.u16()) != 0:
+                write_error("error: package edit is active or interrupted; wait for it to finish or follow the transaction recovery instructions\n")
                 return false
+            # Another recovery may have completed between our initial state
+            # read and guard acquisition. In that case, release the guard we
+            # just created and let the command proceed.
+            transaction_state <- Platform::pkg_package_file_size(".elisapkg/transaction.state")
+            if transaction_state == -2:
+                return remove_empty_directory(&guard)
             return false if transaction_state < 0
             state: mutable darray[u8] = []
             state.resize(128)
@@ -2786,7 +2846,7 @@ module Cli:
                 _ = transaction_restore()
                 return EXIT_SOURCE
             options: Model::CommandOptions = Model::CommandOptions{locked: false, offline: false, frozen: false, json: false, verbose: false, profile: "debug", target_name: "", target_kind: "", update_name: ""}
-            resolved: i64 = run_resolve(&root, options)
+            resolved: i64 = run_resolve(&root, options, true)
             if resolved != EXIT_OK:
                 restored: bool = transaction_restore()
                 if not restored:
@@ -3106,7 +3166,7 @@ module Cli:
             write_ok("\n")
             return EXIT_OK
 
-        def run_resolve(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+        def run_resolve(start: darray[u8]&, options: Model::CommandOptions, transaction_owned: bool) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             if not project_manifest_exists():
                 write_error("error: could not find elisapkg.json in the current directory\n")
                 return EXIT_USAGE
@@ -3224,7 +3284,27 @@ module Cli:
                 existing.resize(1048577)
                 return EXIT_RESOLVE if not read_cstr_into("elisapkg.lock", &existing)
                 return EXIT_RESOLVE if not bytes_equal(existing, lock)
-            return EXIT_RESOLVE if not (options.locked or options.frozen) and not write_cstr_file("elisapkg.lock", &lock)
+            if not (options.locked or options.frozen):
+                if not transaction_owned:
+                    if not transaction_begin_with_lock(raw, lock_state, preferred_lock):
+                        write_error("error: could not claim the package transaction; another edit may be active or the manifest or lockfile may have changed\n")
+                        return EXIT_SECURITY
+                # Record the exact replacement before publishing it. Recovery
+                # can then distinguish our new lock from an unrelated edit if
+                # the process stops between these two writes.
+                if not write_cstr_file(".elisapkg/transaction.new-lock", &lock):
+                    if not transaction_owned:
+                        _ = transaction_restore()
+                    return EXIT_SECURITY
+                if not write_cstr_file("elisapkg.lock", &lock):
+                    if not transaction_owned:
+                        _ = transaction_restore()
+                    return EXIT_RESOLVE
+                if not transaction_owned:
+                    if not transaction_mark_lock():
+                        _ = transaction_restore()
+                        return EXIT_SECURITY
+                    return EXIT_SECURITY if not transaction_commit()
             write_resolved_text(resolved_name_text, resolved_version_text, options)
             return EXIT_OK
 
@@ -3834,7 +3914,7 @@ module Cli:
             package_version: mutable darray[u8] = []
             return EXIT_RESOLVE if not validate_manifest_at(raw, start, &package_name, &package_version)
             lock_options: Model::CommandOptions = Model::CommandOptions{locked: true, offline: true, frozen: true, json: false, verbose: false, profile: "debug", target_name: "", target_kind: "", update_name: ""}
-            return EXIT_RESOLVE if run_resolve(start, lock_options) != EXIT_OK
+            return EXIT_RESOLVE if run_resolve(start, lock_options, false) != EXIT_OK
             lock: mutable darray[u8] = []
             lock.resize(1048577)
             return EXIT_SECURITY if not read_cstr_into("elisapkg.lock", &lock)
@@ -3985,7 +4065,7 @@ module Cli:
                 write_error("error: install prefix directories must be owned by root or the current user, without group or other write permission\n")
                 return 7
             root: mutable darray[u8] = [46]
-            resolved: i64 = run_resolve(&root, options)
+            resolved: i64 = run_resolve(&root, options, false)
             return resolved if resolved != EXIT_OK
             manifest_raw: mutable darray[u8] = []
             manifest_raw.resize(1048577)
@@ -4209,7 +4289,7 @@ module Cli:
                 _ = transaction_restore()
                 return EXIT_SOURCE
             options: Model::CommandOptions = Model::CommandOptions{locked: false, offline: false, frozen: false, json: false, verbose: false, profile: "debug", target_name: "", target_kind: "", update_name: ""}
-            resolved: i64 = run_resolve(&root, options)
+            resolved: i64 = run_resolve(&root, options, true)
             if resolved != EXIT_OK:
                 restored: bool = transaction_restore()
                 if not restored:
@@ -4244,7 +4324,7 @@ module Cli:
             options: Model::CommandOptions = Model::CommandOptions{locked: false, offline: false, frozen: false, json: false, verbose: false, profile: "debug", target_name: "", target_kind: "", update_name: ""}
             if wanted.count > 0.usize():
                 options.update_name <- slots[2].cast[cstr]
-            resolved: i64 = run_resolve(&root, options)
+            resolved: i64 = run_resolve(&root, options, true)
             if resolved != EXIT_OK:
                 restored: bool = transaction_restore()
                 if not restored:
@@ -4688,7 +4768,7 @@ module Cli:
                 write_error("note: signing is required before publish; this command only previews files\n")
                 return EXIT_OK
             lock_options: Model::CommandOptions = Model::CommandOptions{locked: true, offline: true, frozen: true, json: false, verbose: false, profile: "debug", target_name: "", target_kind: "", update_name: ""}
-            return EXIT_RESOLVE if run_resolve(start, lock_options) != EXIT_OK
+            return EXIT_RESOLVE if run_resolve(start, lock_options, false) != EXIT_OK
             lock_raw: mutable darray[u8] = []
             lock_raw.resize(1048577)
             return EXIT_SECURITY if not read_cstr_into("elisapkg.lock", &lock_raw)
@@ -4874,7 +4954,7 @@ module Cli:
                 target_entry_name <- resolved_target
             else:
                 return EXIT_BUILD
-            lock_status: i64 = run_resolve(start, options)
+            lock_status: i64 = run_resolve(start, options, false)
             return lock_status if lock_status != EXIT_OK
             lock_raw: mutable darray[u8] = []
             lock_raw.resize(1048577)
@@ -5727,7 +5807,7 @@ module Cli:
             if cstr_equal(command, "check-manifest"):
                 return run_check(&start, options)
             if cstr_equal(command, "resolve"):
-                return run_resolve(&start, options)
+                return run_resolve(&start, options, false)
             if cstr_equal(command, "tree"):
                 return run_tree(&start, options)
             if cstr_equal(command, "why"):

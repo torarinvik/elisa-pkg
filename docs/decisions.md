@@ -95,11 +95,12 @@ platform adapter, not a claim that hostile build code is fully contained.
 ## D-009: project transaction ownership
 
 Manifest and lock edits acquire an exclusive `.elisapkg/transaction.guard`
-directory before journaling state. A guard with no recoverable state is treated
-as an active or interrupted transaction and blocks further commands; the client
-does not guess whether it is safe to delete another process's lock. Successful
-commit and rollback remove the guard, while stale guards require explicit
-operator recovery.
+directory before journaling state. Normal lockfile publication uses the same
+journal and guard, and records the replacement bytes before publishing them.
+Recovery claims the guard before replaying a stale journal; an existing guard is
+treated as an active or interrupted transaction and blocks further commands.
+Successful commit, rollback, and recovery remove the guard. A guard left by an
+interrupted process still requires explicit operator recovery.
 
 ## D-010: local archive cache identity
 
