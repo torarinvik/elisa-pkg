@@ -55,6 +55,14 @@ name already exists, the operation fails closed instead of replacing prior evide
 
 Project commands accept `--manifest-path PATH`; PATH may name the project directory or its `elisapkg.json`, including dependency mutations such as `add`, `remove`, and `update`. Local path resolution walks the dependency graph transitively, sorts package records by canonical name, normalizes relative paths, records SHA-256 manifest and complete sanitized source-tree digests, and rejects conflicting duplicate package identities. Target paths are resolved with `realpath` and must remain below their package root, including when a symlink is present. `build` selects the first target by default or a named target with `--bin NAME`, `--lib NAME`, or `--test NAME`; executable and test artifacts use the target name under `.elisapkg/build/`, while libraries use the same name with an `.o` suffix. Build receipts and cache validation bind the target kind and artifact name, while `run --bin NAME` and `install --local --bin NAME` reject library targets before attempting execution or publication. `test --test NAME` selects a named test target. `clean` removes known build artifacts plus `.elisapkg/package.tar`, `.elisapkg/package.receipt`, and empty build directories. Registry dependency declarations are syntax-checked locally, including exact, caret, tilde, and comparison SemVer ranges. Registry-only graphs use the signed local `primary` provider described in [`docs/registry.md`](docs/registry.md), produce lockfile version 3, and can be cached with `fetch PACKAGE VERSION`; mixed local/registry graphs and network transport remain fail-closed.
 
+The local provider's plain-text version index is unsigned. Owner and mode checks
+on every no-follow path component, plus ACL checks where supported, prevent
+another UID from replacing it through shared-writable directories, but
+signatures on individual releases do not prove index completeness or freshness;
+first-use omission and replay remain possible. Signed, expiring index snapshots
+with persisted monotonic generations are required before remote or mirror
+transport.
+
 Fetched registry blobs have immutable receipts beside their content-addressed cache
 objects. The exact signed metadata bytes and detached signature are cached by metadata
 digest, while the receipt binds the lock selection to the archive and authenticated
@@ -67,15 +75,18 @@ After archive verification, each signed registry selection is recorded in a
 user-owned trust-state file outside the project. The default location is
 `$HOME/.local/share/elisapkg/trust/<sha256-of-registry-root>.state`; set
 `ELISAPKG_TRUST_STATE` to an absolute path for an isolated location. Updates
-use an exclusive lock and durable atomic replacement. A lower version or a
-same-version digest change is rejected even if the project lockfile is deleted
-or restored. The adjacent `.clock` sidecar durably records the greatest wall
+use an exclusive lock and durable atomic replacement. Trust-state format v2
+binds each package/version to both its archive and signed metadata digests; a
+lower version or same-version change to either digest is rejected even if the
+project lockfile is deleted or restored. Legacy records without metadata
+identity fail closed. The adjacent `.clock` sidecar durably records the greatest wall
 clock value observed for the registry; malformed values and clock rollback are
 rejected before a signed selection can update trust state. Removing it after a
 record exists fails closed rather than resetting that floor. The sidecar also
 stores the SHA-256 of the exact state bytes; a restored or missing state file
-with the newer sidecar fails closed during both recording and offline
-verification. Restoring both user-owned files together is outside this local
+with the newer sidecar fails closed during recording and verification. After
+offline signed metadata and archive checks pass, verification rechecks expiry
+under the state lock and advances that bound clock. Restoring both user-owned files together is outside this local
 rollback check's protection.
 The derived `HOME` path is accepted only when it is absolute and contains no
 control bytes or backslashes; trailing separators are normalized, and malformed

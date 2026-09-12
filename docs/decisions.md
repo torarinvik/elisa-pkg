@@ -41,9 +41,10 @@ inode/mtime checks in `scripts/test.sh`.
 
 Remote operations remain fail-closed until an established signed-metadata
 protocol, trusted-root bootstrap, publisher authorization, expiry/rollback
-state, and audited cryptographic binding are implemented together. SHA-256 is
-an integrity primitive only. No URL, checksum, or lockfile entry enables a
-remote source by itself.
+state, signed expiring index snapshots with persisted monotonic generations,
+and audited cryptographic binding are implemented together. SHA-256 is an
+integrity primitive only. No URL, checksum, or lockfile entry enables a remote
+source by itself.
 
 ## D-006: source and archive policy
 
@@ -130,7 +131,18 @@ selection is persisted outside the project in a per-user monotonic trust-state
 file protected by an exclusive lock and durable atomic replacement. On macOS,
 ACL allow entries and unknown ACL tags on both trust directories and regular
 trust files are rejected; deny-only entries are accepted. A network
-transport and publisher delegation remain separate release gates.
+transport and publisher delegation remain separate release gates. The local
+version index is unsigned filesystem-trusted data. Its no-follow descriptor
+walk checks owner, mode, and supported ACL policy for each ancestor and the
+file, but does not authenticate completeness or freshness: first-use omissions
+and replay remain possible, and the same user can modify it. It is not fully
+rollback-safe. Signed expiring index snapshots and a persisted monotonic index
+generation are mandatory before remote or mirror transport. Trust history
+format v2 binds package, version, archive digest, and metadata digest; legacy
+history without metadata identity fails closed. Successful offline
+verification advances the state-bound clock only after signed metadata and
+archive checks, and rechecks expiry using the time sampled while holding the
+trust-state lock.
 
 ## D-012: local installation directory trust
 

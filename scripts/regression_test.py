@@ -23,7 +23,7 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
     lines = [f'include "{ROOT}/src/registry.elisa"',
              f'include "{ROOT}/src/manifest.elisa"',
              f'include "{ROOT}/src/cache.elisa"',
-             'def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:']
+             'def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:']
     lines.extend([
         '    platform_buffer: mutable darray[u8] = []',
         '    platform_size: i64 = Platform::pkg_package_file_size("src/main.elisa")',
@@ -129,7 +129,8 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
     verify_package = data('acme')
     verify_version = data('1.0.0')
     verify_digest = data('a' * 64)
-    lines.append(f'    trust_status: Registry::ResultCode = Registry::verify_trusted({verify_package}, {verify_version}, {verify_digest})')
+    verify_metadata_digest = data('b' * 64)
+    lines.append(f'    trust_status: Registry::ResultCode = Registry::verify_trusted({verify_package}, {verify_version}, {verify_digest}, {verify_metadata_digest}, 4102444800)')
     check('trust_status == Registry::ResultCode.TrustStateUnavailable')
     check('Platform::pkg_strlen(Registry::result_message(Registry::ResultCode.Unsatisfiable)) > 0.usize()')
     cache_digest = data('a' * 64)

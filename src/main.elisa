@@ -1995,7 +1995,7 @@ module Cli:
             out.resize(cursor)
 
         def registry_security_status(code: Registry::ResultCode) -> bool:
-            return code == Registry::ResultCode.MalformedMetadata or code == Registry::ResultCode.MissingSignature or code == Registry::ResultCode.MissingTrustRoot or code == Registry::ResultCode.InvalidSignature or code == Registry::ResultCode.ExpiredMetadata or code == Registry::ResultCode.RollbackDetected or code == Registry::ResultCode.DigestMismatch or code == Registry::ResultCode.ResourceLimit or code == Registry::ResultCode.TrustStateUnavailable or code == Registry::ResultCode.TrustStateMalformed or code == Registry::ResultCode.ClockRollback
+            return code == Registry::ResultCode.InvalidConfiguration or code == Registry::ResultCode.MalformedMetadata or code == Registry::ResultCode.MissingSignature or code == Registry::ResultCode.MissingTrustRoot or code == Registry::ResultCode.InvalidSignature or code == Registry::ResultCode.ExpiredMetadata or code == Registry::ResultCode.RollbackDetected or code == Registry::ResultCode.DigestMismatch or code == Registry::ResultCode.ResourceLimit or code == Registry::ResultCode.TrustStateUnavailable or code == Registry::ResultCode.TrustStateMalformed or code == Registry::ResultCode.ClockRollback or code == Registry::ResultCode.ClockUnavailable
 
         def registry_candidate_matches(candidates: darray[Solver::Candidate]&, package: darray[u8]&, version: Model::Version) -> bool:
             for index in 0..<candidates.count |candidates, package, version|:
@@ -2070,6 +2070,9 @@ module Cli:
                     exact: mutable darray[u8] = []
                     Registry::exact_requirement(parsed, &exact)
                     candidate_status: Registry::ResultCode = Registry::resolve_metadata(package, exact, Model::Version{major:0,minor:0,patch:0,prerelease:false}, &selected_text, &archive, &digest, &archive_size, &metadata)
+                    if candidate_status == Registry::ResultCode.ExpiredMetadata:
+                        cursor <- finish + 1
+                        continue
                     if candidate_status != Registry::ResultCode.Ok and persist_trust and registry_security_status(candidate_status):
                         out.push(candidate_status.u8() + 1.u8())
                         return out
@@ -2196,7 +2199,7 @@ module Cli:
                         return out
                     return []
                 if persist_trust:
-                    trust_status: Registry::ResultCode = Registry::record_trusted(candidate.package, selected_text, digest)
+                    trust_status: Registry::ResultCode = Registry::record_trusted(candidate.package, selected_text, digest, metadata_digest, snapshot_expires)
                     if trust_status != Registry::ResultCode.Ok:
                         out.push(trust_status.u8() + 1.u8())
                         return out
@@ -3201,13 +3204,17 @@ module Cli:
                 code <- Registry::ResultCode.TrustStateMalformed if lock[0] == 16
                 code <- Registry::ResultCode.ClockRollback if lock[0] == 17
                 code <- Registry::ResultCode.Unsatisfiable if lock[0] == 18
+                code <- Registry::ResultCode.ClockUnavailable if lock[0] == 19
                 write_error("error: ")
                 write_error(Registry::result_message(code))
                 if code == Registry::ResultCode.Unsatisfiable:
                     write_registry_conflict(lock)
                     write_error("\n")
                     return EXIT_RESOLVE
-                write_error(" while recording registry trust state\n")
+                if code == Registry::ResultCode.TrustStateUnavailable or code == Registry::ResultCode.TrustStateMalformed or code == Registry::ResultCode.ClockRollback:
+                    write_error(" while recording registry trust state\n")
+                else:
+                    write_error("\n")
                 return EXIT_SECURITY
 
             return EXIT_RESOLVE if lock.count == 0.usize()
@@ -3352,7 +3359,7 @@ module Cli:
             for index in 0..<metadata_digest.count |metadata_digest|:
                 byte: u8 = metadata_digest[index]
                 return false if (byte < 48 or byte > 57) and (byte < 97 or byte > 102)
-            return false if not Cache::blob_path(metadata_digest, &out)
+            return false if not Cache::blob_path(metadata_digest, out)
             bytes_push_view(out, ".sig")
             return out.count <= 4096.usize()
 
@@ -3381,10 +3388,10 @@ module Cli:
         def registry_cache_read_metadata(metadata_digest: darray[u8]&, metadata_out: mutable darray[u8]&, signature_out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             metadata_out.resize(0)
             signature_out.resize(0)
-            return false if not cache_read_verified_blob(metadata_digest, &metadata_out)
+            return false if not cache_read_verified_blob(metadata_digest, metadata_out)
             signature_path: mutable darray[u8] = []
             return false if not registry_cache_signature_path(metadata_digest, &signature_path)
-            return false if not read_package_file_into(&signature_path, &signature_out) or signature_out.count != 64.usize()
+            return false if not read_package_file_into(signature_path, signature_out) or signature_out.count != 64.usize()
             return true
 
         def registry_cache_store_receipt(package: darray[u8]&, version: darray[u8]&, archive: darray[u8]&, archive_size: u64, digest: darray[u8]&, metadata_digest: darray[u8]&, expires: u64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
@@ -3510,14 +3517,6 @@ module Cli:
                 expires: mutable u64 = 0
                 return EXIT_SECURITY if not registry_cache_receipt_matches(receipt, package, version_text, archive, archive_size, digest, metadata_digest, &expires)
                 return EXIT_SECURITY if expires <= now.u64()
-                trust_status: Registry::ResultCode = Registry::verify_trusted(package, version_text, digest)
-                if trust_status != Registry::ResultCode.Ok:
-                    write_error("error: ")
-                    write_error(Registry::result_message(trust_status))
-                    write_error(" while using cached ")
-                    write_bytes(2, &package)
-                    write_error("\n")
-                    return EXIT_SECURITY
                 cached_metadata: mutable darray[u8] = []
                 cached_signature: mutable darray[u8] = []
                 return EXIT_SECURITY if not registry_cache_read_metadata(metadata_digest, &cached_metadata, &cached_signature)
@@ -3532,6 +3531,17 @@ module Cli:
                     return EXIT_SECURITY if not registry_lock_satisfies_constraint(lock, packages_start, packages_end, metadata_dependencies[dependency_index])
                 archive_bytes: mutable darray[u8] = []
                 return EXIT_SECURITY if not cache_read_verified_blob(digest, &archive_bytes) or archive_bytes.count.u64() != archive_size or not Archive::verify_ustar_archive(archive_bytes)
+                # Only authenticated cache content may advance the durable
+                # trust clock. Do this after snapshot, dependency, expiry, and
+                # archive validation so rejected cache data cannot update it.
+                trust_status: Registry::ResultCode = Registry::verify_trusted(package, version_text, digest, metadata_digest, metadata_expires)
+                if trust_status != Registry::ResultCode.Ok:
+                    write_error("error: ")
+                    write_error(Registry::result_message(trust_status))
+                    write_error(" while using cached ")
+                    write_bytes(2, &package)
+                    write_error("\n")
+                    return EXIT_SECURITY
                 write_ok("verified cached registry artifact ")
                 write_bytes(1, &package)
                 write_ok(" ")
@@ -3668,7 +3678,7 @@ module Cli:
                     write_error("\n")
                     return EXIT_SECURITY if registry_security_status(archive_status)
                     return EXIT_SOURCE
-                trust_status: Registry::ResultCode = Registry::record_trusted(package, version_text, digest)
+                trust_status: Registry::ResultCode = Registry::record_trusted(package, version_text, digest, metadata_digest, snapshot_expires)
                 if trust_status != Registry::ResultCode.Ok:
                     write_error("error: ")
                     write_error(Registry::result_message(trust_status))
@@ -3770,7 +3780,7 @@ module Cli:
                     write_error("\n")
                     return EXIT_SECURITY if registry_security_status(archive_status)
                     return EXIT_SOURCE
-                trust_status: Registry::ResultCode = Registry::record_trusted(package, selected, digest)
+                trust_status: Registry::ResultCode = Registry::record_trusted(package, selected, digest, metadata_digest, snapshot_expires)
                 if trust_status != Registry::ResultCode.Ok:
                     write_error("error: ")
                     write_error(Registry::result_message(trust_status))

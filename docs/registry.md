@@ -59,6 +59,18 @@ newline-separated list of unique, complete SemVer versions. The resolver picks
 the highest version satisfying the requested exact, caret, tilde, or comparison
 requirement.
 
+The local `index` is plain, unsigned filesystem data; per-version signatures
+authenticate only the individual metadata records they cover. The client reads
+the index through a no-follow descriptor and checks ownership, permissions, and
+supported ACL policy for every ancestor and the final regular file. This blocks
+an unrelated UID or a shared-writable directory from replacing or omitting
+entries, but it does not authenticate index completeness or freshness. An index
+can be replayed or can omit releases on first use, and a writer with the same
+user identity can still change it. Local resolution therefore trusts the
+configured filesystem; its index is not fully rollback-safe. Before any remote
+or mirror transport is enabled, signed expiring index snapshots and a persisted
+monotonic index generation are mandatory release gates.
+
 `metadata.json` is signed byte-for-byte as stored, including its final newline
 if present. It must be a unique-key JSON object containing only the documented
 root fields (plus the optional dependency map); unknown protocol fields are
@@ -105,15 +117,21 @@ default the file is
 needed. The file is written through an exclusive lock directory, a temporary
 file, `fsync`, atomic rename, and parent-directory `fsync`. Each package's
 history is monotonic: a lower version is rejected, and a same-version digest
-change is rejected. History is independent of the project lockfile, so
+change is rejected. Format v2 binds package, version, archive digest, and signed
+metadata digest together; changing either digest for an existing version is
+rejected. Legacy records without metadata identity fail closed and are not
+migrated. History is independent of the project lockfile, so
 restoring or deleting a project cannot reset rollback protection. A stale lock
 directory is left for manual recovery and causes a fail-closed trust-state
 error rather than being removed automatically. Beside the state file, elisapkg
 durably records the greatest observed wall-clock value and the SHA-256 of the
 exact state bytes in `<state>.clock`, using the same exclusive temporary-file,
 `fsync`, atomic-rename, and parent-directory `fsync` sequence. Both recording
-and read-only verification compare the state digest before using its version
-history. A missing or restored state file with the retained clock therefore
+and successful verification compare the state digest before using its version
+history. Verification also rechecks metadata expiry against the wall-clock
+value read under the trust-state lock, then advances the bound clock on success;
+expired or otherwise rejected evidence cannot advance it. A missing or restored
+state file with the retained clock therefore
 fails closed. A malformed clock or a later observation below its value is also
 rejected before trust history can advance, protecting expiry checks from a
 wall-clock rollback. A clock without a state digest is malformed and is not

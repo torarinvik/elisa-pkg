@@ -13,6 +13,16 @@ that only publishes the current package's verified build output under the
 user-selected prefix. This is an intentional fail-closed boundary, not a
 temporary insecure mode.
 
+The local registry's version `index` is unsigned plain text. Reads verify the
+owner, mode, ACL policy, and no-follow traversal of every ancestor and the final
+file, so another UID cannot replace or omit entries through a shared-writable
+directory. Individual Ed25519 metadata signatures do not authenticate index
+completeness or freshness: an index replay or omission can affect first-use
+selection, and the same user can still change it. The configured filesystem is
+therefore trusted input, and index resolution is not fully rollback-safe.
+Signed, expiring index snapshots with a persisted monotonic generation are a
+hard release gate before any remote or mirror transport is enabled.
+
 Local installation checks the nearest existing prefix ancestor before creating
 directories. Existing path components must be real directories owned by root or
 the effective user and must have no group or other write bits. Installation
@@ -29,20 +39,25 @@ Before enabling remote packages, the implementation must use an established sign
 
 The `Trust` module exposes metadata prechecks for expiry, rollback, namespace,
 and algorithm policy plus an exact-byte detached Ed25519 verification gate.
-Verified local-registry selections persist monotonic package/version/digest
-records outside the project in a user-owned trust-state file. Updates hold an
+Verified local-registry selections persist monotonic package/version/archive-
+digest/metadata-digest records outside the project in a user-owned trust-state
+file. Trust-state format v2 is required; legacy records without metadata
+identity fail closed rather than being migrated. Updates hold an
 exclusive lock directory and publish the complete state with a durable atomic
-rename. Lower versions and same-version digest changes fail closed; malformed
-or unavailable state is a security error. The default path is
+rename. Lower versions and same-version archive- or metadata-digest changes
+fail closed; malformed or unavailable state is a security error. The default
+path is
 `$HOME/.local/share/elisapkg/trust/<sha256-of-registry-root>.state`, with
 `ELISAPKG_TRUST_STATE` available for an explicit absolute path. Override paths
 must use canonical non-empty components; `.` and `..` are rejected before any
 state directory is opened. Network operations remain disabled until transport
 and publisher delegation are reviewed. The sibling `.clock` file stores both
 the greatest observed wall-clock timestamp and the SHA-256 of the exact state
-bytes. Recording and read-only verification compare that digest before using
-history, so a missing or restored state file with a retained newer clock fails
-closed. The sidecar is written before changed state bytes; a crash between the
+bytes. Recording and successful verification compare that digest before using
+history; successful verification advances the bound clock while holding the
+same lock and rechecks evidence expiry against that clock observation. A missing
+or restored state file with a retained newer clock fails closed. The sidecar is
+written before changed state bytes; a crash between the
 two atomic writes also fails closed. A legacy clock without a state digest is
 malformed and is not migrated automatically. Restoring both user-owned files
 together remains outside this local check's protection because they are not

@@ -18,6 +18,7 @@ export ELISA_ALLOW_STALE_STAGE1="${ELISA_ALLOW_STALE_STAGE1:-0}"
 "$BIN" --version | grep -F 'elisapkg 0.1.0' >/dev/null
 "$BIN" doctor | grep -F 'local Ed25519 provider available' >/dev/null
 python3 "$ROOT/scripts/ffi_boundary_test.py"
+python3 "$ROOT/scripts/ffi_fifo_regression.py"
 python3 "$ROOT/scripts/sandbox_policy_test.py"
 
 # Global output modes are strict: quiet suppresses human success text without
@@ -296,6 +297,200 @@ if ! ELISAPKG_REGISTRY_DIR="$TEST_TMP/missing-registry-root" ELISAPKG_REGISTRY_T
   exit 1
 fi
 
+# Registry graph resolution excludes signed, expired historical releases while
+# retaining hard failures for malformed expiry data. Generate ephemeral keys
+# with the same OpenSSL executable search order used by the native verifier.
+REGISTRY_EXPIRY_CASE="$TEST_TMP/registry-expiry-regression"
+REGISTRY_EXPIRY_ROOT="$REGISTRY_EXPIRY_CASE/registry"
+REGISTRY_EXPIRY_KEY="$REGISTRY_EXPIRY_CASE/trust/key"
+REGISTRY_EXPIRY_PRIVATE="$REGISTRY_EXPIRY_CASE/test-private.pem"
+REGISTRY_EXPIRY_PUBLIC_DER="$REGISTRY_EXPIRY_CASE/test-public.der"
+REGISTRY_EXPIRY_SOURCE="$REGISTRY_EXPIRY_CASE/archive-source"
+REGISTRY_EXPIRY_APP="$REGISTRY_EXPIRY_CASE/app-broad"
+REGISTRY_EXPIRY_EXACT_APP="$REGISTRY_EXPIRY_CASE/app-exact"
+REGISTRY_EXPIRY_MALFORMED_APP="$REGISTRY_EXPIRY_CASE/app-malformed"
+REGISTRY_EXPIRY_STATE="$REGISTRY_EXPIRY_CASE/trust.state"
+REGISTRY_EXPIRY_MALFORMED_STATE="$REGISTRY_EXPIRY_CASE/trust-malformed.state"
+OPENSSL_BIN=""
+for candidate in /opt/homebrew/opt/openssl@3/bin/openssl /opt/homebrew/opt/openssl/bin/openssl /usr/bin/openssl; do
+  if [[ -x "$candidate" ]]; then
+    OPENSSL_BIN="$candidate"
+    break
+  fi
+done
+if [[ -z "$OPENSSL_BIN" ]]; then
+  echo "no OpenSSL executable is available for signed registry regression fixtures" >&2
+  exit 1
+fi
+mkdir -m 700 -p "$REGISTRY_EXPIRY_ROOT" "$REGISTRY_EXPIRY_CASE/trust"
+"$OPENSSL_BIN" genpkey -algorithm ED25519 -out "$REGISTRY_EXPIRY_PRIVATE"
+chmod 600 "$REGISTRY_EXPIRY_PRIVATE"
+"$OPENSSL_BIN" pkey -in "$REGISTRY_EXPIRY_PRIVATE" -pubout -outform DER -out "$REGISTRY_EXPIRY_PUBLIC_DER"
+python3 - "$REGISTRY_EXPIRY_PUBLIC_DER" "$REGISTRY_EXPIRY_KEY" <<'PY'
+from pathlib import Path
+import os, sys
+
+der = Path(sys.argv[1]).read_bytes()
+prefix = bytes.fromhex("302a300506032b6570032100")
+if len(der) != len(prefix) + 32 or not der.startswith(prefix):
+    raise SystemExit("OpenSSL emitted an unexpected Ed25519 public-key encoding")
+Path(sys.argv[2]).write_bytes(der[-32:])
+os.chmod(sys.argv[2], 0o600)
+PY
+"$BIN" init "$REGISTRY_EXPIRY_SOURCE" >/dev/null
+(
+  cd "$REGISTRY_EXPIRY_SOURCE"
+  "$BIN" resolve >/dev/null
+  "$BIN" package >/dev/null
+)
+python3 - "$REGISTRY_EXPIRY_ROOT" "$REGISTRY_EXPIRY_SOURCE/.elisapkg/package.tar" "$REGISTRY_EXPIRY_PRIVATE" "$OPENSSL_BIN" <<'PY'
+from pathlib import Path
+import hashlib, json, subprocess, sys, time
+
+root = Path(sys.argv[1])
+archive = Path(sys.argv[2]).read_bytes()
+private_key = sys.argv[3]
+openssl = sys.argv[4]
+digest = hashlib.sha256(archive).hexdigest()
+root.mkdir(mode=0o700, parents=True, exist_ok=True)
+for version, expires in (("1.0.0", 1), ("1.1.0", int(time.time()) + 3600)):
+    version_dir = root / "foo" / version
+    version_dir.mkdir(mode=0o700, parents=True)
+    (version_dir / "archive.tar").write_bytes(archive)
+    metadata = {
+        "schema-version": 1,
+        "algorithm": "ed25519",
+        "registry": str(root),
+        "package": "foo",
+        "version": version,
+        "archive": "archive.tar",
+        "archive-size": len(archive),
+        "archive-digest": digest,
+        "expires": expires,
+    }
+    metadata_path = version_dir / "metadata.json"
+    metadata_path.write_bytes((json.dumps(metadata, separators=(",", ":")) + "\n").encode())
+    subprocess.run([openssl, "pkeyutl", "-sign", "-rawin", "-inkey", private_key,
+                    "-in", str(metadata_path), "-out", str(version_dir / "metadata.sig")],
+                   check=True)
+(root / "foo" / "index").write_text("1.0.0\n1.1.0\n", encoding="ascii")
+PY
+
+write_registry_dependency() {
+  local app="$1"
+  local requirement="$2"
+  "$BIN" init "$app" >/dev/null
+  python3 - "$app/elisapkg.json" "$requirement" <<'PY'
+from pathlib import Path
+import json, sys
+
+path = Path(sys.argv[1])
+manifest = json.loads(path.read_text(encoding="utf-8"))
+manifest["dependencies"] = {"foo": {"version": sys.argv[2], "registry": "primary"}}
+path.write_text(json.dumps(manifest, separators=(",", ":")) + "\n", encoding="utf-8")
+PY
+}
+
+write_registry_dependency "$REGISTRY_EXPIRY_APP" "^1.0.0"
+(
+  cd "$REGISTRY_EXPIRY_APP"
+  ELISAPKG_REGISTRY_DIR="$REGISTRY_EXPIRY_ROOT" \
+  ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_EXPIRY_KEY" \
+  ELISAPKG_TRUST_STATE="$REGISTRY_EXPIRY_STATE" \
+    "$BIN" resolve >/dev/null
+)
+python3 - "$REGISTRY_EXPIRY_APP/elisapkg.lock" <<'PY'
+from pathlib import Path
+import json, sys
+
+lock = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+versions = [record["version"] for record in lock["packages"] if record["name"] == "foo"]
+if versions != ["1.1.0"]:
+    raise SystemExit(f"expired historical release affected resolution: {versions!r}")
+PY
+
+# Populate the signed metadata cache through the normal provider path, then
+# hide all package provider files during offline validation. The configured
+# trust root remains available because snapshot verification checks its
+# registry binding before using the cached metadata and signature.
+(
+  cd "$REGISTRY_EXPIRY_APP"
+  ELISAPKG_REGISTRY_DIR="$REGISTRY_EXPIRY_ROOT" \
+  ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_EXPIRY_KEY" \
+  ELISAPKG_TRUST_STATE="$REGISTRY_EXPIRY_STATE" \
+    "$BIN" fetch >/dev/null
+)
+mv "$REGISTRY_EXPIRY_ROOT/foo" "$REGISTRY_EXPIRY_CASE/foo.offline-hidden"
+(
+  cd "$REGISTRY_EXPIRY_APP"
+  ELISAPKG_REGISTRY_DIR="$REGISTRY_EXPIRY_ROOT" \
+  ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_EXPIRY_KEY" \
+    ELISAPKG_TRUST_STATE="$REGISTRY_EXPIRY_STATE" \
+    "$BIN" fetch --offline >/dev/null
+)
+mv "$REGISTRY_EXPIRY_CASE/foo.offline-hidden" "$REGISTRY_EXPIRY_ROOT/foo"
+
+# The expired artifact itself must remain unavailable even when it is pinned.
+write_registry_dependency "$REGISTRY_EXPIRY_EXACT_APP" "1.0.0"
+if (
+  cd "$REGISTRY_EXPIRY_EXACT_APP"
+  ELISAPKG_REGISTRY_DIR="$REGISTRY_EXPIRY_ROOT" \
+  ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_EXPIRY_KEY" \
+  ELISAPKG_TRUST_STATE="$REGISTRY_EXPIRY_STATE" \
+    "$BIN" resolve >/dev/null 2>&1
+); then
+  echo "resolution accepted a pinned expired registry version" >&2
+  exit 1
+else
+  test "$?" -eq 3
+fi
+test ! -e "$REGISTRY_EXPIRY_EXACT_APP/elisapkg.lock"
+
+# An absent expiry is malformed metadata, not a stale release to skip.
+python3 - "$REGISTRY_EXPIRY_ROOT/foo/1.0.0/metadata.json" <<'PY'
+from pathlib import Path
+import json, sys
+
+path = Path(sys.argv[1])
+metadata = json.loads(path.read_text(encoding="utf-8"))
+metadata.pop("expires")
+path.write_text(json.dumps(metadata, separators=(",", ":")) + "\n", encoding="utf-8")
+PY
+"$OPENSSL_BIN" pkeyutl -sign -rawin -inkey "$REGISTRY_EXPIRY_PRIVATE" \
+  -in "$REGISTRY_EXPIRY_ROOT/foo/1.0.0/metadata.json" \
+  -out "$REGISTRY_EXPIRY_ROOT/foo/1.0.0/metadata.sig"
+write_registry_dependency "$REGISTRY_EXPIRY_MALFORMED_APP" "^1.0.0"
+if (
+  cd "$REGISTRY_EXPIRY_MALFORMED_APP"
+  ELISAPKG_REGISTRY_DIR="$REGISTRY_EXPIRY_ROOT" \
+  ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_EXPIRY_KEY" \
+  ELISAPKG_TRUST_STATE="$REGISTRY_EXPIRY_MALFORMED_STATE" \
+    "$BIN" resolve >/dev/null 2>&1
+); then
+  echo "resolution skipped signed metadata with a malformed expiry" >&2
+  exit 1
+else
+  test "$?" -eq 5
+fi
+test ! -e "$REGISTRY_EXPIRY_MALFORMED_APP/elisapkg.lock"
+
+# The index is unsigned local filesystem data. A writable package directory
+# must be rejected as a security failure before it can omit or replace entries.
+chmod 0770 "$REGISTRY_EXPIRY_ROOT/foo"
+if (
+  cd "$REGISTRY_EXPIRY_APP"
+  ELISAPKG_REGISTRY_DIR="$REGISTRY_EXPIRY_ROOT" \
+  ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_EXPIRY_KEY" \
+  ELISAPKG_TRUST_STATE="$REGISTRY_EXPIRY_STATE" \
+    "$BIN" resolve >/dev/null 2>"$TEST_TMP/untrusted-index-parent.err"
+); then
+  echo "resolution accepted an index beneath a group-writable parent" >&2
+  exit 1
+else
+  test "$?" -eq 5
+fi
+grep -F "registry configuration is invalid" "$TEST_TMP/untrusted-index-parent.err" >/dev/null
+
 # Trust anchors are opened and read through one descriptor. Secure roots work;
 # writable parents, writable key files, and symlinked path components fail.
 TRUST_READ_PROBE="$TEST_TMP/trusted-read-probe-$$.elisa"
@@ -392,7 +587,7 @@ EOF
 fi
 
 # Persistent trust state is outside the project lockfile. Verify monotonic
-# versions, same-version digest pinning, durable re-entry, and fail-closed
+# versions, same-version archive/metadata digest pinning, durable re-entry, and fail-closed
 # malformed/duplicate history handling through the public Registry boundary.
 TRUST_STATE_PROBE="$TEST_TMP/trust-state-probe-$$.elisa"
 TRUST_STATE_BIN="$TEST_TMP/trust-state-probe-$$"
@@ -405,6 +600,13 @@ TRUST_STATE_REPEAT_PROBE="$TEST_TMP/trust-state-repeat-$$.elisa"
 TRUST_STATE_REPEAT_BIN="$TEST_TMP/trust-state-repeat-$$"
 TRUST_STATE_VERIFY_V1_PROBE="$TEST_TMP/trust-state-verify-v1-$$.elisa"
 TRUST_STATE_VERIFY_V1_BIN="$TEST_TMP/trust-state-verify-v1-$$"
+TRUST_STATE_VERIFY_FAIL_PROBE="$TEST_TMP/trust-state-verify-fail-$$.elisa"
+TRUST_STATE_VERIFY_FAIL_BIN="$TEST_TMP/trust-state-verify-fail-$$"
+TRUST_STATE_RECORD_EXPIRED_PROBE="$TEST_TMP/trust-state-record-expired-$$.elisa"
+TRUST_STATE_RECORD_EXPIRED_BIN="$TEST_TMP/trust-state-record-expired-$$"
+TRUST_STATE_LEGACY_PROBE="$TEST_TMP/trust-state-legacy-$$.elisa"
+TRUST_STATE_LEGACY_BIN="$TEST_TMP/trust-state-legacy-$$"
+TRUST_STATE_LEGACY_FILE="$TEST_TMP/trust-state-legacy-$$.state"
 cat > "$TRUST_STATE_V1_PROBE" <<EOF
 include "$ROOT/src/registry.elisa"
 def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
@@ -413,7 +615,10 @@ def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.
     digest: mutable darray[u8] = []
     for _index in 0..<64 |digest|:
         digest.push(97)
-    return 0 if Registry::record_trusted(package, version, digest) == Registry::ResultCode.Ok else 1
+    metadata_digest: mutable darray[u8] = []
+    for _index in 0..<64 |metadata_digest|:
+        metadata_digest.push(99)
+    return 0 if Registry::record_trusted(package, version, digest, metadata_digest, 4102444800) == Registry::ResultCode.Ok else 1
 EOF
 ELISA_STAGE1_BIN="${ELISA_STAGE1_BIN:-$ELISA_COMPILER_ROOT/bin/elisac-stage1}" \
 ELISA_ALLOW_STALE_STAGE1="${ELISA_ALLOW_STALE_STAGE1:-0}" \
@@ -421,20 +626,104 @@ ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_COMPILER_ROOT/build/runtime/elisa
   "$ELISA_COMPILER_ROOT/scripts/elisac_stage1.sh" -emit exe -o "$TRUST_STATE_V1_BIN" "$TRUST_STATE_V1_PROBE"
 cat > "$TRUST_STATE_VERIFY_V1_PROBE" <<EOF
 include "$ROOT/src/registry.elisa"
-def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
     package: mutable darray[u8] = [97,112,112]
     version: mutable darray[u8] = [49,46,48,46,48]
     digest: mutable darray[u8] = []
     for _index in 0..<64 |digest|:
         digest.push(97)
-    return 0 if Registry::verify_trusted(package, version, digest) == Registry::ResultCode.Ok else 1
+    metadata_digest: mutable darray[u8] = []
+    for _index in 0..<64 |metadata_digest|:
+        metadata_digest.push(99)
+    return 0 if Registry::verify_trusted(package, version, digest, metadata_digest, 4102444800) == Registry::ResultCode.Ok else 1
 EOF
 ELISA_STAGE1_BIN="${ELISA_STAGE1_BIN:-$ELISA_COMPILER_ROOT/bin/elisac-stage1}" \
 ELISA_ALLOW_STALE_STAGE1="${ELISA_ALLOW_STALE_STAGE1:-0}" \
 ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_COMPILER_ROOT/build/runtime/elisacore_runtime.o}" \
-  "$ELISA_COMPILER_ROOT/scripts/elisac_stage1.sh" -emit exe -o "$TRUST_STATE_VERIFY_V1_BIN" "$TRUST_STATE_VERIFY_V1_PROBE"
+"$ELISA_COMPILER_ROOT/scripts/elisac_stage1.sh" -emit exe -o "$TRUST_STATE_VERIFY_V1_BIN" "$TRUST_STATE_VERIFY_V1_PROBE"
+cat > "$TRUST_STATE_LEGACY_PROBE" <<EOF
+include "$ROOT/src/registry.elisa"
+def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+    package: mutable darray[u8] = [97,112,112]
+    version: mutable darray[u8] = [49,46,48,46,48]
+    digest: mutable darray[u8] = []
+    metadata_digest: mutable darray[u8] = []
+    for _index in 0..<64 |digest, metadata_digest|:
+        digest.push(97)
+        metadata_digest.push(99)
+    return 0 if Registry::verify_trusted(package, version, digest, metadata_digest, 4102444800) == Registry::ResultCode.TrustStateMalformed else 1
+EOF
+ELISA_STAGE1_BIN="${ELISA_STAGE1_BIN:-$ELISA_COMPILER_ROOT/bin/elisac-stage1}" \
+ELISA_ALLOW_STALE_STAGE1="${ELISA_ALLOW_STALE_STAGE1:-0}" \
+ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_COMPILER_ROOT/build/runtime/elisacore_runtime.o}" \
+  "$ELISA_COMPILER_ROOT/scripts/elisac_stage1.sh" -emit exe -o "$TRUST_STATE_LEGACY_BIN" "$TRUST_STATE_LEGACY_PROBE"
+printf 'elisapkg-trust-state:1\napp 1.0.0 %064d\n' 0 > "$TRUST_STATE_LEGACY_FILE"
+python3 - "$TRUST_STATE_LEGACY_FILE" <<'PY'
+from pathlib import Path
+import os, sys
+
+os.chmod(sys.argv[1], 0o600)
+PY
+ELISAPKG_REGISTRY_DIR="$ROOT" ELISAPKG_TRUST_STATE="$TRUST_STATE_LEGACY_FILE" "$TRUST_STATE_LEGACY_BIN"
 ELISAPKG_REGISTRY_DIR="$ROOT" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_V1_BIN"
 cp "$TRUST_STATE_FILE" "$TRUST_STATE_V1_SNAPSHOT"
+TRUST_STATE_CURRENT_HASH=$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$TRUST_STATE_FILE")
+printf 'clock:0\nstate-sha256:%s\n' "$TRUST_STATE_CURRENT_HASH" > "$TRUST_STATE_FILE.clock"
+ELISAPKG_REGISTRY_DIR="$ROOT" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_VERIFY_V1_BIN"
+python3 - "$TRUST_STATE_FILE" "$TRUST_STATE_FILE.clock" "$TRUST_STATE_CURRENT_HASH" <<'PY'
+from pathlib import Path
+import hashlib, sys
+
+state = Path(sys.argv[1]).read_bytes()
+clock = Path(sys.argv[2]).read_text(encoding="ascii").splitlines()
+if hashlib.sha256(state).hexdigest() != sys.argv[3]:
+    raise SystemExit("successful trust verification rewrote trust-state bytes")
+if len(clock) != 2 or not clock[0].startswith("clock:") or int(clock[0][6:]) <= 0:
+    raise SystemExit("successful trust verification did not advance the bound clock")
+if clock[1] != "state-sha256:" + sys.argv[3]:
+    raise SystemExit("advanced trust clock is not bound to unchanged state bytes")
+PY
+cat > "$TRUST_STATE_VERIFY_FAIL_PROBE" <<EOF
+include "$ROOT/src/registry.elisa"
+def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+    package: mutable darray[u8] = [97,112,112]
+    version: mutable darray[u8] = [49,46,48,46,48]
+    digest: mutable darray[u8] = []
+    metadata_digest: mutable darray[u8] = []
+    for _index in 0..<64 |digest, metadata_digest|:
+        digest.push(97)
+        metadata_digest.push(100)
+    return 1 if Registry::verify_trusted(package, version, digest, metadata_digest, 4102444800) != Registry::ResultCode.DigestMismatch
+    metadata_digest.resize(0)
+    for _index in 0..<64 |metadata_digest|:
+        metadata_digest.push(99)
+    return 0 if Registry::verify_trusted(package, version, digest, metadata_digest, 1) == Registry::ResultCode.ExpiredMetadata else 2
+EOF
+ELISA_STAGE1_BIN="${ELISA_STAGE1_BIN:-$ELISA_COMPILER_ROOT/bin/elisac-stage1}" \
+ELISA_ALLOW_STALE_STAGE1="${ELISA_ALLOW_STALE_STAGE1:-0}" \
+ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_COMPILER_ROOT/build/runtime/elisacore_runtime.o}" \
+  "$ELISA_COMPILER_ROOT/scripts/elisac_stage1.sh" -emit exe -o "$TRUST_STATE_VERIFY_FAIL_BIN" "$TRUST_STATE_VERIFY_FAIL_PROBE"
+printf 'clock:0\nstate-sha256:%s\n' "$TRUST_STATE_CURRENT_HASH" > "$TRUST_STATE_FILE.clock"
+ELISAPKG_REGISTRY_DIR="$ROOT" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_VERIFY_FAIL_BIN"
+grep -Fx "clock:0" "$TRUST_STATE_FILE.clock" >/dev/null
+cat > "$TRUST_STATE_RECORD_EXPIRED_PROBE" <<EOF
+include "$ROOT/src/registry.elisa"
+def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+    package: mutable darray[u8] = [97,112,112]
+    version: mutable darray[u8] = [49,46,48,46,48]
+    digest: mutable darray[u8] = []
+    metadata_digest: mutable darray[u8] = []
+    for _index in 0..<64 |digest, metadata_digest|:
+        digest.push(97)
+        metadata_digest.push(99)
+    return 0 if Registry::record_trusted(package, version, digest, metadata_digest, 1) == Registry::ResultCode.ExpiredMetadata else 1
+EOF
+ELISA_STAGE1_BIN="${ELISA_STAGE1_BIN:-$ELISA_COMPILER_ROOT/bin/elisac-stage1}" \
+ELISA_ALLOW_STALE_STAGE1="${ELISA_ALLOW_STALE_STAGE1:-0}" \
+ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_COMPILER_ROOT/build/runtime/elisacore_runtime.o}" \
+  "$ELISA_COMPILER_ROOT/scripts/elisac_stage1.sh" -emit exe -o "$TRUST_STATE_RECORD_EXPIRED_BIN" "$TRUST_STATE_RECORD_EXPIRED_PROBE"
+ELISAPKG_REGISTRY_DIR="$ROOT" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_RECORD_EXPIRED_BIN"
+grep -Fx "clock:0" "$TRUST_STATE_FILE.clock" >/dev/null
 cat > "$TRUST_STATE_PROBE" <<EOF
 include "$ROOT/src/registry.elisa"
 
@@ -451,11 +740,14 @@ def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.
     v2: mutable darray[u8] = [50,46,48,46,48]
     digest_a: mutable darray[u8] = filled(97)
     digest_b: mutable darray[u8] = filled(98)
-    return 1 if Registry::record_trusted(package, v1, digest_a) != Registry::ResultCode.Ok
-    return 2 if Registry::record_trusted(package, v0, digest_a) != Registry::ResultCode.RollbackDetected
-    return 3 if Registry::record_trusted(package, v1, digest_b) != Registry::ResultCode.DigestMismatch
-    return 4 if Registry::record_trusted(package, v2, digest_b) != Registry::ResultCode.Ok
-    return 5 if Registry::record_trusted(package, v2, digest_b) != Registry::ResultCode.Ok
+    metadata_a: mutable darray[u8] = filled(99)
+    metadata_b: mutable darray[u8] = filled(100)
+    return 1 if Registry::record_trusted(package, v1, digest_a, metadata_a, 4102444800) != Registry::ResultCode.Ok
+    return 2 if Registry::record_trusted(package, v0, digest_a, metadata_a, 4102444800) != Registry::ResultCode.RollbackDetected
+    return 3 if Registry::record_trusted(package, v1, digest_b, metadata_a, 4102444800) != Registry::ResultCode.DigestMismatch
+    return 4 if Registry::record_trusted(package, v1, digest_a, metadata_b, 4102444800) != Registry::ResultCode.DigestMismatch
+    return 5 if Registry::record_trusted(package, v2, digest_b, metadata_b, 4102444800) != Registry::ResultCode.Ok
+    return 6 if Registry::record_trusted(package, v2, digest_b, metadata_b, 4102444800) != Registry::ResultCode.Ok
     return 0
 EOF
 ELISA_STAGE1_BIN="${ELISA_STAGE1_BIN:-$ELISA_COMPILER_ROOT/bin/elisac-stage1}" \
@@ -470,8 +762,11 @@ def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.
     digest: mutable darray[u8] = []
     for _index in 0..<64 |digest|:
         digest.push(98)
+    metadata_digest: mutable darray[u8] = []
+    for _index in 0..<64 |metadata_digest|:
+        metadata_digest.push(100)
     version: mutable darray[u8] = [50,46,48,46,48]
-    return 0 if Registry::record_trusted(package, version, digest) == Registry::ResultCode.Ok else 1
+    return 0 if Registry::record_trusted(package, version, digest, metadata_digest, 4102444800) == Registry::ResultCode.Ok else 1
 EOF
 ELISA_STAGE1_BIN="${ELISA_STAGE1_BIN:-$ELISA_COMPILER_ROOT/bin/elisac-stage1}" \
 ELISA_ALLOW_STALE_STAGE1="${ELISA_ALLOW_STALE_STAGE1:-0}" \
