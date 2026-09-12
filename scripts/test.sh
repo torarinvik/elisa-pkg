@@ -1116,14 +1116,17 @@ ARCHIVE_EXTRACT_512_DIR="$TEST_TMP/archive-extract-512-$$"
 ARCHIVE_EXTRACT_LIMIT_DIR="$TEST_TMP/archive-extract-limit-$$"
 ARCHIVE_EXTRACT_TRAVERSAL_DIR="$TEST_TMP/archive-extract-traversal-$$"
 ARCHIVE_EXTRACT_COLLISION_DIR="$TEST_TMP/archive-extract-collision-$$"
+ARCHIVE_EXTRACT_PUBLIC_DIR="$TEST_TMP/archive-extract-public-$$"
 ARCHIVE_TRAVERSAL_ESCAPE="$TEST_TMP/outside"
-mkdir -p "$ARCHIVE_EXTRACT_DIR"
-mkdir -p "$ARCHIVE_EXTRACT_DIR-partial"
-mkdir -p "$ARCHIVE_EXTRACT_DIR-end"
-mkdir -p "$ARCHIVE_EXTRACT_512_DIR"
-mkdir -p "$ARCHIVE_EXTRACT_LIMIT_DIR"
-mkdir -p "$ARCHIVE_EXTRACT_TRAVERSAL_DIR"
-mkdir -p "$ARCHIVE_EXTRACT_COLLISION_DIR"
+mkdir -m 700 "$ARCHIVE_EXTRACT_DIR"
+mkdir -m 700 "$ARCHIVE_EXTRACT_DIR-partial"
+mkdir -m 700 "$ARCHIVE_EXTRACT_DIR-end"
+mkdir -m 700 "$ARCHIVE_EXTRACT_512_DIR"
+mkdir -m 700 "$ARCHIVE_EXTRACT_LIMIT_DIR"
+mkdir -m 700 "$ARCHIVE_EXTRACT_TRAVERSAL_DIR"
+mkdir -m 700 "$ARCHIVE_EXTRACT_COLLISION_DIR"
+mkdir -m 700 "$ARCHIVE_EXTRACT_PUBLIC_DIR"
+chmod 777 "$ARCHIVE_EXTRACT_PUBLIC_DIR"
 cat > "$ARCHIVE_PROBE" <<EOF
 include "$ROOT/src/archive.elisa"
 
@@ -1186,6 +1189,9 @@ def main() -> i64:
     destination: mutable darray[u8] = []
     append_text(&destination, "$ARCHIVE_EXTRACT_DIR")
     return 5 if not Archive::extract_ustar_archive(valid, destination)
+    public_destination: mutable darray[u8] = []
+    append_text(&public_destination, "$ARCHIVE_EXTRACT_PUBLIC_DIR")
+    return 16 if Archive::extract_ustar_archive(valid, public_destination)
     valid[156] <- 50
     return 3 if Archive::verify_ustar_archive(valid)
     upper_name: mutable darray[u8] = [83, 82, 67, 47, 77, 65, 73, 78, 46, 69, 76, 73, 83, 65]
@@ -1265,6 +1271,7 @@ ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_COMPILER_ROOT/build/runtime/elisa
 "$ARCHIVE_BIN"
 test -f "$ARCHIVE_EXTRACT_DIR/src/main.elisa"
 test "$(cat "$ARCHIVE_EXTRACT_DIR/src/main.elisa")" = abc
+test -z "$(find "$ARCHIVE_EXTRACT_PUBLIC_DIR" -mindepth 1 -print -quit)"
 test -z "$(find "$ARCHIVE_EXTRACT_COLLISION_DIR" -mindepth 1 -print -quit)"
 test -z "$(find "$ARCHIVE_EXTRACT_TRAVERSAL_DIR" -mindepth 1 -print -quit)"
 test ! -e "$ARCHIVE_TRAVERSAL_ESCAPE"

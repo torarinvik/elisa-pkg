@@ -342,6 +342,10 @@ module PlatformNative:
             destination_name: cstr = (&destination_c[0]).cast[cstr] can Unsafe.PointerCast
             root: i64 = open_directory_path(destination_name)
             return root if root < 0
+            # Extraction writes incrementally, so the opened root must be an
+            # owner-only staging directory. Check the descriptor (not the
+            # caller's path) before inspecting or creating any entries.
+            return close_error(root, -13) if not private_staging_directory_fd(root, native_geteuid().u64())
             return close_error(root, -directory_not_empty_error) if not directory_empty(root)
             seen: mutable darray[u8] = []
             created_directories: mutable darray[u8] = []
@@ -383,6 +387,9 @@ module PlatformNative:
                 leaf_offset: mutable usize = 0.usize()
                 parent: i64 = archive_open_parent(root, name, &parent_copy, &leaf_offset, true, &created_directories)
                 return extraction_failure(root, seen, created_directories, -22) if parent < 0
+                leaf_snapshot: mutable darray[u8] = []
+                for index in leaf_offset..<parent_copy.count |leaf_snapshot, parent_copy|:
+                    leaf_snapshot.push(parent_copy[index])
                 leaf: cstr = (&parent_copy[leaf_offset]).cast[cstr] can Unsafe.PointerCast
                 file: i64 = native_openat(parent, leaf, flags_write_create_exclusive(), 420)
                 if file < 0:
@@ -409,7 +416,11 @@ module PlatformNative:
                 close_status: i64 = native_close(file)
                 directory_sync: i64 = native_fsync(parent) if not write_failed and sync_status == 0 and close_status == 0 else -5
                 if write_failed or sync_status != 0 or close_status != 0 or directory_sync != 0:
-                    _ = native_unlinkat(parent, leaf, 0)
+                    cleanup_leaf: mutable darray[u8] = []
+                    for index in 0..<leaf_snapshot.count |cleanup_leaf, leaf_snapshot|:
+                        cleanup_leaf.push(leaf_snapshot[index])
+                    cleanup_name: cstr = (&cleanup_leaf[0]).cast[cstr] can Unsafe.PointerCast
+                    _ = native_unlinkat(parent, cleanup_name, 0)
                     _ = native_close(parent)
                     return extraction_failure(root, seen, created_directories, -5)
                 return extraction_failure(root, seen, created_directories, -5) if native_close(parent) != 0
@@ -1619,6 +1630,18 @@ module PlatformNative:
 
         def trusted_directory_fd(fd: i64, expected_uid: u64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return trusted_fd(fd, expected_uid, directory_mode) and trusted_acl_fd(fd)
+
+        def private_staging_directory_fd(fd: i64, expected_uid: u64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            stat: mutable darray[u8] = []
+            stat.resize(144)
+            raw: mutable void& = (&stat[0]).cast[mutable void&] can Unsafe.PointerCast
+            return false if native_fstat(fd, raw) != 0
+            mode: u64 = read_u16(stat, stat_mode_offset)
+            owner: u64 = read_u32(stat, stat_uid_offset)
+            # mkdtemp creates staging roots as euid-owned 0700 directories.
+            # Reject special bits and every group/other permission as well.
+            return false if (mode & 61440.u64()) != directory_mode or owner != expected_uid or (mode & 4095.u64()) != 448.u64()
+            return trusted_acl_fd(fd)
 
         def trusted_acl_fd(fd: i64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             static if ELISA_TARGET_OS_MACOS:
