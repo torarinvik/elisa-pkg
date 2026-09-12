@@ -2078,6 +2078,48 @@ PY
   "$BIN" check-manifest >/dev/null
   cmp recovered.manifest elisapkg.json >/dev/null
   test ! -e .elisapkg/transaction.state
+  # A journaled manifest intent must recover both sides of the publication
+  # rename: before publication the live file is original; afterward it is the
+  # staged new content. Both cases roll back to the original manifest.
+  cp recovered.manifest .elisapkg/transaction.manifest
+  cp elisapkg.lock .elisapkg/transaction.lock
+  printf '%s\n' '{}' > .elisapkg/transaction.new-manifest
+  printf '%s\n' 'manifest-pending' > .elisapkg/transaction.state
+  "$BIN" check-manifest >/dev/null
+  cmp recovered.manifest elisapkg.json >/dev/null
+  test ! -e .elisapkg/transaction.state
+  cp recovered.manifest .elisapkg/transaction.manifest
+  cp elisapkg.lock .elisapkg/transaction.lock
+  printf '%s\n' '{}' > .elisapkg/transaction.new-manifest
+  printf '%s\n' 'manifest-pending' > .elisapkg/transaction.state
+  cp .elisapkg/transaction.new-manifest elisapkg.json
+  "$BIN" check-manifest >/dev/null
+  cmp recovered.manifest elisapkg.json >/dev/null
+  test ! -e .elisapkg/transaction.state
+  cp recovered.manifest .elisapkg/transaction.manifest
+  cp elisapkg.lock .elisapkg/transaction.lock
+  printf '%s\n' '{}' > .elisapkg/transaction.new-manifest
+  printf '%s\n' 'manifest-pending' > .elisapkg/transaction.state
+  printf '%s\n' '{"external":"manifest-edit"}' > elisapkg.json
+  if "$BIN" check-manifest >/dev/null 2>&1; then
+    echo "pending transaction recovery overwrote an external manifest edit" >&2
+    exit 1
+  else
+    test "$?" -eq 5
+  fi
+  cp recovered.manifest elisapkg.json
+  "$BIN" check-manifest >/dev/null
+  test ! -e .elisapkg/transaction.state
+  # Older journals may have already restored the original manifest but crash
+  # before deleting their recovery files. Recovery must be safe to repeat.
+  cp recovered.manifest .elisapkg/transaction.manifest
+  cp elisapkg.lock .elisapkg/transaction.lock
+  printf '%s\n' '{}' > .elisapkg/transaction.new-manifest
+  printf '%s\n' 'manifest-replaced' > .elisapkg/transaction.state
+  cp recovered.manifest elisapkg.json
+  "$BIN" check-manifest >/dev/null
+  cmp recovered.manifest elisapkg.json >/dev/null
+  test ! -e .elisapkg/transaction.state
   cp recovered.manifest .elisapkg/transaction.manifest
   cp elisapkg.lock .elisapkg/transaction.lock
   printf '%s\n' '{}' > .elisapkg/transaction.new-manifest

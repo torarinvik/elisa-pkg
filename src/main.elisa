@@ -228,7 +228,7 @@ module Cli:
             out.resize(0)
             path_c: mutable darray[u8] = []
             path_with_nul_into(path, &path_c)
-            path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
+            path_name: mutable cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
             stream: mutable heap void&? = Platform::pkg_fopen(path_name, O_READ)
             if stream is open_stream:
                 chunk: mutable darray[u8] = []
@@ -257,13 +257,18 @@ module Cli:
 
         def read_package_file_into(path: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out.resize(0)
+            path_snapshot: mutable darray[u8] = []
+            bytes_push_array(&path_snapshot, path)
             path_c: mutable darray[u8] = []
-            path_with_nul_into(path, &path_c)
-            path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
+            path_with_nul_into(&path_snapshot, &path_c)
+            path_name: mutable cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
             file_size: i64 = Platform::pkg_package_file_size(path_name)
             return false if file_size < 0 or file_size > 67108864
             out.resize(file_size.usize() + 1.usize())
             out_raw: mutable u8& = (&out[0]).cast[mutable u8&] can Unsafe.PointerCast
+            path_c.resize(0)
+            path_with_nul_into(&path_snapshot, &path_c)
+            path_name <- (&path_c[0]).cast[cstr] can Unsafe.PointerCast
             read_size: i64 = Platform::pkg_read_package_file(path_name, out_raw, out.count)
             return false if read_size < 0 or read_size != file_size
             out.resize(read_size.usize())
@@ -347,13 +352,16 @@ module Cli:
         def write_cstr_file(path_name: cstr, value: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             # mkstemp provides an exclusive 0600 temporary file; fsync and rename make
             # the lockfile transition atomic and prevent readers from seeing a prefix.
+            path_snapshot: mutable darray[u8] = []
+            bytes_push_cstr(&path_snapshot, path_name)
             template: mutable darray[u8] = []
-            bytes_push_cstr(&template, path_name)
+            bytes_push_array(&template, path_snapshot)
             bytes_push_view(&template, ".tmp.XXXXXX")
             template.push(0)
             fd: i64 = Platform::pkg_mkstemp(&template)
             return false if fd < 0
-            temp_name: cstr = (&template[0]).cast[cstr] can Unsafe.PointerCast
+            temp_snapshot: mutable darray[u8] = []
+            bytes_push_array(&temp_snapshot, template)
             if not write_fd_all(fd, value):
                 _ = Platform::pkg_close(fd)
                 return false
@@ -362,9 +370,18 @@ module Cli:
                 return false
             if Platform::pkg_close(fd) != 0:
                 return false
-            if Platform::pkg_rename(temp_name, path_name) != 0:
+            temp_c: mutable darray[u8] = []
+            bytes_push_array(&temp_c, temp_snapshot)
+            target_c: mutable darray[u8] = []
+            path_with_nul_into(&path_snapshot, &target_c)
+            temp_name: cstr = (&temp_c[0]).cast[cstr] can Unsafe.PointerCast
+            target_name: mutable cstr = (&target_c[0]).cast[cstr] can Unsafe.PointerCast
+            if Platform::pkg_rename(temp_name, target_name) != 0:
                 return false
-            return Platform::pkg_fsync_parent(path_name) == 0
+            target_c.resize(0)
+            path_with_nul_into(&path_snapshot, &target_c)
+            target_name <- (&target_c[0]).cast[cstr] can Unsafe.PointerCast
+            return Platform::pkg_fsync_parent(target_name) == 0
 
         # Return zero when this call publishes the destination, -17 when an
         # existing destination wins the exclusive link, and another negative
@@ -374,24 +391,36 @@ module Cli:
             # Link the fsynced temporary into place so an existing destination can
             # never be replaced by a rename race. The temporary is removed after the
             # link, leaving one durable directory entry for the caller to own.
+            path_snapshot: mutable darray[u8] = []
+            bytes_push_cstr(&path_snapshot, path_name)
             template: mutable darray[u8] = []
-            bytes_push_cstr(&template, path_name)
+            bytes_push_array(&template, path_snapshot)
             bytes_push_view(&template, ".tmp.XXXXXX")
             template.push(0)
             fd: i64 = Platform::pkg_mkstemp(&template)
             return -5 if fd < 0
-            temp_name: cstr = (&template[0]).cast[cstr] can Unsafe.PointerCast
+            temp_snapshot: mutable darray[u8] = []
+            bytes_push_array(&temp_snapshot, template)
             if not write_fd_all(fd, value) or Platform::pkg_fsync(fd) != 0:
                 _ = Platform::pkg_close(fd)
                 return -5
             if Platform::pkg_close(fd) != 0:
                 return -5
-            link_status: i64 = Platform::pkg_link(temp_name, path_name)
+            temp_c: mutable darray[u8] = []
+            bytes_push_array(&temp_c, temp_snapshot)
+            target_c: mutable darray[u8] = []
+            path_with_nul_into(&path_snapshot, &target_c)
+            temp_name: mutable cstr = (&temp_c[0]).cast[cstr] can Unsafe.PointerCast
+            target_name: mutable cstr = (&target_c[0]).cast[cstr] can Unsafe.PointerCast
+            link_status: i64 = Platform::pkg_link(temp_name, target_name)
             if link_status != 0:
                 # Keep the exclusive temporary for recovery. Unlinking this
                 # pathname after the descriptor is closed could remove a
                 # replacement installed by another actor.
                 return link_status
+            temp_c.resize(0)
+            bytes_push_array(&temp_c, temp_snapshot)
+            temp_name <- (&temp_c[0]).cast[cstr] can Unsafe.PointerCast
             unlink_status: i64 = Platform::pkg_unlink(temp_name)
             if unlink_status != 0:
                 # The destination link is already published. Do not remove it
@@ -399,7 +428,10 @@ module Cli:
                 # replaced that name while the temporary link was being
                 # retired. Leave the evidence for a later recovery pass.
                 return -5
-            if Platform::pkg_fsync_parent(path_name) != 0:
+            target_c.resize(0)
+            path_with_nul_into(&path_snapshot, &target_c)
+            target_name <- (&target_c[0]).cast[cstr] can Unsafe.PointerCast
+            if Platform::pkg_fsync_parent(target_name) != 0:
                 # The link is visible, but its directory durability is unknown.
                 # Removing the destination by pathname could delete a concurrent
                 # replacement, so report the durability failure and leave the
@@ -483,7 +515,7 @@ module Cli:
         def write_file(path: darray[u8]&, value: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             path_c: mutable darray[u8] = []
             path_with_nul_into(path, &path_c)
-            path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
+            path_name: mutable cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
             # Initialization files use the same durable atomic replacement primitive as
             # manifests and lockfiles. This keeps a crash from exposing a truncated
             # scaffold and avoids leaving a partially written file after an I/O error.
@@ -541,12 +573,17 @@ module Cli:
             return entry_real[root_length].u8() == 47
 
         def remove_known_file(path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            path_snapshot: mutable darray[u8] = []
+            bytes_push_array(&path_snapshot, path)
             path_c: mutable darray[u8] = []
-            path_with_nul_into(path, &path_c)
-            path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
+            path_with_nul_into(&path_snapshot, &path_c)
+            path_name: mutable cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
             state: i64 = Platform::pkg_package_file_size(path_name)
             return true if state == -2
             return false if state < 0
+            path_c.resize(0)
+            path_with_nul_into(&path_snapshot, &path_c)
+            path_name <- (&path_c[0]).cast[cstr] can Unsafe.PointerCast
             return Platform::pkg_unlink(path_name) == 0
 
         def remove_empty_directory(path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -657,13 +694,14 @@ module Cli:
             no_expected_lock: mutable darray[u8] = []
             return transaction_begin_with_lock(original_manifest, -3, no_expected_lock)
 
-        def transaction_mark_manifest() -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
-            new_manifest: mutable darray[u8] = []
-            new_manifest.resize(1048577)
-            return false if not read_cstr_into("elisapkg.json", &new_manifest)
+        def transaction_stage_manifest(new_manifest: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            # Persist the exact intended content and publish a recovery phase
+            # before replacing the live manifest. Recovery can then distinguish
+            # the old, new, and externally edited states even across a crash at
+            # either atomic rename boundary.
             return false if not write_cstr_file(".elisapkg/transaction.new-manifest", &new_manifest)
             state: mutable darray[u8] = []
-            bytes_push_view(&state, "manifest-replaced\n")
+            bytes_push_view(&state, "manifest-pending\n")
             return write_cstr_file(".elisapkg/transaction.state", &state)
 
         def transaction_mark_lock() -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
@@ -690,7 +728,7 @@ module Cli:
             state: mutable darray[u8] = []
             state.resize(128)
             return false if not read_cstr_into(".elisapkg/transaction.state", &state)
-            recognized: bool = bytes_equal_view(state, "prepared-lock\n") or bytes_equal_view(state, "prepared-no-lock\n") or bytes_equal_view(state, "manifest-replaced\n")
+            recognized: bool = bytes_equal_view(state, "prepared-lock\n") or bytes_equal_view(state, "prepared-no-lock\n") or bytes_equal_view(state, "manifest-pending\n") or bytes_equal_view(state, "manifest-replaced\n")
             return false if not recognized
             original_manifest: mutable darray[u8] = []
             original_manifest.resize(1048577)
@@ -698,11 +736,11 @@ module Cli:
             current_manifest: mutable darray[u8] = []
             current_manifest.resize(1048577)
             return false if not read_cstr_into("elisapkg.json", &current_manifest)
-            if bytes_equal_view(state, "manifest-replaced\n"):
+            if bytes_equal_view(state, "manifest-pending\n") or bytes_equal_view(state, "manifest-replaced\n"):
                 new_manifest: mutable darray[u8] = []
                 new_manifest.resize(1048577)
                 return false if not read_cstr_into(".elisapkg/transaction.new-manifest", &new_manifest)
-                if not bytes_equal(current_manifest, new_manifest):
+                if not bytes_equal(current_manifest, new_manifest) and not bytes_equal(current_manifest, original_manifest):
                     write_error("error: transaction recovery found an external manifest edit; recovery files were retained\n")
                     return false
             elif not bytes_equal(current_manifest, original_manifest):
@@ -738,7 +776,7 @@ module Cli:
                 write_error("error: transaction recovery found an external lockfile edit; recovery files were retained\n")
                 return false
             return false if not write_cstr_file("elisapkg.json", &original_manifest)
-            if bytes_equal_view(state, "prepared-lock\n") or (bytes_equal_view(state, "manifest-replaced\n") and original_lock_present):
+            if bytes_equal_view(state, "prepared-lock\n") or ((bytes_equal_view(state, "manifest-pending\n") or bytes_equal_view(state, "manifest-replaced\n")) and original_lock_present):
                 return false if not write_cstr_file("elisapkg.lock", &original_lock)
             else:
                 return false if not remove_cstr_file("elisapkg.lock")
@@ -781,14 +819,25 @@ module Cli:
             transaction_state <- Platform::pkg_package_file_size(".elisapkg/transaction.state")
             if transaction_state == -2:
                 return remove_empty_directory(&guard)
-            return false if transaction_state < 0
+            if transaction_state < 0:
+                _ = remove_empty_directory(&guard)
+                return false
             state: mutable darray[u8] = []
             state.resize(128)
-            return false if not read_cstr_into(".elisapkg/transaction.state", &state)
-            if bytes_equal_view(state, "complete\n"):
-                return transaction_cleanup()
-            return false if not (bytes_equal_view(state, "prepared-lock\n") or bytes_equal_view(state, "prepared-no-lock\n") or bytes_equal_view(state, "manifest-replaced\n"))
-            return transaction_restore()
+            if not read_cstr_into(".elisapkg/transaction.state", &state):
+                _ = remove_empty_directory(&guard)
+                return false
+            recognized: bool = bytes_equal_view(state, "complete\n") or bytes_equal_view(state, "prepared-lock\n") or bytes_equal_view(state, "prepared-no-lock\n") or bytes_equal_view(state, "manifest-pending\n") or bytes_equal_view(state, "manifest-replaced\n")
+            if not recognized:
+                _ = remove_empty_directory(&guard)
+                return false
+            recovered: bool = transaction_cleanup() if bytes_equal_view(state, "complete\n") else transaction_restore()
+            if not recovered:
+                # Keep the journal, but release our temporary recovery guard.
+                # A later command can retry after the user repairs an external
+                # edit or after a transient filesystem error clears.
+                _ = remove_empty_directory(&guard)
+            return recovered
 
         def transaction_commit() -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             state: mutable darray[u8] = []
@@ -2842,7 +2891,7 @@ module Cli:
                 write_error("error: dependency is already declared or the manifest has no dependency object\n")
                 return EXIT_RESOLVE
             return EXIT_SECURITY if not transaction_begin(raw)
-            if not write_cstr_file("elisapkg.json", &updated) or not transaction_mark_manifest():
+            if not transaction_stage_manifest(updated) or not write_cstr_file("elisapkg.json", &updated):
                 _ = transaction_restore()
                 return EXIT_SOURCE
             options: Model::CommandOptions = Model::CommandOptions{locked: false, offline: false, frozen: false, json: false, verbose: false, profile: "debug", target_name: "", target_kind: "", update_name: ""}
@@ -4112,12 +4161,10 @@ module Cli:
             receipt_path: mutable darray[u8] = []
             path_join_into(bin_dir, name_raw, &destination)
             path_join_into(receipt_dir, name_raw, &receipt_path)
-            destination_c: mutable darray[u8] = []
-            receipt_c: mutable darray[u8] = []
-            path_with_nul_into(&destination, &destination_c)
-            path_with_nul_into(&receipt_path, &receipt_c)
-            destination_name: cstr = (&destination_c[0]).cast[cstr] can Unsafe.PointerCast
-            receipt_name: cstr = (&receipt_c[0]).cast[cstr] can Unsafe.PointerCast
+            destination_snapshot: mutable darray[u8] = []
+            receipt_snapshot: mutable darray[u8] = []
+            bytes_push_array(&destination_snapshot, destination)
+            bytes_push_array(&receipt_snapshot, receipt_path)
             prefix_c: mutable darray[u8] = []
             path_with_nul_into(&prefix, &prefix_c)
             prefix_name: cstr = (&prefix_c[0]).cast[cstr] can Unsafe.PointerCast
@@ -4125,10 +4172,26 @@ module Cli:
             if lock_fd < 0:
                 write_error("error: could not acquire the local installation lock; check the prefix and any legacy lock path\n")
                 return 7
-            if file_exists(&destination) or file_exists(&receipt_path):
+            destination.resize(0)
+            bytes_push_array(&destination, destination_snapshot)
+            if file_exists(&destination):
                 return finish_local_install_error(lock_fd, "error: install destination or receipt already exists; refusing to overwrite\n")
+            receipt_path.resize(0)
+            bytes_push_array(&receipt_path, receipt_snapshot)
+            if file_exists(&receipt_path):
+                return finish_local_install_error(lock_fd, "error: install destination or receipt already exists; refusing to overwrite\n")
+            destination.resize(0)
+            bytes_push_array(&destination, destination_snapshot)
+            destination_c: mutable darray[u8] = []
+            path_with_nul_into(&destination, &destination_c)
+            destination_name: mutable cstr = (&destination_c[0]).cast[cstr] can Unsafe.PointerCast
             if not write_cstr_file_noclobber(destination_name, &artifact_bytes):
                 return finish_local_install_error(lock_fd, "error: could not publish the local installation binary\n")
+            destination.resize(0)
+            bytes_push_array(&destination, destination_snapshot)
+            destination_c.resize(0)
+            path_with_nul_into(&destination, &destination_c)
+            destination_name <- (&destination_c[0]).cast[cstr] can Unsafe.PointerCast
             if Platform::pkg_chmod(destination_name, 493.u16()) != 0:
                 removed: bool = remove_known_file(&destination)
                 return finish_local_install_error(lock_fd, "error: could not set local installation permissions\n") if removed else finish_local_install_error(lock_fd, "error: could not set local installation permissions or clean up the binary\n")
@@ -4138,11 +4201,18 @@ module Cli:
             bytes_push_view(&receipt, "\nversion:")
             bytes_push_array(&receipt, version)
             bytes_push_view(&receipt, "\npath:")
-            bytes_push_array(&receipt, destination)
+            bytes_push_array(&receipt, destination_snapshot)
             bytes_push_view(&receipt, "\nartifact-digest:sha256:")
             bytes_push_array(&receipt, digest)
             bytes_push_view(&receipt, "\n")
+            receipt_path.resize(0)
+            bytes_push_array(&receipt_path, receipt_snapshot)
+            receipt_c: mutable darray[u8] = []
+            path_with_nul_into(&receipt_path, &receipt_c)
+            receipt_name: cstr = (&receipt_c[0]).cast[cstr] can Unsafe.PointerCast
             if not write_cstr_file_noclobber(receipt_name, &receipt):
+                destination.resize(0)
+                bytes_push_array(&destination, destination_snapshot)
                 removed: bool = remove_known_file(&destination)
                 return finish_local_install_error(lock_fd, "error: could not publish the local installation receipt\n") if removed else finish_local_install_error(lock_fd, "error: could not publish the local installation receipt or clean up the binary\n")
             return 7 if not release_install_lock(lock_fd)
@@ -4196,12 +4266,10 @@ module Cli:
             receipt_path: mutable darray[u8] = []
             path_join_into(bin_dir, name_raw, &destination)
             path_join_into(receipt_dir, name_raw, &receipt_path)
-            destination_c: mutable darray[u8] = []
-            receipt_c: mutable darray[u8] = []
-            path_with_nul_into(&destination, &destination_c)
-            path_with_nul_into(&receipt_path, &receipt_c)
-            destination_name: cstr = (&destination_c[0]).cast[cstr] can Unsafe.PointerCast
-            receipt_name: cstr = (&receipt_c[0]).cast[cstr] can Unsafe.PointerCast
+            destination_snapshot: mutable darray[u8] = []
+            receipt_snapshot: mutable darray[u8] = []
+            bytes_push_array(&destination_snapshot, destination)
+            bytes_push_array(&receipt_snapshot, receipt_path)
             prefix_c: mutable darray[u8] = []
             path_with_nul_into(&prefix, &prefix_c)
             prefix_name: cstr = (&prefix_c[0]).cast[cstr] can Unsafe.PointerCast
@@ -4209,12 +4277,27 @@ module Cli:
             if lock_fd < 0:
                 write_error("error: could not acquire the local installation lock; check the prefix and any legacy lock path\n")
                 return 7
-            if not file_exists(&destination) or not file_exists(&receipt_path):
+            destination.resize(0)
+            bytes_push_array(&destination, destination_snapshot)
+            if not file_exists(&destination):
+                return finish_local_install_error(lock_fd, "error: no matching local installation receipt is available\n")
+            receipt_path.resize(0)
+            bytes_push_array(&receipt_path, receipt_snapshot)
+            if not file_exists(&receipt_path):
                 return finish_local_install_error(lock_fd, "error: no matching local installation receipt is available\n")
             artifact_bytes: mutable darray[u8] = []
             receipt: mutable darray[u8] = []
             receipt.resize(4096)
-            if not read_file_into(&destination, &artifact_bytes) or not read_cstr_into(receipt_name, &receipt):
+            destination.resize(0)
+            bytes_push_array(&destination, destination_snapshot)
+            if not read_file_into(&destination, &artifact_bytes):
+                return finish_local_install_error(lock_fd, "error: could not read the local installation or its receipt\n")
+            receipt_path.resize(0)
+            bytes_push_array(&receipt_path, receipt_snapshot)
+            receipt_c: mutable darray[u8] = []
+            path_with_nul_into(&receipt_path, &receipt_c)
+            receipt_name: cstr = (&receipt_c[0]).cast[cstr] can Unsafe.PointerCast
+            if not read_cstr_into(receipt_name, &receipt):
                 return finish_local_install_error(lock_fd, "error: could not read the local installation or its receipt\n")
             digest_bytes: mutable darray[u8] = []
             digest: mutable darray[u8] = []
@@ -4226,7 +4309,7 @@ module Cli:
             bytes_push_array(&expected_prefix, name)
             bytes_push_view(&expected_prefix, "\nversion:")
             bytes_push_view(&expected_suffix, "\npath:")
-            bytes_push_array(&expected_suffix, destination)
+            bytes_push_array(&expected_suffix, destination_snapshot)
             bytes_push_view(&expected_suffix, "\nartifact-digest:sha256:")
             bytes_push_array(&expected_suffix, digest)
             bytes_push_view(&expected_suffix, "\n")
@@ -4239,7 +4322,13 @@ module Cli:
             parsed_version: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
             if not parse_version(version_bytes, &parsed_version):
                 return finish_local_install_error(lock_fd, "error: installation receipt does not match the current file; refusing removal\n")
-            if not remove_known_file(&destination) or not remove_known_file(&receipt_path):
+            destination.resize(0)
+            bytes_push_array(&destination, destination_snapshot)
+            if not remove_known_file(&destination):
+                return finish_local_install_error(lock_fd, "error: could not remove the local installation and its receipt\n")
+            receipt_path.resize(0)
+            bytes_push_array(&receipt_path, receipt_snapshot)
+            if not remove_known_file(&receipt_path):
                 return finish_local_install_error(lock_fd, "error: could not remove the local installation and its receipt\n")
             return 7 if not release_install_lock(lock_fd)
             write_ok("uninstalled ")
@@ -4287,7 +4376,7 @@ module Cli:
                 write_error("error: dependency is not declared; no manifest or lockfile mutation was performed\n")
                 return EXIT_RESOLVE
             return EXIT_SECURITY if not transaction_begin(raw)
-            if not write_cstr_file("elisapkg.json", &updated) or not transaction_mark_manifest():
+            if not transaction_stage_manifest(updated) or not write_cstr_file("elisapkg.json", &updated):
                 _ = transaction_restore()
                 return EXIT_SOURCE
             options: Model::CommandOptions = Model::CommandOptions{locked: false, offline: false, frozen: false, json: false, verbose: false, profile: "debug", target_name: "", target_kind: "", update_name: ""}

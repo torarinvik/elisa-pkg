@@ -275,11 +275,17 @@ module PlatformNative:
             parent: mutable darray[u8] = []
             leaf: mutable darray[u8] = []
             return -22 if not split_parent_leaf(path, &parent, &leaf)
+            leaf_snapshot: mutable darray[u8] = []
+            for index in 0..<leaf.count |leaf_snapshot, leaf|:
+                leaf_snapshot.push(leaf[index])
             parent_name: cstr = (&parent[0]).cast[cstr] can Unsafe.PointerCast
-            leaf_name: cstr = (&leaf[0]).cast[cstr] can Unsafe.PointerCast
             trusted_uid: u64 = native_geteuid().u64()
             directory: i64 = open_trusted_directory(parent_name, trusted_uid)
             return directory if directory < 0
+            leaf_c: mutable darray[u8] = []
+            for index in 0..<leaf_snapshot.count |leaf_c, leaf_snapshot|:
+                leaf_c.push(leaf_snapshot[index])
+            leaf_name: cstr = (&leaf_c[0]).cast[cstr] can Unsafe.PointerCast
             fd: i64 = native_openat(directory, leaf_name, flags_file_read())
             open_error: i64 = current_errno()
             directory_close: i64 = native_close(directory)
@@ -419,13 +425,23 @@ module PlatformNative:
             parent: mutable darray[u8] = []
             leaf: mutable darray[u8] = []
             return -22 if not split_parent_leaf(path, &parent, &leaf)
+            leaf_snapshot: mutable darray[u8] = []
+            for index in 0..<leaf.count |leaf_snapshot, leaf|:
+                leaf_snapshot.push(leaf[index])
             parent_name: cstr = (&parent[0]).cast[cstr] can Unsafe.PointerCast
-            leaf_name: cstr = (&leaf[0]).cast[cstr] can Unsafe.PointerCast
             directory: i64 = open_directory_path(parent_name)
             return directory if directory < 0
+            leaf_c: mutable darray[u8] = []
+            for index in 0..<leaf_snapshot.count |leaf_c, leaf_snapshot|:
+                leaf_c.push(leaf_snapshot[index])
+            leaf_name: cstr = (&leaf_c[0]).cast[cstr] can Unsafe.PointerCast
             result: i64 = native_mkdirat(directory, leaf_name, mode.i64())
             errno_value: i64 = current_errno()
-            return close_result(directory, 0) if result == 0
+            if result == 0:
+                sync_status: i64 = native_fsync(directory)
+                sync_errno: i64 = current_errno()
+                return close_result(directory, 0) if sync_status == 0
+                return close_error(directory, negative_value(sync_errno))
             return close_error(directory, negative_value(errno_value))
 
         # Flushing the containing directory completes the durability contract
@@ -467,10 +483,17 @@ module PlatformNative:
             parent: mutable darray[u8] = []
             leaf: mutable darray[u8] = []
             return -22 if not split_parent_leaf(path, &parent, &leaf)
+            leaf_snapshot: mutable darray[u8] = []
+            for index in 0..<leaf.count |leaf_snapshot, leaf|:
+                leaf_snapshot.push(leaf[index])
             parent_name: cstr = (&parent[0]).cast[cstr] can Unsafe.PointerCast
-            leaf_name: cstr = (&leaf[0]).cast[cstr] can Unsafe.PointerCast
             directory: i64 = open_directory_path(parent_name)
             return directory if directory < 0
+            leaf_c: mutable darray[u8] = []
+            for index in 0..<leaf_snapshot.count |leaf_c, leaf_snapshot|:
+                leaf_c.push(leaf_snapshot[index])
+            leaf_c.push(0)
+            leaf_name: cstr = (&leaf_c[0]).cast[cstr] can Unsafe.PointerCast
             fd: i64 = native_openat(directory, leaf_name, flags_read_no_follow())
             open_error: i64 = current_errno()
             if fd < 0:
@@ -478,8 +501,11 @@ module PlatformNative:
             return close_two_error(directory, fd, -21) if not regular_fd(fd)
             result: i64 = native_fchmod(fd, mode.i64())
             errno_value: i64 = current_errno()
-            return close_two_result(fd, directory, 0) if result == 0
-            return close_two_error(fd, directory, negative_value(errno_value))
+            return close_two_error(fd, directory, negative_value(errno_value)) if result != 0
+            sync_status: i64 = native_fsync(fd)
+            sync_errno: i64 = current_errno()
+            return close_two_result(fd, directory, 0) if sync_status == 0
+            return close_two_error(fd, directory, negative_value(sync_errno))
 
         def acquire_install_lock(prefix: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             # Use one persistent inode for every installer process. Never unlink
@@ -604,7 +630,11 @@ module PlatformNative:
                         # treat creation as failed. Remove the newly-created
                         # name so an unreported temporary cannot accumulate
                         # in the package cache.
-                        _ = unlink_kind(path, 0)
+                        cleanup_path: mutable darray[u8] = []
+                        for index in 0..<template_path.count |cleanup_path, template_path|:
+                            cleanup_path.push(template_path[index])
+                        cleanup_name: cstr = (&cleanup_path[0]).cast[cstr] can Unsafe.PointerCast
+                        _ = unlink_kind(cleanup_name, 0)
                         return -5
                     return fd
                 return close_error(directory, negative_errno()) if current_errno() != 17
@@ -650,7 +680,11 @@ module PlatformNative:
                     for index in 0..<leaf.count |template_path, leaf, start|:
                         template_path[start + index] <- leaf[index]
                     if native_close(directory) != 0:
-                        _ = unlink_kind(path, at_remove_directory)
+                        cleanup_path: mutable darray[u8] = []
+                        for index in 0..<template_path.count |cleanup_path, template_path|:
+                            cleanup_path.push(template_path[index])
+                        cleanup_name: cstr = (&cleanup_path[0]).cast[cstr] can Unsafe.PointerCast
+                        _ = unlink_kind(cleanup_name, at_remove_directory)
                         return -5
                     return 0
                 return close_error(directory, negative_value(current_errno())) if current_errno() != 17
@@ -932,10 +966,21 @@ module PlatformNative:
             parent: mutable darray[u8] = []
             leaf: mutable darray[u8] = []
             return null if not split_parent_leaf(path, &parent, &leaf)
+            path_snapshot: mutable darray[u8] = []
+            path_length_value: usize = native_strlen(path)
+            for index in 0..<path_length_value |path_snapshot, path|:
+                path_snapshot.push(path[index].u8())
+            path_snapshot.push(0)
+            leaf_snapshot: mutable darray[u8] = []
+            for index in 0..<leaf.count |leaf_snapshot, leaf|:
+                leaf_snapshot.push(leaf[index])
             parent_name: cstr = (&parent[0]).cast[cstr] can Unsafe.PointerCast
-            leaf_name: cstr = (&leaf[0]).cast[cstr] can Unsafe.PointerCast
             directory: i64 = open_directory_path(parent_name)
             return null if directory < 0
+            leaf_c: mutable darray[u8] = []
+            for index in 0..<leaf_snapshot.count |leaf_c, leaf_snapshot|:
+                leaf_c.push(leaf_snapshot[index])
+            leaf_name: cstr = (&leaf_c[0]).cast[cstr] can Unsafe.PointerCast
             fd: i64 = native_openat(directory, leaf_name, flags_write_create_exclusive(), 384)
             directory_close_status: i64 = native_close(directory)
             if directory_close_status != 0:
@@ -944,7 +989,11 @@ module PlatformNative:
                     # Exclusive creation succeeded, but the directory handle
                     # did not close cleanly. Do not leave an unreachable file
                     # behind when reporting the operation as failed.
-                    _ = unlink_kind(path, 0)
+                    cleanup_path: mutable darray[u8] = []
+                    for index in 0..<path_snapshot.count |cleanup_path, path_snapshot|:
+                        cleanup_path.push(path_snapshot[index])
+                    cleanup_name: cstr = (&cleanup_path[0]).cast[cstr] can Unsafe.PointerCast
+                    _ = unlink_kind(cleanup_name, 0)
                 return null
             return null if fd < 0
             stream: mutable heap void&? = native_fdopen(fd, "wb")
@@ -953,7 +1002,11 @@ module PlatformNative:
             _ = native_close(fd)
             # `fdopen` can fail after the exclusive open succeeded. Remove
             # that newly-created name before reporting the wrapper failure.
-            _ = unlink_kind(path, 0)
+            cleanup_path: mutable darray[u8] = []
+            for index in 0..<path_snapshot.count |cleanup_path, path_snapshot|:
+                cleanup_path.push(path_snapshot[index])
+            cleanup_name: cstr = (&cleanup_path[0]).cast[cstr] can Unsafe.PointerCast
+            _ = unlink_kind(cleanup_name, 0)
             return null
 
         def ferror(stream: heap void&) -> int:
@@ -971,13 +1024,23 @@ module PlatformNative:
             parent: mutable darray[u8] = []
             leaf: mutable darray[u8] = []
             return -22 if not split_parent_leaf(path, &parent, &leaf)
+            leaf_snapshot: mutable darray[u8] = []
+            for index in 0..<leaf.count |leaf_snapshot, leaf|:
+                leaf_snapshot.push(leaf[index])
             parent_name: cstr = (&parent[0]).cast[cstr] can Unsafe.PointerCast
-            leaf_name: cstr = (&leaf[0]).cast[cstr] can Unsafe.PointerCast
             parent_directory: i64 = open_directory_path(parent_name)
             return parent_directory if parent_directory < 0
+            leaf_c: mutable darray[u8] = []
+            for index in 0..<leaf_snapshot.count |leaf_c, leaf_snapshot|:
+                leaf_c.push(leaf_snapshot[index])
+            leaf_name: cstr = (&leaf_c[0]).cast[cstr] can Unsafe.PointerCast
             removed: i64 = native_unlinkat(parent_directory, leaf_name, at_remove_directory)
             errno_value: i64 = error_code()
-            return close_result(parent_directory, 0) if removed == 0
+            if removed == 0:
+                sync_status: i64 = native_fsync(parent_directory)
+                sync_errno: i64 = error_code()
+                return close_result(parent_directory, 0) if sync_status == 0
+                return close_error(parent_directory, negative_value(sync_errno))
             return close_error(parent_directory, negative_value(errno_value))
 
         def rename_secure(old_path: cstr, new_path: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -986,14 +1049,28 @@ module PlatformNative:
             new_parent: mutable darray[u8] = []
             new_leaf: mutable darray[u8] = []
             return -22 if not split_parent_leaf(old_path, &old_parent, &old_leaf) or not split_parent_leaf(new_path, &new_parent, &new_leaf)
+            old_leaf_snapshot: mutable darray[u8] = []
+            new_parent_snapshot: mutable darray[u8] = []
+            new_leaf_snapshot: mutable darray[u8] = []
+            for index in 0..<old_leaf.count |old_leaf_snapshot, old_leaf|:
+                old_leaf_snapshot.push(old_leaf[index])
+            for index in 0..<new_parent.count |new_parent_snapshot, new_parent|:
+                new_parent_snapshot.push(new_parent[index])
+            for index in 0..<new_leaf.count |new_leaf_snapshot, new_leaf|:
+                new_leaf_snapshot.push(new_leaf[index])
             old_name: cstr = (&old_parent[0]).cast[cstr] can Unsafe.PointerCast
-            old_leaf_name: cstr = (&old_leaf[0]).cast[cstr] can Unsafe.PointerCast
-            new_name: cstr = (&new_parent[0]).cast[cstr] can Unsafe.PointerCast
-            new_leaf_name: cstr = (&new_leaf[0]).cast[cstr] can Unsafe.PointerCast
             old_directory: i64 = open_directory_path(old_name)
             return old_directory if old_directory < 0
+            new_parent_c: mutable darray[u8] = []
+            for index in 0..<new_parent_snapshot.count |new_parent_c, new_parent_snapshot|:
+                new_parent_c.push(new_parent_snapshot[index])
+            new_name: cstr = (&new_parent_c[0]).cast[cstr] can Unsafe.PointerCast
             new_directory: i64 = open_directory_path(new_name)
             return close_error(old_directory, new_directory) if new_directory < 0
+            old_leaf_c: mutable darray[u8] = []
+            for index in 0..<old_leaf_snapshot.count |old_leaf_c, old_leaf_snapshot|:
+                old_leaf_c.push(old_leaf_snapshot[index])
+            old_leaf_name: cstr = (&old_leaf_c[0]).cast[cstr] can Unsafe.PointerCast
             source_fd: i64 = native_openat(old_directory, old_leaf_name, flags_read_no_follow())
             source_errno: i64 = current_errno()
             return close_two_error(old_directory, new_directory, negative_value(source_errno)) if source_fd < 0
@@ -1001,6 +1078,10 @@ module PlatformNative:
             source_close_status: i64 = native_close(source_fd)
             return close_two_error(old_directory, new_directory, -5) if source_close_status != 0
             return close_two_error(old_directory, new_directory, -21) if not source_regular
+            new_leaf_c: mutable darray[u8] = []
+            for index in 0..<new_leaf_snapshot.count |new_leaf_c, new_leaf_snapshot|:
+                new_leaf_c.push(new_leaf_snapshot[index])
+            new_leaf_name: cstr = (&new_leaf_c[0]).cast[cstr] can Unsafe.PointerCast
             destination_fd: i64 = native_openat(new_directory, new_leaf_name, flags_read_no_follow())
             destination_errno: i64 = error_code()
             if destination_fd >= 0:
@@ -1010,7 +1091,15 @@ module PlatformNative:
                 return close_two_error(old_directory, new_directory, -21) if not destination_regular
             if destination_fd < 0 and destination_errno != 2:
                 return close_two_error(old_directory, new_directory, -destination_errno)
-            result: i64 = native_renameat(old_directory, old_leaf_name, new_directory, new_leaf_name)
+            old_rename_leaf: mutable darray[u8] = []
+            new_rename_leaf: mutable darray[u8] = []
+            for index in 0..<old_leaf_snapshot.count |old_rename_leaf, old_leaf_snapshot|:
+                old_rename_leaf.push(old_leaf_snapshot[index])
+            for index in 0..<new_leaf_snapshot.count |new_rename_leaf, new_leaf_snapshot|:
+                new_rename_leaf.push(new_leaf_snapshot[index])
+            old_rename_name: cstr = (&old_rename_leaf[0]).cast[cstr] can Unsafe.PointerCast
+            new_rename_name: cstr = (&new_rename_leaf[0]).cast[cstr] can Unsafe.PointerCast
+            result: i64 = native_renameat(old_directory, old_rename_name, new_directory, new_rename_name)
             result_errno: i64 = error_code()
             return close_two_result(old_directory, new_directory, 0) if result == 0
             return close_two_error(old_directory, new_directory, -result_errno)
@@ -1133,12 +1222,22 @@ module PlatformNative:
                 next: mutable i64 = native_openat(directory, part, flags_directory() + flag_no_follow)
                 created: mutable bool = false
                 if next < 0 and current_errno() == 2 and create_missing:
-                    mkdir_status: i64 = native_mkdirat(directory, part, 493)
+                    mkdir_part: mutable darray[u8] = []
+                    for index in start..<finish |mkdir_part, name|:
+                        mkdir_part.push(name[index])
+                    mkdir_part.push(0)
+                    mkdir_name: cstr = (&mkdir_part[0]).cast[cstr] can Unsafe.PointerCast
+                    mkdir_status: i64 = native_mkdirat(directory, mkdir_name, 493)
                     mkdir_errno: i64 = current_errno()
                     if mkdir_status != 0 and mkdir_errno != 17:
                         return close_error(directory, negative_errno())
                     created <- mkdir_status == 0
-                    next <- native_openat(directory, part, flags_directory() + flag_no_follow)
+                    reopen_part: mutable darray[u8] = []
+                    for index in start..<finish |reopen_part, name|:
+                        reopen_part.push(name[index])
+                    reopen_part.push(0)
+                    reopen_name: cstr = (&reopen_part[0]).cast[cstr] can Unsafe.PointerCast
+                    next <- native_openat(directory, reopen_name, flags_directory() + flag_no_follow)
                 if next < 0:
                     # If this call created the directory, do not leave an
                     # untracked staging entry behind when reopening it fails.
@@ -1147,7 +1246,14 @@ module PlatformNative:
                     # this cleanup path. Preserve the original open error
                     # unless cleanup or closing the parent also fails.
                     open_errno: i64 = negative_errno()
-                    cleanup_status: i64 = native_unlinkat(directory, part, at_remove_directory) if created else 0
+                    cleanup_status: mutable i64 = 0
+                    if created:
+                        cleanup_part: mutable darray[u8] = []
+                        for index in start..<finish |cleanup_part, name|:
+                            cleanup_part.push(name[index])
+                        cleanup_part.push(0)
+                        cleanup_name: cstr = (&cleanup_part[0]).cast[cstr] can Unsafe.PointerCast
+                        cleanup_status <- native_unlinkat(directory, cleanup_name, at_remove_directory)
                     close_status: i64 = native_close(directory)
                     return -5 if cleanup_status != 0 or close_status != 0
                     return open_errno
@@ -1376,13 +1482,24 @@ module PlatformNative:
             parent: mutable darray[u8] = []
             leaf: mutable darray[u8] = []
             return -22 if not split_parent_leaf(path, &parent, &leaf)
+            leaf_snapshot: mutable darray[u8] = []
+            for index in 0..<leaf.count |leaf_snapshot, leaf|:
+                leaf_snapshot.push(leaf[index])
             parent_name: cstr = (&parent[0]).cast[cstr] can Unsafe.PointerCast
-            leaf_name: cstr = (&leaf[0]).cast[cstr] can Unsafe.PointerCast
             directory: i64 = open_directory_path(parent_name)
             return directory if directory < 0
+            leaf_c: mutable darray[u8] = []
+            for index in 0..<leaf_snapshot.count |leaf_c, leaf_snapshot|:
+                leaf_c.push(leaf_snapshot[index])
+            leaf_c.push(0)
+            leaf_name: cstr = (&leaf_c[0]).cast[cstr] can Unsafe.PointerCast
             result: i64 = native_unlinkat(directory, leaf_name, flags)
             errno_value: i64 = error_code()
-            return close_result(directory, 0) if result == 0
+            if result == 0:
+                sync_status: i64 = native_fsync(directory)
+                sync_errno: i64 = error_code()
+                return close_result(directory, 0) if sync_status == 0
+                return close_error(directory, negative_value(sync_errno))
             return close_error(directory, negative_value(errno_value))
 
         def stat_mode(directory: i64, path: cstr, out: mutable darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -1398,14 +1515,28 @@ module PlatformNative:
             new_parent: mutable darray[u8] = []
             new_leaf: mutable darray[u8] = []
             return -22 if not split_parent_leaf(old_path, &old_parent, &old_leaf) or not split_parent_leaf(new_path, &new_parent, &new_leaf)
+            old_leaf_snapshot: mutable darray[u8] = []
+            new_parent_snapshot: mutable darray[u8] = []
+            new_leaf_snapshot: mutable darray[u8] = []
+            for index in 0..<old_leaf.count |old_leaf_snapshot, old_leaf|:
+                old_leaf_snapshot.push(old_leaf[index])
+            for index in 0..<new_parent.count |new_parent_snapshot, new_parent|:
+                new_parent_snapshot.push(new_parent[index])
+            for index in 0..<new_leaf.count |new_leaf_snapshot, new_leaf|:
+                new_leaf_snapshot.push(new_leaf[index])
             old_name: cstr = (&old_parent[0]).cast[cstr] can Unsafe.PointerCast
-            old_leaf_name: cstr = (&old_leaf[0]).cast[cstr] can Unsafe.PointerCast
-            new_name: cstr = (&new_parent[0]).cast[cstr] can Unsafe.PointerCast
-            new_leaf_name: cstr = (&new_leaf[0]).cast[cstr] can Unsafe.PointerCast
             old_directory: i64 = open_directory_path(old_name)
             return old_directory if old_directory < 0
+            new_parent_c: mutable darray[u8] = []
+            for index in 0..<new_parent_snapshot.count |new_parent_c, new_parent_snapshot|:
+                new_parent_c.push(new_parent_snapshot[index])
+            new_name: cstr = (&new_parent_c[0]).cast[cstr] can Unsafe.PointerCast
             new_directory: i64 = open_directory_path(new_name)
             return close_error(old_directory, new_directory) if new_directory < 0
+            old_leaf_c: mutable darray[u8] = []
+            for index in 0..<old_leaf_snapshot.count |old_leaf_c, old_leaf_snapshot|:
+                old_leaf_c.push(old_leaf_snapshot[index])
+            old_leaf_name: cstr = (&old_leaf_c[0]).cast[cstr] can Unsafe.PointerCast
             source_fd: i64 = native_openat(old_directory, old_leaf_name, flags_read_no_follow())
             source_errno: i64 = current_errno()
             return close_two_error(old_directory, new_directory, negative_value(source_errno)) if source_fd < 0
@@ -1413,6 +1544,10 @@ module PlatformNative:
             source_close_status: i64 = native_close(source_fd)
             return close_two_error(old_directory, new_directory, -5) if source_close_status != 0
             return close_two_error(old_directory, new_directory, -21) if not source_regular
+            new_leaf_c: mutable darray[u8] = []
+            for index in 0..<new_leaf_snapshot.count |new_leaf_c, new_leaf_snapshot|:
+                new_leaf_c.push(new_leaf_snapshot[index])
+            new_leaf_name: cstr = (&new_leaf_c[0]).cast[cstr] can Unsafe.PointerCast
             new_stat: mutable darray[u8] = []
             new_stat.resize(144)
             new_stat_raw: mutable void& = (&new_stat[0]).cast[mutable void&] can Unsafe.PointerCast
@@ -1426,11 +1561,27 @@ module PlatformNative:
                     return close_two_error(old_directory, new_directory, -21) if (new_mode & 61440.u64()) != regular_mode
                 if new_result != 0 and new_errno != 2:
                     return close_two_error(old_directory, new_directory, -new_errno)
-                result <- native_renameat(old_directory, old_leaf_name, new_directory, new_leaf_name)
+                old_move_leaf: mutable darray[u8] = []
+                new_move_leaf: mutable darray[u8] = []
+                for index in 0..<old_leaf_snapshot.count |old_move_leaf, old_leaf_snapshot|:
+                    old_move_leaf.push(old_leaf_snapshot[index])
+                for index in 0..<new_leaf_snapshot.count |new_move_leaf, new_leaf_snapshot|:
+                    new_move_leaf.push(new_leaf_snapshot[index])
+                old_move_name: cstr = (&old_move_leaf[0]).cast[cstr] can Unsafe.PointerCast
+                new_move_name: cstr = (&new_move_leaf[0]).cast[cstr] can Unsafe.PointerCast
+                result <- native_renameat(old_directory, old_move_name, new_directory, new_move_name)
             else:
                 return close_two_error(old_directory, new_directory, -17) if new_result == 0
                 return close_two_error(old_directory, new_directory, -new_errno) if new_result != 0 and new_errno != 2
-                result <- native_linkat(old_directory, old_leaf_name, new_directory, new_leaf_name, 0)
+                old_link_leaf: mutable darray[u8] = []
+                new_link_leaf: mutable darray[u8] = []
+                for index in 0..<old_leaf_snapshot.count |old_link_leaf, old_leaf_snapshot|:
+                    old_link_leaf.push(old_leaf_snapshot[index])
+                for index in 0..<new_leaf_snapshot.count |new_link_leaf, new_leaf_snapshot|:
+                    new_link_leaf.push(new_leaf_snapshot[index])
+                old_link_name: cstr = (&old_link_leaf[0]).cast[cstr] can Unsafe.PointerCast
+                new_link_name: cstr = (&new_link_leaf[0]).cast[cstr] can Unsafe.PointerCast
+                result <- native_linkat(old_directory, old_link_name, new_directory, new_link_name, 0)
             errno_value: i64 = error_code()
             return close_two_result(old_directory, new_directory, 0) if result == 0
             return close_two_error(old_directory, new_directory, negative_value(errno_value))

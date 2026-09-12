@@ -68,6 +68,56 @@ def main() -> int:
         if (state / "transaction.state").exists() or guard.exists():
             raise SystemExit("successful transaction recovery retained its journal")
 
+        # The manifest replacement intent is durable before publication. A
+        # crash on either side of the manifest rename must safely roll back.
+        (state / "transaction.manifest").write_bytes(original_manifest)
+        (state / "transaction.lock").write_bytes(original_lock)
+        (state / "transaction.new-manifest").write_bytes(new_manifest)
+        (state / "transaction.state").write_bytes(b"manifest-pending\n")
+        run("check-manifest", cwd=project, expected=0)
+        if manifest.read_bytes() != original_manifest:
+            raise SystemExit("pending recovery before publication changed the original manifest")
+        if (state / "transaction.state").exists():
+            raise SystemExit("pending recovery before publication retained its journal")
+
+        (state / "transaction.manifest").write_bytes(original_manifest)
+        (state / "transaction.lock").write_bytes(original_lock)
+        (state / "transaction.new-manifest").write_bytes(new_manifest)
+        (state / "transaction.state").write_bytes(b"manifest-pending\n")
+        manifest.write_bytes(new_manifest)
+        run("check-manifest", cwd=project, expected=0)
+        if manifest.read_bytes() != original_manifest:
+            raise SystemExit("pending recovery after publication did not restore the original manifest")
+        if (state / "transaction.state").exists():
+            raise SystemExit("pending recovery after publication retained its journal")
+
+        # Recovery must reject an unrelated edit during a pending phase, while
+        # retaining evidence so the user can restore the known original and
+        # safely retry recovery.
+        (state / "transaction.manifest").write_bytes(original_manifest)
+        (state / "transaction.lock").write_bytes(original_lock)
+        (state / "transaction.new-manifest").write_bytes(new_manifest)
+        (state / "transaction.state").write_bytes(b"manifest-pending\n")
+        external_manifest = b'{"external":"manifest-edit"}\n'
+        manifest.write_bytes(external_manifest)
+        run("check-manifest", cwd=project, expected=5)
+        if manifest.read_bytes() != external_manifest or not (state / "transaction.state").is_file():
+            raise SystemExit("pending recovery overwrote an external edit or discarded its journal")
+        if guard.exists():
+            raise SystemExit("failed recovery retained its temporary guard and blocked a repaired retry")
+        manifest.write_bytes(original_manifest)
+        run("check-manifest", cwd=project, expected=0)
+
+        # Older releases could crash after restoration but before deleting the
+        # journal. Replaying that recovery must remain idempotent.
+        (state / "transaction.manifest").write_bytes(original_manifest)
+        (state / "transaction.lock").write_bytes(original_lock)
+        (state / "transaction.new-manifest").write_bytes(new_manifest)
+        (state / "transaction.state").write_bytes(b"manifest-replaced\n")
+        run("check-manifest", cwd=project, expected=0)
+        if manifest.read_bytes() != original_manifest or (state / "transaction.state").exists():
+            raise SystemExit("recovery after an already-restored manifest was not idempotent")
+
         # A resolver can be interrupted after staging replacement bytes but
         # before publishing a lock that did not exist when the transaction
         # began. Recovery must still recognize this as its own staged write.
