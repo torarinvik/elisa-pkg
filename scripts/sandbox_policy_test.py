@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import platform
+import re
 import shutil
 import socket
 import stat
@@ -185,6 +186,34 @@ def run() -> int:
             raise RuntimeError("generated compiler profile omitted the network denial")
         if b'(allow file-write-data (literal (param "CALLBACK_PATH")))' not in profile_result.stdout:
             raise RuntimeError("generated compiler profile omitted the exact callback data-write rule")
+        credential_rule = re.search(rb'\(deny file-read\* \(regex #"([^\"]+)"\)\)', profile_result.stdout)
+        if credential_rule is None:
+            raise RuntimeError("generated compiler profile omitted credential-path read denials")
+        credential_pattern = re.compile(credential_rule.group(1).decode("ascii"))
+        credential_paths = (
+            "/Users/test/.AZURE/credentials.json",
+            "/Users/test/.TERRAFORM.D/state",
+            "/Users/test/.CONFIG/GH/hosts.yml",
+            "/Users/test/.GIT-CREDENTIALS",
+            "/Users/test/id_ECDSA",
+            "/Users/test/credentials-backup/token.txt",
+            "/Users/test/.env.production/token.txt",
+            "/Users/test/config.ENV",
+            "/Users/test/private.key.backup",
+            "/Users/test/private.P12",
+            "/Users/test/private.JKS",
+        )
+        for path in credential_paths:
+            if credential_pattern.match(path) is None:
+                raise RuntimeError(f"compiler profile credential rule missed {path}")
+        ordinary_paths = (
+            "/Users/test/project/src/main.elisa",
+            "/Users/test/project/.github/workflows/ci.yml",
+            "/Users/test/project/credentialed-notes.txt",
+        )
+        for path in ordinary_paths:
+            if credential_pattern.match(path) is not None:
+                raise RuntimeError(f"compiler profile credential rule unexpectedly denied {path}")
         profile_path = base / "compiler.sb"
         profile_path.write_bytes(profile_result.stdout)
 

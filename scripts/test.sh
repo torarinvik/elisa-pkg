@@ -55,6 +55,36 @@ fi
 json_quiet="$(cd "$QUIET_FIXTURE" && "$BIN" check-manifest --json --quiet)"
 test "$json_quiet" = '{"schema-version":1,"valid":true,"manifest":"elisapkg.json"}'
 
+# Credential filtering is relative to the package root. A checkout nested under
+# a credential-store directory must still fingerprint its own source files.
+ANCESTOR_FIXTURE="$TEST_TMP/.config/gcloud/ordinary-package"
+mkdir -p "$TEST_TMP/.config/gcloud"
+"$BIN" init "$ANCESTOR_FIXTURE" >/dev/null
+(
+  cd "$ANCESTOR_FIXTURE"
+  "$BIN" resolve >/dev/null
+  cp src/main.elisa "$TEST_TMP/ancestor-project-main.good"
+  printf '%s\n' '# source identity must include this package file' >> src/main.elisa
+  if "$BIN" resolve --frozen >/dev/null 2>&1; then
+    echo "source under a credential-named ancestor was omitted from the lock digest" >&2
+    exit 1
+  else
+    test "$?" -eq 3
+  fi
+  cp "$TEST_TMP/ancestor-project-main.good" src/main.elisa
+  "$BIN" resolve --frozen >/dev/null
+)
+
+# If the package root itself is a credential-store directory, its children
+# have ordinary relative names. Resolution must reject that root explicitly.
+for CREDENTIAL_ROOT in "$TEST_TMP/.docker" "$TEST_TMP/.config" "$TEST_TMP/.config/gh"; do
+  "$BIN" init "$CREDENTIAL_ROOT" >/dev/null
+  if (cd "$CREDENTIAL_ROOT" && "$BIN" resolve >/dev/null 2>&1); then
+    echo "resolution accepted a package rooted in a credential store: $CREDENTIAL_ROOT" >&2
+    exit 1
+  fi
+done
+
 # Exercise the pure SemVer requirement module independently of the CLI. This
 # keeps parser/range regressions visible without requiring a registry fixture.
 SEMVER_PROBE="$TEST_TMP/semver-probe-$$.elisa"
@@ -1066,11 +1096,65 @@ PY
   printf '%s' secret > src/.env
   printf '%s' secret > src/config.env
   printf '%s' secret > src/private.pem
-  "$BIN" package >/dev/null
-  if tar -tf .elisapkg/package.tar | grep -E 'src/\.env|src/config\.env|src/private\.pem' >/dev/null; then
-    echo "package archive included a credential-like file" >&2
+  cp elisapkg.json "$TEST_TMP/credentials-manifest.good"
+  python3 - <<'PY'
+import json
+from pathlib import Path
+
+path = Path('elisapkg.json')
+manifest = json.loads(path.read_text())
+manifest.pop('include', None)
+manifest.pop('exclude', None)
+path.write_text(json.dumps(manifest, indent=2) + '\n')
+PY
+  mkdir -p .docker .kube .ssh .gnupg .AWS .azure .terraform .terraform.d .config/gcloud .config/gh .config/rclone .env.production credentials-backup private.pem-store private.key-store
+  printf '%s' secret > .docker/config.json
+  printf '%s' secret > .kube/config
+  printf '%s' secret > .ssh/id_ed25519
+  printf '%s' secret > .AWS/credentials
+  printf '%s' secret > .azure/credentials
+  printf '%s' secret > .terraform/terraform.tfstate
+  printf '%s' secret > .terraform.d/credentials
+  printf '%s' secret > .config/gcloud/application_default_credentials.json
+  printf '%s' secret > .config/gh/hosts.yml
+  printf '%s' secret > .config/rclone/rclone.conf
+  printf '%s' secret > .env.production/secret.txt
+  printf '%s' secret > credentials-backup/token.txt
+  printf '%s' secret > private.pem-store/secret.txt
+  printf '%s' secret > private.key-store/secret.txt
+  printf '%s' secret > signing.p12
+  printf '%s' secret > signing.PFX
+  printf '%s' secret > signing.p8
+  printf '%s' secret > trust.jks
+  printf '%s' secret > token.keystore
+  printf '%s' secret > .NPMRC
+  printf '%s' secret > .pypirc
+  printf '%s' secret > .git-credentials
+  "$BIN" resolve >/dev/null
+  "$BIN" package --list > "$TEST_TMP/package-files-secret-check.txt"
+  credential_path_pattern='\.docker/|\.kube/|\.ssh/|\.gnupg/|\.aws/|\.azure/|\.terraform(\.d)?/|\.config/(gcloud|gh|rclone)/|\.npmrc|\.pypirc|\.git-credentials|id_(rsa|ed25519|ecdsa|dsa)|credentials|\.env|\.pem|\.key|\.(p12|pfx|p8|jks|keystore)'
+  if grep -Ei "$credential_path_pattern" "$TEST_TMP/package-files-secret-check.txt" >/dev/null; then
+    echo "package listing included a credential-bearing path" >&2
     exit 1
   fi
+  "$BIN" package >/dev/null
+  if tar -tf .elisapkg/package.tar | grep -Ei "$credential_path_pattern" >/dev/null; then
+    echo "package archive included a credential-bearing path" >&2
+    exit 1
+  fi
+  mv "$TEST_TMP/credentials-manifest.good" elisapkg.json
+  rm -rf .docker .kube .ssh .gnupg .AWS .azure .terraform .terraform.d .config .env.production credentials-backup private.pem-store private.key-store .NPMRC .pypirc .git-credentials signing.p12 signing.PFX signing.p8 trust.jks token.keystore src/.env src/config.env src/private.pem
+  "$BIN" resolve >/dev/null
+  "$BIN" package >/dev/null
+  ln -s main.elisa src/linked-main
+  "$BIN" resolve >/dev/null
+  "$BIN" package --list > "$TEST_TMP/package-files-symlink-check.txt"
+  if grep -F 'src/linked-main' "$TEST_TMP/package-files-symlink-check.txt" >/dev/null; then
+    echo "package listing included a symlinked source path" >&2
+    exit 1
+  fi
+  rm src/linked-main
+  "$BIN" resolve --frozen >/dev/null
   printf '%s' junk >> .elisapkg/package.receipt
   if "$BIN" cache verify >/dev/null 2>&1; then
     echo "cache verification accepted a tampered package receipt" >&2
