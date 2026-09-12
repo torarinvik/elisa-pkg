@@ -29,6 +29,10 @@ extern native_write(fd: i64, buffer: void&, count: usize) -> i64
 extern native_close(fd: i64) -> i64
 @link_name("dup")
 extern native_dup(fd: i64) -> i64
+@link_name("dup2")
+extern native_dup2(fd: i64, target: i64) -> i64
+@link_name("fcntl")
+extern native_fcntl(fd: i64, command: i64, ...) -> i64
 @link_name("fsync")
 extern native_fsync(fd: i64) -> i64
 @link_name("fchmod")
@@ -84,6 +88,8 @@ extern native_execvp(path: cstr, argv: mutable cstr&&) -> i64
 extern native_exit(code: i64)
 @link_name("setpgid")
 extern native_setpgid(pid: i64, group: i64) -> i64
+@link_name("getpid")
+extern native_getpid() -> i64
 @link_name("waitpid")
 extern native_waitpid(pid: i64, status: mutable i64&, options: i64) -> i64
 @link_name("kill")
@@ -94,6 +100,8 @@ extern native_clock_gettime(clock: i64, timespec: mutable void&) -> i64
 extern native_nanosleep(request: void&, remaining: mutable void&) -> i64
 @link_name("setrlimit")
 extern native_setrlimit(resource: i64, limits: void&) -> i64
+@link_name("getdtablesize")
+extern native_getdtablesize() -> i32
 
 static if ELISA_TARGET_OS_LINUX and ELISA_TARGET_ARCH_ARM64:
     # glibc places st_mode at offset 16 on Linux arm64.
@@ -194,6 +202,23 @@ module PlatformNative:
                 continue if result < 0 and current_errno() == 4
                 return result
             return -5
+        def read_fd(fd: i64, buffer: mutable u8&, capacity: usize) -> i64 can[Unsafe.PointerCast]:
+            return -22 if fd < 0
+            raw: mutable void& = buffer.cast[mutable void&] can Unsafe.PointerCast
+            while true |fd, raw, capacity|:
+                result: i64 = native_read(fd, raw, capacity)
+                continue if result < 0 and current_errno() == 4
+                return result if result >= 0
+                return negative_errno()
+            return -5
+        def seek_fd(fd: i64, offset: i64, origin: i64) -> i64:
+            return native_lseek(fd, offset, origin)
+        def duplicate_fd(fd: i64, target: i64) -> i64:
+            return native_dup2(fd, target)
+        def duplicate_fd_min(fd: i64, minimum: i64) -> i64:
+            return native_fcntl(fd, 0, minimum)
+        def open_null() -> i64:
+            return native_open("/dev/null", 0)
         def close(fd: i64) -> i64:
             return native_close(fd)
         def fsync(fd: i64) -> i64:
@@ -549,6 +574,52 @@ module PlatformNative:
                 return close_error(directory, negative_errno()) if current_errno() != 17
             return close_error(directory, -17)
 
+        # Reserve a caller-selected name without following a pre-planted symlink.
+        # This is used only for the legacy stage1 callback filename, which is
+        # fixed to /tmp/<compiler-pid> by the external compiler.
+        def create_exclusive_file(path: cstr) -> i64:
+            fd: i64 = native_open(path, flags_write_create_exclusive(), 384)
+            return fd if fd < 0
+            return -5 if native_close(fd) != 0
+            return 0
+
+        # Create a private per-build directory under an already trusted parent.
+        # All path traversal uses openat with O_NOFOLLOW; the random leaf is
+        # reserved atomically with mkdirat rather than checked before creation.
+        def mkdtemp(template_path: mutable darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return -22 if template_path.count == 0 or template_path.count > 4096.usize() or template_path[template_path.count - 1.usize()] != 0
+            path_length: usize = native_strlen((&template_path[0]).cast[cstr] can Unsafe.PointerCast)
+            path: cstr = (&template_path[0]).cast[cstr] can Unsafe.PointerCast
+            parent: mutable darray[u8] = []
+            leaf: mutable darray[u8] = []
+            return -22 if not split_parent_leaf(path, &parent, &leaf) or leaf.count < 7.usize()
+            suffix: usize = leaf.count - 7.usize()
+            for index in 0..<6 |leaf|:
+                return -22 if leaf[suffix + index] != 88
+            parent_name: cstr = (&parent[0]).cast[cstr] can Unsafe.PointerCast
+            directory: i64 = open_directory_path(parent_name)
+            return directory if directory < 0
+            alphabet: cstr = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+            entropy: mutable darray[u8] = []
+            entropy.resize(6)
+            entropy_raw: mutable void& = (&entropy[0]).cast[mutable void&] can Unsafe.PointerCast
+            native_arc4random_buf(entropy_raw, 6)
+            for attempt in 0..<256 |leaf, alphabet, entropy, directory, template_path, path_length|:
+                for index in 0..<6 |leaf, alphabet, entropy, attempt|:
+                    leaf[suffix + index] <- alphabet[((entropy[index].u64() + attempt.u64() * 17.u64() + index.u64()) % 62.u64()).usize()].u8()
+                leaf_name: cstr = (&leaf[0]).cast[cstr] can Unsafe.PointerCast
+                result: i64 = native_mkdirat(directory, leaf_name, 448)
+                if result == 0:
+                    start: usize = path_length - leaf.count + 1.usize()
+                    for index in 0..<leaf.count |template_path, leaf, start|:
+                        template_path[start + index] <- leaf[index]
+                    if native_close(directory) != 0:
+                        _ = unlink_kind(path, at_remove_directory)
+                        return -5
+                    return 0
+                return close_error(directory, negative_value(current_errno())) if current_errno() != 17
+            return close_error(directory, -17)
+
         def fork() -> i64:
             return native_fork()
 
@@ -703,6 +774,46 @@ module PlatformNative:
         def set_process_group() -> i64:
             result: i64 = native_setpgid(0, 0)
             return 0 if result == 0 else negative_errno()
+
+        def process_id() -> i64:
+            return native_getpid()
+
+        def terminate_process_group(process_group: i64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return -22 if process_group <= 0
+            if native_kill(-process_group, 9) != 0:
+                kill_errno: i64 = current_errno()
+                return 0 if kill_errno == 3
+                return negative_value(kill_errno)
+            started: i64 = monotonic_milliseconds()
+            return -5 if started < 0
+            deadline: i64 = started + 5000
+            while true |process_group, deadline|:
+                probe: i64 = native_kill(-process_group, 0)
+                if probe != 0:
+                    probe_errno: i64 = current_errno()
+                    return 0 if probe_errno == 3
+                    return negative_value(probe_errno)
+                now: i64 = monotonic_milliseconds()
+                return -5 if now < 0
+                return -110 if now >= deadline
+                pause: mutable darray[u8] = timespec_bytes(0, 10000000)
+                pause_raw: void& = (&pause[0]).cast[void&] can Unsafe.PointerCast
+                remaining: mutable darray[u8] = timespec_bytes(0, 0)
+                remaining_raw: mutable void& = (&remaining[0]).cast[mutable void&] can Unsafe.PointerCast
+                if native_nanosleep(pause_raw, remaining_raw) != 0 and current_errno() != 4:
+                    return negative_errno()
+            return -5
+
+        def close_extra_descriptors() -> i64:
+            static if ELISA_TARGET_OS_MACOS:
+                maximum_fd: i32 = native_getdtablesize()
+                return -22 if maximum_fd < 3 or maximum_fd > 1048576
+                descriptor: mutable i32 = 3
+                while descriptor < maximum_fd |descriptor, maximum_fd|:
+                    _ = native_close(descriptor.i64())
+                    descriptor <- descriptor + 1
+                return 0
+            return 0
 
         def set_process_limits(profile: i64) -> i64 can[Memory.Allocate, Unsafe.PointerCast]:
             cpu: mutable i64 = 0

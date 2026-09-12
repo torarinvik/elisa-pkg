@@ -1019,19 +1019,31 @@ PY
   env -u ELISAPKG_INSTALL_PREFIX HOME="$TRAILING_HOME/" "$BIN" uninstall --local app >/dev/null
   test ! -e "$TRAILING_HOME/.local/bin/app"
   PROBE="$CASE/compiler-env-probe.sh"
-  DUMP="$CASE/compiler-env.dump"
-  printf '%s\n' '#!/bin/sh' "/usr/bin/env > '$DUMP'" 'exit 127' > "$PROBE"
+  PROBE_OUTPUT="$CASE/compiler-env.output"
+  printf '%s\n' '#!/bin/sh' 'exec /usr/bin/env' > "$PROBE"
   chmod +x "$PROBE"
-  if ELISAPKG_COMPILER="$PROBE" ELISAPKG_SECRET=should_not_cross "$BIN" build >/dev/null 2>&1; then
+  if ELISAPKG_COMPILER="$PROBE" ELISAPKG_SECRET=should_not_cross "$BIN" build >"$PROBE_OUTPUT" 2>&1; then
     echo "compiler probe unexpectedly succeeded" >&2
     exit 1
   else
     test "$?" -eq 6
   fi
-  if grep -F 'ELISAPKG_SECRET=should_not_cross' "$DUMP" >/dev/null 2>&1; then
+  grep -F 'ELISA_STAGE1_SEMANTIC_GATE=1' "$PROBE_OUTPUT" >/dev/null
+  if grep -F 'ELISAPKG_SECRET=should_not_cross' "$PROBE_OUTPUT" >/dev/null 2>&1; then
     echo "compiler child inherited a parent secret" >&2
     exit 1
   fi
+  WRITE_PROBE="$CASE/compiler-write-probe.sh"
+  WRITE_MARKER="$CASE/src/compiler-write.marker"
+  printf '%s\n' '#!/bin/sh' "printf blocked > '$WRITE_MARKER'" 'exec /usr/bin/env' > "$WRITE_PROBE"
+  chmod +x "$WRITE_PROBE"
+  if ELISAPKG_COMPILER="$WRITE_PROBE" "$BIN" build >/dev/null 2>&1; then
+    echo "compiler probe unexpectedly succeeded after a project write" >&2
+    exit 1
+  else
+    test "$?" -eq 6
+  fi
+  test ! -e "$WRITE_MARKER"
   if ELISAPKG_COMPILER='-invalid-compiler' "$BIN" build >/dev/null 2>&1; then
     echo "option-shaped compiler override unexpectedly succeeded" >&2
     exit 1

@@ -34,7 +34,8 @@ executable must be explicitly present and executable.
 | sorted regular-file walk | bounded `opendir`/`readdir` traversal through the private Elisa platform module | package reproducibility tests | Extraction accepts regular files and creates only parent directories |
 | atomic file replacement | `mkstemp` + file fsync + rename + parent-directory fsync | lockfile fixtures | Filesystem durability guarantees still depend on the host filesystem |
 | exclusive publication | hard-link from fsynced temp | install fixtures | Prefix lock is a mkdir lock, not a kernel lease |
-| process execution | argv array through `env -i`, private process groups, monotonic deadlines, and resource profiles | compiler environment fixture and native timeout seam | No OS sandbox; signalled child processes return 130 |
+| compiler build isolation | macOS Seatbelt deny-default profile with network denial, unique scratch subtree for all compiler outputs, pre-created callback inode with data-write only, captured stdio | `scripts/test.sh` environment and project-write probes; manual callback write/unlink probe | Network and callback checks lack checked-in probes; hostile descendants can escape process groups; project, local dependency, and selected toolchain trees remain readable |
+| process execution | argv array through `env -i`, private process groups, monotonic deadlines, and resource profiles | compiler environment fixture and native timeout seam | `run` and `test` execute artifacts as the invoking user, outside the build sandbox |
 | native target artifacts | `bin`/`test` targets use `-emit exe`; `lib` targets use `-emit obj` through the same structured adapter | library-target fixture in `scripts/test.sh` | Dependency compile/link planning remains future adapter work |
 | semantic checking | mandatory stage1 gate | invalid-source fixture | Supported toolchain must still be pinned for release |
 | SHA-256 | in-language implementation | FIPS known-answer fixture | Digest is not publisher authentication |
@@ -47,6 +48,10 @@ executable must be explicitly present and executable.
 
 Unsupported hosts and missing capabilities must produce an actionable error;
 they must not silently fall back to an unreviewed shell or network path.
+
+Build isolation currently requires macOS and a working `sandbox-exec`. Linux
+builds return the build error status before invoking a compiler. Other package
+operations use the documented native FFI target matrix above.
 
 The private POSIX FFI currently has explicit layouts for macOS arm64, Linux
 x86_64, and Linux arm64. Other host layouts remain unsupported and must be

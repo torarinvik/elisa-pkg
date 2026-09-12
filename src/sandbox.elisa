@@ -1,0 +1,403 @@
+# Compile-time isolation policy for package builds.
+#
+# Policy construction lives in Elisa. The macOS enforcement frontend is an
+# explicitly temporary Seatbelt adapter; unsupported platforms fail closed.
+module Sandbox:
+    public:
+        def build_sandbox_available() -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            static if ELISA_TARGET_OS_MACOS:
+                return Platform::pkg_access("/usr/bin/sandbox-exec", 1) == 0
+            return false
+
+        def darwin_build_profile(home: cstr, project_root: darray[u8]&, build_root: darray[u8]&,
+                                 dependency_roots: darray[u8]&, tool_paths: darray[cstr]&,
+                                 executable_paths: darray[cstr]&, output_temp: cstr) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            static if not ELISA_TARGET_OS_MACOS:
+                return []
+            home_real: mutable darray[u8] = []
+            project_real: mutable darray[u8] = []
+            build_real: mutable darray[u8] = []
+            if not canonical_path(home, &home_real):
+                return []
+            if not canonical_path_array(project_root, &project_real):
+                return []
+            if not canonical_path_array(build_root, &build_real):
+                return []
+            return [] if not absolute_path(home_real) or not absolute_path(project_real) or not absolute_path(build_real)
+            return [] if Platform::pkg_strlen(output_temp) == 0.usize()
+
+            tool_roots: mutable darray[u8] = []
+            for index in 0..<tool_paths.count |tool_paths, tool_roots|:
+                return [] if not add_toolchain_root(tool_paths[index], home_real, &tool_roots)
+
+            system_roots: mutable darray[u8] = []
+            add_existing_root("/System", &system_roots)
+            add_existing_root("/usr", &system_roots)
+            add_existing_root("/bin", &system_roots)
+            add_existing_root("/sbin", &system_roots)
+            add_existing_root("/Library/Developer/CommandLineTools", &system_roots)
+            add_existing_root("/Applications/Xcode.app", &system_roots)
+
+            extra_read_roots: mutable darray[u8] = []
+            add_existing_root("/private/var/db/dyld", &extra_read_roots)
+            add_existing_root("/var/select", &extra_read_roots)
+
+            profile: mutable darray[u8] = []
+            bytes_push_view(&profile, "(version 1)\n(deny default)\n(deny network*)\n")
+            bytes_push_view(&profile, "(allow process-fork)\n(allow process-info* (target self))\n(allow signal (target self))\n")
+            # Some system utilities query the filesystem root as a directory
+            # object during startup; granting the literal path does not expose
+            # files beneath it.
+            bytes_push_view(&profile, "(allow file-read* (literal \"/\"))\n")
+
+            # Host runtime and SDK files are read-only. Executable access is
+            # granted later to specific compiler helpers rather than to every
+            # binary below these roots.
+            root_cursor: mutable usize = 0.usize()
+            while root_cursor < system_roots.count |system_roots, root_cursor, profile|:
+                root: mutable darray[u8] = []
+                return [] if not next_root(system_roots, &root_cursor, &root)
+                return [] if not append_read_root(&profile, root)
+            root_cursor <- 0.usize()
+            while root_cursor < extra_read_roots.count |extra_read_roots, root_cursor, profile|:
+                root: mutable darray[u8] = []
+                return [] if not next_root(extra_read_roots, &root_cursor, &root)
+                return [] if not append_read_root(&profile, root)
+            return [] if not append_read_alias_root(&profile, "/var/select")
+            bytes_push_view(&profile, "(allow file-read-metadata (path-ancestors \"/dev\"))\n")
+            bytes_push_view(&profile, "(allow file-read* (literal \"/dev/null\"))\n(allow file-read* (literal \"/dev/zero\"))\n(allow file-read* (literal \"/dev/random\"))\n(allow file-read* (literal \"/dev/urandom\"))\n(allow file-write* (literal \"/dev/null\"))\n")
+
+            # Toolchain files are user-selected compiler inputs, while package
+            # sources are data. Neither grants write access. Only the latter
+            # may be read from project directories.
+            root_cursor <- 0.usize()
+            while root_cursor < tool_roots.count |tool_roots, root_cursor, profile|:
+                root: mutable darray[u8] = []
+                return [] if not next_root(tool_roots, &root_cursor, &root)
+                return [] if not append_read_root(&profile, root)
+            # Homebrew's opt prefix is a symlink to the versioned Cellar
+            # directory. dyld consults the install-name spelling, so preserve
+            # the narrow LLVM library alias as well as the canonical tool root.
+            homebrew_clang: mutable darray[u8] = []
+            if canonical_path("/opt/homebrew/opt/llvm/bin/clang", &homebrew_clang):
+                return [] if not append_read_alias_root(&profile, "/opt/homebrew/opt/llvm/lib")
+                return [] if not append_homebrew_llvm_dependency(&profile, "/opt/homebrew", "z3", home_real)
+                return [] if not append_homebrew_llvm_dependency(&profile, "/opt/homebrew", "zstd", home_real)
+            local_clang: mutable darray[u8] = []
+            if canonical_path("/usr/local/opt/llvm/bin/clang", &local_clang):
+                return [] if not append_read_alias_root(&profile, "/usr/local/opt/llvm/lib")
+                return [] if not append_homebrew_llvm_dependency(&profile, "/usr/local", "z3", home_real)
+                return [] if not append_homebrew_llvm_dependency(&profile, "/usr/local", "zstd", home_real)
+            return [] if not append_read_root(&profile, project_real)
+            root_cursor <- 0.usize()
+            while root_cursor < dependency_roots.count |dependency_roots, root_cursor, profile|:
+                dependency_path: mutable darray[u8] = []
+                return [] if not next_root(dependency_roots, &root_cursor, &dependency_path)
+                dependency_real: mutable darray[u8] = []
+                return [] if not canonical_path_array(dependency_path, &dependency_real)
+                return [] if not append_read_root(&profile, dependency_real)
+
+            return [] if not append_subpath_rule(&profile, "allow", "file-read*", "subpath", build_real)
+            return [] if not append_subpath_rule(&profile, "allow", "file-write*", "subpath", build_real)
+
+            # Explicit denials are placed after broad runtime roots. Narrow
+            # project/toolchain/build exceptions are then re-added below.
+            bytes_push_view(&profile, "(deny file-read* (subpath ")
+            return [] if not append_quoted_path(&profile, home_real)
+            bytes_push_view(&profile, "))\n(deny file-write* (subpath ")
+            return [] if not append_quoted_path(&profile, home_real)
+            bytes_push_view(&profile, "))\n(deny process-exec (subpath ")
+            return [] if not append_quoted_path(&profile, home_real)
+            bytes_push_view(&profile, "))\n(deny file-map-executable (subpath ")
+            return [] if not append_quoted_path(&profile, home_real)
+            bytes_push_view(&profile, "))\n")
+            bytes_push_view(&profile, "(deny file-read* (subpath \"/private/tmp\"))\n(deny file-write* (subpath \"/private/tmp\"))\n")
+
+            return [] if not append_read_root(&profile, project_real)
+            root_cursor <- 0.usize()
+            while root_cursor < dependency_roots.count |dependency_roots, root_cursor, profile|:
+                dependency_path: mutable darray[u8] = []
+                return [] if not next_root(dependency_roots, &root_cursor, &dependency_path)
+                dependency_real: mutable darray[u8] = []
+                return [] if not canonical_path_array(dependency_path, &dependency_real)
+                return [] if not append_read_root(&profile, dependency_real)
+            root_cursor <- 0.usize()
+            while root_cursor < tool_roots.count |tool_roots, root_cursor, profile|:
+                root: mutable darray[u8] = []
+                return [] if not next_root(tool_roots, &root_cursor, &root)
+                return [] if not append_read_root(&profile, root)
+            for index in 0..<tool_paths.count |tool_paths, profile|:
+                return [] if not append_toolchain_library_root(&profile, tool_paths[index], home_real)
+
+            # The compiler's controlled linker path uses these exact host
+            # utilities. Allow their exact paths so it cannot execute
+            # unrelated programs simply because they share /usr/bin.
+            return [] if not append_executable_path(&profile, "/usr/bin/env")
+            return [] if not append_executable_path(&profile, "/bin/sh")
+            return [] if not append_executable_path(&profile, "/bin/bash")
+            return [] if not append_executable_path(&profile, "/usr/bin/ld")
+            return [] if not append_executable_path(&profile, "/usr/bin/as")
+            return [] if not append_executable_path(&profile, "/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild")
+
+            # The selected compiler and bootstrap binary can be individual
+            # files anywhere on disk. Their exact paths are the only
+            # toolchain execution exceptions; toolchain roots remain read-only.
+            for index in 0..<executable_paths.count |executable_paths, profile|:
+                return [] if not append_executable_path(&profile, executable_paths[index])
+
+            # Common credentials and private build state are not source inputs.
+            # Project and toolchain roots are reallowed narrowly above; retain
+            # these denials after those exceptions to keep obvious secret files
+            # outside the compiler's view.
+            bytes_push_view(&profile, "(deny file-read* (regex #\"^.*/(\\.env[^/]*|\\.netrc|\\.ssh|\\.aws|\\.gnupg|\\.kube|\\.docker|\\.npmrc|\\.pypirc|id_rsa|id_ed25519|credentials(\\.json)?)($|/.*)$\"))\n")
+            bytes_push_view(&profile, "(deny file-read* (regex #\"^.*\\.(pem|key|p12|pfx)$\"))\n")
+
+            return [] if not append_subpath_rule(&profile, "allow", "file-read*", "subpath", build_real)
+            return [] if not append_subpath_rule(&profile, "allow", "file-write*", "subpath", build_real)
+            output_real: mutable darray[u8] = []
+            return [] if not canonical_path(output_temp, &output_real) or not absolute_path(output_real)
+            return [] if output_real.count <= build_real.count or not path_is_same_or_ancestor(build_real, output_real)
+            # The stage1 linker emits one fixed-name C fallback under /tmp.
+            # The child pre-creates it with O_EXCL before entering Seatbelt. The
+            # sandbox may then truncate/write that existing inode and let clang
+            # read it, but cannot create, chmod, rename, or unlink the host path.
+            bytes_push_view(&profile, "(allow file-read-metadata (path-ancestors \"/tmp\"))\n(allow file-read-metadata (literal \"/tmp\"))\n")
+            bytes_push_view(&profile, "(allow file-read-metadata (path-ancestors (param \"CALLBACK_PATH\")))\n")
+            bytes_push_view(&profile, "(allow file-read* (literal (param \"CALLBACK_PATH\")))\n")
+            bytes_push_view(&profile, "(allow file-write-data (literal (param \"CALLBACK_PATH\")))\n")
+            return [] if profile.count > 65536.usize()
+            return profile
+
+    private:
+        def bytes_push_view(out: mutable darray[u8]&, value: cstr) -> void can[Memory.Allocate, Abort.Panic]:
+            length: usize = Platform::pkg_strlen(value)
+            for index in 0..<length |out, value|:
+                out.push(value[index].u8())
+
+        def bytes_push_array(out: mutable darray[u8]&, value: darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
+            for index in 0..<value.count |out, value|:
+                out.push(value[index])
+
+        def absolute_path(value: darray[u8]&) -> bool:
+            return value.count > 0.usize() and value[0] == 47
+
+        def canonical_path(path: cstr, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            out.resize(0)
+            resolved: mutable darray[u8] = []
+            resolved.resize(4096)
+            if Platform::pkg_realpath(path, &resolved) is canonical:
+                length: usize = Platform::pkg_strlen(canonical)
+                return false if length == 0.usize() or length >= 4096.usize()
+                for index in 0..<length |out, canonical|:
+                    out.push(canonical[index].u8())
+                return true
+            else:
+                return false
+
+        def canonical_path_array(path: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            path_c: mutable darray[u8] = []
+            bytes_push_array(&path_c, path)
+            path_c.push(0)
+            path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
+            return canonical_path(path_name, out)
+
+        def add_existing_root(path: cstr, roots: mutable darray[u8]&) -> void can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            root: mutable darray[u8] = []
+            if canonical_path(path, &root):
+                append_root(roots, root)
+
+        def path_contains_slash(path: cstr) -> bool can[Memory.Allocate, Abort.Panic]:
+            length: usize = Platform::pkg_strlen(path)
+            for index in 0..<length |path|:
+                return true if path[index].u8() == 47
+            return false
+
+        def parent_directory(path: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            out.resize(0)
+            return false if not absolute_path(path)
+            cursor: mutable usize = path.count
+            while cursor > 1.usize() and path[cursor - 1.usize()] != 47 |path, cursor|:
+                cursor <- cursor - 1.usize()
+            return false if cursor <= 1.usize()
+            for index in 0..<(cursor - 1.usize()) |out, path|:
+                out.push(path[index])
+            return true
+
+        def leaf_is(path: darray[u8]&, wanted: cstr) -> bool can[Memory.Allocate, Abort.Panic]:
+            start: mutable usize = path.count
+            while start > 0.usize() and path[start - 1.usize()] != 47 |path, start|:
+                start <- start - 1.usize()
+            length: usize = Platform::pkg_strlen(wanted)
+            return false if path.count - start != length
+            for index in 0..<length |path, wanted, start|:
+                return false if path[start + index] != wanted[index].u8()
+            return true
+
+        def append_root(roots: mutable darray[u8]&, path: darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
+            return if not absolute_path(path)
+            cursor: mutable usize = 0.usize()
+            while cursor < roots.count |roots, path, cursor|:
+                current: mutable darray[u8] = []
+                return if not next_root(roots, &cursor, &current)
+                return if bytes_equal(current, path)
+            bytes_push_array(roots, path)
+            roots.push(0)
+
+        def bytes_equal(left: darray[u8]&, right: darray[u8]&) -> bool:
+            return false if left.count != right.count
+            for index in 0..<left.count |left, right|:
+                return false if left[index] != right[index]
+            return true
+
+        def next_root(roots: darray[u8]&, cursor: mutable usize&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            out.resize(0)
+            return false if cursor >= roots.count
+            finish: mutable usize = cursor
+            while finish < roots.count and roots[finish] != 0 |roots, finish|:
+                finish <- finish + 1.usize()
+            return false if finish == cursor or finish >= roots.count
+            while cursor < finish |roots, cursor, out|:
+                out.push(roots[cursor])
+                cursor <- cursor + 1.usize()
+            cursor <- cursor + 1.usize()
+            return true
+
+        def add_toolchain_root(path: cstr, home: darray[u8]&, roots: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return true if Platform::pkg_strlen(path) == 0.usize()
+            canonical: mutable darray[u8] = []
+            if not canonical_path(path, &canonical):
+                return true if not path_contains_slash(path)
+                return false
+            directory: mutable darray[u8] = []
+            return false if not parent_directory(canonical, &directory)
+            # Read the containing directory by default. Expand one level only
+            # for a recognized tool in its standard compiler/LLVM layout, and
+            # never grant HOME itself or one of its ancestors as a tool root.
+            root: mutable darray[u8] = []
+            bytes_push_array(&root, directory)
+            if leaf_is(directory, "bin") and (leaf_is(canonical, "elisac-stage1") or leaf_is_clang_tool(canonical)):
+                candidate: mutable darray[u8] = []
+                if parent_directory(directory, &candidate) and not path_is_same_or_ancestor(candidate, home):
+                    root <- candidate
+            elif leaf_is(directory, "scripts") and leaf_is(canonical, "elisac_stage1.sh"):
+                candidate: mutable darray[u8] = []
+                if parent_directory(directory, &candidate) and not path_is_same_or_ancestor(candidate, home):
+                    root <- candidate
+            return true if path_is_same_or_ancestor(root, home)
+            append_root(roots, root)
+            return true
+
+        def append_toolchain_library_root(out: mutable darray[u8]&, path: cstr, home: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            canonical: mutable darray[u8] = []
+            return true if not canonical_path(path, &canonical) or not leaf_is_clang_tool(canonical)
+            binary_directory: mutable darray[u8] = []
+            return true if not parent_directory(canonical, &binary_directory) or not leaf_is(binary_directory, "bin")
+            toolchain_root: mutable darray[u8] = []
+            return true if not parent_directory(binary_directory, &toolchain_root)
+            return true if path_is_same_or_ancestor(toolchain_root, home)
+            library_path: mutable darray[u8] = []
+            bytes_push_array(&library_path, toolchain_root)
+            bytes_push_view(&library_path, "/lib")
+            library_path.push(0)
+            library_name: cstr = (&library_path[0]).cast[cstr] can Unsafe.PointerCast
+            library_real: mutable darray[u8] = []
+            return true if not canonical_path(library_name, &library_real)
+            return append_read_root(out, library_real)
+
+        def leaf_is_clang_tool(path: darray[u8]&) -> bool:
+            return true if leaf_is(path, "clang")
+            leaf_start: mutable usize = path.count
+            while leaf_start > 0.usize() and path[leaf_start - 1.usize()] != 47 |path, leaf_start|:
+                leaf_start <- leaf_start - 1.usize()
+            leaf_length: usize = path.count - leaf_start
+            return false if leaf_length <= 6.usize()
+            return false if path[leaf_start] != 99 or path[leaf_start + 1.usize()] != 108 or path[leaf_start + 2.usize()] != 97 or path[leaf_start + 3.usize()] != 110 or path[leaf_start + 4.usize()] != 103 or path[leaf_start + 5.usize()] != 45
+            for index in (leaf_start + 6.usize())..<path.count |path|:
+                byte: u8 = path[index]
+                return false if (byte < 48 or byte > 57) and byte != 46
+            return true
+
+        def path_is_same_or_ancestor(parent: darray[u8]&, child: darray[u8]&) -> bool:
+            return false if parent.count == 0.usize() or parent.count > child.count
+            for index in 0..<parent.count |parent, child|:
+                return false if parent[index] != child[index]
+            return true if parent.count == child.count
+            return true if parent.count == 1.usize() and parent[0] == 47
+            return child[parent.count] == 47
+
+        def append_executable_path(out: mutable darray[u8]&, path: cstr) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return true if Platform::pkg_strlen(path) == 0.usize()
+            path_bytes: mutable darray[u8] = []
+            bytes_push_view(&path_bytes, path)
+            if not absolute_path(path_bytes):
+                return true if not path_contains_slash(path)
+                return false
+            return false if not append_literal_rule(out, "file-read*", path_bytes)
+            return false if not append_literal_rule(out, "process-exec", path_bytes)
+            return false if not append_literal_rule(out, "file-map-executable", path_bytes)
+            canonical: mutable darray[u8] = []
+            if canonical_path(path, &canonical) and not bytes_equal(path_bytes, canonical):
+                return false if not append_literal_rule(out, "file-read*", canonical)
+                return false if not append_literal_rule(out, "process-exec", canonical)
+                return false if not append_literal_rule(out, "file-map-executable", canonical)
+            return true
+
+        def append_quoted_path(out: mutable darray[u8]&, path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            return false if not absolute_path(path)
+            out.push(34)
+            for index in 0..<path.count |out, path|:
+                byte: u8 = path[index]
+                return false if byte == 0 or byte < 32 or byte == 127
+                if byte == 34 or byte == 92:
+                    out.push(92)
+                out.push(byte)
+            out.push(34)
+            return true
+
+        def append_subpath_rule(out: mutable darray[u8]&, action: cstr, operation: cstr, predicate: cstr, path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            bytes_push_view(out, "(")
+            bytes_push_view(out, action)
+            bytes_push_view(out, " ")
+            bytes_push_view(out, operation)
+            bytes_push_view(out, " (")
+            bytes_push_view(out, predicate)
+            bytes_push_view(out, " ")
+            return false if not append_quoted_path(out, path)
+            bytes_push_view(out, "))\n")
+            return true
+
+        def append_read_root(out: mutable darray[u8]&, root: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            return false if not append_subpath_rule(out, "allow", "file-read*", "subpath", root)
+            return false if not append_subpath_rule(out, "allow", "file-read-metadata", "path-ancestors", root)
+            return true
+
+        def append_read_alias_root(out: mutable darray[u8]&, root_name: cstr) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            root: mutable darray[u8] = []
+            bytes_push_view(&root, root_name)
+            return false if not absolute_path(root)
+            return false if not append_subpath_rule(out, "allow", "file-read*", "subpath", root)
+            return false if not append_subpath_rule(out, "allow", "file-read-metadata", "path-ancestors", root)
+            return true
+
+        def append_homebrew_llvm_dependency(out: mutable darray[u8]&, prefix: cstr, formula: cstr,
+                                           home: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            alias: mutable darray[u8] = []
+            bytes_push_view(&alias, prefix)
+            bytes_push_view(&alias, "/opt/")
+            bytes_push_view(&alias, formula)
+            bytes_push_view(&alias, "/lib")
+            alias.push(0)
+            alias_name: cstr = (&alias[0]).cast[cstr] can Unsafe.PointerCast
+            canonical: mutable darray[u8] = []
+            return true if not canonical_path(alias_name, &canonical)
+            return true if path_is_same_or_ancestor(canonical, home) or path_is_same_or_ancestor(home, canonical)
+            return false if not append_read_root(out, canonical)
+            return append_read_alias_root(out, alias_name)
+
+        def append_literal_rule(out: mutable darray[u8]&, operation: cstr, path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            bytes_push_view(out, "(allow ")
+            bytes_push_view(out, operation)
+            bytes_push_view(out, " (literal ")
+            return false if not append_quoted_path(out, path)
+            bytes_push_view(out, "))\n")
+            return true

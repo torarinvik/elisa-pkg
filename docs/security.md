@@ -74,23 +74,35 @@ lexically safe path that escapes through a symlink. `Integrity::sha256` is
 covered by FIPS known-answer tests and is used only as a content primitive;
 `Trust` must still authenticate any digest before remote bytes are accepted.
 
-Build subprocesses receive no credentials and no arbitrary dependency scripts. Compile-time execution is currently trusted-source execution; sandboxing is not claimed. A security review, fuzz corpus, interruption/concurrency tests, key rotation/revocation exercise, and compromise-recovery drill are release blockers for remote support.
+Compiler children on macOS run under a deny-by-default Seatbelt profile. The profile denies network access and gives the child a unique private scratch directory for HOME/TMPDIR/cache data and every compiler output, including stage1's intermediate object. It does not grant write access to the build cache, artifact, or receipt. Stage1's legacy callback path is reserved by the trusted launcher with exclusive creation before sandbox entry; the child receives exact-path read access and data-write access to that existing inode, without create, mode, or unlink permission. The parent removes the callback path after the child exits. Compiler stdin is redirected to `/dev/null`; stdout and stderr are captured in exclusive files inside private scratch and forwarded by the parent after the compiler process group has stopped. The writable exceptions are private scratch, the pre-created callback inode, and `/dev/null`. Exact compiler and required system-helper paths receive execution and executable-mapping rights; selected toolchain and runtime-library directories are read-only. Tool-root expansion is limited to known compiler and LLVM layouts and never grants HOME or an ancestor as an inferred tool root. Unsupported platforms, profile construction failures, and sandbox launch failures stop the build; there is no unsandboxed build fallback.
 
-The local executor starts compiler and application children through `/usr/bin/env -i` with a fixed PATH. It retains only the three compiler bootstrap variables needed by the self-hosting wrapper and never forwards the parent environment wholesale. This is credential minimization, not a sandbox: the selected compiler and trusted source still have the operating-system privileges of the invoking user.
+The compiler must read the whole project and each locked local dependency tree, plus the configured compiler/toolchain roots and narrow runtime-library directories required by selected Homebrew LLVM installations. Common credential filenames and private-key suffixes are denied, but that name-based denylist is partial and does not protect arbitrary secrets stored under those readable roots. The profile also allows process creation and the selected build tools, so this is a constrained compiler boundary, not a general hostile-code sandbox or a guarantee that a compromised compiler cannot attack the invoking account through an unmodeled OS interface. Network denial is configured in the policy but does not yet have a checked-in connectivity regression probe. Linux build execution remains unavailable and fails closed. This profile is an interim macOS adapter, not a substitute for independent sandbox review, adversarial tests, and a maintained platform isolation API.
+
+Build subprocesses receive a minimal environment through `/usr/bin/env -i`; registry credentials and unrelated variables are omitted. When the selected adapter and stage1 binary resolve to the expected sibling `scripts/elisac_stage1.sh` and `bin/elisac-stage1` layout, elisapkg invokes stage1 directly because macOS refuses the wrapper's setuid `ps` RSS poll under Seatbelt. This skips the wrapper's source-freshness check as well as RSS polling; the selected binary's digest is recorded in the receipt, but it is not verified against compiler source. The package parent applies CPU, file-size, and deadline limits, disables core dumps, and kills the compiler's process group before it validates output. Memory use is not capped: this host rejects the attempted low data-segment/address-space limits for ordinary compiler processes, while the resident-size limit is not reliable. This is a material limitation for hostile builds.
+
+`run` and `test` launch the resulting artifact as the invoking user, outside the compiler sandbox. Users should treat these commands as executing the package's code with their account's permissions. Arbitrary build scripts, plugins, and automatic native dependency installation remain disabled.
 
 Compiler children have a ten-minute monotonic deadline; `run` and `test`
 children have a two-minute deadline. Each child enters a private process group,
-and refuses to execute if that group cannot be established. A timeout then kills
-the group before the temporary artifact is removed. This
-limits hangs and descendant-process leaks, but it does not replace a sandbox or
-prevent a trusted child from consuming resources until the deadline.
+and refuses to execute if that group cannot be established. Build execution
+kills and checks the group after normal exit as well as after timeout or wait
+failure, before reading the output artifact. macOS Seatbelt still allows a
+forked child to create a new session, so process-group cleanup does not prove
+that every descendant has exited. The compiler-owned output is therefore
+copied to a fresh parent-owned inode after hashing; the old exact output path
+is unlinked before publication, preventing a retained output descriptor from
+changing the cached artifact. Detached descendants remain a resource/cleanup
+limitation and are a release gate for hostile remote builds.
 
 Before `exec`, the child also applies a platform resource profile: compiler
-children receive 600 seconds of CPU time and a 128 MiB file-size limit, while
-run/test children receive 120 seconds of CPU time and a 64 MiB file-size limit;
-core dumps are disabled. If the operating system refuses the profile, the child
-exits before running user-selected code. These limits are host-specific
-guardrails and do not provide filesystem or network isolation.
+children receive 600 seconds of CPU time and a 128 MiB per-file limit, while
+run/test children receive 120 seconds of CPU time and a 64 MiB per-file limit;
+core dumps are disabled. The attempted memory limits were removed because this
+macOS host rejects the data-segment/address-space settings for ordinary
+processes and resident-size limits are unreliable. Memory use is therefore not
+capped. If the operating system refuses one of the remaining limits, the child
+exits before running selected code. These controls do not provide
+application-run filesystem or network isolation.
 
 Every package build additionally sets `ELISA_STAGE1_SEMANTIC_GATE=1` in the
 controlled child environment. A semantic diagnostic therefore stops the build
@@ -140,7 +152,7 @@ avoid deleting destination pathnames after a concurrent replacement, while
 rejecting special files.
 Archive validation
 also checks zero data padding and file/directory conflicts. Frozen resolution
-performs no lockfile replacement. Build receipt v7 reuses only when the
+performs no lockfile replacement. Build receipt v9 reuses only when the
 complete sanitized source tree, selected target, manifest, compiler settings,
 compiler/stage1/runtime content identities, and artifact digest all match. The
 source-tree digest is checked again immediately before artifact publication so
@@ -157,7 +169,9 @@ stale artifact.
 
 These changes supply detached Ed25519 verification and persistent rollback
 state for the local registry fixture, but do not supply the planned remote
-transport, publisher delegation, or execution sandbox. Project mutation and
-installation still assume a trusted, user-owned directory; concurrent
-malicious changes to installation directories require further handle-based
-filesystem work before hostile shared directories are supported.
+transport or publisher delegation. The current Seatbelt profile applies only
+to compiler children on macOS; output execution and project mutation are not
+sandboxed. Project mutation and installation still assume a trusted, user-owned
+directory; concurrent malicious changes to installation directories require
+further handle-based filesystem work before hostile shared directories are
+supported.

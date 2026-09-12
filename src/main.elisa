@@ -7,6 +7,7 @@
 # present; no command silently falls back to an insecure mode.
 
 include "./platform.elisa"
+include "./sandbox.elisa"
 include "./model.elisa"
 include "./trust.elisa"
 include "./security.elisa"
@@ -135,6 +136,41 @@ module Cli:
             for index in 0..<suffix_count |value, suffix, offset|:
                 return false if value[offset + index] != suffix[index].u8()
             return true
+
+        def canonical_path_bytes(path: cstr, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            resolved: mutable darray[u8] = []
+            resolved.resize(4096)
+            if Platform::pkg_realpath(path, &resolved) is canonical:
+                length: usize = Platform::pkg_strlen(canonical)
+                return false if length == 0.usize() or length >= 4096.usize()
+                out.resize(0)
+                for index in 0..<length |out, canonical|:
+                    out.push(canonical[index].u8())
+                return true
+            return false
+
+        def path_without_suffix(path: darray[u8]&, suffix: cstr, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            suffix_length: usize = Platform::pkg_strlen(suffix)
+            return false if suffix_length >= path.count
+            offset: usize = path.count - suffix_length
+            for index in 0..<suffix_length |path, suffix, offset|:
+                return false if path[offset + index] != suffix[index].u8()
+            return false if offset == 0.usize() or path[offset - 1.usize()] == 47
+            out.resize(0)
+            for index in 0..<offset |out, path|:
+                out.push(path[index])
+            return true
+
+        def stage1_wrapper_pair_matches(wrapper: cstr, stage1: cstr) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return false if Platform::pkg_strlen(wrapper) == 0.usize() or Platform::pkg_strlen(stage1) == 0.usize()
+            wrapper_real: mutable darray[u8] = []
+            stage1_real: mutable darray[u8] = []
+            return false if not canonical_path_bytes(wrapper, &wrapper_real) or not canonical_path_bytes(stage1, &stage1_real)
+            wrapper_root: mutable darray[u8] = []
+            stage1_root: mutable darray[u8] = []
+            return false if not path_without_suffix(wrapper_real, "/scripts/elisac_stage1.sh", &wrapper_root)
+            return false if not path_without_suffix(stage1_real, "/bin/elisac-stage1", &stage1_root)
+            return bytes_equal(wrapper_root, stage1_root)
 
         def write_bytes(fd: i64, value: darray[u8]&) -> void can[Console.Write, Unsafe.PointerCast]:
             return if fd == 1 and cli_quiet and not cli_json_output
@@ -3191,7 +3227,10 @@ module Cli:
             write_ok("resolver: deterministic local v1\n")
             write_ok("source integrity: local file verification\n")
             write_ok("metadata signatures: local Ed25519 provider available; network transport disabled\n")
-            write_ok("build sandbox: not enabled; dependency builds are trusted-source execution\n")
+            if Sandbox::build_sandbox_available():
+                write_ok("build sandbox: sandbox-exec is present; compiler builds apply a deny-default profile and fail closed if it is rejected\n")
+            else:
+                write_ok("build sandbox: sandbox-exec is unavailable; builds fail closed on this platform\n")
             write_ok("child environment: scrubbed; only compiler bootstrap variables are retained\n")
             write_ok("compiler: set ELISAPKG_COMPILER to an audited compiler adapter\n")
             return EXIT_OK
@@ -4639,7 +4678,62 @@ module Cli:
             write_ok("\n")
             return EXIT_OK
 
+        def sandbox_dependency_roots(lock: darray[u8]&, start: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            out.resize(0)
+            return true if not lock_version_is(lock, 2)
+            packages_start: usize = json_key_value_offset(lock, "packages")
+            packages_end: usize = json_array_end(lock, packages_start)
+            return false if packages_start >= lock.count or packages_end <= packages_start or lock[packages_start] != 91
+            cursor: mutable usize = packages_start + 1.usize()
+            count: mutable usize = 0.usize()
+            while cursor < packages_end |lock, cursor, count, out, start|:
+                while cursor < packages_end and (lock[cursor] == 32 or lock[cursor] == 9 or lock[cursor] == 10 or lock[cursor] == 13) |lock, cursor|:
+                    cursor <- cursor + 1.usize()
+                break if cursor >= packages_end or lock[cursor] == 93
+                return false if lock[cursor] != 123 or count >= MAX_DEPENDENCIES
+                record_end: usize = json_object_end(lock, cursor)
+                return false if record_end <= cursor or record_end >= packages_end
+                source_start: mutable usize = 0.usize()
+                source_end: mutable usize = 0.usize()
+                return false if not object_object_value_span(lock, cursor, record_end, "source", &source_start, &source_end)
+                source_type: mutable darray[u8] = []
+                if object_string_value(lock, source_start, source_end, "type", &source_type) and bytes_equal_view(source_type, "path"):
+                    relative: mutable darray[u8] = []
+                    return false if not object_string_value(lock, source_start, source_end, "path", &relative) or not valid_dependency_path(relative)
+                    relative_c: mutable darray[u8] = []
+                    path_with_nul_into(&relative, &relative_c)
+                    relative_name: cstr = (&relative_c[0]).cast[cstr] can Unsafe.PointerCast
+                    joined: mutable darray[u8] = []
+                    path_join_into(start, relative_name, &joined)
+                    normalized: mutable darray[u8] = []
+                    return false if not normalize_relative_path(joined, &normalized)
+                    normalized_c: mutable darray[u8] = []
+                    path_with_nul_into(&normalized, &normalized_c)
+                    normalized_name: cstr = (&normalized_c[0]).cast[cstr] can Unsafe.PointerCast
+                    resolved: mutable darray[u8] = []
+                    resolved.resize(4096)
+                    if Platform::pkg_realpath(normalized_name, &resolved) is canonical:
+                        canonical_root: mutable darray[u8] = []
+                        length: usize = Platform::pkg_strlen(canonical)
+                        return false if length == 0.usize() or length >= 4096.usize()
+                        for index in 0..<length |canonical_root, canonical|:
+                            canonical_root.push(canonical[index].u8())
+                        bytes_push_array(&out, canonical_root)
+                        out.push(0)
+                    else:
+                        return false
+                cursor <- record_end + 1.usize()
+                while cursor < packages_end and (lock[cursor] == 32 or lock[cursor] == 9 or lock[cursor] == 10 or lock[cursor] == 13) |lock, cursor|:
+                    cursor <- cursor + 1.usize()
+                if cursor < packages_end and lock[cursor] == 44:
+                    cursor <- cursor + 1.usize()
+                count <- count + 1.usize()
+            return true
+
         def run_build(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            if not Sandbox::build_sandbox_available():
+                write_error("error: compiler builds require the macOS Seatbelt sandbox; builds fail closed on this platform\n")
+                return EXIT_BUILD
             return EXIT_USAGE if not cstr_equal(options.profile, "debug") and not cstr_equal(options.profile, "release")
             return EXIT_BUILD if not load_package(start)
             manifest_raw: mutable darray[u8] = []
@@ -4749,13 +4843,53 @@ module Cli:
             stage1_bin: mutable cstr = ""
             runtime_obj: mutable cstr = ""
             allow_stale: mutable cstr = ""
+            clang_tool: mutable cstr = ""
             if Platform::pkg_getenv("ELISA_STAGE1_BIN") is configured_stage1:
                 stage1_bin <- configured_stage1.cast[cstr]
             if Platform::pkg_getenv("ELISA_RUNTIME_OBJ") is configured_runtime:
                 runtime_obj <- configured_runtime.cast[cstr]
             if Platform::pkg_getenv("ELISA_ALLOW_STALE_STAGE1") is configured_stale:
                 allow_stale <- configured_stale.cast[cstr]
-            return EXIT_BUILD if not valid_toolchain_value(stage1_bin, 4096.usize()) or not valid_toolchain_value(runtime_obj, 4096.usize()) or not valid_toolchain_value(allow_stale, 64.usize())
+            if Platform::pkg_getenv("ELISA_CLANG") is configured_clang:
+                clang_tool <- configured_clang.cast[cstr]
+            return EXIT_BUILD if not valid_toolchain_value(stage1_bin, 4096.usize()) or not valid_toolchain_value(runtime_obj, 4096.usize()) or not valid_toolchain_value(allow_stale, 64.usize()) or not valid_toolchain_value(clang_tool, 4096.usize())
+            compiler_executable: mutable cstr = compiler
+            compiler_is_stage1_wrapper: bool = stage1_wrapper_pair_matches(compiler, stage1_bin)
+            if compiler_is_stage1_wrapper and stage1_bin[0].u8() != 0:
+                compiler_executable <- stage1_bin
+            home_name: mutable cstr = ""
+            if Platform::pkg_getenv("HOME") is configured_home:
+                home_name <- configured_home.cast[cstr]
+            else:
+                write_error("error: HOME must name an existing directory to construct the build sandbox\n")
+                return EXIT_BUILD
+            dependency_roots: mutable darray[u8] = []
+            return EXIT_BUILD if not sandbox_dependency_roots(lock_raw, start, &dependency_roots)
+            tool_paths: mutable darray[cstr] = []
+            if not compiler_is_stage1_wrapper:
+                tool_paths.push(compiler)
+            tool_paths.push(stage1_bin)
+            tool_paths.push(runtime_obj)
+            executable_paths: mutable darray[cstr] = []
+            if not compiler_is_stage1_wrapper:
+                executable_paths.push(compiler)
+            executable_paths.push(stage1_bin)
+            if clang_tool[0].u8() != 0:
+                tool_paths.push(clang_tool)
+                executable_paths.push(clang_tool)
+            for candidate_index in 0..<3 |tool_paths, executable_paths|:
+                candidate: mutable cstr = "/opt/homebrew/opt/llvm/bin/clang"
+                if candidate_index == 1:
+                    candidate <- "/usr/local/opt/llvm/bin/clang"
+                elif candidate_index == 2:
+                    candidate <- "/usr/bin/clang"
+                candidate_real: mutable darray[u8] = []
+                candidate_real.resize(4096)
+                if Platform::pkg_realpath(candidate, &candidate_real) is resolved_candidate:
+                    if Platform::pkg_access(resolved_candidate, 1) == 0:
+                        tool_paths.push(candidate)
+                        executable_paths.push(candidate)
+                        clang_tool <- candidate if clang_tool[0].u8() == 0
             compiler_identity: mutable darray[u8] = []
             stage1_identity: mutable darray[u8] = []
             runtime_identity: mutable darray[u8] = []
@@ -4818,7 +4952,7 @@ module Cli:
                         bytes_push_array(&runtime_identity, runtime_digest)
             toolchain_identity_ok: bool = compiler_identity_ok and stage1_identity_ok and runtime_identity_ok
             receipt: mutable darray[u8] = []
-            bytes_push_view(&receipt, "elisapkg-build-receipt:7\nentry:")
+            bytes_push_view(&receipt, "elisapkg-build-receipt:9\nentry:")
             bytes_push_array(&receipt, target_entry)
             bytes_push_view(&receipt, "\ntarget-kind:")
             bytes_push_array(&receipt, target_kind)
@@ -4841,6 +4975,8 @@ module Cli:
             bytes_push_array(&receipt, lock_digest)
             bytes_push_view(&receipt, "\ncompiler:")
             bytes_push_cstr(&receipt, compiler)
+            bytes_push_view(&receipt, "\ncompiler-executable:")
+            bytes_push_cstr(&receipt, compiler_executable)
             bytes_push_view(&receipt, "\nstage1-bin:")
             bytes_push_cstr(&receipt, stage1_bin)
             bytes_push_view(&receipt, "\nruntime-object:")
@@ -4853,7 +4989,7 @@ module Cli:
             bytes_push_array(&receipt, runtime_identity)
             bytes_push_view(&receipt, "\nallow-stale:")
             bytes_push_cstr(&receipt, allow_stale)
-            bytes_push_view(&receipt, "\nsemantic-gate:1")
+            bytes_push_view(&receipt, "\nsemantic-gate:1\nsandbox-policy:macos-seatbelt-v2")
             artifact_c: mutable darray[u8] = []
             receipt_c: mutable darray[u8] = []
             path_with_nul_into(&artifact, &artifact_c)
@@ -4882,48 +5018,106 @@ module Cli:
             # The lock digest includes every resolved local dependency identity and
             # source digest. Recompile whenever that graph changes instead of reusing a
             # root-only artifact.
-            # mkstemp keeps the compiler output path exclusive for the whole child
-            # process, preventing a predictable temporary symlink from redirecting the
-            # output. The final rename is the only point at which app becomes visible.
+            # Each compiler gets a distinct private scratch directory for HOME,
+            # TMPDIR, and caches. It is the only writable subtree; the final
+            # artifact and its receipt stay outside the child's writable set.
+            sandbox_template: mutable darray[u8] = []
+            bytes_push_array(&sandbox_template, build_dir)
+            if sandbox_template.count == 0.usize() or sandbox_template[sandbox_template.count - 1.usize()] != 47:
+                sandbox_template.push(47)
+            bytes_push_view(&sandbox_template, ".sandbox-XXXXXX")
+            sandbox_template.push(0)
+            if Platform::pkg_mkdtemp(&sandbox_template) != 0:
+                write_error("error: unable to create the private compiler scratch directory\n")
+                return EXIT_BUILD
+            sandbox_work_length: usize = Platform::pkg_strlen((&sandbox_template[0]).cast[cstr] can Unsafe.PointerCast)
+            sandbox_work_dir: mutable darray[u8] = []
+            for index in 0..<sandbox_work_length |sandbox_work_dir, sandbox_template|:
+                sandbox_work_dir.push(sandbox_template[index])
+            sandbox_work_c: mutable darray[u8] = []
+            path_with_nul_into(sandbox_work_dir, &sandbox_work_c)
+            sandbox_work_name: cstr = (&sandbox_work_c[0]).cast[cstr] can Unsafe.PointerCast
+            canonical_sandbox_work: mutable darray[u8] = []
+            canonical_sandbox_work.resize(4096)
+            canonical_sandbox_work_name: mutable cstr = ""
+            if Platform::pkg_realpath(sandbox_work_name, &canonical_sandbox_work) is resolved_sandbox_work:
+                canonical_sandbox_work_name <- resolved_sandbox_work
+            else:
+                _ = Platform::pkg_rmdir(sandbox_work_name)
+                write_error("error: unable to resolve the private compiler scratch directory\n")
+                return EXIT_BUILD
+            # Keep every compiler-created output, including stage1's adjacent
+            # object file, inside the private scratch subtree. The parent copies
+            # only the validated final bytes into the public cache after teardown.
             temp_template: mutable darray[u8] = []
-            for index in 0..<build_dir.count |temp_template, build_dir|:
-                temp_template.push(build_dir[index])
+            for index in 0..<sandbox_work_dir.count |temp_template, sandbox_work_dir|:
+                temp_template.push(sandbox_work_dir[index])
             if temp_template.count == 0.usize() or temp_template[temp_template.count - 1.usize()] != 47:
                 temp_template.push(47)
             bytes_push_cstr(&temp_template, artifact_leaf)
             bytes_push_view(&temp_template, ".tmp.XXXXXX")
             temp_template.push(0)
             temp_fd: i64 = Platform::pkg_mkstemp(&temp_template)
-            return EXIT_BUILD if temp_fd < 0
+            if temp_fd < 0:
+                _ = Platform::pkg_rmdir(sandbox_work_name)
+                write_error("error: unable to create the exclusive compiler output file\n")
+                return EXIT_BUILD
             temp_name: cstr = (&temp_template[0]).cast[cstr] can Unsafe.PointerCast
             if Platform::pkg_close(temp_fd) != 0:
                 _ = Platform::pkg_unlink(temp_name)
+                _ = Platform::pkg_rmdir(sandbox_work_name)
+                write_error("error: unable to close the exclusive compiler output file\n")
                 return EXIT_BUILD
+            sandbox_profile: mutable darray[u8] = Sandbox::darwin_build_profile(home_name, start, sandbox_work_dir, dependency_roots, tool_paths, executable_paths, temp_name)
+            if sandbox_profile.count == 0.usize():
+                _ = Platform::pkg_unlink(temp_name)
+                _ = Platform::pkg_rmdir(sandbox_work_name)
+                write_error("error: could not construct the mandatory compiler sandbox profile\n")
+                return EXIT_BUILD
+            sandbox_profile.push(0)
+            sandbox_profile_name: cstr = (&sandbox_profile[0]).cast[cstr] can Unsafe.PointerCast
+            callback_parameter: mutable darray[u8] = []
+            bytes_push_view(&callback_parameter, "CALLBACK_PATH=/private/tmp/elisa-stage1-callback-")
+            callback_digits_offset: usize = callback_parameter.count
+            for _digit in 0..<20 |callback_parameter|:
+                callback_parameter.push(48)
+            bytes_push_view(&callback_parameter, ".c")
+            callback_parameter.push(0)
             # An explicit compiler is required for reproducible builds. PATH lookup is
             # delegated to execvp only after the user has selected the executable.
             stage1_env: mutable darray[u8] = []
             runtime_env: mutable darray[u8] = []
             stale_env: mutable darray[u8] = []
+            clang_env: mutable darray[u8] = []
             temporary_env: mutable darray[u8] = []
             args: mutable darray[cstr] = []
-            build_dir_c: mutable darray[u8] = []
-            path_with_nul_into(build_dir, &build_dir_c)
-            build_dir_name: cstr = (&build_dir_c[0]).cast[cstr] can Unsafe.PointerCast
-            canonical_build_dir: mutable darray[u8] = []
-            canonical_build_dir.resize(4096)
-            canonical_build_dir_name: mutable cstr = ""
-            if Platform::pkg_realpath(build_dir_name, &canonical_build_dir) is resolved_build_dir:
-                canonical_build_dir_name <- resolved_build_dir
-            else:
-                _ = Platform::pkg_unlink(temp_name)
-                return EXIT_BUILD
+            args.push("/usr/bin/sandbox-exec")
+            args.push("-D")
+            args.push((&callback_parameter[0]).cast[cstr] can Unsafe.PointerCast)
+            args.push("-p")
+            args.push(sandbox_profile_name)
             args.push("/usr/bin/env")
             args.push("-i")
             args.push("PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin")
             bytes_push_view(&temporary_env, "TMPDIR=")
-            bytes_push_cstr(&temporary_env, canonical_build_dir_name)
+            bytes_push_cstr(&temporary_env, canonical_sandbox_work_name)
             temporary_env.push(0)
             args.push((&temporary_env[0]).cast[cstr] can Unsafe.PointerCast)
+            sandbox_home_env: mutable darray[u8] = []
+            bytes_push_view(&sandbox_home_env, "HOME=")
+            bytes_push_cstr(&sandbox_home_env, canonical_sandbox_work_name)
+            sandbox_home_env.push(0)
+            args.push((&sandbox_home_env[0]).cast[cstr] can Unsafe.PointerCast)
+            fixed_home_env: mutable darray[u8] = []
+            bytes_push_view(&fixed_home_env, "CFFIXED_USER_HOME=")
+            bytes_push_cstr(&fixed_home_env, canonical_sandbox_work_name)
+            fixed_home_env.push(0)
+            args.push((&fixed_home_env[0]).cast[cstr] can Unsafe.PointerCast)
+            cache_home_env: mutable darray[u8] = []
+            bytes_push_view(&cache_home_env, "XDG_CACHE_HOME=")
+            bytes_push_cstr(&cache_home_env, canonical_sandbox_work_name)
+            cache_home_env.push(0)
+            args.push((&cache_home_env[0]).cast[cstr] can Unsafe.PointerCast)
             args.push("ELISA_STAGE1_SEMANTIC_GATE=1")
             if not cstr_equal(stage1_bin, ""):
                 bytes_push_view(&stage1_env, "ELISA_STAGE1_BIN=")
@@ -4940,7 +5134,19 @@ module Cli:
                 bytes_push_cstr(&stale_env, allow_stale)
                 stale_env.push(0)
                 args.push((&stale_env[0]).cast[cstr] can Unsafe.PointerCast)
-            args.push(compiler)
+            if clang_tool[0].u8() != 0:
+                bytes_push_view(&clang_env, "ELISA_CLANG=")
+                bytes_push_cstr(&clang_env, clang_tool)
+                clang_env.push(0)
+                args.push((&clang_env[0]).cast[cstr] can Unsafe.PointerCast)
+            if compiler_is_stage1_wrapper:
+                # The host stage1 wrapper invokes /bin/ps for its RSS polling;
+                # macOS marks ps setuid and refuses it inside Seatbelt. The
+                # wrapper/binary paths have been checked to share the expected
+                # compiler root. Execute stage1 directly; the package parent
+                # applies the process group, resource caps, and deadline.
+                compiler_executable <- stage1_bin
+            args.push(compiler_executable)
             if cstr_equal(options.profile, "release"):
                 args.push("-O2")
             else:
@@ -4952,33 +5158,138 @@ module Cli:
             args.push(temp_name)
             args.push(target_entry_name)
             args.push(null)
+            stdout_template: mutable darray[u8] = []
+            bytes_push_array(&stdout_template, sandbox_work_dir)
+            if stdout_template.count == 0.usize() or stdout_template[stdout_template.count - 1.usize()] != 47:
+                stdout_template.push(47)
+            bytes_push_view(&stdout_template, "compiler.stdout.XXXXXX")
+            stdout_template.push(0)
+            compiler_stdout_fd: mutable i64 = Platform::pkg_mkstemp(&stdout_template)
+            if compiler_stdout_fd < 0:
+                _ = Platform::pkg_unlink(temp_name)
+                _ = Platform::pkg_rmdir(sandbox_work_name)
+                write_error("error: unable to create the private compiler stdout capture\n")
+                return EXIT_BUILD
+            if compiler_stdout_fd < 3:
+                raised_stdout_fd: i64 = Platform::pkg_dup_fd_min(compiler_stdout_fd, 3)
+                if raised_stdout_fd < 0:
+                    _ = Platform::pkg_close(compiler_stdout_fd)
+                    _ = Platform::pkg_unlink((&stdout_template[0]).cast[cstr] can Unsafe.PointerCast)
+                    _ = Platform::pkg_unlink(temp_name)
+                    _ = Platform::pkg_rmdir(sandbox_work_name)
+                    write_error("error: unable to secure the compiler stdout capture descriptor\n")
+                    return EXIT_BUILD
+                _ = Platform::pkg_close(compiler_stdout_fd)
+                compiler_stdout_fd <- raised_stdout_fd
+            compiler_stdout_name: cstr = (&stdout_template[0]).cast[cstr] can Unsafe.PointerCast
+            stderr_template: mutable darray[u8] = []
+            bytes_push_array(&stderr_template, sandbox_work_dir)
+            if stderr_template.count == 0.usize() or stderr_template[stderr_template.count - 1.usize()] != 47:
+                stderr_template.push(47)
+            bytes_push_view(&stderr_template, "compiler.stderr.XXXXXX")
+            stderr_template.push(0)
+            compiler_stderr_fd: mutable i64 = Platform::pkg_mkstemp(&stderr_template)
+            if compiler_stderr_fd < 0:
+                _ = Platform::pkg_close(compiler_stdout_fd)
+                _ = Platform::pkg_unlink(compiler_stdout_name)
+                _ = Platform::pkg_unlink(temp_name)
+                _ = Platform::pkg_rmdir(sandbox_work_name)
+                write_error("error: unable to create the private compiler stderr capture\n")
+                return EXIT_BUILD
+            if compiler_stderr_fd < 3:
+                raised_stderr_fd: i64 = Platform::pkg_dup_fd_min(compiler_stderr_fd, 3)
+                if raised_stderr_fd < 0:
+                    _ = Platform::pkg_close(compiler_stderr_fd)
+                    _ = Platform::pkg_close(compiler_stdout_fd)
+                    _ = Platform::pkg_unlink((&stderr_template[0]).cast[cstr] can Unsafe.PointerCast)
+                    _ = Platform::pkg_unlink(compiler_stdout_name)
+                    _ = Platform::pkg_unlink(temp_name)
+                    _ = Platform::pkg_rmdir(sandbox_work_name)
+                    write_error("error: unable to secure the compiler stderr capture descriptor\n")
+                    return EXIT_BUILD
+                _ = Platform::pkg_close(compiler_stderr_fd)
+                compiler_stderr_fd <- raised_stderr_fd
+            compiler_stderr_name: cstr = (&stderr_template[0]).cast[cstr] can Unsafe.PointerCast
             child_argv: mutable cstr&& = (&args[0]).cast[mutable cstr&&] can Unsafe.PointerCast
             pid: i64 = Platform::pkg_fork()
             if pid == 0:
+                process_id: i64 = Platform::pkg_process_id()
+                if not set_callback_path_pid(&callback_parameter, callback_digits_offset, process_id):
+                    Platform::pkg_process_exit(126)
+                callback_file_name: cstr = (&callback_parameter[14]).cast[cstr] can Unsafe.PointerCast
+                if Platform::pkg_create_exclusive_file(callback_file_name) != 0:
+                    Platform::pkg_process_exit(126)
                 if Platform::pkg_set_process_group() != 0:
                     Platform::pkg_process_exit(126)
                 if Platform::pkg_set_process_limits(1) != 0:
                     Platform::pkg_process_exit(126)
-                _ = Platform::pkg_execvp("/usr/bin/env", child_argv)
+                null_fd: i64 = Platform::pkg_open_null()
+                if null_fd < 0 or Platform::pkg_dup2(null_fd, 0) != 0 or Platform::pkg_dup2(compiler_stdout_fd, 1) != 1 or Platform::pkg_dup2(compiler_stderr_fd, 2) != 2:
+                    Platform::pkg_process_exit(126)
+                if null_fd > 2:
+                    _ = Platform::pkg_close(null_fd)
+                if Platform::pkg_close_extra_descriptors() != 0:
+                    Platform::pkg_process_exit(126)
+                _ = Platform::pkg_execvp("/usr/bin/sandbox-exec", child_argv)
                 Platform::pkg_process_exit(127)
             if pid < 0:
+                _ = Platform::pkg_close(compiler_stdout_fd)
+                _ = Platform::pkg_close(compiler_stderr_fd)
+                _ = Platform::pkg_unlink(compiler_stdout_name)
+                _ = Platform::pkg_unlink(compiler_stderr_name)
                 _ = Platform::pkg_unlink(temp_name)
+                _ = Platform::pkg_rmdir(sandbox_work_name)
+                write_error("error: unable to start the sandboxed compiler process\n")
                 return EXIT_BUILD
+            if not set_callback_path_pid(&callback_parameter, callback_digits_offset, pid):
+                _ = Platform::pkg_terminate_process_group(pid)
+                _ = Platform::pkg_close(compiler_stdout_fd)
+                _ = Platform::pkg_close(compiler_stderr_fd)
+                _ = Platform::pkg_unlink(compiler_stdout_name)
+                _ = Platform::pkg_unlink(compiler_stderr_name)
+                _ = Platform::pkg_unlink(temp_name)
+                _ = Platform::pkg_rmdir(sandbox_work_name)
+                write_error("error: unable to name the stage1 callback file safely\n")
+                return EXIT_BUILD
+            callback_file_name: cstr = (&callback_parameter[14]).cast[cstr] can Unsafe.PointerCast
             status: mutable i64 = 0
             waited: i64 = Platform::pkg_waitpid_timeout(pid, &status, BUILD_TIMEOUT_MS)
+            group_cleanup: i64 = Platform::pkg_terminate_process_group(pid)
+            callback_remove_status: i64 = Platform::pkg_unlink(callback_file_name)
+            if group_cleanup != 0 or (callback_remove_status != 0 and callback_remove_status != -2):
+                _ = Platform::pkg_close(compiler_stdout_fd)
+                _ = Platform::pkg_close(compiler_stderr_fd)
+                _ = Platform::pkg_unlink(compiler_stdout_name)
+                _ = Platform::pkg_unlink(compiler_stderr_name)
+                _ = Platform::pkg_unlink(temp_name)
+                _ = Platform::pkg_rmdir(sandbox_work_name)
+                write_error("error: unable to stop the compiler process group before output validation\n")
+                return EXIT_BUILD
+            replay_stdout_ok: bool = forward_fd_output(compiler_stdout_fd, 1)
+            replay_stderr_ok: bool = forward_fd_output(compiler_stderr_fd, 2)
+            stdout_close_status: i64 = Platform::pkg_close(compiler_stdout_fd)
+            stderr_close_status: i64 = Platform::pkg_close(compiler_stderr_fd)
+            stdout_remove_status: i64 = Platform::pkg_unlink(compiler_stdout_name)
+            stderr_remove_status: i64 = Platform::pkg_unlink(compiler_stderr_name)
+            if not replay_stdout_ok or not replay_stderr_ok or stdout_close_status != 0 or stderr_close_status != 0 or stdout_remove_status != 0 or stderr_remove_status != 0:
+                _ = Platform::pkg_unlink(temp_name)
+                _ = Platform::pkg_rmdir(sandbox_work_name)
+                write_error("error: unable to safely collect compiler output\n")
+                return EXIT_BUILD
             if waited == Platform::pkg_timeout_error():
                 _ = Platform::pkg_unlink(temp_name)
+                _ = Platform::pkg_rmdir(sandbox_work_name)
                 write_error("error: compiler exceeded the 10-minute execution limit\n")
                 return EXIT_CANCEL
             if waited < 0 or status != 0:
                 _ = Platform::pkg_unlink(temp_name)
+                _ = Platform::pkg_rmdir(sandbox_work_name)
+                write_error("error: sandboxed compiler process failed or could not be reaped\n")
                 return EXIT_BUILD
             temporary_size: i64 = Platform::pkg_package_file_size(temp_name)
             if temporary_size <= 0:
                 _ = Platform::pkg_unlink(temp_name)
-                return EXIT_BUILD
-            if Platform::pkg_access(temp_name, artifact_access_mode) != 0:
-                _ = Platform::pkg_unlink(temp_name)
+                _ = Platform::pkg_rmdir(sandbox_work_name)
                 return EXIT_BUILD
             temporary_path: mutable darray[u8] = []
             bytes_push_cstr(&temporary_path, temp_name)
@@ -4987,12 +5298,22 @@ module Cli:
             artifact_digest: mutable darray[u8] = []
             if not read_package_file_into(&temporary_path, &artifact_content):
                 _ = Platform::pkg_unlink(temp_name)
+                _ = Platform::pkg_rmdir(sandbox_work_name)
                 return EXIT_BUILD
             if Integrity::sha256(artifact_content, &artifact_digest_bytes) != Integrity::DigestCode.Ok:
                 _ = Platform::pkg_unlink(temp_name)
+                _ = Platform::pkg_rmdir(sandbox_work_name)
                 return EXIT_BUILD
             if not Integrity::hex_digest(artifact_digest_bytes, &artifact_digest):
                 _ = Platform::pkg_unlink(temp_name)
+                _ = Platform::pkg_rmdir(sandbox_work_name)
+                return EXIT_BUILD
+            # Detach the compiler-owned output inode before validating the source
+            # tree or publishing. A session-escaping child may retain an fd, but
+            # it cannot change the bytes already copied into artifact_content.
+            if Platform::pkg_unlink(temp_name) != 0:
+                _ = Platform::pkg_rmdir(sandbox_work_name)
+                write_error("error: unable to detach compiler-owned output before validation\n")
                 return EXIT_BUILD
             # Do not publish an artifact whose compiler input tree changed while
             # the child was running. The receipt records the pre-build digest;
@@ -5006,15 +5327,50 @@ module Cli:
             lock_after_build.resize(1048577)
             if not read_cstr_into("elisapkg.json", &manifest_after_build) or not read_cstr_into("elisapkg.lock", &lock_after_build):
                 _ = Platform::pkg_unlink(temp_name)
+                _ = Platform::pkg_rmdir(sandbox_work_name)
                 return EXIT_BUILD
             if not bytes_equal(manifest_after_build, manifest_raw) or not bytes_equal(lock_after_build, lock_raw) or not lock_matches_manifest(manifest_raw, lock_raw, root_name, root_version, start):
                 _ = Platform::pkg_unlink(temp_name)
+                _ = Platform::pkg_rmdir(sandbox_work_name)
                 return EXIT_BUILD
             post_source_tree_digest: mutable darray[u8] = []
             if not source_tree_digest_into(&post_source_tree_digest) or not bytes_equal(post_source_tree_digest, source_tree_digest):
                 _ = Platform::pkg_unlink(temp_name)
+                _ = Platform::pkg_rmdir(sandbox_work_name)
                 return EXIT_BUILD
-            if Platform::pkg_rename(temp_name, artifact_name) != 0:
+            if Platform::pkg_rmdir(sandbox_work_name) != 0:
+                _ = Platform::pkg_unlink(temp_name)
+                write_error("error: compiler left files in its private scratch directory; refusing to publish the build result\n")
+                return EXIT_BUILD
+            # Never publish the compiler-owned inode directly. A descendant can
+            # leave its process group and retain an already-open descriptor even
+            # after the main compiler exits. Copy the bytes we hashed into a new
+            # parent-owned inode that was not present in the sandbox during build.
+            publish_template: mutable darray[u8] = []
+            bytes_push_array(&publish_template, build_dir)
+            if publish_template.count == 0.usize() or publish_template[publish_template.count - 1.usize()] != 47:
+                publish_template.push(47)
+            bytes_push_cstr(&publish_template, artifact_leaf)
+            bytes_push_view(&publish_template, ".publish.XXXXXX")
+            publish_template.push(0)
+            publish_fd: i64 = Platform::pkg_mkstemp(&publish_template)
+            if publish_fd < 0:
+                _ = Platform::pkg_unlink(temp_name)
+                return EXIT_BUILD
+            publish_name: cstr = (&publish_template[0]).cast[cstr] can Unsafe.PointerCast
+            output_mode: u16 = 493.u16() if cstr_equal(emit_kind, "exe") else 420.u16()
+            publish_ok: mutable bool = write_fd_all(publish_fd, artifact_content)
+            publish_ok <- false if Platform::pkg_chmod(publish_name, output_mode) != 0
+            publish_ok <- false if Platform::pkg_access(publish_name, artifact_access_mode) != 0
+            publish_ok <- false if Platform::pkg_fsync(publish_fd) != 0
+            publish_close_status: i64 = Platform::pkg_close(publish_fd)
+            if not publish_ok or publish_close_status != 0:
+                _ = Platform::pkg_unlink(publish_name)
+                _ = Platform::pkg_unlink(temp_name)
+                write_error("error: unable to create a normalized parent-owned build artifact\n")
+                return EXIT_BUILD
+            if Platform::pkg_rename(publish_name, artifact_name) != 0:
+                _ = Platform::pkg_unlink(publish_name)
                 _ = Platform::pkg_unlink(temp_name)
                 return EXIT_BUILD
             bytes_push_view(&receipt, "\nartifact-digest:sha256:")
@@ -5033,6 +5389,40 @@ module Cli:
             write_ok("\n")
             _ = options
             return EXIT_OK
+
+        def set_callback_path_pid(value: mutable darray[u8]&, digits_offset: usize, process_id: i64) -> bool:
+            return false if process_id <= 0 or digits_offset + 22.usize() >= value.count
+            digits: mutable darray[u8] = []
+            remaining: mutable u64 = process_id.u64()
+            while remaining > 0.u64() |digits, remaining|:
+                digits.push((48.u64() + (remaining % 10.u64())).u8())
+                remaining <- remaining / 10.u64()
+            return false if digits.count == 0.usize() or digits.count > 20.usize()
+            for index in 0..<digits.count |value, digits, digits_offset|:
+                value[digits_offset + index] <- digits[digits.count - index - 1.usize()]
+            value[digits_offset + digits.count] <- 46
+            value[digits_offset + digits.count + 1.usize()] <- 99
+            value[digits_offset + digits.count + 2.usize()] <- 0
+            return true
+
+        def forward_fd_output(fd: i64, target: i64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            return false if Platform::pkg_seek_fd(fd, 0, 0) < 0
+            total: mutable i64 = 0
+            buffer: mutable darray[u8] = []
+            buffer.resize(8192)
+            while total < 134217728 |total, buffer, fd, target|:
+                raw: mutable u8& = (&buffer[0]).cast[mutable u8&] can Unsafe.PointerCast
+                capacity: usize = 8192.usize()
+                if 134217728 - total < capacity.i64():
+                    capacity <- (134217728 - total).usize()
+                amount: i64 = Platform::pkg_read_fd(fd, raw, capacity)
+                return false if amount < 0 or amount > capacity.i64()
+                break if amount == 0
+                buffer.resize(amount.usize())
+                write_bytes(target, &buffer)
+                total <- total + amount
+                buffer.resize(8192)
+            return true
 
         def run_program(argc: i64, slots: mutable cstr&&, options: Model::CommandOptions, expected_kind: cstr) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             manifest_raw: mutable darray[u8] = []

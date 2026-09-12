@@ -58,7 +58,7 @@ corruption and native symlink tests in `scripts/regression_test.py`.
 
 ## D-007: build reuse
 
-Receipt version 7 fingerprints the complete sanitized source tree, selected
+Receipt version 9 fingerprints the complete sanitized source tree, selected
 target source and kind, manifest bytes, resolved-lock bytes, compiler
 configuration, content identities for the selected compiler/stage1/runtime
 inputs, artifact name, and output artifact. The source-tree digest is rechecked
@@ -73,11 +73,23 @@ suite.
 
 ## D-008: trusted-source execution
 
-The current supported build path executes selected compiler and Elisa source
-with a scrubbed environment but does not claim an OS sandbox. Dependency build
-scripts, plugins, post-install hooks, and automatic native dependency
-installation are disabled. This remains a release limitation until an
-enforceable process-isolation adapter is proven.
+Compiler children on macOS require the deny-by-default Seatbelt profile. It
+denies network access, gives each build a private scratch directory, and
+permits compiler writes only inside it plus data writes to one exclusively
+pre-created stage1 callback inode. The compiler cannot create, chmod, or unlink
+that host path. Compiler output and adjacent linker intermediates stay in
+scratch. Compiler stdin is detached, and stdout/stderr are
+captured privately until the compiler process group is stopped. Since a child
+can create a new session, process-group cleanup is best effort; the compiler's
+output is copied to a new parent-owned inode before publication so retained
+descriptors cannot alter the cached artifact. Builds fail closed when the
+profile is unavailable or rejected.
+Project and local dependency trees plus selected toolchain directories remain
+readable, and a name-based secret denylist is incomplete. Direct stage1
+execution skips wrapper freshness/RSS polling; resource limits are best effort.
+The policy does not cover run/test artifact execution; those commands execute
+as the invoking user. Linux builds remain unavailable. This is an interim
+platform adapter, not a claim that hostile build code is fully contained.
 
 ## D-009: project transaction ownership
 
