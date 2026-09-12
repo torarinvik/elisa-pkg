@@ -162,10 +162,13 @@ avoid deleting destination pathnames after a concurrent replacement, while
 rejecting special files.
 Archive validation
 also checks zero data padding and file/directory conflicts. Frozen resolution
-performs no lockfile replacement. Build receipt v9 reuses only when the
+performs no lockfile replacement. Build receipt v10 reuses only when the
 complete sanitized source tree, selected target, manifest, compiler settings,
-compiler/stage1/runtime content identities, and artifact digest all match. The
-source-tree digest is checked again immediately before artifact publication so
+compiler/stage1/runtime/linker resolved paths and content identities, and
+artifact digest all match. An unavailable linker identity disables reuse.
+Identifiable toolchain files are checked again after compilation so changes
+during the build cannot be recorded as the original input identity. The
+source-tree digest is also checked immediately before artifact publication so
 source changes during compilation cannot be recorded as the old input identity.
 Package publication applies the same boundary around archive creation: it
 revalidates the lock and source digest after resolution, checks the digest again

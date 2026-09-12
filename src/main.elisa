@@ -276,6 +276,47 @@ module Cli:
             out.resize(read_size.usize())
             return true
 
+        # Build receipt identities bind both the selected path and executable
+        # bytes. Resolve symlinks first so toolchain paths such as Homebrew's
+        # `opt/llvm/bin/clang` identify the actual file that will be read.
+        # An unavailable identity is never represented as a reusable value.
+        def tool_file_identity(path: cstr, optional: bool, executable: bool, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            out.resize(0)
+            if path[0].u8() == 0:
+                bytes_push_view(out, "none" if optional else "unavailable")
+                return optional
+            resolved_path: mutable darray[u8] = []
+            if not canonical_path_bytes(path, &resolved_path):
+                bytes_push_view(out, "unavailable")
+                return false
+            for index in 0..<resolved_path.count |resolved_path, out|:
+                byte: u8 = resolved_path[index]
+                if byte < 32 or byte == 127:
+                    out.resize(0)
+                    bytes_push_view(out, "unavailable")
+                    return false
+            if executable:
+                resolved_path_c: mutable darray[u8] = []
+                path_with_nul_into(&resolved_path, &resolved_path_c)
+                resolved_path_name: cstr = (&resolved_path_c[0]).cast[cstr] can Unsafe.PointerCast
+                if Platform::pkg_access(resolved_path_name, 1) != 0:
+                    bytes_push_view(out, "unavailable")
+                    return false
+            content: mutable darray[u8] = []
+            if not read_package_file_into(&resolved_path, &content):
+                bytes_push_view(out, "unavailable")
+                return false
+            digest_bytes: mutable darray[u8] = []
+            digest: mutable darray[u8] = []
+            if Integrity::sha256(content, &digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(digest_bytes, &digest):
+                bytes_push_view(out, "unavailable")
+                return false
+            bytes_push_view(out, "path:")
+            bytes_push_array(out, resolved_path)
+            bytes_push_view(out, ";sha256:")
+            bytes_push_array(out, digest)
+            return true
+
         def read_cstr_into(path_name: cstr, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return false if out.count == 0.usize()
             stream: mutable heap void&? = Platform::pkg_fopen(path_name, O_READ)
@@ -4943,66 +4984,14 @@ module Cli:
             compiler_identity: mutable darray[u8] = []
             stage1_identity: mutable darray[u8] = []
             runtime_identity: mutable darray[u8] = []
-            compiler_identity_ok: mutable bool = true
-            if compiler[0].u8() == 0:
-                bytes_push_view(&compiler_identity, "none")
-            else:
-                compiler_content: mutable darray[u8] = []
-                compiler_path: mutable darray[u8] = []
-                bytes_push_cstr(&compiler_path, compiler)
-                if not read_package_file_into(&compiler_path, &compiler_content):
-                    bytes_push_view(&compiler_identity, "unavailable")
-                    compiler_identity_ok <- false
-                else:
-                    compiler_digest_bytes: mutable darray[u8] = []
-                    compiler_digest: mutable darray[u8] = []
-                    if Integrity::sha256(compiler_content, &compiler_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(compiler_digest_bytes, &compiler_digest):
-                        bytes_push_view(&compiler_identity, "unavailable")
-                        compiler_identity_ok <- false
-                    else:
-                        bytes_push_view(&compiler_identity, "sha256:")
-                        bytes_push_array(&compiler_identity, compiler_digest)
-            stage1_identity_ok: mutable bool = true
-            if stage1_bin[0].u8() == 0:
-                bytes_push_view(&stage1_identity, "none")
-            else:
-                stage1_content: mutable darray[u8] = []
-                stage1_path: mutable darray[u8] = []
-                bytes_push_cstr(&stage1_path, stage1_bin)
-                if not read_package_file_into(&stage1_path, &stage1_content):
-                    bytes_push_view(&stage1_identity, "unavailable")
-                    stage1_identity_ok <- false
-                else:
-                    stage1_digest_bytes: mutable darray[u8] = []
-                    stage1_digest: mutable darray[u8] = []
-                    if Integrity::sha256(stage1_content, &stage1_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(stage1_digest_bytes, &stage1_digest):
-                        bytes_push_view(&stage1_identity, "unavailable")
-                        stage1_identity_ok <- false
-                    else:
-                        bytes_push_view(&stage1_identity, "sha256:")
-                        bytes_push_array(&stage1_identity, stage1_digest)
-            runtime_identity_ok: mutable bool = true
-            if runtime_obj[0].u8() == 0:
-                bytes_push_view(&runtime_identity, "none")
-            else:
-                runtime_content: mutable darray[u8] = []
-                runtime_path: mutable darray[u8] = []
-                bytes_push_cstr(&runtime_path, runtime_obj)
-                if not read_package_file_into(&runtime_path, &runtime_content):
-                    bytes_push_view(&runtime_identity, "unavailable")
-                    runtime_identity_ok <- false
-                else:
-                    runtime_digest_bytes: mutable darray[u8] = []
-                    runtime_digest: mutable darray[u8] = []
-                    if Integrity::sha256(runtime_content, &runtime_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(runtime_digest_bytes, &runtime_digest):
-                        bytes_push_view(&runtime_identity, "unavailable")
-                        runtime_identity_ok <- false
-                    else:
-                        bytes_push_view(&runtime_identity, "sha256:")
-                        bytes_push_array(&runtime_identity, runtime_digest)
-            toolchain_identity_ok: bool = compiler_identity_ok and stage1_identity_ok and runtime_identity_ok
+            clang_identity: mutable darray[u8] = []
+            compiler_identity_ok: bool = tool_file_identity(compiler, true, true, &compiler_identity)
+            stage1_identity_ok: bool = tool_file_identity(stage1_bin, false, true, &stage1_identity)
+            runtime_identity_ok: bool = tool_file_identity(runtime_obj, false, false, &runtime_identity)
+            clang_identity_ok: bool = tool_file_identity(clang_tool, false, true, &clang_identity)
+            toolchain_identity_ok: bool = compiler_identity_ok and stage1_identity_ok and runtime_identity_ok and clang_identity_ok
             receipt: mutable darray[u8] = []
-            bytes_push_view(&receipt, "elisapkg-build-receipt:9\nentry:")
+            bytes_push_view(&receipt, "elisapkg-build-receipt:10\nentry:")
             bytes_push_array(&receipt, target_entry)
             bytes_push_view(&receipt, "\ntarget-kind:")
             bytes_push_array(&receipt, target_kind)
@@ -5037,6 +5026,10 @@ module Cli:
             bytes_push_array(&receipt, stage1_identity)
             bytes_push_view(&receipt, "\nruntime-identity:")
             bytes_push_array(&receipt, runtime_identity)
+            bytes_push_view(&receipt, "\nclang-tool:")
+            bytes_push_cstr(&receipt, clang_tool)
+            bytes_push_view(&receipt, "\nclang-identity:")
+            bytes_push_array(&receipt, clang_identity)
             bytes_push_view(&receipt, "\nallow-stale:")
             bytes_push_cstr(&receipt, allow_stale)
             bytes_push_view(&receipt, "\nsemantic-gate:1\nsandbox-policy:macos-seatbelt-v2")
@@ -5385,6 +5378,20 @@ module Cli:
             if not source_tree_digest_into(&post_source_tree_digest) or not bytes_equal(post_source_tree_digest, source_tree_digest):
                 _ = Platform::pkg_unlink(temp_name)
                 _ = Platform::pkg_rmdir(sandbox_work_name)
+                return EXIT_BUILD
+            toolchain_unchanged: mutable bool = true
+            post_tool_identity: mutable darray[u8] = []
+            if compiler_identity_ok:
+                toolchain_unchanged <- tool_file_identity(compiler, true, true, &post_tool_identity) and bytes_equal(post_tool_identity, compiler_identity)
+            if toolchain_unchanged and stage1_identity_ok:
+                toolchain_unchanged <- tool_file_identity(stage1_bin, false, true, &post_tool_identity) and bytes_equal(post_tool_identity, stage1_identity)
+            if toolchain_unchanged and runtime_identity_ok:
+                toolchain_unchanged <- tool_file_identity(runtime_obj, false, false, &post_tool_identity) and bytes_equal(post_tool_identity, runtime_identity)
+            if toolchain_unchanged and clang_identity_ok:
+                toolchain_unchanged <- tool_file_identity(clang_tool, false, true, &post_tool_identity) and bytes_equal(post_tool_identity, clang_identity)
+            if not toolchain_unchanged:
+                _ = Platform::pkg_rmdir(sandbox_work_name)
+                write_error("error: compiler toolchain changed during the build; refusing to publish the artifact\n")
                 return EXIT_BUILD
             if Platform::pkg_rmdir(sandbox_work_name) != 0:
                 _ = Platform::pkg_unlink(temp_name)
