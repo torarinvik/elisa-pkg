@@ -618,11 +618,16 @@ ARCHIVE_BIN="$TEST_TMP/archive-probe-$$"
 ARCHIVE_EXTRACT_DIR="$TEST_TMP/archive-extract-$$"
 ARCHIVE_EXTRACT_512_DIR="$TEST_TMP/archive-extract-512-$$"
 ARCHIVE_EXTRACT_LIMIT_DIR="$TEST_TMP/archive-extract-limit-$$"
+ARCHIVE_EXTRACT_TRAVERSAL_DIR="$TEST_TMP/archive-extract-traversal-$$"
+ARCHIVE_EXTRACT_COLLISION_DIR="$TEST_TMP/archive-extract-collision-$$"
+ARCHIVE_TRAVERSAL_ESCAPE="$TEST_TMP/outside"
 mkdir -p "$ARCHIVE_EXTRACT_DIR"
 mkdir -p "$ARCHIVE_EXTRACT_DIR-partial"
 mkdir -p "$ARCHIVE_EXTRACT_DIR-end"
 mkdir -p "$ARCHIVE_EXTRACT_512_DIR"
 mkdir -p "$ARCHIVE_EXTRACT_LIMIT_DIR"
+mkdir -p "$ARCHIVE_EXTRACT_TRAVERSAL_DIR"
+mkdir -p "$ARCHIVE_EXTRACT_COLLISION_DIR"
 cat > "$ARCHIVE_PROBE" <<EOF
 include "$ROOT/src/archive.elisa"
 
@@ -650,6 +655,25 @@ def append_indexed_zero_file(out: mutable darray[u8]&, index: usize) -> void can
     name.push(48 + (index % 10).u8())
     header: darray[u8] = Archive::tar_file_header(name, 0)
     append_bytes(out, header)
+
+def replace_header_name_and_checksum(header: mutable darray[u8]&, name: darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
+    for index in 0..<100 |header|:
+        header[index] <- 0
+    for index in 0..<name.count |header, name|:
+        header[index] <- name[index]
+    for index in 148..<156 |header|:
+        header[index] <- 32
+    checksum: mutable usize = 0
+    for index in 0..<512 |header, checksum|:
+        checksum <- checksum + header[index].usize()
+    divisor: mutable usize = 1
+    for _step in 0..<5 |divisor|:
+        divisor <- divisor * 8
+    for index in 0..<6 |header, checksum, divisor|:
+        header[148 + index] <- 48 + ((checksum / divisor) % 8).u8()
+        divisor <- divisor / 8
+    header[154] <- 0
+    header[155] <- 32
 
 def main() -> i64:
     name: mutable darray[u8] = [115, 114, 99, 47, 109, 97, 105, 110, 46, 101, 108, 105, 115, 97]
@@ -683,6 +707,25 @@ def main() -> i64:
     append_zeroes(&duplicate, 509)
     append_zeroes(&duplicate, 1024)
     return 4 if Archive::verify_ustar_archive(duplicate)
+    duplicate_destination: mutable darray[u8] = []
+    append_text(&duplicate_destination, "$ARCHIVE_EXTRACT_COLLISION_DIR")
+    return 12 if Archive::extract_ustar_archive(duplicate, duplicate_destination)
+    forged_header: mutable darray[u8] = Archive::tar_file_header(name, 0)
+    safe_header_name: mutable darray[u8] = [115, 97, 102, 101, 45, 102, 105, 108, 101]
+    replace_header_name_and_checksum(&forged_header, safe_header_name)
+    safe_header_archive: mutable darray[u8] = []
+    append_bytes(&safe_header_archive, forged_header)
+    append_zeroes(&safe_header_archive, 1024)
+    return 13 if not Archive::verify_ustar_archive(safe_header_archive)
+    traversal_name: mutable darray[u8] = [46, 46, 47, 111, 117, 116, 115, 105, 100, 101]
+    replace_header_name_and_checksum(&forged_header, traversal_name)
+    traversal_archive: mutable darray[u8] = []
+    append_bytes(&traversal_archive, forged_header)
+    append_zeroes(&traversal_archive, 1024)
+    return 14 if Archive::verify_ustar_archive(traversal_archive)
+    traversal_destination: mutable darray[u8] = []
+    append_text(&traversal_destination, "$ARCHIVE_EXTRACT_TRAVERSAL_DIR")
+    return 15 if Archive::extract_ustar_archive(traversal_archive, traversal_destination)
     nested_name: mutable darray[u8] = [110, 101, 115, 116, 101, 100, 47, 102, 105, 108, 101]
     nested_header: darray[u8] = Archive::tar_file_header(nested_name, 3)
     partial: mutable darray[u8] = []
@@ -726,6 +769,9 @@ ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_COMPILER_ROOT/build/runtime/elisa
 "$ARCHIVE_BIN"
 test -f "$ARCHIVE_EXTRACT_DIR/src/main.elisa"
 test "$(cat "$ARCHIVE_EXTRACT_DIR/src/main.elisa")" = abc
+test -z "$(find "$ARCHIVE_EXTRACT_COLLISION_DIR" -mindepth 1 -print -quit)"
+test -z "$(find "$ARCHIVE_EXTRACT_TRAVERSAL_DIR" -mindepth 1 -print -quit)"
+test ! -e "$ARCHIVE_TRAVERSAL_ESCAPE"
 test -z "$(find "$ARCHIVE_EXTRACT_DIR-partial" -mindepth 1 -print -quit)"
 test -z "$(find "$ARCHIVE_EXTRACT_DIR-end" -mindepth 1 -print -quit)"
 test "$(find "$ARCHIVE_EXTRACT_512_DIR" -type f | wc -l | tr -d ' ')" -eq 512
