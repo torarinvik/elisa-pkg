@@ -311,6 +311,9 @@ REGISTRY_EXPIRY_SOURCE="$REGISTRY_EXPIRY_CASE/archive-source"
 REGISTRY_EXPIRY_APP="$REGISTRY_EXPIRY_CASE/app-broad"
 REGISTRY_EXPIRY_EXACT_APP="$REGISTRY_EXPIRY_CASE/app-exact"
 REGISTRY_EXPIRY_MALFORMED_APP="$REGISTRY_EXPIRY_CASE/app-malformed"
+REGISTRY_EXPIRY_LONG_APP="$REGISTRY_EXPIRY_CASE/app-long-expiry"
+REGISTRY_EXPIRY_SNAPSHOT_PROBE="$REGISTRY_EXPIRY_CASE/expiry-snapshot-probe.elisa"
+REGISTRY_EXPIRY_SNAPSHOT_BIN="$REGISTRY_EXPIRY_CASE/expiry-snapshot-probe"
 REGISTRY_EXPIRY_STATE="$REGISTRY_EXPIRY_CASE/trust.state"
 REGISTRY_EXPIRY_MALFORMED_STATE="$REGISTRY_EXPIRY_CASE/trust-malformed.state"
 OPENSSL_BIN=""
@@ -475,6 +478,89 @@ else
   test "$?" -eq 5
 fi
 test ! -e "$REGISTRY_EXPIRY_MALFORMED_APP/elisapkg.lock"
+
+# A valid signature does not permit effectively permanent replay. The client
+# caps each release metadata lifetime at 30 days and treats longer signed
+# expiries as a security error instead of silently selecting another version.
+python3 - "$REGISTRY_EXPIRY_ROOT" "$REGISTRY_EXPIRY_SOURCE/.elisapkg/package.tar" "$REGISTRY_EXPIRY_PRIVATE" "$OPENSSL_BIN" <<'PY'
+from pathlib import Path
+import hashlib, json, subprocess, sys
+
+root = Path(sys.argv[1])
+archive = Path(sys.argv[2]).read_bytes()
+private_key = sys.argv[3]
+openssl = sys.argv[4]
+digest = hashlib.sha256(archive).hexdigest()
+version_dir = root / "foo" / "1.2.0"
+version_dir.mkdir(mode=0o700, parents=True)
+(version_dir / "archive.tar").write_bytes(archive)
+metadata = {
+    "schema-version": 1,
+    "algorithm": "ed25519",
+    "registry": str(root),
+    "package": "foo",
+    "version": "1.2.0",
+    "archive": "archive.tar",
+    "archive-size": len(archive),
+    "archive-digest": digest,
+    "expires": 18446744073709551615,
+}
+metadata_path = version_dir / "metadata.json"
+metadata_path.write_bytes((json.dumps(metadata, separators=(",", ":")) + "\n").encode())
+subprocess.run([openssl, "pkeyutl", "-sign", "-rawin", "-inkey", private_key,
+                "-in", str(metadata_path), "-out", str(version_dir / "metadata.sig")],
+               check=True)
+(root / "foo" / "index").write_text("1.1.0\n1.2.0\n", encoding="ascii")
+PY
+cat > "$REGISTRY_EXPIRY_SNAPSHOT_PROBE" <<EOF
+include "$ROOT/src/registry.elisa"
+def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    metadata: mutable darray[u8] = []
+    metadata.resize(1048576)
+    metadata_raw: mutable u8& = (&metadata[0]).cast[mutable u8&] can Unsafe.PointerCast
+    metadata_size: i64 = Platform::pkg_read_trusted_file("$REGISTRY_EXPIRY_ROOT/foo/1.2.0/metadata.json", metadata_raw, metadata.count)
+    return 1 if metadata_size <= 0
+    metadata.resize(metadata_size.usize())
+    signature: mutable darray[u8] = []
+    # The trusted-file API reserves an extra byte to detect exact-limit files.
+    signature.resize(65)
+    signature_raw: mutable u8& = (&signature[0]).cast[mutable u8&] can Unsafe.PointerCast
+    return 2 if Platform::pkg_read_trusted_file("$REGISTRY_EXPIRY_ROOT/foo/1.2.0/metadata.sig", signature_raw, signature.count) != 64
+    signature.resize(64)
+    metadata_digest_bytes: mutable darray[u8] = []
+    metadata_digest: mutable darray[u8] = []
+    return 3 if Integrity::sha256(metadata, &metadata_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(metadata_digest_bytes, &metadata_digest)
+    package: mutable darray[u8] = [102,111,111]
+    version: mutable darray[u8] = [49,46,50,46,48]
+    archive: mutable darray[u8] = []
+    digest: mutable darray[u8] = []
+    archive_size: mutable u64 = 0
+    expires: mutable u64 = 0
+    dependencies: mutable darray[Solver::Constraint] = []
+    status: Registry::ResultCode = Registry::verify_metadata_snapshot(package, version, metadata_digest, metadata, signature, &archive, &digest, &archive_size, &expires, &dependencies)
+    return 0 if status == Registry::ResultCode.ExpiryHorizon else 4
+EOF
+ELISA_STAGE1_BIN="${ELISA_STAGE1_BIN:-$ELISA_COMPILER_ROOT/bin/elisac-stage1}" \
+ELISA_ALLOW_STALE_STAGE1="${ELISA_ALLOW_STALE_STAGE1:-0}" \
+ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_COMPILER_ROOT/build/runtime/elisacore_runtime.o}" \
+  "$ELISA_COMPILER_ROOT/scripts/elisac_stage1.sh" -emit exe -o "$REGISTRY_EXPIRY_SNAPSHOT_BIN" "$REGISTRY_EXPIRY_SNAPSHOT_PROBE"
+ELISAPKG_REGISTRY_DIR="$REGISTRY_EXPIRY_ROOT" \
+ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_EXPIRY_KEY" \
+  "$REGISTRY_EXPIRY_SNAPSHOT_BIN"
+write_registry_dependency "$REGISTRY_EXPIRY_LONG_APP" "^1.0.0"
+if (
+  cd "$REGISTRY_EXPIRY_LONG_APP"
+  ELISAPKG_REGISTRY_DIR="$REGISTRY_EXPIRY_ROOT" \
+  ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_EXPIRY_KEY" \
+  ELISAPKG_TRUST_STATE="$REGISTRY_EXPIRY_CASE/trust-long.state" \
+    "$BIN" resolve >/dev/null 2>&1
+); then
+  echo "resolution accepted signed metadata beyond the expiry horizon" >&2
+  exit 1
+else
+  test "$?" -eq 5
+fi
+test ! -e "$REGISTRY_EXPIRY_LONG_APP/elisapkg.lock"
 
 # The index is unsigned local filesystem data. A writable package directory
 # must be rejected as a security failure before it can omit or replace entries.

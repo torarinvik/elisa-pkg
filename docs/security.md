@@ -22,6 +22,10 @@ selection, and the same user can still change it. The configured filesystem is
 therefore trusted input, and index resolution is not fully rollback-safe.
 Signed, expiring index snapshots with a persisted monotonic generation are a
 hard release gate before any remote or mirror transport is enabled.
+Individual signed release metadata must also expire within 30 days of
+verification. Longer lifetimes fail as a distinct security error, bounding the
+replay window even when a signing key creates an accidentally far-future
+expiry.
 
 Local installation checks the nearest existing prefix ancestor before creating
 directories. Existing path components must be real directories owned by root or

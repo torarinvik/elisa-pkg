@@ -87,7 +87,7 @@ rejected before signature use. Dependency objects likewise accept only
   "archive": "archive.tar",
   "archive-size": 1024,
   "archive-digest": "64 lowercase hexadecimal characters",
-  "expires": 4102444800
+  "expires": "<Unix timestamp generated at publish time + 1 day>"
 }
 ```
 
@@ -95,7 +95,10 @@ The registry identity, package, version, archive name, byte size, and SHA-256
 digest are all compared with the selected path and bytes. Every registry file
 must also resolve through `realpath` to the exact requested path; symlinked
 metadata, trust roots, indexes, and archives are refused. Expiry is checked
-against the host wall clock. A detached signature or trust root that is missing,
+against the host wall clock, and metadata more than 30 days ahead is rejected
+to prevent an accidentally or maliciously long replay window. The expiry shown
+above is a placeholder: publishers must write a fresh integer Unix timestamp
+within that 30-day horizon before signing. A detached signature or trust root that is missing,
 malformed, unavailable, or invalid fails closed. The Ed25519 provider is the
 small FFI seam in `src/platform_native.elisa`; signature policy remains in
 `src/trust.elisa` and `src/registry.elisa`.

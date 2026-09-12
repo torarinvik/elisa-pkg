@@ -35,6 +35,7 @@ module Registry:
             ClockRollback
             Unsatisfiable
             ClockUnavailable
+            ExpiryHorizon
 
         # Render a selected stable version as the exact solver requirement used
         # when replaying registry lock preferences. Keeping this formatter in
@@ -180,7 +181,8 @@ module Registry:
             return ResultCode.MalformedMetadata if not metadata_integer(metadata, "expires", expires_out)
             now: i64 = Platform::pkg_wall_clock_seconds()
             return ResultCode.ClockUnavailable if now < 0
-            return ResultCode.ExpiredMetadata if not expiry_is_future(expires_out, now.u64())
+            expiry_status: ResultCode = metadata_expiry_status(expires_out, now.u64())
+            return expiry_status if expiry_status != ResultCode.Ok
             return ResultCode.MalformedMetadata if not metadata_dependencies(metadata, dependencies_out)
             return ResultCode.Ok
 
@@ -242,7 +244,8 @@ module Registry:
             return ResultCode.MalformedMetadata if not metadata_integer(metadata, "expires", &expires)
             now: i64 = Platform::pkg_wall_clock_seconds()
             return ResultCode.ClockUnavailable if now < 0
-            return ResultCode.ExpiredMetadata if not expiry_is_future(expires, now.u64())
+            expiry_status: ResultCode = metadata_expiry_status(expires, now.u64())
+            return expiry_status if expiry_status != ResultCode.Ok
             if not verify_archive:
                 for index in 0..<selected.count |version_out, selected|:
                     version_out.push(selected[index])
@@ -294,6 +297,7 @@ module Registry:
             return "registry trust clock moved backwards" if code == ResultCode.ClockRollback
             return "registry dependency graph is unsatisfiable" if code == ResultCode.Unsatisfiable
             return "host wall clock is unavailable" if code == ResultCode.ClockUnavailable
+            return "registry metadata expiry exceeds the 30-day policy horizon" if code == ResultCode.ExpiryHorizon
             return "unknown registry result"
 
     private:
@@ -1529,8 +1533,12 @@ module Registry:
                     return false if depth < 0
             return not in_string and not escaped and depth == 0
 
-        def expiry_is_future(expires: u64, now: u64) -> bool:
-            return expires > now
+        const max_metadata_lifetime_seconds: u64 = 2592000
+
+        def metadata_expiry_status(expires: u64, now: u64) -> ResultCode:
+            return ResultCode.ExpiredMetadata if expires <= now
+            return ResultCode.ExpiryHorizon if expires - now > max_metadata_lifetime_seconds
+            return ResultCode.Ok
 
         def valid_digest(value: darray[u8]&) -> bool:
             return false if value.count != 64
