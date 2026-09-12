@@ -1,0 +1,63 @@
+include "../../src/platform.elisa"
+
+static assert ELISA_TARGET_OS_MACOS, "sandbox callback probe is macOS-only"
+
+module SandboxCallbackProbe:
+    private:
+        def report(message: cstr) -> bool can[Console.Write, Unsafe.PointerCast]:
+            length: usize = Platform::pkg_strlen(message)
+            offset: mutable usize = 0.usize()
+            while offset < length |message, offset|:
+                raw: void& = (&message[offset]).cast[void&] can Unsafe.PointerCast
+                written: i64 = Platform::pkg_write(1, raw, length - offset) can Console.Write
+                return false if written <= 0 or written > (length - offset).i64()
+                offset <- offset + written.usize()
+            return true
+
+        def path_with_suffix(path: cstr, suffix: cstr, out: mutable darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
+            out.resize(0)
+            path_length: usize = Platform::pkg_strlen(path)
+            suffix_length: usize = Platform::pkg_strlen(suffix)
+            for index in 0..<path_length |out, path|:
+                out.push(path[index].u8())
+            for index in 0..<suffix_length |out, suffix|:
+                out.push(suffix[index].u8())
+            out.push(0)
+
+    public:
+        def run() -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            callback_path: mutable cstr = ""
+            if Platform::pkg_getenv("ELISAPKG_TEST_CALLBACK_PATH") is raw_path:
+                callback_path <- raw_path.cast[cstr] can Unsafe.PointerCast
+            else:
+                _ = report("CALLBACK_PROBE_CONFIGURATION_ERROR\n")
+                return 80
+            if Platform::pkg_chmod(callback_path, 384.u16()) == 0:
+                _ = report("CALLBACK_CHMOD_ALLOWED\n")
+                return 83
+            sibling_storage: mutable darray[u8] = []
+            path_with_suffix(callback_path, ".sibling", &sibling_storage)
+            sibling_path: cstr = (&sibling_storage[0]).cast[cstr] can Unsafe.PointerCast
+            if Platform::pkg_create_exclusive_file(sibling_path) == 0:
+                _ = report("CALLBACK_CREATE_ALLOWED\n")
+                return 84
+            link_storage: mutable darray[u8] = []
+            path_with_suffix(callback_path, ".link", &link_storage)
+            link_path: cstr = (&link_storage[0]).cast[cstr] can Unsafe.PointerCast
+            if Platform::pkg_link(callback_path, link_path) == 0:
+                _ = report("CALLBACK_LINK_ALLOWED\n")
+                return 85
+            rename_storage: mutable darray[u8] = []
+            path_with_suffix(callback_path, ".renamed", &rename_storage)
+            rename_path: cstr = (&rename_storage[0]).cast[cstr] can Unsafe.PointerCast
+            if Platform::pkg_rename(callback_path, rename_path) == 0:
+                _ = report("CALLBACK_RENAME_ALLOWED\n")
+                return 86
+            if Platform::pkg_unlink(callback_path) == 0:
+                _ = report("CALLBACK_UNLINK_ALLOWED\n")
+                return 87
+            _ = report("CALLBACK_POLICY_OK\n")
+            return 0
+
+def main() -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    return SandboxCallbackProbe::run()

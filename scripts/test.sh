@@ -18,6 +18,7 @@ export ELISA_ALLOW_STALE_STAGE1="${ELISA_ALLOW_STALE_STAGE1:-0}"
 "$BIN" --version | grep -F 'elisapkg 0.1.0' >/dev/null
 "$BIN" doctor | grep -F 'local Ed25519 provider available' >/dev/null
 python3 "$ROOT/scripts/ffi_boundary_test.py"
+python3 "$ROOT/scripts/sandbox_policy_test.py"
 
 # Global output modes are strict: quiet suppresses human success text without
 # hiding JSON results, and color values are validated even though the current
