@@ -13,6 +13,16 @@ that only publishes the current package's verified build output under the
 user-selected prefix. This is an intentional fail-closed boundary, not a
 temporary insecure mode.
 
+Local installation checks the nearest existing prefix ancestor before creating
+directories. Existing path components must be real directories owned by root or
+the effective user and must have no group or other write bits. Installation
+then rechecks the completed `bin` and receipt directory chains; uninstall checks
+both existing chains before opening its transaction lock or reading files. This
+reduces cross-user replacement risk for ordinary mode-bit-controlled paths, but
+the check does not inspect ACL grants or prevent pathname races by another
+process with the same user ID. Handle-relative identity-checked removal remains
+required before hostile shared prefixes can be supported.
+
 Before enabling remote packages, the implementation must use an established signed-metadata protocol and an audited cryptographic provider. The client must bootstrap a trusted root out of band, validate threshold-signed role metadata and namespace delegation, bind identity/version/registry/archive digest and size together, enforce expiry and monotonic rollback protection, and persist trusted metadata versions atomically. The local fixture takes this first step by requiring `ELISAPKG_REGISTRY_TRUST_ROOT` to point to an independently provisioned 32-byte key outside `ELISAPKG_REGISTRY_DIR`; registry contents cannot select their own trust root. The key and persisted trust files are opened once through descriptor-relative, no-follow paths. Every directory in those paths and each file must be owned by root or the effective user and must not be group- or world-writable. Symlinks and shared writable directories such as `/tmp` are rejected. The Elisa `Trust` module already exposes fail-closed prechecks for those bindings, publisher attestation, thresholds, revocation, and clock rollback; these prechecks never substitute for cryptographic verification. Publisher authorization must cover the exact deterministic archive bytes. Unknown algorithms, missing thresholds, stale or replayed metadata, invalid signatures, revoked keys, and unauthorized namespaces are hard failures.
 
 The `Trust` module exposes metadata prechecks for expiry, rollback, namespace,
@@ -171,7 +181,8 @@ These changes supply detached Ed25519 verification and persistent rollback
 state for the local registry fixture, but do not supply the planned remote
 transport or publisher delegation. The current Seatbelt profile applies only
 to compiler children on macOS; output execution and project mutation are not
-sandboxed. Project mutation and installation still assume a trusted, user-owned
-directory; concurrent malicious changes to installation directories require
-further handle-based filesystem work before hostile shared directories are
-supported.
+sandboxed. Project mutation assumes a trusted, user-owned directory. Local
+installation enforces the root/effective-user ownership and no-group/other-write
+precondition on its directory chain, but it does not inspect ACLs or stop a
+same-UID process from racing pathnames. Handle-relative identity-checked removal
+remains required before hostile shared installation directories are supported.

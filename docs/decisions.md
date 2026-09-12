@@ -129,3 +129,16 @@ locked fetch reauthenticates every v3 record before caching it. Each verified
 selection is persisted outside the project in a per-user monotonic trust-state
 file protected by an exclusive lock and durable atomic replacement. A network
 transport and publisher delegation remain separate release gates.
+
+## D-012: local installation directory trust
+
+Local install checks the nearest existing prefix ancestor before creating
+directories and rechecks the final `bin` and receipt directory chains. Uninstall
+requires both existing chains to pass the same check before it reads or removes
+files. Every checked directory must be owned by root or the effective user and
+must not have group or other write bits; symlinks are rejected by the
+descriptor-relative walker. The check does not inspect ACL grants and does not
+prevent same-UID pathname races, so handle-relative identity-checked removal
+remains a release gate for hostile shared directories. Fixtures cover writable
+prefixes and ancestors, symlinked components, and writable binary or receipt
+directories in `scripts/test.sh`.

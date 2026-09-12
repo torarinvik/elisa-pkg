@@ -982,6 +982,37 @@ PY
   else
     test "$?" -eq 2
   fi
+  INSECURE_PREFIX="$CASE/insecure-prefix"
+  mkdir -m 777 "$INSECURE_PREFIX"
+  chmod 777 "$INSECURE_PREFIX"
+  if ELISAPKG_INSTALL_PREFIX="$INSECURE_PREFIX" "$BIN" install --local >/dev/null 2>&1; then
+    echo "local install accepted a group/other-writable prefix" >&2
+    exit 1
+  else
+    test "$?" -eq 7
+  fi
+  test ! -e "$INSECURE_PREFIX/bin"
+  INSECURE_PARENT="$CASE/insecure-parent"
+  mkdir "$INSECURE_PARENT"
+  chmod 777 "$INSECURE_PARENT"
+  if ELISAPKG_INSTALL_PREFIX="$INSECURE_PARENT/nested-prefix" "$BIN" install --local >/dev/null 2>&1; then
+    echo "local install accepted a writable existing prefix ancestor" >&2
+    exit 1
+  else
+    test "$?" -eq 7
+  fi
+  test ! -e "$INSECURE_PARENT/nested-prefix"
+  SYMLINK_TARGET="$CASE/symlink-target"
+  SYMLINK_PREFIX="$CASE/symlink-prefix"
+  mkdir "$SYMLINK_TARGET"
+  ln -s "$SYMLINK_TARGET" "$SYMLINK_PREFIX"
+  if ELISAPKG_INSTALL_PREFIX="$SYMLINK_PREFIX/nested-prefix" "$BIN" install --local >/dev/null 2>&1; then
+    echo "local install accepted a symlinked prefix component" >&2
+    exit 1
+  else
+    test "$?" -eq 7
+  fi
+  test ! -e "$SYMLINK_TARGET/nested-prefix"
   ELISAPKG_INSTALL_PREFIX="$PREFIX" "$BIN" install --local >/dev/null
   test -x "$PREFIX/bin/app"
   ELISAPKG_INSTALL_PREFIX="$PREFIX" "$PREFIX/bin/app"
@@ -1010,6 +1041,26 @@ PY
     test "$?" -eq 7
   fi
   mv "$PREFIX/share/elisapkg/receipts/app.good" "$PREFIX/share/elisapkg/receipts/app"
+  chmod 777 "$PREFIX/bin"
+  if ELISAPKG_INSTALL_PREFIX="$PREFIX" "$BIN" uninstall --local app >/dev/null 2>&1; then
+    echo "local uninstall accepted a group/other-writable binary directory" >&2
+    exit 1
+  else
+    test "$?" -eq 7
+  fi
+  test -x "$PREFIX/bin/app"
+  test -f "$PREFIX/share/elisapkg/receipts/app"
+  chmod 755 "$PREFIX/bin"
+  chmod 777 "$PREFIX/share/elisapkg/receipts"
+  if ELISAPKG_INSTALL_PREFIX="$PREFIX" "$BIN" uninstall --local app >/dev/null 2>&1; then
+    echo "local uninstall accepted a group/other-writable receipt directory" >&2
+    exit 1
+  else
+    test "$?" -eq 7
+  fi
+  test -x "$PREFIX/bin/app"
+  test -f "$PREFIX/share/elisapkg/receipts/app"
+  chmod 755 "$PREFIX/share/elisapkg/receipts"
   ELISAPKG_INSTALL_PREFIX="$PREFIX" "$BIN" uninstall --local app >/dev/null
   test ! -e "$PREFIX/bin/app"
   TRAILING_HOME="$CASE/trailing-home"

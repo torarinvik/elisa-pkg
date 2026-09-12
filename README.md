@@ -103,8 +103,12 @@ exclusive hard-link publication, so an existing file cannot be replaced. A
 receipt under `share/elisapkg/receipts` binds the package name, destination, and
 SHA-256 artifact digest. `uninstall --local NAME` removes only a matching,
 unchanged receipt-owned binary; modified files and malformed receipts are
-refused. Remote `install NAME` remains trust-gated with the other network
-operations.
+refused. Before installation or removal, the prefix and its existing directory
+chain must contain only real directories owned by root or the effective user,
+with no group or other write bits; shared writable locations such as `/tmp` are
+refused. This owner and mode check does not inspect ACL grants or stop another
+process running as the same user from racing pathnames. Remote `install NAME`
+remains trust-gated with the other network operations.
 
 ## Security posture
 
