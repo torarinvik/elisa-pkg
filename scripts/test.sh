@@ -326,9 +326,16 @@ if [ "$(uname -s)" = "Darwin" ]; then
   ACL_NONE_DIR="$TEST_TMP/acl-none"
   ACL_DENY_DIR="$TEST_TMP/acl-deny"
   ACL_ALLOW_DIR="$TEST_TMP/acl-allow"
+  ACL_DENY_FILE="$TEST_TMP/acl-deny-file"
+  ACL_ALLOW_FILE="$TEST_TMP/acl-allow-file"
   mkdir -m 700 "$ACL_NONE_DIR" "$ACL_DENY_DIR" "$ACL_ALLOW_DIR"
+  cp "$TRUST_ROOT_FILE" "$ACL_DENY_FILE"
+  cp "$TRUST_ROOT_FILE" "$ACL_ALLOW_FILE"
+  chmod 600 "$ACL_DENY_FILE" "$ACL_ALLOW_FILE"
   chmod +a "everyone deny delete" "$ACL_DENY_DIR"
   chmod +a "everyone allow add_file,delete_child" "$ACL_ALLOW_DIR"
+  chmod +a "everyone deny write" "$ACL_DENY_FILE"
+  chmod +a "everyone allow write" "$ACL_ALLOW_FILE"
   ACL_PROBE="$TEST_TMP/trusted-acl-probe-$$.elisa"
   ACL_BIN="$TEST_TMP/trusted-acl-probe-$$"
   cat > "$ACL_PROBE" <<EOF
@@ -337,6 +344,15 @@ def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
     return 1 if Platform::pkg_is_trusted_directory("$ACL_NONE_DIR") != 1
     return 2 if Platform::pkg_is_trusted_directory("$ACL_DENY_DIR") != 1
     return 3 if Platform::pkg_is_trusted_directory("$ACL_ALLOW_DIR") != 0
+    denied_key: mutable darray[u8] = []
+    denied_key.resize(33)
+    denied_raw: mutable u8& = (&denied_key[0]).cast[mutable u8&] can Unsafe.PointerCast
+    return 4 if Platform::pkg_read_trusted_file("$ACL_DENY_FILE", denied_raw, denied_key.count) != 32
+    return 5 if denied_key[0] != 0 or denied_key[31] != 31
+    allowed_key: mutable darray[u8] = []
+    allowed_key.resize(33)
+    allowed_raw: mutable u8& = (&allowed_key[0]).cast[mutable u8&] can Unsafe.PointerCast
+    return 6 if Platform::pkg_read_trusted_file("$ACL_ALLOW_FILE", allowed_raw, allowed_key.count) >= 0
     return 0
 EOF
   ELISA_STAGE1_BIN="${ELISA_STAGE1_BIN:-$ELISA_COMPILER_ROOT/bin/elisac-stage1}" \
@@ -345,8 +361,11 @@ EOF
     "$ELISA_COMPILER_ROOT/scripts/elisac_stage1.sh" -emit exe -o "$ACL_BIN" "$ACL_PROBE"
   "$ACL_BIN"
   test "$(stat -f '%Lp' "$ACL_ALLOW_DIR")" = "700"
+  test "$(stat -f '%Lp' "$ACL_ALLOW_FILE")" = "600"
   chmod -a "everyone deny delete" "$ACL_DENY_DIR"
   chmod -a "everyone allow add_file,delete_child" "$ACL_ALLOW_DIR"
+  chmod -a "everyone deny write" "$ACL_DENY_FILE"
+  chmod -a "everyone allow write" "$ACL_ALLOW_FILE"
 fi
 
 # Persistent trust state is outside the project lockfile. Verify monotonic

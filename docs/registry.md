@@ -51,9 +51,9 @@ configured key path is compared with the registry path lexically and, when the
 paths exist, by canonical identity as well. Reads use one no-follow descriptor,
 so the bytes verified are the bytes from the checked file. Persisted trust-state
 and clock files follow the same ownership, permission, and descriptor rules.
-On macOS, trusted directory descriptors also reject extended ACL allow entries
-and unknown ACL tags while permitting deny-only entries; Linux ACL grants are
-not inspected. `metadata.sig` is exactly 64 raw Ed25519
+On macOS, trusted directory and regular-file descriptors also reject extended
+ACL allow entries and unknown ACL tags while permitting deny-only entries;
+Linux ACL grants are not inspected. `metadata.sig` is exactly 64 raw Ed25519
 signature bytes. `index` is a
 newline-separated list of unique, complete SemVer versions. The resolver picks
 the highest version satisfying the requested exact, caret, tilde, or comparison

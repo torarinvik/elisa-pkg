@@ -127,7 +127,9 @@ recomputes its digest before returning success. Registry file reads reject
 symlinked descendants by requiring `realpath` equality, and a no-argument
 locked fetch reauthenticates every v3 record before caching it. Each verified
 selection is persisted outside the project in a per-user monotonic trust-state
-file protected by an exclusive lock and durable atomic replacement. A network
+file protected by an exclusive lock and durable atomic replacement. On macOS,
+ACL allow entries and unknown ACL tags on both trust directories and regular
+trust files are rejected; deny-only entries are accepted. A network
 transport and publisher delegation remain separate release gates.
 
 ## D-012: local installation directory trust
