@@ -574,9 +574,13 @@ ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_COMPILER_ROOT/build/runtime/elisa
 ARCHIVE_PROBE="$TEST_TMP/archive-probe-$$.elisa"
 ARCHIVE_BIN="$TEST_TMP/archive-probe-$$"
 ARCHIVE_EXTRACT_DIR="$TEST_TMP/archive-extract-$$"
+ARCHIVE_EXTRACT_512_DIR="$TEST_TMP/archive-extract-512-$$"
+ARCHIVE_EXTRACT_LIMIT_DIR="$TEST_TMP/archive-extract-limit-$$"
 mkdir -p "$ARCHIVE_EXTRACT_DIR"
 mkdir -p "$ARCHIVE_EXTRACT_DIR-partial"
 mkdir -p "$ARCHIVE_EXTRACT_DIR-end"
+mkdir -p "$ARCHIVE_EXTRACT_512_DIR"
+mkdir -p "$ARCHIVE_EXTRACT_LIMIT_DIR"
 cat > "$ARCHIVE_PROBE" <<EOF
 include "$ROOT/src/archive.elisa"
 
@@ -593,6 +597,17 @@ def append_text(out: mutable darray[u8]&, value: cstr) -> void:
     while value[index].u8() != 0:
         out.push(value[index].u8())
         index <- index + 1
+
+def append_indexed_zero_file(out: mutable darray[u8]&, index: usize) -> void can[Memory.Allocate, Abort.Panic]:
+    name: mutable darray[u8] = []
+    for _prefix in 0..<92 |name|:
+        name.push(97)
+    name.push(47)
+    name.push(48 + (index / 100).u8())
+    name.push(48 + ((index / 10) % 10).u8())
+    name.push(48 + (index % 10).u8())
+    header: darray[u8] = Archive::tar_file_header(name, 0)
+    append_bytes(out, header)
 
 def main() -> i64:
     name: mutable darray[u8] = [115, 114, 99, 47, 109, 97, 105, 110, 46, 101, 108, 105, 115, 97]
@@ -644,6 +659,22 @@ def main() -> i64:
     end_destination: mutable darray[u8] = []
     append_text(&end_destination, "$ARCHIVE_EXTRACT_DIR-end")
     return 7 if Archive::extract_ustar_archive(partial, end_destination)
+    archive_512: mutable darray[u8] = []
+    for index in 0..<512.usize() |archive_512|:
+        append_indexed_zero_file(&archive_512, index)
+    append_zeroes(&archive_512, 1024)
+    return 8 if not Archive::verify_ustar_archive(archive_512)
+    accepted_destination: mutable darray[u8] = []
+    append_text(&accepted_destination, "$ARCHIVE_EXTRACT_512_DIR")
+    return 11 if not Archive::extract_ustar_archive(archive_512, accepted_destination)
+    archive_513: mutable darray[u8] = []
+    for index in 0..<513.usize() |archive_513|:
+        append_indexed_zero_file(&archive_513, index)
+    append_zeroes(&archive_513, 1024)
+    return 9 if Archive::verify_ustar_archive(archive_513)
+    limit_destination: mutable darray[u8] = []
+    append_text(&limit_destination, "$ARCHIVE_EXTRACT_LIMIT_DIR")
+    return 10 if Archive::extract_ustar_archive(archive_513, limit_destination)
     return 0
 EOF
 ELISA_STAGE1_BIN="${ELISA_STAGE1_BIN:-$ELISA_COMPILER_ROOT/bin/elisac-stage1}" \
@@ -655,6 +686,48 @@ test -f "$ARCHIVE_EXTRACT_DIR/src/main.elisa"
 test "$(cat "$ARCHIVE_EXTRACT_DIR/src/main.elisa")" = abc
 test -z "$(find "$ARCHIVE_EXTRACT_DIR-partial" -mindepth 1 -print -quit)"
 test -z "$(find "$ARCHIVE_EXTRACT_DIR-end" -mindepth 1 -print -quit)"
+test "$(find "$ARCHIVE_EXTRACT_512_DIR" -type f | wc -l | tr -d ' ')" -eq 512
+test -z "$(find "$ARCHIVE_EXTRACT_LIMIT_DIR" -mindepth 1 -print -quit)"
+
+# Transitive local paths are normalized without duplicate separators. This
+# nested/../ form used to retain the separator at the removed component and
+# emit a lock path containing `//`, which later build validation rejected.
+NORMALIZE_PATH_CASE="$TEST_TMP/normalize-dependency-path-$$"
+mkdir -p "$NORMALIZE_PATH_CASE/src" "$NORMALIZE_PATH_CASE/group/local-util/src" "$NORMALIZE_PATH_CASE/group/local-util/nested" "$NORMALIZE_PATH_CASE/group/local-util/nested-util/src"
+printf '%s\n' 'def main() -> i64:' '    return 0' > "$NORMALIZE_PATH_CASE/src/main.elisa"
+printf '%s\n' 'def main() -> i64:' '    return 0' > "$NORMALIZE_PATH_CASE/group/local-util/src/main.elisa"
+printf '%s\n' 'def main() -> i64:' '    return 0' > "$NORMALIZE_PATH_CASE/group/local-util/nested-util/src/main.elisa"
+printf '%s\n' '{"schema-version":1,"package":{"name":"normalize-root","version":"1.0.0"},"targets":[{"name":"normalize-root","kind":"bin","entry":"src/main.elisa"}],"dependencies":{"local-util":{"path":"group/local-util"}}}' > "$NORMALIZE_PATH_CASE/elisapkg.json"
+printf '%s\n' '{"schema-version":1,"package":{"name":"local-util","version":"1.0.0"},"targets":[{"name":"local-util","kind":"lib","entry":"src/main.elisa"}],"dependencies":{"nested-util":{"path":"nested/../nested-util"}}}' > "$NORMALIZE_PATH_CASE/group/local-util/elisapkg.json"
+printf '%s\n' '{"schema-version":1,"package":{"name":"nested-util","version":"1.0.0"},"targets":[{"name":"nested-util","kind":"lib","entry":"src/main.elisa"}],"dependencies":{}}' > "$NORMALIZE_PATH_CASE/group/local-util/nested-util/elisapkg.json"
+(
+  cd "$NORMALIZE_PATH_CASE"
+  "$BIN" resolve >/dev/null
+  grep -F '"path":"group/local-util/nested-util"' elisapkg.lock >/dev/null
+  "$BIN" resolve --frozen >/dev/null
+)
+
+# The source collector rejects packages beyond the archive's documented entry
+# cap before the writer or duplicate scanner sees an oversized list.
+PACKAGE_ENTRY_LIMIT_CASE="$TEST_TMP/package-entry-limit-$$"
+mkdir -p "$PACKAGE_ENTRY_LIMIT_CASE/src" "$PACKAGE_ENTRY_LIMIT_CASE/extra"
+printf '%s\n' 'def main() -> i64:' '    return 0' > "$PACKAGE_ENTRY_LIMIT_CASE/src/main.elisa"
+printf '%s\n' '{"schema-version":1,"package":{"name":"entry-limit","version":"1.0.0"},"targets":[{"name":"entry-limit","kind":"bin","entry":"src/main.elisa"}],"dependencies":{}}' > "$PACKAGE_ENTRY_LIMIT_CASE/elisapkg.json"
+(
+  cd "$PACKAGE_ENTRY_LIMIT_CASE"
+  "$BIN" resolve >/dev/null
+  for index in $(seq 1 509); do
+    printf x > "extra/file-$index"
+  done
+  "$BIN" package --list >/dev/null
+  printf x > extra/file-510
+  if "$BIN" package --list >/dev/null 2>&1; then
+    echo "package listing accepted more than 512 archive entries" >&2
+    exit 1
+  else
+    test "$?" -eq 2
+  fi
+)
 
 # Read-only graph inspection must not refresh a registry or depend on its
 # current availability. A structurally valid v3 lock with matching local root

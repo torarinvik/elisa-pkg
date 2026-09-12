@@ -90,9 +90,12 @@ small FFI seam in `src/platform_native.elisa`; signature policy remains in
 
 The archive reader verifies the strict deterministic ustar subset again at the
 cache boundary. `Archive::extract_ustar_archive` can extract only into a private,
-empty staging directory; it rejects links, unsafe path components, duplicate
-case-folded names, nonzero metadata fields, oversized files, and malformed
-checksums, and uses descriptor-relative no-follow operations for every parent.
+empty staging directory; it accepts at most 512 regular-file entries and
+rejects links, unsafe path components, duplicate case-folded names, nonzero
+metadata fields, oversized files, and malformed checksums, and uses
+descriptor-relative no-follow operations for every parent. The entry limit
+keeps the verifier's and extractor's flat duplicate-name scans bounded even
+for long common prefixes.
 Network/TLS transport and publisher authorization are still disabled until
 their independent security review gates are complete. Signed selections are
 also recorded in a user-owned trust-state file after archive verification. By

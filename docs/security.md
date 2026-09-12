@@ -130,7 +130,8 @@ receipt, package name, path, and current bytes all match. A changed executable
 or receipt is left in place for manual recovery.
 
 The local package writer emits only regular files in sorted ustar order with
-zero timestamps and normalized ownership. A shared `PackagePathPolicy` rejects
+zero timestamps and normalized ownership, with a maximum of 512 selected files
+per archive. A shared `PackagePathPolicy` rejects
 unsafe or overlong names, state/VCS directories, credential-bearing directories
 such as `.ssh`, `.aws`, `.kube`, and `.docker`, and credential files such as
 `.npmrc`, `.pypirc`, `.env*`, and private-key formats before reading bytes;
