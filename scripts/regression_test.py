@@ -240,7 +240,7 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
         '    cycle_selected: mutable darray[usize] = []',
         '    cycle_result: Solver::SolveCode = Solver::solve(cycle_candidates, cycle_roots, &cycle_selected)',
     ])
-    check('cycle_result == Solver::SolveCode.Malformed and cycle_selected.count == 0.usize()')
+    check('cycle_result == Solver::SolveCode.Unsatisfiable and cycle_selected.count == 0.usize()')
     lines.append('    return 0')
     source = work / 'probe.elisa'
     source.write_text('\n'.join(lines) + '\n')

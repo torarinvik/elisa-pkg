@@ -166,6 +166,40 @@ ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_COMPILER_ROOT/build/runtime/elisa
   "$ELISA_COMPILER_ROOT/scripts/elisac_stage1.sh" -emit exe -o "$RESOLVE_BIN" "$RESOLVE_PROBE"
 "$RESOLVE_BIN"
 
+# A cyclic highest-version branch must backtrack when a lower version yields
+# an acyclic solution, rather than misclassifying the input as malformed.
+SOLVER_PROBE="$TEST_TMP/solver-probe-$$.elisa"
+SOLVER_BIN="$TEST_TMP/solver-probe-$$"
+cat > "$SOLVER_PROBE" <<EOF
+include "$ROOT/src/solver.elisa"
+
+def main() -> i64 can[Memory.Allocate, Abort.Panic]:
+    a: mutable darray[u8] = [97]
+    b: mutable darray[u8] = [98]
+    any_v1: mutable darray[u8] = [94,49,46,48,46,48]
+    a_high_dependencies: mutable darray[Solver::Constraint] = []
+    a_high_dependencies.push(Solver::Constraint{package: b, requirement: any_v1})
+    b_dependencies: mutable darray[Solver::Constraint] = []
+    b_dependencies.push(Solver::Constraint{package: a, requirement: any_v1})
+    candidates: mutable darray[Solver::Candidate] = []
+    candidates.push(Solver::Candidate{package: a, version: Model::Version{major: 1, minor: 1, patch: 0, prerelease: false}, dependencies: a_high_dependencies, yanked: false})
+    candidates.push(Solver::Candidate{package: a, version: Model::Version{major: 1, minor: 0, patch: 0, prerelease: false}, dependencies: [], yanked: false})
+    candidates.push(Solver::Candidate{package: b, version: Model::Version{major: 1, minor: 0, patch: 0, prerelease: false}, dependencies: b_dependencies, yanked: false})
+    roots: mutable darray[Solver::Constraint] = []
+    roots.push(Solver::Constraint{package: a, requirement: any_v1})
+    selected: mutable darray[usize] = []
+    result: Solver::SolveCode = Solver::solve(candidates, roots, &selected)
+    return 1 if result != Solver::SolveCode.Solved
+    return 2 if selected.count != 1
+    return 3 if selected[0] != 1
+    return 0
+EOF
+ELISA_STAGE1_BIN="${ELISA_STAGE1_BIN:-$ELISA_COMPILER_ROOT/bin/elisac-stage1}" \
+ELISA_ALLOW_STALE_STAGE1="${ELISA_ALLOW_STALE_STAGE1:-0}" \
+ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_COMPILER_ROOT/build/runtime/elisacore_runtime.o}" \
+  "$ELISA_COMPILER_ROOT/scripts/elisac_stage1.sh" -emit exe -o "$SOLVER_BIN" "$SOLVER_PROBE"
+"$SOLVER_BIN"
+
 # Trust policy prechecks are distinct from cryptographic verification. Exercise
 # their expiry, rollback, namespace, and algorithm failures while the production
 # remote provider remains disabled.
