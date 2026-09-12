@@ -36,7 +36,8 @@ The directory must be an absolute, symlink-free path. Its layout is:
 
 ```text
 REGISTRY/
-  PACKAGE/index
+  PACKAGE/index          # signed snapshot payload
+  PACKAGE/index.sig      # 64 raw Ed25519 signature bytes
   PACKAGE/VERSION/metadata.json
   PACKAGE/VERSION/metadata.sig
   PACKAGE/VERSION/archive.tar
@@ -53,23 +54,40 @@ so the bytes verified are the bytes from the checked file. Persisted trust-state
 and clock files follow the same ownership, permission, and descriptor rules.
 On macOS, trusted directory and regular-file descriptors also reject extended
 ACL allow entries and unknown ACL tags while permitting deny-only entries;
-Linux ACL grants are not inspected. `metadata.sig` is exactly 64 raw Ed25519
-signature bytes. `index` is a
-newline-separated list of unique, complete SemVer versions. The resolver picks
-the highest version satisfying the requested exact, caret, tilde, or comparison
-requirement.
+Linux ACL grants are not inspected. Both `metadata.sig` and `index.sig` are
+exactly 64 raw Ed25519 signature bytes. The `index` payload is signed
+byte-for-byte and uses this bounded line format:
 
-The local `index` is plain, unsigned filesystem data; per-version signatures
-authenticate only the individual metadata records they cover. The client reads
-the index through a no-follow descriptor and checks ownership, permissions, and
-supported ACL policy for every ancestor and the final regular file. This blocks
-an unrelated UID or a shared-writable directory from replacing or omitting
-entries, but it does not authenticate index completeness or freshness. An index
-can be replayed or can omit releases on first use, and a writer with the same
-user identity can still change it. Local resolution therefore trusts the
-configured filesystem; its index is not fully rollback-safe. Before any remote
-or mirror transport is enabled, signed expiring index snapshots and a persisted
-monotonic index generation are mandatory release gates.
+```text
+elisapkg-index:1
+registry:/absolute/registry/path
+package:example
+generation:7
+expires:1780000000
+versions:
+1.0.0
+1.2.0
+```
+
+The registry and package fields must match the configured registry and
+requested package. Generation and expiry are canonical unsigned decimal
+integers; generation must be positive. Versions must be unique, ascending,
+stable SemVer values, with at most 4096 entries. The resolver picks the highest
+version satisfying the requested exact, caret, tilde, or comparison
+requirement. The snapshot expires within 30 days, and its generation is stored
+in rollback-protected trust state under an identity bound to the registry and
+package. A lower generation is rejected; reusing a generation with different
+signed bytes is also rejected.
+
+The detached signature authenticates the publisher's declared complete
+version set and its freshness window. It cannot prove that a trusted publisher
+did not omit a release. A first-use client also cannot distinguish an older
+still-valid signed snapshot from the latest unseen generation; expiry bounds
+that replay window. Once a generation has been persisted, an older signed
+snapshot is rejected. A same-user writer can still delete or corrupt provider
+files to cause denial of service, but cannot alter a snapshot without the
+signing key. Restoring both user-owned trust state and its clock together
+remains outside this local storage mechanism's protection.
 
 `metadata.json` is signed byte-for-byte as stored, including its final newline
 if present. It must be a unique-key JSON object containing only the documented

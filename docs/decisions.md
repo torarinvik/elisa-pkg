@@ -133,12 +133,15 @@ file protected by an exclusive lock and durable atomic replacement. On macOS,
 ACL allow entries and unknown ACL tags on both trust directories and regular
 trust files are rejected; deny-only entries are accepted. A network
 transport and publisher delegation remain separate release gates. The local
-version index is unsigned filesystem-trusted data. Its no-follow descriptor
-walk checks owner, mode, and supported ACL policy for each ancestor and the
-file, but does not authenticate completeness or freshness: first-use omissions
-and replay remain possible, and the same user can modify it. It is not fully
-rollback-safe. Signed expiring index snapshots and a persisted monotonic index
-generation are mandatory before remote or mirror transport. Trust history
+version index is an exact-byte Ed25519-signed snapshot binding the registry,
+package, generation, expiry, and complete declared stable-version list. Its
+generation and payload digest are persisted in the same checksum-bound trust
+state as package history; lower generations and same-generation equivocation
+fail closed. Owner, mode, no-follow, and supported ACL checks apply to the
+snapshot, signature, and trust root. The authorized signer asserts that the
+list is complete; a first-use client cannot know about a newer unseen signed
+generation, so expiry bounds replay. Same-user deletion or corruption can
+still deny service. Trust history
 format v2 binds package, version, archive digest, and metadata digest; legacy
 history without metadata identity fails closed. Successful offline
 verification advances the state-bound clock only after signed metadata and

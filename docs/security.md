@@ -13,15 +13,16 @@ that only publishes the current package's verified build output under the
 user-selected prefix. This is an intentional fail-closed boundary, not a
 temporary insecure mode.
 
-The local registry's version `index` is unsigned plain text. Reads verify the
-owner, mode, ACL policy, and no-follow traversal of every ancestor and the final
-file, so another UID cannot replace or omit entries through a shared-writable
-directory. Individual Ed25519 metadata signatures do not authenticate index
-completeness or freshness: an index replay or omission can affect first-use
-selection, and the same user can still change it. The configured filesystem is
-therefore trusted input, and index resolution is not fully rollback-safe.
-Signed, expiring index snapshots with a persisted monotonic generation are a
-hard release gate before any remote or mirror transport is enabled.
+The local registry version `index` is a signed, expiring snapshot. Its
+byte-for-byte Ed25519 signature binds the configured registry, package,
+positive generation, expiry, and complete declared version list. The list is
+bounded, sorted, unique, and limited to stable SemVer. Each package generation
+and snapshot digest are persisted in the clock-bound trust state; a lower
+generation or changed bytes at the same generation fail closed. Index files,
+signatures, and trust roots use the same owner, mode, ACL, and no-follow checks
+as other trusted inputs. The signature authenticates the publisher's claim of
+completeness, but a first-use client cannot know about a newer unseen snapshot;
+the expiry bounds that replay window.
 Individual signed release metadata must also expire within 30 days of
 verification. Longer lifetimes fail as a distinct security error, bounding the
 replay window even when a signing key creates an accidentally far-future

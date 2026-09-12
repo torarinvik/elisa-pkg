@@ -55,13 +55,14 @@ name already exists, the operation fails closed instead of replacing prior evide
 
 Project commands accept `--manifest-path PATH`; PATH may name the project directory or its `elisapkg.json`, including dependency mutations such as `add`, `remove`, and `update`. Local path resolution walks the dependency graph transitively, sorts package records by canonical name, normalizes relative paths, records SHA-256 manifest and complete sanitized source-tree digests, and rejects conflicting duplicate package identities. Target paths are resolved with `realpath` and must remain below their package root, including when a symlink is present. `build` selects the first target by default or a named target with `--bin NAME`, `--lib NAME`, or `--test NAME`; executable and test artifacts use the target name under `.elisapkg/build/`, while libraries use the same name with an `.o` suffix. Build receipts and cache validation bind the target kind and artifact name, while `run --bin NAME` and `install --local --bin NAME` reject library targets before attempting execution or publication. `test --test NAME` selects a named test target. `clean` removes known build artifacts plus `.elisapkg/package.tar`, `.elisapkg/package.receipt`, and empty build directories. Registry dependency declarations are syntax-checked locally, including exact, caret, tilde, and comparison SemVer ranges. Registry-only graphs use the signed local `primary` provider described in [`docs/registry.md`](docs/registry.md), produce lockfile version 3, and can be cached with `fetch PACKAGE VERSION`; mixed local/registry graphs and network transport remain fail-closed.
 
-The local provider's plain-text version index is unsigned. Owner and mode checks
-on every no-follow path component, plus ACL checks where supported, prevent
-another UID from replacing it through shared-writable directories, but
-signatures on individual releases do not prove index completeness or freshness;
-first-use omission and replay remain possible. Signed, expiring index snapshots
-with persisted monotonic generations are required before remote or mirror
-transport.
+The local provider's version index is a byte-for-byte Ed25519-signed snapshot
+that binds the registry, package, generation, expiry, and complete declared
+version list. The list is bounded, sorted, unique stable SemVer. The client
+persists each package's generation in rollback-protected trust state and rejects
+lower generations or changed bytes at the same generation. Owner, mode, no-follow,
+and supported ACL checks still protect every path component. A trusted publisher
+signature asserts completeness; a first-use client cannot know about a newer
+unseen snapshot, so the bounded expiry limits that replay window.
 
 Fetched registry blobs have immutable receipts beside their content-addressed cache
 objects. The exact signed metadata bytes and detached signature are cached by metadata

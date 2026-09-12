@@ -378,6 +378,51 @@ if len(der) != len(prefix) + 32 or not der.startswith(prefix):
 Path(sys.argv[2]).write_bytes(der[-32:])
 os.chmod(sys.argv[2], 0o600)
 PY
+write_registry_index() {
+  local expiry_kind="${4:-}"
+  local identity_mode="${5:-}"
+  python3 - "$REGISTRY_EXPIRY_ROOT" "$REGISTRY_EXPIRY_PRIVATE" "$OPENSSL_BIN" "$1" "$2" "$3" "$expiry_kind" "$identity_mode" <<'PY'
+from pathlib import Path
+import subprocess, sys, time
+
+root = Path(sys.argv[1])
+private_key = sys.argv[2]
+openssl = sys.argv[3]
+package = sys.argv[4]
+generation = int(sys.argv[5])
+versions = sys.argv[6].split(",")
+if versions == ["4097-versions"]:
+    versions = [f"0.0.{number}" for number in range(1, 4098)]
+expiry_kind = sys.argv[7]
+identity_mode = sys.argv[8]
+expires = int(time.time()) + 86400
+if expiry_kind == "expired":
+    expires = 1
+elif expiry_kind == "long":
+    expires = int(time.time()) + 31 * 86400
+elif expiry_kind:
+    expires = int(expiry_kind)
+registry_field = str(root) + ("-other" if identity_mode == "wrong-registry" else "")
+package_field = package + ("-other" if identity_mode == "wrong-package" else "")
+payload = (
+    "elisapkg-index:1\n"
+    f"registry:{registry_field}\n"
+    f"package:{package_field}\n"
+    f"generation:{generation}\n"
+    f"expires:{expires}\n"
+    "versions:\n"
+    + "".join(f"{version}\n" for version in versions)
+).encode("ascii")
+package_dir = root / package
+package_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+index_path = package_dir / "index"
+index_path.write_bytes(payload)
+index_path.chmod(0o600)
+subprocess.run([openssl, "pkeyutl", "-sign", "-rawin", "-inkey", private_key,
+                "-in", str(index_path), "-out", str(package_dir / "index.sig")], check=True)
+(package_dir / "index.sig").chmod(0o600)
+PY
+}
 "$BIN" init "$REGISTRY_EXPIRY_SOURCE" >/dev/null
 (
   cd "$REGISTRY_EXPIRY_SOURCE"
@@ -414,7 +459,6 @@ for version, expires in (("1.0.0", 1), ("1.1.0", int(time.time()) + 3600)):
     subprocess.run([openssl, "pkeyutl", "-sign", "-rawin", "-inkey", private_key,
                     "-in", str(metadata_path), "-out", str(version_dir / "metadata.sig")],
                    check=True)
-(root / "foo" / "index").write_text("1.0.0\n1.1.0\n", encoding="ascii")
 unused_dir = root / "unused" / "1.0.0"
 unused_dir.mkdir(parents=True)
 (unused_dir / "archive.tar").write_bytes(archive)
@@ -434,8 +478,9 @@ unused_metadata_path.write_bytes((json.dumps(unused_metadata, separators=(",", "
 subprocess.run([openssl, "pkeyutl", "-sign", "-rawin", "-inkey", private_key,
                 "-in", str(unused_metadata_path), "-out", str(unused_dir / "metadata.sig")],
                check=True)
-(root / "unused" / "index").write_text("1.0.0\n", encoding="ascii")
 PY
+write_registry_index foo 1 1.0.0,1.1.0
+write_registry_index unused 1 1.0.0
 
 write_registry_dependency() {
   local app="$1"
@@ -450,6 +495,16 @@ manifest = json.loads(path.read_text(encoding="utf-8"))
 manifest["dependencies"] = {"foo": {"version": sys.argv[2], "registry": "primary"}}
 path.write_text(json.dumps(manifest, separators=(",", ":")) + "\n", encoding="utf-8")
 PY
+}
+
+resolve_registry_app() {
+  (
+    cd "$REGISTRY_EXPIRY_APP"
+    ELISAPKG_REGISTRY_DIR="$REGISTRY_EXPIRY_ROOT" \
+    ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_EXPIRY_KEY" \
+    ELISAPKG_TRUST_STATE="$REGISTRY_EXPIRY_STATE" \
+      "$BIN" resolve >/dev/null
+  )
 }
 
 write_registry_dependency "$REGISTRY_EXPIRY_APP" "^1.0.0"
@@ -469,6 +524,97 @@ versions = [record["version"] for record in lock["packages"] if record["name"] =
 if versions != ["1.1.0"]:
     raise SystemExit(f"expired historical release affected resolution: {versions!r}")
 PY
+
+# Signed index payloads bind the whole version list to the registry, package,
+# generation, and expiry. A byte edit without resigning and a validly signed
+# generation replay must fail before either the lockfile or trust state moves.
+write_registry_index foo 2 1.0.0,1.1.0
+resolve_registry_app
+cp "$REGISTRY_EXPIRY_APP/elisapkg.lock" "$REGISTRY_EXPIRY_CASE/lock-before-index-failures"
+cp "$REGISTRY_EXPIRY_STATE" "$REGISTRY_EXPIRY_CASE/state-before-index-failures"
+cp "$REGISTRY_EXPIRY_STATE.clock" "$REGISTRY_EXPIRY_CASE/clock-before-index-failures"
+python3 - "$REGISTRY_EXPIRY_ROOT/foo/index" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+payload = path.read_bytes()
+if b"1.1.0\n" not in payload:
+    raise SystemExit("signed index fixture did not contain the expected latest version")
+path.write_bytes(payload.replace(b"1.1.0\n", b"1.2.0\n", 1))
+PY
+if resolve_registry_app >/dev/null 2>&1; then
+  echo "resolution accepted an index payload changed without a new signature" >&2
+  exit 1
+else
+  test "$?" -eq 5
+fi
+cmp "$REGISTRY_EXPIRY_CASE/lock-before-index-failures" "$REGISTRY_EXPIRY_APP/elisapkg.lock" >/dev/null
+cmp "$REGISTRY_EXPIRY_CASE/state-before-index-failures" "$REGISTRY_EXPIRY_STATE" >/dev/null
+cmp "$REGISTRY_EXPIRY_CASE/clock-before-index-failures" "$REGISTRY_EXPIRY_STATE.clock" >/dev/null
+
+# Even an authorized signature cannot roll the persisted generation backward.
+# Equal-generation equivocation is rejected as well, because a generation
+# identifies one immutable complete snapshot.
+write_registry_index foo 2 1.0.0
+if resolve_registry_app >/dev/null 2>&1; then
+  echo "resolution accepted a different signed index at the same generation" >&2
+  exit 1
+else
+  test "$?" -eq 5
+fi
+cmp "$REGISTRY_EXPIRY_CASE/lock-before-index-failures" "$REGISTRY_EXPIRY_APP/elisapkg.lock" >/dev/null
+cmp "$REGISTRY_EXPIRY_CASE/state-before-index-failures" "$REGISTRY_EXPIRY_STATE" >/dev/null
+cmp "$REGISTRY_EXPIRY_CASE/clock-before-index-failures" "$REGISTRY_EXPIRY_STATE.clock" >/dev/null
+write_registry_index foo 1 1.0.0
+if resolve_registry_app >/dev/null 2>&1; then
+  echo "resolution accepted a validly signed older index generation" >&2
+  exit 1
+else
+  test "$?" -eq 5
+fi
+cmp "$REGISTRY_EXPIRY_CASE/lock-before-index-failures" "$REGISTRY_EXPIRY_APP/elisapkg.lock" >/dev/null
+cmp "$REGISTRY_EXPIRY_CASE/state-before-index-failures" "$REGISTRY_EXPIRY_STATE" >/dev/null
+cmp "$REGISTRY_EXPIRY_CASE/clock-before-index-failures" "$REGISTRY_EXPIRY_STATE.clock" >/dev/null
+write_registry_index foo 3 1.0.0,1.1.0
+resolve_registry_app
+
+cp "$REGISTRY_EXPIRY_APP/elisapkg.lock" "$REGISTRY_EXPIRY_CASE/lock-before-index-policy-failures"
+cp "$REGISTRY_EXPIRY_STATE" "$REGISTRY_EXPIRY_CASE/state-before-index-policy-failures"
+cp "$REGISTRY_EXPIRY_STATE.clock" "$REGISTRY_EXPIRY_CASE/clock-before-index-policy-failures"
+for invalid_index_case in "wrong-registry" "wrong-package" "expired" "long" "unsorted" "duplicate" "prerelease" "overflow-generation" "too-many-versions" "missing-signature" "short-signature"; do
+  case "$invalid_index_case" in
+    wrong-registry) write_registry_index foo 4 1.0.0,1.1.0 "" wrong-registry ;;
+    wrong-package) write_registry_index foo 4 1.0.0,1.1.0 "" wrong-package ;;
+    expired) write_registry_index foo 4 1.0.0,1.1.0 expired ;;
+    long) write_registry_index foo 4 1.0.0,1.1.0 long ;;
+    unsorted) write_registry_index foo 4 1.1.0,1.0.0 ;;
+    duplicate) write_registry_index foo 4 1.0.0,1.0.0 ;;
+    prerelease) write_registry_index foo 4 1.0.0-alpha ;;
+    overflow-generation) write_registry_index foo 18446744073709551616 1.0.0,1.1.0 ;;
+    too-many-versions) write_registry_index foo 4 4097-versions ;;
+    missing-signature) write_registry_index foo 4 1.0.0,1.1.0; rm "$REGISTRY_EXPIRY_ROOT/foo/index.sig" ;;
+    short-signature) write_registry_index foo 4 1.0.0,1.1.0; python3 - "$REGISTRY_EXPIRY_ROOT/foo/index.sig" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+path.write_bytes(path.read_bytes()[:-1])
+PY
+      ;;
+  esac
+  if resolve_registry_app >/dev/null 2>&1; then
+    echo "resolution accepted signed index case: $invalid_index_case" >&2
+    exit 1
+  else
+    test "$?" -eq 5
+  fi
+  cmp "$REGISTRY_EXPIRY_CASE/lock-before-index-policy-failures" "$REGISTRY_EXPIRY_APP/elisapkg.lock" >/dev/null
+  cmp "$REGISTRY_EXPIRY_CASE/state-before-index-policy-failures" "$REGISTRY_EXPIRY_STATE" >/dev/null
+  cmp "$REGISTRY_EXPIRY_CASE/clock-before-index-policy-failures" "$REGISTRY_EXPIRY_STATE.clock" >/dev/null
+done
+write_registry_index foo 4 1.0.0,1.1.0
+resolve_registry_app
 
 # Populate the signed metadata cache through the normal provider path, then
 # hide all package provider files during offline validation. The configured
@@ -621,8 +767,8 @@ metadata_path.write_bytes((json.dumps(metadata, separators=(",", ":")) + "\n").e
 subprocess.run([openssl, "pkeyutl", "-sign", "-rawin", "-inkey", private_key,
                 "-in", str(metadata_path), "-out", str(version_dir / "metadata.sig")],
                check=True)
-(root / "foo" / "index").write_text("1.1.0\n1.2.0\n", encoding="ascii")
 PY
+write_registry_index foo 5 1.0.0,1.1.0,1.2.0
 cat > "$REGISTRY_EXPIRY_SNAPSHOT_PROBE" <<EOF
 include "$ROOT/src/registry.elisa"
 def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -673,8 +819,8 @@ else
 fi
 test ! -e "$REGISTRY_EXPIRY_LONG_APP/elisapkg.lock"
 
-# The index is unsigned local filesystem data. A writable package directory
-# must be rejected as a security failure before it can omit or replace entries.
+# A writable package directory must be rejected as a security failure before
+# it can replace a signed snapshot or its detached signature.
 chmod 0770 "$REGISTRY_EXPIRY_ROOT/foo"
 if (
   cd "$REGISTRY_EXPIRY_APP"
