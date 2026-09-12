@@ -3602,11 +3602,118 @@ module Cli:
             expires_out <- expires
             return true
 
+        def registry_lock_record_starts(lock: darray[u8]&, packages_start: usize, packages_end: usize, out: mutable darray[usize]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            out.resize(0)
+            return false if packages_start >= packages_end or lock[packages_start] != 91
+            cursor: mutable usize = packages_start + 1.usize()
+            while cursor < packages_end:
+                while cursor < packages_end and (lock[cursor] == 32 or lock[cursor] == 9 or lock[cursor] == 10 or lock[cursor] == 13) |lock, cursor|:
+                    cursor <- cursor + 1.usize()
+                break if cursor == packages_end
+                return false if lock[cursor] != 123 or out.count >= MAX_DEPENDENCIES
+                record_end: usize = json_object_end(lock, cursor)
+                return false if record_end <= cursor or record_end >= packages_end
+                out.push(cursor)
+                cursor <- record_end + 1.usize()
+                while cursor < packages_end and (lock[cursor] == 32 or lock[cursor] == 9 or lock[cursor] == 10 or lock[cursor] == 13) |lock, cursor|:
+                    cursor <- cursor + 1.usize()
+                if cursor < packages_end:
+                    return false if lock[cursor] != 44
+                    cursor <- cursor + 1.usize()
+            return out.count > 0.usize()
+
+        def registry_lock_record_index(lock: darray[u8]&, starts: darray[usize]&, wanted: darray[u8]&, out: mutable usize&) -> bool can[Memory.Allocate, Abort.Panic]:
+            lower: mutable usize = 0.usize()
+            upper: mutable usize = starts.count
+            while lower < upper |lock, starts, wanted, lower, upper|:
+                middle: usize = lower + (upper - lower) / 2.usize()
+                record_start: usize = starts[middle]
+                record_end: usize = json_object_end(lock, record_start)
+                package: mutable darray[u8] = []
+                return false if record_end <= record_start or not object_string_value(lock, record_start, record_end, "name", &package)
+                if bytes_less(package, wanted):
+                    lower <- middle + 1.usize()
+                else:
+                    upper <- middle
+            return false if lower >= starts.count
+            record_start: usize = starts[lower]
+            record_end: usize = json_object_end(lock, record_start)
+            package: mutable darray[u8] = []
+            return false if record_end <= record_start or not object_string_value(lock, record_start, record_end, "name", &package) or not bytes_equal(package, wanted)
+            out <- lower
+            return true
+
+        def registry_offline_graph_closure(manifest: darray[u8]&, lock: darray[u8]&, packages_start: usize, packages_end: usize) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            roots: mutable darray[Solver::Constraint] = []
+            has_local: mutable bool = false
+            return EXIT_RESOLVE if not collect_registry_roots(manifest, &roots, &has_local) or has_local or roots.count == 0.usize()
+            starts: mutable darray[usize] = []
+            return EXIT_RESOLVE if not registry_lock_record_starts(lock, packages_start, packages_end, &starts)
+            reachable: mutable darray[u8] = []
+            reachable_count: mutable usize = 0.usize()
+            for index in 0..<roots.count |roots, reachable, reachable_count|:
+                if not registry_queue_contains(reachable, roots[index].package):
+                    return EXIT_RESOLVE if reachable_count >= MAX_DEPENDENCIES
+                    registry_queue_append(&reachable, roots[index].package)
+                    reachable_count <- reachable_count + 1.usize()
+            processed: mutable usize = 0.usize()
+            while processed < reachable_count:
+                package: mutable darray[u8] = []
+                return EXIT_RESOLVE if not registry_queue_field_at(reachable, processed, &package)
+                record_index: mutable usize = 0.usize()
+                return EXIT_SECURITY if not registry_lock_record_index(lock, starts, package, &record_index)
+                record_start: usize = starts[record_index]
+                record_end: usize = json_object_end(lock, record_start)
+                version_text: mutable darray[u8] = []
+                return EXIT_SECURITY if not object_string_value(lock, record_start, record_end, "version", &version_text)
+                source_start: mutable usize = 0.usize()
+                source_end: mutable usize = 0.usize()
+                return EXIT_SECURITY if not object_object_value_span(lock, record_start, record_end, "source", &source_start, &source_end)
+                archive: mutable darray[u8] = []
+                encoded_digest: mutable darray[u8] = []
+                encoded_metadata_digest: mutable darray[u8] = []
+                digest: mutable darray[u8] = []
+                metadata_digest: mutable darray[u8] = []
+                return EXIT_SECURITY if not object_string_value(lock, source_start, source_end, "archive", &archive) or not object_string_value(lock, record_start, record_end, "archive-digest", &encoded_digest) or not object_string_value(lock, record_start, record_end, "metadata-digest", &encoded_metadata_digest)
+                return EXIT_SECURITY if not valid_lock_sha256(encoded_digest) or not valid_lock_sha256(encoded_metadata_digest)
+                for digest_index in 0..<64.usize() |encoded_digest, encoded_metadata_digest, digest, metadata_digest|:
+                    digest.push(encoded_digest[7.usize() + digest_index])
+                    metadata_digest.push(encoded_metadata_digest[7.usize() + digest_index])
+                archive_size: mutable u64 = 0
+                return EXIT_SECURITY if not object_unsigned_value(lock, record_start, record_end, "archive-size", &archive_size)
+                cached_metadata: mutable darray[u8] = []
+                cached_signature: mutable darray[u8] = []
+                return EXIT_SECURITY if not registry_cache_read_metadata(metadata_digest, &cached_metadata, &cached_signature)
+                resolved_archive: mutable darray[u8] = []
+                resolved_digest: mutable darray[u8] = []
+                resolved_size: mutable u64 = 0
+                expires: mutable u64 = 0
+                dependencies: mutable darray[Solver::Constraint] = []
+                status: Registry::ResultCode = Registry::verify_metadata_snapshot(package, version_text, metadata_digest, cached_metadata, cached_signature, &resolved_archive, &resolved_digest, &resolved_size, &expires, &dependencies)
+                return EXIT_SECURITY if status != Registry::ResultCode.Ok or not bytes_equal(resolved_archive, archive) or not bytes_equal(resolved_digest, digest) or resolved_size != archive_size
+                for dependency_index in 0..<dependencies.count |lock, packages_start, packages_end, dependencies, reachable, reachable_count, dependency_index|:
+                    dependency: Solver::Constraint = dependencies[dependency_index]
+                    return EXIT_SECURITY if not registry_lock_satisfies_constraint(lock, packages_start, packages_end, dependency)
+                    if not registry_queue_contains(reachable, dependency.package):
+                        return EXIT_RESOLVE if reachable_count >= MAX_DEPENDENCIES
+                        registry_queue_append(&reachable, dependency.package)
+                        reachable_count <- reachable_count + 1.usize()
+                processed <- processed + 1.usize()
+            # Every locked record must be in the authenticated closure. All
+            # reachable names were looked up above, so matching the unique
+            # record and closure counts proves exact set equality.
+            return EXIT_RESOLVE if starts.count != reachable_count
+            return EXIT_OK
+
         def fetch_registry_lock_offline(manifest: darray[u8]&, lock: darray[u8]&, root_name: darray[u8]&, root_version: darray[u8]&, start: darray[u8]&) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return EXIT_RESOLVE if not lock_matches_manifest(manifest, lock, root_name, root_version, start)
             packages_start: usize = json_key_value_offset(lock, "packages")
             packages_end: usize = json_array_end(lock, packages_start)
             return EXIT_RESOLVE if packages_start >= lock.count or packages_end <= packages_start
+            closure_status: i64 = registry_offline_graph_closure(manifest, lock, packages_start, packages_end)
+            if closure_status != EXIT_OK:
+                write_error("error: offline registry lock does not match its signed dependency graph\n") if closure_status == EXIT_RESOLVE
+                return closure_status
             cursor: mutable usize = packages_start + 1.usize()
             fetched: mutable usize = 0.usize()
             now: i64 = Platform::pkg_wall_clock_seconds()

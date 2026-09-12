@@ -413,6 +413,26 @@ for version, expires in (("1.0.0", 1), ("1.1.0", int(time.time()) + 3600)):
                     "-in", str(metadata_path), "-out", str(version_dir / "metadata.sig")],
                    check=True)
 (root / "foo" / "index").write_text("1.0.0\n1.1.0\n", encoding="ascii")
+unused_dir = root / "unused" / "1.0.0"
+unused_dir.mkdir(parents=True)
+(unused_dir / "archive.tar").write_bytes(archive)
+unused_metadata = {
+    "schema-version": 1,
+    "algorithm": "ed25519",
+    "registry": str(root),
+    "package": "unused",
+    "version": "1.0.0",
+    "archive": "archive.tar",
+    "archive-size": len(archive),
+    "archive-digest": digest,
+    "expires": int(time.time()) + 3600,
+}
+unused_metadata_path = unused_dir / "metadata.json"
+unused_metadata_path.write_bytes((json.dumps(unused_metadata, separators=(",", ":")) + "\n").encode())
+subprocess.run([openssl, "pkeyutl", "-sign", "-rawin", "-inkey", private_key,
+                "-in", str(unused_metadata_path), "-out", str(unused_dir / "metadata.sig")],
+               check=True)
+(root / "unused" / "index").write_text("1.0.0\n", encoding="ascii")
 PY
 
 write_registry_dependency() {
@@ -468,6 +488,61 @@ mv "$REGISTRY_EXPIRY_ROOT/foo" "$REGISTRY_EXPIRY_CASE/foo.offline-hidden"
     "$BIN" fetch --offline >/dev/null
 )
 mv "$REGISTRY_EXPIRY_CASE/foo.offline-hidden" "$REGISTRY_EXPIRY_ROOT/foo"
+
+# A valid signed but disconnected package record must not be replayed offline.
+# Populate its metadata and artifact cache through a temporary manifest using a
+# separate trust state, then attach its record to the foo-only lock. Closure
+# validation must reject the edit before the user's trust state advances.
+cp "$REGISTRY_EXPIRY_APP/elisapkg.json" "$REGISTRY_EXPIRY_CASE/foo-only.manifest"
+cp "$REGISTRY_EXPIRY_APP/elisapkg.lock" "$REGISTRY_EXPIRY_CASE/foo-only.lock"
+python3 - "$REGISTRY_EXPIRY_APP/elisapkg.json" <<'PY'
+from pathlib import Path
+import json, sys
+
+path = Path(sys.argv[1])
+manifest = json.loads(path.read_text(encoding="utf-8"))
+manifest["dependencies"]["unused"] = {"version": "1.0.0", "registry": "primary"}
+path.write_text(json.dumps(manifest, separators=(",", ":")) + "\n", encoding="utf-8")
+PY
+(
+  cd "$REGISTRY_EXPIRY_APP"
+  ELISAPKG_REGISTRY_DIR="$REGISTRY_EXPIRY_ROOT" \
+  ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_EXPIRY_KEY" \
+  ELISAPKG_TRUST_STATE="$REGISTRY_EXPIRY_CASE/trust/extra-state" \
+    "$BIN" resolve >/dev/null
+  ELISAPKG_REGISTRY_DIR="$REGISTRY_EXPIRY_ROOT" \
+  ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_EXPIRY_KEY" \
+  ELISAPKG_TRUST_STATE="$REGISTRY_EXPIRY_CASE/trust/extra-state" \
+    "$BIN" fetch >/dev/null
+)
+cp "$REGISTRY_EXPIRY_CASE/foo-only.manifest" "$REGISTRY_EXPIRY_APP/elisapkg.json"
+python3 - "$REGISTRY_EXPIRY_APP/elisapkg.lock" "$REGISTRY_EXPIRY_CASE/foo-only.lock" <<'PY'
+from pathlib import Path
+import json, sys
+
+edited_path = Path(sys.argv[1])
+original = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+with_extra = json.loads(edited_path.read_text(encoding="utf-8"))
+extra = next(record for record in with_extra["packages"] if record["name"] == "unused")
+original["packages"].append(extra)
+original["packages"].sort(key=lambda record: record["name"])
+edited_path.write_text(json.dumps(original, separators=(",", ":")) + "\n", encoding="utf-8")
+PY
+cp "$REGISTRY_EXPIRY_STATE" "$REGISTRY_EXPIRY_CASE/trust/state.before-disconnected"
+if (
+  cd "$REGISTRY_EXPIRY_APP"
+  ELISAPKG_REGISTRY_DIR="$REGISTRY_EXPIRY_ROOT" \
+  ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_EXPIRY_KEY" \
+  ELISAPKG_TRUST_STATE="$REGISTRY_EXPIRY_STATE" \
+    "$BIN" fetch --offline >/dev/null 2>&1
+); then
+  echo "offline fetch accepted a signed package disconnected from the manifest" >&2
+  exit 1
+else
+  test "$?" -eq 3
+fi
+cmp "$REGISTRY_EXPIRY_CASE/trust/state.before-disconnected" "$REGISTRY_EXPIRY_STATE" >/dev/null
+cp "$REGISTRY_EXPIRY_CASE/foo-only.lock" "$REGISTRY_EXPIRY_APP/elisapkg.lock"
 
 # The expired artifact itself must remain unavailable even when it is pinned.
 write_registry_dependency "$REGISTRY_EXPIRY_EXACT_APP" "1.0.0"
