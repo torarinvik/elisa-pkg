@@ -44,8 +44,13 @@ REGISTRY/
 
 Set `ELISAPKG_REGISTRY_TRUST_ROOT` to an independently provisioned absolute
 file containing exactly 32 raw Ed25519 public-key bytes. The key must not be
-stored under the mutable registry directory. `metadata.sig` is exactly 64 raw
-Ed25519 signature bytes. `index` is a
+stored under the mutable registry directory. The key and every directory above
+it must be owned by root or the effective user and must not be group- or
+world-writable; symlinks and shared writable directories are rejected. Reads
+use one no-follow descriptor, so the bytes verified are the bytes from the
+checked file. Persisted trust-state and clock files follow the same ownership,
+permission, and descriptor rules. `metadata.sig` is exactly 64 raw Ed25519
+signature bytes. `index` is a
 newline-separated list of unique, complete SemVer versions. The resolver picks
 the highest version satisfying the requested exact, caret, tilde, or comparison
 requirement.

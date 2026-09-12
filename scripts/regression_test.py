@@ -243,7 +243,6 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
     lines.append('    return 0')
     source = work / 'probe.elisa'
     source.write_text('\n'.join(lines) + '\n')
-    (ROOT / 'build/review-probe.elisa').write_text(source.read_text())
     run([COMPILER, '-emit', 'exe', '-o', work / 'probe', source])
     empty_home = work / 'empty-home'
     empty_home.mkdir()

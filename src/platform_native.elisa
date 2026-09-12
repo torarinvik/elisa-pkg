@@ -45,6 +45,8 @@ extern native_lseek(fd: i64, offset: i64, whence: i64) -> i64
 extern native_strlen(value: cstr) -> usize
 @link_name("getenv")
 extern native_getenv(name: cstr) -> u8&?
+@link_name("geteuid")
+extern native_geteuid() -> u32
 @link_name("realpath")
 extern native_realpath(path: cstr, resolved: void&?) -> u8&?
 @link_name("free")
@@ -96,11 +98,14 @@ extern native_setrlimit(resource: i64, limits: void&) -> i64
 static if ELISA_TARGET_OS_LINUX and ELISA_TARGET_ARCH_ARM64:
     # glibc places st_mode at offset 16 on Linux arm64.
     const stat_mode_offset: usize = 16
+    const stat_uid_offset: usize = 24
 static elif ELISA_TARGET_OS_LINUX:
     # glibc places st_mode at offset 24 on Linux x86_64.
     const stat_mode_offset: usize = 24
+    const stat_uid_offset: usize = 28
 static else:
     const stat_mode_offset: usize = 4
+    const stat_uid_offset: usize = 16
 
 static if ELISA_TARGET_OS_LINUX:
     # Linux x86_64 and arm64 use the POSIX open flag values below.
@@ -218,6 +223,52 @@ module PlatformNative:
             return -5 if close_status != 0
             return -27 if used == capacity
             return used.i64()
+
+        # Trust roots and persisted anti-rollback state are read from one
+        # descriptor. Every traversed directory and the final regular file
+        # must be owned by root or the effective user and must not be writable
+        # by group/other. This prevents a co-user from swapping trust material
+        # through a shared directory between path validation and file reads.
+        def read_trusted_file(path: cstr, output: mutable u8&, capacity: usize) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return -22 if capacity == 0.usize()
+            parent: mutable darray[u8] = []
+            leaf: mutable darray[u8] = []
+            return -22 if not split_parent_leaf(path, &parent, &leaf)
+            parent_name: cstr = (&parent[0]).cast[cstr] can Unsafe.PointerCast
+            leaf_name: cstr = (&leaf[0]).cast[cstr] can Unsafe.PointerCast
+            trusted_uid: u64 = native_geteuid().u64()
+            directory: i64 = open_trusted_directory(parent_name, trusted_uid)
+            return directory if directory < 0
+            fd: i64 = native_openat(directory, leaf_name, flags_file_read())
+            open_error: i64 = current_errno()
+            directory_close: i64 = native_close(directory)
+            return close_error(fd, -5) if fd >= 0 and directory_close != 0
+            return -5 if directory_close != 0
+            return negative_value(open_error) if fd < 0
+            return close_error(fd, -13) if not trusted_regular_fd(fd, trusted_uid)
+            used: mutable usize = 0.usize()
+            while used < capacity |output, used, capacity, fd|:
+                raw: mutable void& = (&output[used]).cast[mutable void&] can Unsafe.PointerCast
+                amount: i64 = native_read(fd, raw, capacity - used)
+                if amount < 0:
+                    errno_value: i64 = current_errno()
+                    continue if errno_value == 4
+                    return close_error(fd, negative_value(errno_value))
+                break if amount == 0
+                if amount > (capacity - used).i64():
+                    return close_error(fd, -75)
+                used <- used + amount.usize()
+            close_status: i64 = native_close(fd)
+            return -5 if close_status != 0
+            return -27 if used == capacity
+            return used.i64()
+
+        def is_trusted_directory(path: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            trusted_uid: u64 = native_geteuid().u64()
+            directory: i64 = open_trusted_directory(path, trusted_uid)
+            return 0 if directory < 0
+            return 0 if native_close(directory) != 0
+            return 1
 
         def package_file_size(path: cstr) -> i64:
             fd: i64 = open_package_file(path)
@@ -1254,6 +1305,62 @@ module PlatformNative:
 
         def read_u16(value: darray[u8]&, offset: usize) -> u64:
             return value[offset].u64() + value[offset + 1.usize()].u64() * 256.u64()
+
+        def read_u32(value: darray[u8]&, offset: usize) -> u64:
+            return value[offset].u64() + value[offset + 1.usize()].u64() * 256.u64() + value[offset + 2.usize()].u64() * 65536.u64() + value[offset + 3.usize()].u64() * 16777216.u64()
+
+        def trusted_fd(fd: i64, expected_uid: u64, expected_kind: u64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            stat: mutable darray[u8] = []
+            stat.resize(144)
+            raw: mutable void& = (&stat[0]).cast[mutable void&] can Unsafe.PointerCast
+            return false if native_fstat(fd, raw) != 0
+            mode: u64 = read_u16(stat, stat_mode_offset)
+            owner: u64 = read_u32(stat, stat_uid_offset)
+            return false if (mode & 61440.u64()) != expected_kind or (owner != 0.u64() and owner != expected_uid)
+            return (mode & 18.u64()) == 0.u64()
+
+        def trusted_regular_fd(fd: i64, expected_uid: u64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return trusted_fd(fd, expected_uid, regular_mode)
+
+        def trusted_directory_fd(fd: i64, expected_uid: u64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return trusted_fd(fd, expected_uid, directory_mode)
+
+        def open_trusted_directory(path: cstr, expected_uid: u64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            length: usize = native_strlen(path)
+            return -22 if length == 0 or length > 4096 or path[0].u8() != 47
+            path_copy: mutable darray[u8] = []
+            for index in 0..<length |path_copy, path|:
+                path_copy.push(path[index].u8())
+            path_copy.push(0)
+            effective_length: mutable usize = length
+            while effective_length > 1.usize() and path_copy[effective_length - 1.usize()] == 47:
+                effective_length <- effective_length - 1.usize()
+            directory: mutable i64 = native_open("/", flags_directory())
+            return -error_code() if directory < 0
+            if not trusted_directory_fd(directory, expected_uid):
+                return close_error(directory, -13)
+            start: mutable usize = 1.usize()
+            while start < effective_length:
+                finish: mutable usize = start
+                while finish < effective_length and path_copy[finish] != 47 |path_copy, finish|:
+                    finish <- finish + 1.usize()
+                return close_error(directory, -22) if finish == start
+                part_storage: mutable darray[u8] = []
+                for index in start..<finish |part_storage, path_copy|:
+                    part_storage.push(path_copy[index])
+                part_storage.push(0)
+                part: cstr = (&part_storage[0]).cast[cstr] can Unsafe.PointerCast
+                return close_error(directory, -22) if cstr_equal(part, ".") or cstr_equal(part, "..")
+                next: i64 = native_openat(directory, part, flags_directory() + flag_no_follow)
+                return close_error(directory, -error_code()) if next < 0
+                if not trusted_directory_fd(next, expected_uid):
+                    return close_two_error(directory, next, -13)
+                return close_error(next, -5) if native_close(directory) != 0
+                directory <- next
+                break if finish == effective_length
+                start <- finish + 1.usize()
+                return close_error(directory, -22) if start == effective_length or path_copy[start] == 47
+            return directory
 
         def regular_fd(fd: i64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             stat: mutable darray[u8] = []

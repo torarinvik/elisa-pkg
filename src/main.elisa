@@ -487,6 +487,16 @@ module Cli:
             return true if result == 0 or result == -2
             return false
 
+        def remove_build_directory_if_empty(path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            path_c: mutable darray[u8] = []
+            path_with_nul_into(path, &path_c)
+            path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
+            result: i64 = Platform::pkg_rmdir(path_name)
+            # Keep compiler metadata and any unrecognized build files. Clean
+            # owns only the artifacts named by the manifest and their receipts.
+            return true if result == 0 or result == -2 or result == -Platform::pkg_directory_not_empty_error()
+            return false
+
         def remove_state_directory(path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             path_c: mutable darray[u8] = []
             path_with_nul_into(path, &path_c)
@@ -3265,7 +3275,7 @@ module Cli:
                 byte: u8 = metadata_digest[index]
                 return false if (byte < 48 or byte > 57) and (byte < 97 or byte > 102)
             return false if not Cache::blob_path(metadata_digest, &out)
-            bytes_push_view(&out, ".sig")
+            bytes_push_view(out, ".sig")
             return out.count <= 4096.usize()
 
         def registry_cache_store_metadata(metadata_digest: darray[u8]&, metadata: darray[u8]&, signature: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
@@ -4189,8 +4199,8 @@ module Cli:
             return EXIT_BUILD if not remove_known_file(&receipt)
             return EXIT_BUILD if not remove_known_file(&package_archive)
             return EXIT_BUILD if not remove_known_file(&package_receipt)
-            return EXIT_BUILD if not remove_empty_directory(&release_build_dir)
-            return EXIT_BUILD if not remove_empty_directory(&build_dir)
+            return EXIT_BUILD if not remove_build_directory_if_empty(&release_build_dir)
+            return EXIT_BUILD if not remove_build_directory_if_empty(&build_dir)
             # `.elisapkg` is removed only when it is empty; cache/state files are never
             # traversed or recursively deleted by clean. A retained cache makes this
             # directory intentionally non-empty, which is a successful clean result.
@@ -4885,10 +4895,26 @@ module Cli:
             stage1_env: mutable darray[u8] = []
             runtime_env: mutable darray[u8] = []
             stale_env: mutable darray[u8] = []
+            temporary_env: mutable darray[u8] = []
             args: mutable darray[cstr] = []
+            build_dir_c: mutable darray[u8] = []
+            path_with_nul_into(build_dir, &build_dir_c)
+            build_dir_name: cstr = (&build_dir_c[0]).cast[cstr] can Unsafe.PointerCast
+            canonical_build_dir: mutable darray[u8] = []
+            canonical_build_dir.resize(4096)
+            canonical_build_dir_name: mutable cstr = ""
+            if Platform::pkg_realpath(build_dir_name, &canonical_build_dir) is resolved_build_dir:
+                canonical_build_dir_name <- resolved_build_dir
+            else:
+                _ = Platform::pkg_unlink(temp_name)
+                return EXIT_BUILD
             args.push("/usr/bin/env")
             args.push("-i")
             args.push("PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin")
+            bytes_push_view(&temporary_env, "TMPDIR=")
+            bytes_push_cstr(&temporary_env, canonical_build_dir_name)
+            temporary_env.push(0)
+            args.push((&temporary_env[0]).cast[cstr] can Unsafe.PointerCast)
             args.push("ELISA_STAGE1_SEMANTIC_GATE=1")
             if not cstr_equal(stage1_bin, ""):
                 bytes_push_view(&stage1_env, "ELISA_STAGE1_BIN=")

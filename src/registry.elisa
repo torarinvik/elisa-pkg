@@ -171,7 +171,7 @@ module Registry:
             trust_root_status: ResultCode = configured_trust_root(&key_path)
             return trust_root_status if trust_root_status != ResultCode.Ok
             public_key: mutable darray[u8] = []
-            return ResultCode.MissingTrustRoot if not read_file(key_path, 32.usize(), &public_key) or public_key.count != 32.usize()
+            return ResultCode.MissingTrustRoot if read_trusted_file(key_path, 32.usize(), &public_key) != 32
             trust_status: Trust::VerificationCode = Trust::verify_detached("ed25519", public_key, metadata, signature)
             return ResultCode.InvalidSignature if trust_status != Trust::VerificationCode.Valid
             now: i64 = Platform::pkg_wall_clock_seconds()
@@ -226,7 +226,7 @@ module Registry:
             trust_root_status: ResultCode = configured_trust_root(&key_path)
             return trust_root_status if trust_root_status != ResultCode.Ok
             public_key: mutable darray[u8] = []
-            return ResultCode.MissingTrustRoot if not read_file(key_path, 32.usize(), &public_key)
+            return ResultCode.MissingTrustRoot if read_trusted_file(key_path, 32.usize(), &public_key) != 32
             trust_status: Trust::VerificationCode = Trust::verify_detached("ed25519", public_key, metadata, signature)
             return ResultCode.InvalidSignature if trust_status != Trust::VerificationCode.Valid
             expires: mutable u64 = 0
@@ -673,6 +673,24 @@ module Registry:
             out.resize(read.usize())
             return true
 
+        def read_trusted_file(path: darray[u8]&, maximum: usize, out: mutable darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            out.resize(0)
+            return -22 if maximum == 0.usize() or maximum > 1048576.usize()
+            path_c: mutable darray[u8] = []
+            path_with_nul(path, &path_c)
+            path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
+            out.resize(maximum + 1.usize())
+            raw: mutable u8& = (&out[0]).cast[mutable u8&] can Unsafe.PointerCast
+            loaded: i64 = Platform::pkg_read_trusted_file(path_name, raw, out.count)
+            if loaded < 0:
+                out.resize(0)
+                return loaded
+            if loaded > maximum.i64():
+                out.resize(0)
+                return -27
+            out.resize(loaded.usize())
+            return loaded
+
         def metadata_identity(raw: darray[u8]&, root: darray[u8]&, package: darray[u8]&, version: darray[u8]&, archive_out: mutable darray[u8]&, digest_out: mutable darray[u8]&, size_out: mutable u64&) -> bool can[Memory.Allocate, Abort.Panic]:
             schema: mutable u64 = 0
             return false if not metadata_integer(raw, "schema-version", &schema) or schema != 1
@@ -867,8 +885,10 @@ module Registry:
             path_with_nul(path, &path_c)
             path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
             created: i64 = Platform::pkg_mkdir(path_name, 448.u16())
-            return Platform::pkg_fsync_parent(path_name) == 0 if created == 0
-            return Platform::pkg_is_directory(path_name) == 1 if created == -17
+            if created == 0:
+                return false if Platform::pkg_fsync_parent(path_name) != 0
+                return Platform::pkg_is_trusted_directory(path_name) == 1
+            return Platform::pkg_is_trusted_directory(path_name) == 1 if created == -17
             return false
 
         def trust_state_path(root: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -889,12 +909,32 @@ module Registry:
                         segment_length: usize = index - segment_start
                         return [] if segment_length == 0.usize() or segment_length == 1.usize() and value[segment_start].u8() == 46 or segment_length == 2.usize() and value[segment_start].u8() == 46 and value[segment_start + 1.usize()].u8() == 46
                         segment_start <- index + 1.usize()
-                return resolved
+                return [] if not trusted_state_parent(resolved)
+                final_path: mutable darray[u8] = []
+                for index in 0..<length |final_path, value|:
+                    final_path.push(value[index].u8())
+                return final_path
             home_ref: u8&? = Platform::pkg_getenv("HOME")
             if home_ref is home_value:
                 home: cstr = home_value.cast[cstr]
                 return trust_state_path_for_home(root, home)
             return []
+
+        def trusted_state_parent(path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return false if path.count == 0.usize() or path[0] != 47
+            slash: mutable usize = path.count
+            while slash > 0.usize() and path[slash - 1.usize()] != 47:
+                slash <- slash - 1.usize()
+            return false if slash == 0.usize()
+            parent: mutable darray[u8] = []
+            if slash == 1.usize():
+                parent.push(47)
+            else:
+                for index in 0..<(slash - 1.usize()) |parent, path|:
+                    parent.push(path[index])
+            parent.push(0)
+            parent_name: cstr = (&parent[0]).cast[cstr] can Unsafe.PointerCast
+            return Platform::pkg_is_trusted_directory(parent_name) == 1
 
         def trust_state_path_for_home(root: darray[u8]&, home: cstr) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             home_length: usize = safe_home_length(home)
@@ -962,7 +1002,11 @@ module Registry:
                         segment_length: usize = index - segment_start
                         return [] if segment_length == 0.usize() or segment_length == 1.usize() and value[segment_start].u8() == 46 or segment_length == 2.usize() and value[segment_start].u8() == 46 and value[segment_start + 1.usize()].u8() == 46
                         segment_start <- index + 1.usize()
-                return resolved
+                return [] if not trusted_state_parent(resolved)
+                final_path: mutable darray[u8] = []
+                for index in 0..<length |final_path, value|:
+                    final_path.push(value[index].u8())
+                return final_path
             home_ref: u8&? = Platform::pkg_getenv("HOME")
             if home_ref is home_value:
                 home: cstr = home_value.cast[cstr]
@@ -991,15 +1035,13 @@ module Registry:
 
         def trust_state_read(path: darray[u8]&, out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out.resize(0)
-            path_c: mutable darray[u8] = []
-            path_with_nul(path, &path_c)
-            path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
             loaded: mutable darray[u8] = []
-            if not read_file(path, 1048576.usize(), &loaded):
-                # Only an actual missing file is an empty trust history. An
-                # unreadable file, directory, symlink, or other filesystem
-                # failure must not reset rollback protection.
-                return ResultCode.Ok if Platform::pkg_package_file_size(path_name) == -2
+            read_status: i64 = read_trusted_file(path, 1048576.usize(), &loaded)
+            if read_status < 0:
+                # Only the descriptor-relative ENOENT result is an empty
+                # history. Insecure parents, symlinks, and unreadable files
+                # must never reset rollback protection.
+                return ResultCode.Ok if read_status == -2
                 return ResultCode.TrustStateUnavailable
             return ResultCode.TrustStateMalformed if loaded.count == 0 or loaded.count > 1048576 or not bytes_starts_with_text(loaded, "elisapkg-trust-state:1\n")
             for index in 0..<loaded.count |out, loaded|:
@@ -1128,6 +1170,20 @@ module Registry:
             path_with_nul(lock_path, &lock_c)
             lock_name: cstr = (&lock_c[0]).cast[cstr] can Unsafe.PointerCast
             return ResultCode.TrustStateUnavailable if Platform::pkg_mkdir(lock_name, 448.u16()) != 0
+            # Rebuild path buffers after the filesystem call. The stage1 ABI
+            # may invalidate caller-owned darrays across FFI boundaries.
+            root_after_lock: mutable darray[u8] = []
+            if not configured_root(&root_after_lock):
+                _ = Platform::pkg_rmdir(lock_name)
+                return ResultCode.TrustStateUnavailable
+            state_path <- trust_state_path(root_after_lock)
+            if state_path.count == 0 or state_path.count > 4090.usize():
+                _ = Platform::pkg_rmdir(lock_name)
+                return ResultCode.TrustStateUnavailable
+            lock_path.resize(0)
+            for index in 0..<state_path.count |lock_path, state_path|:
+                lock_path.push(state_path[index])
+            registry_push_text(&lock_path, ".lock")
             state: mutable darray[u8] = []
             read_status: ResultCode = trust_state_read(state_path, &state)
             return trust_state_finish(lock_path, read_status) if read_status != ResultCode.Ok
@@ -1223,11 +1279,9 @@ module Registry:
             out <- 0
             missing <- false
             loaded: mutable darray[u8] = []
-            if not read_file(path, 64.usize(), &loaded):
-                path_c: mutable darray[u8] = []
-                path_with_nul(path, &path_c)
-                path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
-                if Platform::pkg_package_file_size(path_name) == -2:
+            read_status: i64 = read_trusted_file(path, 64.usize(), &loaded)
+            if read_status < 0:
+                if read_status == -2:
                     missing <- true
                     return ResultCode.Ok
                 return ResultCode.TrustStateUnavailable

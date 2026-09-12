@@ -4,6 +4,10 @@ set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 "$ROOT/scripts/build.sh"
 BIN="$ROOT/build/elisapkg"
+# Keep every fixture and probe under one private directory so interrupted or
+# successful runs cannot leave stale test files in the shared build tree.
+TEST_TMP="$(mktemp -d "$ROOT/build/test.XXXXXX")"
+trap 'rm -rf -- "$TEST_TMP"' EXIT
 # The Elisa binary uses this same wrapper through execvp. Keep the smoke test
 # independent of whatever compiler happens to be first on the developer's PATH.
 if [[ -n "${ELISA_COMPILER_ROOT:-}" ]]; then
@@ -18,13 +22,13 @@ python3 "$ROOT/scripts/ffi_boundary_test.py"
 # Global output modes are strict: quiet suppresses human success text without
 # hiding JSON results, and color values are validated even though the current
 # renderer intentionally emits no ANSI escapes.
-QUIET_FIXTURE="$ROOT/build/quiet-fixture-$$"
+QUIET_FIXTURE="$TEST_TMP/quiet-fixture-$$"
 mkdir "$QUIET_FIXTURE"
 "$BIN" init "$QUIET_FIXTURE" >/dev/null
-INIT_MODE_FIXTURE="$ROOT/build/init-output-modes-$$"
+INIT_MODE_FIXTURE="$TEST_TMP/init-output-modes-$$"
 init_quiet_output="$("$BIN" init "$INIT_MODE_FIXTURE" --quiet 2>/dev/null)"
 test -z "$init_quiet_output"
-if "$BIN" init "$ROOT/build/init-color-invalid-$$" --color invalid >/dev/null 2>&1; then
+if "$BIN" init "$TEST_TMP/init-color-invalid-$$" --color invalid >/dev/null 2>&1; then
   echo 'init accepted an invalid color mode' >&2
   exit 1
 else
@@ -52,8 +56,8 @@ test "$json_quiet" = '{"schema-version":1,"valid":true,"manifest":"elisapkg.json
 
 # Exercise the pure SemVer requirement module independently of the CLI. This
 # keeps parser/range regressions visible without requiring a registry fixture.
-SEMVER_PROBE="$ROOT/build/semver-probe-$$.elisa"
-SEMVER_BIN="$ROOT/build/semver-probe-$$"
+SEMVER_PROBE="$TEST_TMP/semver-probe-$$.elisa"
+SEMVER_BIN="$TEST_TMP/semver-probe-$$"
 cat > "$SEMVER_PROBE" <<EOF
 include "$ROOT/src/model.elisa"
 include "$ROOT/src/semver.elisa"
@@ -93,8 +97,8 @@ ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_COMPILER_ROOT/build/runtime/elisa
 
 # The resolver primitive has no network/provider dependency. Verify highest
 # satisfying selection, prerelease ordering, and fail-closed catalog parsing.
-RESOLVE_PROBE="$ROOT/build/resolve-probe-$$.elisa"
-RESOLVE_BIN="$ROOT/build/resolve-probe-$$"
+RESOLVE_PROBE="$TEST_TMP/resolve-probe-$$.elisa"
+RESOLVE_BIN="$TEST_TMP/resolve-probe-$$"
 cat > "$RESOLVE_PROBE" <<EOF
 include "$ROOT/src/resolve.elisa"
 
@@ -131,8 +135,8 @@ ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_COMPILER_ROOT/build/runtime/elisa
 # Trust policy prechecks are distinct from cryptographic verification. Exercise
 # their expiry, rollback, namespace, and algorithm failures while the production
 # remote provider remains disabled.
-TRUST_PROBE="$ROOT/build/trust-probe-$$.elisa"
-TRUST_BIN="$ROOT/build/trust-probe-$$"
+TRUST_PROBE="$TEST_TMP/trust-probe-$$.elisa"
+TRUST_BIN="$TEST_TMP/trust-probe-$$"
 cat > "$TRUST_PROBE" <<EOF
 include "$ROOT/src/trust.elisa"
 
@@ -168,8 +172,8 @@ ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_COMPILER_ROOT/build/runtime/elisa
 
 # The provider path is exercised with a fixed Ed25519 vector. A valid detached
 # signature must pass, while a one-byte mutation must fail closed.
-CRYPTO_PROBE="$ROOT/build/crypto-probe-$$.elisa"
-CRYPTO_BIN="$ROOT/build/crypto-probe-$$"
+CRYPTO_PROBE="$TEST_TMP/crypto-probe-$$.elisa"
+CRYPTO_BIN="$TEST_TMP/crypto-probe-$$"
 cat > "$CRYPTO_PROBE" <<EOF
 include "$ROOT/src/trust.elisa"
 
@@ -191,8 +195,8 @@ ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_COMPILER_ROOT/build/runtime/elisa
 # The registry adapter must fail closed when no explicit source root is
 # configured. This also compiles the full provider graph as a standalone
 # module, keeping its public/private boundary independent of the CLI.
-REGISTRY_PROBE="$ROOT/build/registry-probe-$$.elisa"
-REGISTRY_BIN="$ROOT/build/registry-probe-$$"
+REGISTRY_PROBE="$TEST_TMP/registry-probe-$$.elisa"
+REGISTRY_BIN="$TEST_TMP/registry-probe-$$"
 cat > "$REGISTRY_PROBE" <<EOF
 include "$ROOT/src/registry.elisa"
 
@@ -219,14 +223,60 @@ if ELISAPKG_REGISTRY_DIR="$ROOT" ELISAPKG_REGISTRY_TRUST_ROOT="$ROOT/../escape.k
   exit 1
 fi
 
+# Trust anchors are opened and read through one descriptor. Secure roots work;
+# writable parents, writable key files, and symlinked path components fail.
+TRUST_READ_PROBE="$TEST_TMP/trusted-read-probe-$$.elisa"
+TRUST_READ_BIN="$TEST_TMP/trusted-read-probe-$$"
+TRUST_ROOT_DIR="$TEST_TMP/trusted-root"
+TRUST_ROOT_DIR_LINK="$TEST_TMP/trusted-root-link"
+TRUST_ROOT_FILE="$TRUST_ROOT_DIR/key"
+TRUST_ROOT_INSECURE_DIR="$TEST_TMP/trusted-root-insecure"
+TRUST_ROOT_INSECURE_FILE="$TRUST_ROOT_INSECURE_DIR/key"
+TRUST_ROOT_SYMLINK_FILE="$TEST_TMP/trusted-root-symlink"
+mkdir -m 700 "$TRUST_ROOT_DIR"
+mkdir -m 777 "$TRUST_ROOT_INSECURE_DIR"
+python3 - "$TRUST_ROOT_FILE" "$TRUST_ROOT_INSECURE_FILE" <<'PY'
+from pathlib import Path
+import sys
+
+key = bytes(range(32))
+for name in sys.argv[1:]:
+    Path(name).write_bytes(key)
+Path(sys.argv[1]).chmod(0o600)
+Path(sys.argv[2]).chmod(0o600)
+PY
+chmod 666 "$TRUST_ROOT_INSECURE_FILE"
+ln -s "$TRUST_ROOT_DIR" "$TRUST_ROOT_DIR_LINK"
+ln -s "$TRUST_ROOT_FILE" "$TRUST_ROOT_SYMLINK_FILE"
+cat > "$TRUST_READ_PROBE" <<EOF
+include "$ROOT/src/platform.elisa"
+
+def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    key: mutable darray[u8] = []
+    key.resize(33)
+    key_raw: mutable u8& = (&key[0]).cast[mutable u8&] can Unsafe.PointerCast
+    return 1 if Platform::pkg_read_trusted_file("$TRUST_ROOT_FILE", key_raw, key.count) != 32
+    return 2 if key[0] != 0 or key[31] != 31
+    return 3 if Platform::pkg_read_trusted_file("$TRUST_ROOT_INSECURE_FILE", key_raw, key.count) >= 0
+    return 4 if Platform::pkg_read_trusted_file("$TRUST_ROOT_DIR_LINK/key", key_raw, key.count) >= 0
+    return 5 if Platform::pkg_read_trusted_file("$TRUST_ROOT_SYMLINK_FILE", key_raw, key.count) >= 0
+    return 6 if Platform::pkg_is_trusted_directory("$TRUST_ROOT_INSECURE_DIR") != 0
+    return 0
+EOF
+ELISA_STAGE1_BIN="${ELISA_STAGE1_BIN:-$ELISA_COMPILER_ROOT/bin/elisac-stage1}" \
+ELISA_ALLOW_STALE_STAGE1="${ELISA_ALLOW_STALE_STAGE1:-0}" \
+ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_COMPILER_ROOT/build/runtime/elisacore_runtime.o}" \
+  "$ELISA_COMPILER_ROOT/scripts/elisac_stage1.sh" -emit exe -o "$TRUST_READ_BIN" "$TRUST_READ_PROBE"
+"$TRUST_READ_BIN"
+
 # Persistent trust state is outside the project lockfile. Verify monotonic
 # versions, same-version digest pinning, durable re-entry, and fail-closed
 # malformed/duplicate history handling through the public Registry boundary.
-TRUST_STATE_PROBE="$ROOT/build/trust-state-probe-$$.elisa"
-TRUST_STATE_BIN="$ROOT/build/trust-state-probe-$$"
-TRUST_STATE_FILE="$ROOT/build/trust-state-$$.state"
-TRUST_STATE_REPEAT_PROBE="$ROOT/build/trust-state-repeat-$$.elisa"
-TRUST_STATE_REPEAT_BIN="$ROOT/build/trust-state-repeat-$$"
+TRUST_STATE_PROBE="$TEST_TMP/trust-state-probe-$$.elisa"
+TRUST_STATE_BIN="$TEST_TMP/trust-state-probe-$$"
+TRUST_STATE_FILE="$TEST_TMP/trust-state-$$.state"
+TRUST_STATE_REPEAT_PROBE="$TEST_TMP/trust-state-repeat-$$.elisa"
+TRUST_STATE_REPEAT_BIN="$TEST_TMP/trust-state-repeat-$$"
 cat > "$TRUST_STATE_PROBE" <<EOF
 include "$ROOT/src/registry.elisa"
 
@@ -272,6 +322,18 @@ ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_COMPILER_ROOT/build/runtime/elisa
 ELISAPKG_REGISTRY_DIR="$ROOT" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_REPEAT_BIN"
 test -s "$TRUST_STATE_FILE"
 test -s "$TRUST_STATE_FILE.clock"
+chmod 666 "$TRUST_STATE_FILE"
+if ELISAPKG_REGISTRY_DIR="$ROOT" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
+  echo "writable trust-state file was accepted" >&2
+  exit 1
+fi
+chmod 600 "$TRUST_STATE_FILE"
+mkdir -m 777 "$TEST_TMP/trust-state-insecure"
+if ELISAPKG_REGISTRY_DIR="$ROOT" ELISAPKG_TRUST_STATE="$TEST_TMP/trust-state-insecure/state" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
+  echo "trust state in a shared writable directory was accepted" >&2
+  exit 1
+fi
+test ! -e "$TEST_TMP/trust-state-insecure/state"
 printf 'clock:18446744073709551615\n' > "$TRUST_STATE_FILE.clock"
 if ELISAPKG_REGISTRY_DIR="$ROOT" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
   echo "trust-state clock rollback was accepted" >&2
@@ -303,34 +365,34 @@ fi
 # The default HOME-derived trust path must reject control bytes and normalize a
 # trailing separator. This exercises the same path helper used when no explicit
 # ELISAPKG_TRUST_STATE override is configured.
-DEFAULT_TRUST_HOME="$ROOT/build/default-trust-home-$$"
+DEFAULT_TRUST_HOME="$TEST_TMP/default-trust-home-$$"
 mkdir -p "$DEFAULT_TRUST_HOME"
 env -u ELISAPKG_TRUST_STATE HOME="$DEFAULT_TRUST_HOME/" ELISAPKG_REGISTRY_DIR="$ROOT" "$TRUST_STATE_BIN"
 test -n "$(find "$DEFAULT_TRUST_HOME/.local/share/elisapkg/trust" -name '*.state' -type f -print -quit)"
-BAD_TRUST_HOME="$ROOT/build/bad-trust-home-$$"
+BAD_TRUST_HOME="$TEST_TMP/bad-trust-home-$$"
 BAD_TRUST_HOME="$BAD_TRUST_HOME"$'\n'x
 if env -u ELISAPKG_TRUST_STATE HOME="$BAD_TRUST_HOME" ELISAPKG_REGISTRY_DIR="$ROOT" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
   echo "control-byte HOME was accepted for trust state" >&2
   exit 1
 fi
-BAD_TRUST_HOME_PARENT="$ROOT/build/home-parent-$$/../escape"
+BAD_TRUST_HOME_PARENT="$TEST_TMP/home-parent-$$/../escape"
 if env -u ELISAPKG_TRUST_STATE HOME="$BAD_TRUST_HOME_PARENT" ELISAPKG_REGISTRY_DIR="$ROOT" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
   echo "parent traversal HOME was accepted for trust state" >&2
   exit 1
 fi
-if ELISAPKG_TRUST_STATE="$ROOT/build/trust-state-parent-$$/../escape.state" ELISAPKG_REGISTRY_DIR="$ROOT" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
+if ELISAPKG_TRUST_STATE="$TEST_TMP/trust-state-parent-$$/../escape.state" ELISAPKG_REGISTRY_DIR="$ROOT" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
   echo "parent traversal trust-state override was accepted" >&2
   exit 1
 fi
-if ELISAPKG_TRUST_STATE="$ROOT/build/trust-state-dot-$$/./escape.state" ELISAPKG_REGISTRY_DIR="$ROOT" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
+if ELISAPKG_TRUST_STATE="$TEST_TMP/trust-state-dot-$$/./escape.state" ELISAPKG_REGISTRY_DIR="$ROOT" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
   echo "non-canonical trust-state override was accepted" >&2
   exit 1
 fi
 
 # Verify the in-language SHA-256 implementation against the two canonical
 # FIPS vectors used by the package-integrity path.
-HASH_PROBE="$ROOT/build/hash-probe-$$.elisa"
-HASH_BIN="$ROOT/build/hash-probe-$$"
+HASH_PROBE="$TEST_TMP/hash-probe-$$.elisa"
+HASH_BIN="$TEST_TMP/hash-probe-$$"
 cat > "$HASH_PROBE" <<EOF
 include "$ROOT/src/integrity.elisa"
 
@@ -367,9 +429,9 @@ ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_COMPILER_ROOT/build/runtime/elisa
 # Exercise the archive verifier against a valid record and two malformed
 # variants. The verifier is the gate used immediately before package output is
 # published, so checksum and type-field regressions must fail closed.
-ARCHIVE_PROBE="$ROOT/build/archive-probe-$$.elisa"
-ARCHIVE_BIN="$ROOT/build/archive-probe-$$"
-ARCHIVE_EXTRACT_DIR="$ROOT/build/archive-extract-$$"
+ARCHIVE_PROBE="$TEST_TMP/archive-probe-$$.elisa"
+ARCHIVE_BIN="$TEST_TMP/archive-probe-$$"
+ARCHIVE_EXTRACT_DIR="$TEST_TMP/archive-extract-$$"
 mkdir -p "$ARCHIVE_EXTRACT_DIR"
 mkdir -p "$ARCHIVE_EXTRACT_DIR-partial"
 mkdir -p "$ARCHIVE_EXTRACT_DIR-end"
@@ -455,7 +517,7 @@ test -z "$(find "$ARCHIVE_EXTRACT_DIR-end" -mindepth 1 -print -quit)"
 # Read-only graph inspection must not refresh a registry or depend on its
 # current availability. A structurally valid v3 lock with matching local root
 # digests is enough for tree/why to operate while the provider is unset.
-READONLY_REGISTRY_CASE="$ROOT/build/readonly-registry-$$"
+READONLY_REGISTRY_CASE="$TEST_TMP/readonly-registry-$$"
 mkdir -p "$READONLY_REGISTRY_CASE/src"
 printf '%s\n' 'def main() -> i64:' '    return 0' > "$READONLY_REGISTRY_CASE/src/main.elisa"
 printf '%s\n' '{"schema-version":1,"package":{"name":"readonly-app","version":"0.1.0"},"targets":[{"name":"app","kind":"bin","entry":"src/main.elisa"}],"dependencies":{"dep":{"version":"1.0.0","registry":"primary"}}}' > "$READONLY_REGISTRY_CASE/elisapkg.json"
@@ -549,7 +611,7 @@ PY
   fi
 )
 
-CASE="$ROOT/build/test-package-$(date +%s%N)"
+CASE="$TEST_TMP/test-package-$(date +%s%N)"
 mkdir -p "$CASE"
 (
   cd "$CASE"
@@ -1081,7 +1143,7 @@ PY
 # Library targets emit a regular object with the same atomic receipt/cache
 # handling as binaries. They must never be accidentally executed or installed
 # through the local binary path, and clean must remove the object output too.
-LIB_CASE="$ROOT/build/library-target-$$"
+LIB_CASE="$TEST_TMP/library-target-$$"
 LIB_PREFIX="$LIB_CASE/prefix"
 mkdir -p "$LIB_CASE"
 "$BIN" init "$LIB_CASE" --lib >/dev/null
@@ -1116,7 +1178,7 @@ mkdir -p "$LIB_CASE"
 # Named targets must have independent artifact names and selectors. Building a
 # binary, library, and test from one manifest exercises the same target graph
 # without allowing one target's output or run path to shadow another's.
-MULTI_CASE="$ROOT/build/multi-target-$$"
+MULTI_CASE="$TEST_TMP/multi-target-$$"
 mkdir -p "$MULTI_CASE"
 "$BIN" init "$MULTI_CASE" >/dev/null
 (
@@ -1148,7 +1210,7 @@ EOF
 # Keep this hostile-path fixture isolated per invocation. A previous interrupted
 # run may leave its symlink probes behind, and reusing the directory would make
 # the next test fail before exercising the package manager.
-BAD="$ROOT/build/invalid-package-$$"
+BAD="$TEST_TMP/invalid-package-$$"
 mkdir -p "$BAD/src"
 printf '%s\n' 'def main() -> i64:' '    return 0' > "$BAD/src/main.elisa"
 printf '%s\n' '{"schema-version":1,"package":{"name":"Bad_Name","version":"1.0.0"},"targets":[],"dependencies":{}}' > "$BAD/elisapkg.json"
@@ -1167,7 +1229,7 @@ done
 
 # A target that exists only through a symlink escaping the package root must be
 # rejected before any build or package operation can read it.
-OUTSIDE="$ROOT/build/invalid-target-outside-$$"
+OUTSIDE="$TEST_TMP/invalid-target-outside-$$"
 mkdir -p "$OUTSIDE"
 printf '%s\n' 'def main() -> i64:' '    return 0' > "$OUTSIDE/main.elisa"
 ln -s "$OUTSIDE" "$BAD/escape"
@@ -1325,7 +1387,7 @@ if (cd "$BAD" && "$BIN" check-manifest >/dev/null 2>&1); then
   exit 1
 fi
 
-CYCLE="$ROOT/build/cycle-package-$$"
+CYCLE="$TEST_TMP/cycle-package-$$"
 mkdir -p "$CYCLE/a/src" "$CYCLE/b/src" "$CYCLE/src"
 printf '%s\n' 'def main() -> i64:' '    return 0' > "$CYCLE/src/main.elisa"
 cp "$CYCLE/src/main.elisa" "$CYCLE/a/src/main.elisa"
