@@ -37,6 +37,8 @@ extern native_dup2(fd: i64, target: i64) -> i64
 extern native_fcntl(fd: i64, command: i64, ...) -> i64
 @link_name("fsync")
 extern native_fsync(fd: i64) -> i64
+@link_name("flock")
+extern native_flock(fd: i64, operation: i64) -> i64
 @link_name("fchmod")
 extern native_fchmod(fd: i64, mode: i64) -> i64
 @link_name("fchdir")
@@ -164,6 +166,12 @@ static else:
     const crypto_key_template: cstr = "/private/tmp/elisapkg-key.XXXXXX"
     const crypto_message_template: cstr = "/private/tmp/elisapkg-message.XXXXXX"
     const crypto_signature_template: cstr = "/private/tmp/elisapkg-signature.XXXXXX"
+
+# flock operation bits have the same values on the supported macOS and Linux
+# targets. Keep their meaning named at the FFI boundary instead of embedding a
+# platform magic number at the call site.
+const lock_operation_exclusive: i64 = 2
+const lock_operation_nonblocking: i64 = 4
 
 static if ELISA_TARGET_OS_LINUX:
     def dirent_name_length(raw: mutable u8&) -> usize:
@@ -472,6 +480,26 @@ module PlatformNative:
             errno_value: i64 = current_errno()
             return close_two_result(fd, directory, 0) if result == 0
             return close_two_error(fd, directory, negative_value(errno_value))
+
+        def acquire_install_lock(prefix: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            # Use one persistent inode for every installer process. Never unlink
+            # this file: doing so could split advisory locks across old and new
+            # inodes while another process still holds the previous one.
+            expected_uid: u64 = native_geteuid().u64()
+            directory: i64 = open_trusted_directory(prefix, expected_uid)
+            return directory if directory < 0
+            flags: i64 = flag_read_write + flag_create + flag_no_follow + flag_close_on_exec + flag_nonblock
+            fd: i64 = native_openat(directory, ".elisapkg-install.lock", flags, 384)
+            open_errno: i64 = current_errno()
+            directory_close: i64 = native_close(directory)
+            if fd < 0:
+                return negative_value(open_errno)
+            return close_error(fd, -5) if directory_close != 0
+            return close_error(fd, -13) if not trusted_regular_fd(fd, expected_uid)
+            if native_flock(fd, lock_operation_exclusive + lock_operation_nonblocking) != 0:
+                lock_errno: i64 = current_errno()
+                return close_error(fd, negative_value(lock_errno))
+            return fd
 
         def unlink(path: cstr) -> i64:
             return unlink_kind(path, 0)

@@ -138,18 +138,25 @@ Every package build additionally sets `ELISA_STAGE1_SEMANTIC_GATE=1` in the
 controlled child environment. A semantic diagnostic therefore stops the build
 before an artifact can be reported as successful.
 
-Local installation uses a per-prefix mkdir lock and exclusive hard-link
-publication for both the binary and its receipt. It refuses pre-existing
-destinations, records the artifact SHA-256 digest, and only uninstalls when the
-receipt, package name, path, and current bytes all match. A changed executable
-or receipt is left in place for manual recovery.
+Local installation uses a persistent regular lock file and an exclusive
+nonblocking kernel `flock` shared by install and uninstall. The lock inode is
+never removed: unlinking it could let concurrent processes lock different
+inodes for the same prefix. The descriptor is close-on-exec, and the kernel
+releases its lock when the process exits, including after a crash. The lock file
+is opened relative to a trusted prefix directory with no-follow and nonblocking
+flags, then checked as a protected regular file with acceptable ownership and,
+on macOS, ACL entries. Existing legacy directory lock paths and malformed lock
+files fail closed; review and remove a legacy path manually only after ensuring
+no old installer is still running. `scripts/install_lock_regression.py` checks
+contending processes, crash release, persistent inode behavior, and rejection of
+symlinks, FIFOs, and directories.
 
-The mkdir lock is not released automatically when the process exits. An
-interruption can leave that lock permanently, and interruption between binary
-and receipt publication can leave an executable without its ownership receipt.
-The client fails closed; it does not guess whether a lock or partial artifact is
-stale. Replace this protocol with a persistent kernel lock and identity-checked
-recovery before treating local install as crash-safe.
+Binary and receipt publication still occurs as two separate hard-link
+operations. A crash between them can leave a binary without its ownership
+receipt; the client fails closed and does not guess whether a partial artifact
+is stale. Add a durable transaction journal and identity-checked recovery before
+treating local install as crash-safe. Same-UID pathname races and Linux ACL
+grants also remain outside the current protection.
 
 The local package writer emits only regular files in sorted ustar order with
 zero timestamps and normalized ownership, with a maximum of 512 selected files

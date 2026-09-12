@@ -19,6 +19,7 @@ export ELISA_ALLOW_STALE_STAGE1="${ELISA_ALLOW_STALE_STAGE1:-0}"
 "$BIN" doctor | grep -F 'local Ed25519 provider available' >/dev/null
 python3 "$ROOT/scripts/ffi_boundary_test.py"
 python3 "$ROOT/scripts/ffi_fifo_regression.py"
+python3 "$ROOT/scripts/install_lock_regression.py"
 python3 "$ROOT/scripts/transaction_guard_regression.py"
 python3 "$ROOT/scripts/sandbox_policy_test.py"
 

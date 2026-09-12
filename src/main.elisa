@@ -4044,18 +4044,17 @@ module Cli:
                     out.push(108)
             return valid_install_prefix(out)
 
-        def release_install_lock(lock_name: cstr) -> bool:
-            result: i64 = Platform::pkg_rmdir(lock_name)
-            # The caller owns a lock that was just created. If it disappeared before
-            # release, another actor may have interfered with the transaction; report
-            # failure instead of treating the missing directory as idempotent success.
-            return result == 0
+        def release_install_lock(lock_fd: i64) -> bool:
+            # The lock file's inode remains in the prefix permanently. Closing this
+            # descriptor releases the kernel lock without allowing another process
+            # to create a second lock inode by racing an unlink.
+            return Platform::pkg_close(lock_fd) == 0
 
-        def finish_local_install_error(lock_name: cstr, message: cstr) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+        def finish_local_install_error(lock_fd: i64, message: cstr) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             if Platform::pkg_strlen(message) > 0.usize():
                 write_error(message)
-            if not release_install_lock(lock_name):
-                write_error("error: could not release the local installation lock; remove it before retrying\n")
+            if not release_install_lock(lock_fd):
+                write_error("error: could not close the local installation lock descriptor\n")
             return 7
 
         def run_install_local(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -4118,19 +4117,20 @@ module Cli:
             path_with_nul_into(&receipt_path, &receipt_c)
             destination_name: cstr = (&destination_c[0]).cast[cstr] can Unsafe.PointerCast
             receipt_name: cstr = (&receipt_c[0]).cast[cstr] can Unsafe.PointerCast
-            lock_path: mutable darray[u8] = []
-            path_join_into(prefix, ".elisapkg-install.lock", &lock_path)
-            lock_c: mutable darray[u8] = []
-            path_with_nul_into(&lock_path, &lock_c)
-            lock_name: cstr = (&lock_c[0]).cast[cstr] can Unsafe.PointerCast
-            return 7 if Platform::pkg_mkdir(lock_name, 448.u16()) != 0
+            prefix_c: mutable darray[u8] = []
+            path_with_nul_into(&prefix, &prefix_c)
+            prefix_name: cstr = (&prefix_c[0]).cast[cstr] can Unsafe.PointerCast
+            lock_fd: i64 = Platform::pkg_acquire_install_lock(prefix_name)
+            if lock_fd < 0:
+                write_error("error: could not acquire the local installation lock; check the prefix and any legacy lock path\n")
+                return 7
             if file_exists(&destination) or file_exists(&receipt_path):
-                return finish_local_install_error(lock_name, "error: install destination or receipt already exists; refusing to overwrite\n")
+                return finish_local_install_error(lock_fd, "error: install destination or receipt already exists; refusing to overwrite\n")
             if not write_cstr_file_noclobber(destination_name, &artifact_bytes):
-                return finish_local_install_error(lock_name, "error: could not publish the local installation binary\n")
+                return finish_local_install_error(lock_fd, "error: could not publish the local installation binary\n")
             if Platform::pkg_chmod(destination_name, 493.u16()) != 0:
                 removed: bool = remove_known_file(&destination)
-                return finish_local_install_error(lock_name, "error: could not set local installation permissions\n") if removed else finish_local_install_error(lock_name, "error: could not set local installation permissions or clean up the binary\n")
+                return finish_local_install_error(lock_fd, "error: could not set local installation permissions\n") if removed else finish_local_install_error(lock_fd, "error: could not set local installation permissions or clean up the binary\n")
             receipt: mutable darray[u8] = []
             bytes_push_view(&receipt, "elisapkg-install-receipt:1\nname:")
             bytes_push_array(&receipt, name)
@@ -4143,8 +4143,8 @@ module Cli:
             bytes_push_view(&receipt, "\n")
             if not write_cstr_file_noclobber(receipt_name, &receipt):
                 removed: bool = remove_known_file(&destination)
-                return finish_local_install_error(lock_name, "error: could not publish the local installation receipt\n") if removed else finish_local_install_error(lock_name, "error: could not publish the local installation receipt or clean up the binary\n")
-            return 7 if not release_install_lock(lock_name)
+                return finish_local_install_error(lock_fd, "error: could not publish the local installation receipt\n") if removed else finish_local_install_error(lock_fd, "error: could not publish the local installation receipt or clean up the binary\n")
+            return 7 if not release_install_lock(lock_fd)
             write_ok("installed ")
             write_bytes(1, &name)
             write_ok(" to ")
@@ -4201,23 +4201,24 @@ module Cli:
             path_with_nul_into(&receipt_path, &receipt_c)
             destination_name: cstr = (&destination_c[0]).cast[cstr] can Unsafe.PointerCast
             receipt_name: cstr = (&receipt_c[0]).cast[cstr] can Unsafe.PointerCast
-            lock_path: mutable darray[u8] = []
-            path_join_into(prefix, ".elisapkg-install.lock", &lock_path)
-            lock_c: mutable darray[u8] = []
-            path_with_nul_into(&lock_path, &lock_c)
-            lock_name: cstr = (&lock_c[0]).cast[cstr] can Unsafe.PointerCast
-            return 7 if Platform::pkg_mkdir(lock_name, 448.u16()) != 0
+            prefix_c: mutable darray[u8] = []
+            path_with_nul_into(&prefix, &prefix_c)
+            prefix_name: cstr = (&prefix_c[0]).cast[cstr] can Unsafe.PointerCast
+            lock_fd: i64 = Platform::pkg_acquire_install_lock(prefix_name)
+            if lock_fd < 0:
+                write_error("error: could not acquire the local installation lock; check the prefix and any legacy lock path\n")
+                return 7
             if not file_exists(&destination) or not file_exists(&receipt_path):
-                return finish_local_install_error(lock_name, "error: no matching local installation receipt is available\n")
+                return finish_local_install_error(lock_fd, "error: no matching local installation receipt is available\n")
             artifact_bytes: mutable darray[u8] = []
             receipt: mutable darray[u8] = []
             receipt.resize(4096)
             if not read_file_into(&destination, &artifact_bytes) or not read_cstr_into(receipt_name, &receipt):
-                return finish_local_install_error(lock_name, "error: could not read the local installation or its receipt\n")
+                return finish_local_install_error(lock_fd, "error: could not read the local installation or its receipt\n")
             digest_bytes: mutable darray[u8] = []
             digest: mutable darray[u8] = []
             if Integrity::sha256(artifact_bytes, &digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(digest_bytes, &digest):
-                return finish_local_install_error(lock_name, "error: could not verify the local installation binary\n")
+                return finish_local_install_error(lock_fd, "error: could not verify the local installation binary\n")
             expected_prefix: mutable darray[u8] = []
             expected_suffix: mutable darray[u8] = []
             bytes_push_view(&expected_prefix, "elisapkg-install-receipt:1\nname:")
@@ -4231,15 +4232,15 @@ module Cli:
             version_bytes: mutable darray[u8] = []
             version_end: usize = receipt.count - expected_suffix.count if receipt.count >= expected_suffix.count else 0.usize()
             if not bytes_starts_with(receipt, expected_prefix) or not bytes_ends_with(receipt, expected_suffix) or version_end <= expected_prefix.count:
-                return finish_local_install_error(lock_name, "error: installation receipt does not match the current file; refusing removal\n")
+                return finish_local_install_error(lock_fd, "error: installation receipt does not match the current file; refusing removal\n")
             for index in expected_prefix.count..<version_end |receipt, version_bytes|:
                 version_bytes.push(receipt[index])
             parsed_version: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
             if not parse_version(version_bytes, &parsed_version):
-                return finish_local_install_error(lock_name, "error: installation receipt does not match the current file; refusing removal\n")
+                return finish_local_install_error(lock_fd, "error: installation receipt does not match the current file; refusing removal\n")
             if not remove_known_file(&destination) or not remove_known_file(&receipt_path):
-                return finish_local_install_error(lock_name, "error: could not remove the local installation and its receipt\n")
-            return 7 if not release_install_lock(lock_name)
+                return finish_local_install_error(lock_fd, "error: could not remove the local installation and its receipt\n")
+            return 7 if not release_install_lock(lock_fd)
             write_ok("uninstalled ")
             write_bytes(1, &name)
             write_ok("\n")
