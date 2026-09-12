@@ -1078,6 +1078,12 @@ module PlatformNative:
             new_name: cstr = (&new_parent_c[0]).cast[cstr] can Unsafe.PointerCast
             new_directory: i64 = open_directory_path(new_name)
             return close_error(old_directory, new_directory) if new_directory < 0
+            expected_uid: u64 = native_geteuid().u64()
+            # The source is checked by descriptor and then acted on by name.
+            # Require both already-open parents to exclude writes by other
+            # users, so an untrusted directory cannot swap that name between
+            # validation and rename.
+            return close_two_error(old_directory, new_directory, -13) if not trusted_directory_fd(old_directory, expected_uid) or not trusted_directory_fd(new_directory, expected_uid)
             old_leaf_c: mutable darray[u8] = []
             for index in 0..<old_leaf_snapshot.count |old_leaf_c, old_leaf_snapshot|:
                 old_leaf_c.push(old_leaf_snapshot[index])
@@ -1085,7 +1091,7 @@ module PlatformNative:
             source_fd: i64 = native_openat(old_directory, old_leaf_name, flags_read_no_follow())
             source_errno: i64 = current_errno()
             return close_two_error(old_directory, new_directory, negative_value(source_errno)) if source_fd < 0
-            source_regular: bool = regular_fd(source_fd)
+            source_regular: bool = trusted_regular_fd(source_fd, expected_uid)
             source_close_status: i64 = native_close(source_fd)
             return close_two_error(old_directory, new_directory, -5) if source_close_status != 0
             return close_two_error(old_directory, new_directory, -21) if not source_regular
@@ -1096,7 +1102,7 @@ module PlatformNative:
             destination_fd: i64 = native_openat(new_directory, new_leaf_name, flags_read_no_follow())
             destination_errno: i64 = error_code()
             if destination_fd >= 0:
-                destination_regular: bool = regular_fd(destination_fd)
+                destination_regular: bool = trusted_regular_fd(destination_fd, expected_uid)
                 destination_close_status: i64 = native_close(destination_fd)
                 return close_two_error(old_directory, new_directory, -5) if destination_close_status != 0
                 return close_two_error(old_directory, new_directory, -21) if not destination_regular
@@ -1544,6 +1550,10 @@ module PlatformNative:
             new_name: cstr = (&new_parent_c[0]).cast[cstr] can Unsafe.PointerCast
             new_directory: i64 = open_directory_path(new_name)
             return close_error(old_directory, new_directory) if new_directory < 0
+            expected_uid: u64 = native_geteuid().u64()
+            # Keep name-based linkat/renameat operations inside directories
+            # that other users cannot mutate after the source inode check.
+            return close_two_error(old_directory, new_directory, -13) if not trusted_directory_fd(old_directory, expected_uid) or not trusted_directory_fd(new_directory, expected_uid)
             old_leaf_c: mutable darray[u8] = []
             for index in 0..<old_leaf_snapshot.count |old_leaf_c, old_leaf_snapshot|:
                 old_leaf_c.push(old_leaf_snapshot[index])
@@ -1551,7 +1561,7 @@ module PlatformNative:
             source_fd: i64 = native_openat(old_directory, old_leaf_name, flags_read_no_follow())
             source_errno: i64 = current_errno()
             return close_two_error(old_directory, new_directory, negative_value(source_errno)) if source_fd < 0
-            source_regular: bool = regular_fd(source_fd)
+            source_regular: bool = trusted_regular_fd(source_fd, expected_uid)
             source_close_status: i64 = native_close(source_fd)
             return close_two_error(old_directory, new_directory, -5) if source_close_status != 0
             return close_two_error(old_directory, new_directory, -21) if not source_regular

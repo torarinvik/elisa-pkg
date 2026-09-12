@@ -30,13 +30,23 @@ def main() -> int:
         work = Path(directory)
         (work / "source").write_bytes(b"regular source\n")
         os.mkfifo(work / "destination", 0o600)
+        shared = work / "shared"
+        shared.mkdir(mode=0o700)
+        (shared / "rename-source").write_bytes(b"rename source\n")
+        (shared / "link-source").write_bytes(b"link source\n")
+        os.chmod(shared, 0o777)
         probe = work / "fifo_probe.elisa"
         binary = work / "fifo_probe"
         probe.write_text(
             f'include "{ROOT / "src/platform.elisa"}"\n\n'
             'def main() -> i64:\n'
             '    result: i64 = Platform::pkg_rename("source", "destination")\n'
-            '    return 0 if result == -21 else 1\n',
+            '    return 1 if result != -21\n'
+            '    rename_result: i64 = Platform::pkg_rename("shared/rename-source", "shared/rename-destination")\n'
+            '    return 2 if rename_result != -13\n'
+            '    link_result: i64 = Platform::pkg_link("shared/link-source", "shared/link-destination")\n'
+            '    return 3 if link_result != -13\n'
+            '    return 0\n',
             encoding="utf-8",
         )
         environment = dict(os.environ)
@@ -58,6 +68,10 @@ def main() -> int:
             raise SystemExit(f"error: pkg_rename returned {result.returncode}, expected rejection status 0")
         if not (work / "destination").is_fifo() or not (work / "source").is_file():
             raise SystemExit("error: FIFO probe unexpectedly changed either path")
+        if (shared / "rename-source").read_bytes() != b"rename source\n" or (shared / "rename-destination").exists():
+            raise SystemExit("error: pkg_rename modified a source inside an untrusted parent")
+        if (shared / "link-source").read_bytes() != b"link source\n" or (shared / "link-destination").exists():
+            raise SystemExit("error: pkg_link modified a source inside an untrusted parent")
     print("Elisa FFI FIFO probe passed")
     return 0
 
