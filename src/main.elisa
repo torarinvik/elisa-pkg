@@ -4215,6 +4215,11 @@ module Cli:
             path_join_into(prefix, ".elisapkg-install-transaction", out)
 
         def read_trusted_install_file(path: darray[u8]&, maximum: usize, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            device: mutable u64 = 0.u64()
+            inode: mutable u64 = 0.u64()
+            return read_trusted_install_file_identity(path, maximum, out, &device, &inode)
+
+        def read_trusted_install_file_identity(path: darray[u8]&, maximum: usize, out: mutable darray[u8]&, out_device: mutable u64&, out_inode: mutable u64&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out.resize(0)
             path_c: mutable darray[u8] = []
             path_with_nul_into(path, &path_c)
@@ -4223,10 +4228,16 @@ module Cli:
             return false if file_size < 0 or file_size.usize() > maximum
             out.resize(file_size.usize() + 1.usize())
             output: mutable u8& = (&out[0]).cast[mutable u8&] can Unsafe.PointerCast
-            read_size: i64 = Platform::pkg_read_trusted_file(path_name, output, out.count)
+            read_size: i64 = Platform::pkg_read_trusted_file_identity(path_name, output, out.count, out_device, out_inode)
             return false if read_size != file_size
             out.resize(read_size.usize())
             return true
+
+        def remove_trusted_install_file_identity(path: darray[u8]&, device: u64, inode: u64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            path_c: mutable darray[u8] = []
+            path_with_nul_into(path, &path_c)
+            path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
+            return Platform::pkg_unlink_file_identity(path_name, device, inode) == 0
 
         def valid_install_digest(digest: darray[u8]&) -> bool:
             return false if digest.count != 64.usize()
@@ -4399,15 +4410,19 @@ module Cli:
                 else:
                     return false if receipt_state == -2
                     existing_receipt: mutable darray[u8] = []
-                    return false if not read_trusted_install_file(receipt_path, MAX_INSTALL_METADATA_BYTES, &existing_receipt) or not bytes_equal(existing_receipt, expected_receipt)
+                    receipt_device: mutable u64 = 0.u64()
+                    receipt_inode: mutable u64 = 0.u64()
+                    return false if not read_trusted_install_file_identity(receipt_path, MAX_INSTALL_METADATA_BYTES, &existing_receipt, &receipt_device, &receipt_inode) or not bytes_equal(existing_receipt, expected_receipt)
                     if destination_state >= 0:
                         artifact: mutable darray[u8] = []
-                        return false if not read_trusted_install_file(destination, 67108864.usize(), &artifact)
+                        artifact_device: mutable u64 = 0.u64()
+                        artifact_inode: mutable u64 = 0.u64()
+                        return false if not read_trusted_install_file_identity(destination, 67108864.usize(), &artifact, &artifact_device, &artifact_inode)
                         digest_bytes: mutable darray[u8] = []
                         actual_digest: mutable darray[u8] = []
                         return false if Integrity::sha256(artifact, &digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(digest_bytes, &actual_digest) or not bytes_equal(actual_digest, expected_digest)
-                        return false if not remove_known_file(&destination)
-                    return false if not remove_known_file(&receipt_path)
+                        return false if not remove_trusted_install_file_identity(destination, artifact_device, artifact_inode)
+                    return false if not remove_trusted_install_file_identity(receipt_path, receipt_device, receipt_inode)
                     return false if not remove_known_file(&transaction_path)
             for index in 0..<operation.count |out_operation, operation|:
                 out_operation.push(operation[index])
@@ -4626,13 +4641,17 @@ module Cli:
                 return finish_local_install_error(lock_fd, "error: local installation receipt is not a trusted regular file; refusing removal\n")
             artifact_bytes: mutable darray[u8] = []
             receipt: mutable darray[u8] = []
+            artifact_device: mutable u64 = 0.u64()
+            artifact_inode: mutable u64 = 0.u64()
+            receipt_device: mutable u64 = 0.u64()
+            receipt_inode: mutable u64 = 0.u64()
             destination.resize(0)
             bytes_push_array(&destination, destination_snapshot)
-            if not read_trusted_install_file(destination, 67108864.usize(), &artifact_bytes):
+            if not read_trusted_install_file_identity(destination, 67108864.usize(), &artifact_bytes, &artifact_device, &artifact_inode):
                 return finish_local_install_error(lock_fd, "error: could not read the local installation or its receipt\n")
             receipt_path.resize(0)
             bytes_push_array(&receipt_path, receipt_snapshot)
-            if not read_trusted_install_file(receipt_path, MAX_INSTALL_METADATA_BYTES, &receipt):
+            if not read_trusted_install_file_identity(receipt_path, MAX_INSTALL_METADATA_BYTES, &receipt, &receipt_device, &receipt_inode):
                 return finish_local_install_error(lock_fd, "error: could not read the local installation or its receipt\n")
             digest_bytes: mutable darray[u8] = []
             digest: mutable darray[u8] = []
@@ -4668,11 +4687,11 @@ module Cli:
                 return finish_local_install_error(lock_fd, "error: could not durably record the local uninstallation transaction\n")
             destination.resize(0)
             bytes_push_array(&destination, destination_snapshot)
-            if not remove_known_file(&destination):
+            if not remove_trusted_install_file_identity(destination, artifact_device, artifact_inode):
                 return finish_local_install_error(lock_fd, "error: could not remove the local installation; recovery will inspect the durable transaction\n")
             receipt_path.resize(0)
             bytes_push_array(&receipt_path, receipt_snapshot)
-            if not remove_known_file(&receipt_path):
+            if not remove_trusted_install_file_identity(receipt_path, receipt_device, receipt_inode):
                 return finish_local_install_error(lock_fd, "error: could not remove the local installation receipt; recovery will inspect the durable transaction\n")
             if not remove_known_file(&transaction_path):
                 return finish_local_install_error(lock_fd, "error: the local installation was removed but its transaction journal could not be retired\n")

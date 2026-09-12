@@ -271,6 +271,15 @@ module PlatformNative:
         # by group/other. This prevents a co-user from swapping trust material
         # through a shared directory between path validation and file reads.
         def read_trusted_file(path: cstr, output: mutable u8&, capacity: usize) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            device: mutable u64 = 0.u64()
+            inode: mutable u64 = 0.u64()
+            return read_trusted_file_identity(path, output, capacity, &device, &inode)
+
+        # Return the identity of the same open descriptor used for the read.
+        # Callers that later remove receipt-owned artifacts can bind that
+        # removal to the file they actually verified, instead of re-resolving
+        # its pathname after hashing.
+        def read_trusted_file_identity(path: cstr, output: mutable u8&, capacity: usize, out_device: mutable u64&, out_inode: mutable u64&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return -22 if capacity == 0.usize()
             parent: mutable darray[u8] = []
             leaf: mutable darray[u8] = []
@@ -288,11 +297,16 @@ module PlatformNative:
             leaf_name: cstr = (&leaf_c[0]).cast[cstr] can Unsafe.PointerCast
             fd: i64 = native_openat(directory, leaf_name, flags_file_read())
             open_error: i64 = current_errno()
-            directory_close: i64 = native_close(directory)
-            return close_error(fd, -5) if fd >= 0 and directory_close != 0
-            return -5 if directory_close != 0
-            return negative_value(open_error) if fd < 0
-            return close_error(fd, -13) if not trusted_regular_fd(fd, trusted_uid)
+            return close_error(directory, negative_value(open_error)) if fd < 0
+            return close_two_error(directory, fd, -13) if not trusted_regular_fd(fd, trusted_uid)
+            stat: mutable darray[u8] = []
+            stat.resize(144)
+            raw_stat: mutable void& = (&stat[0]).cast[mutable void&] can Unsafe.PointerCast
+            if native_fstat(fd, raw_stat) != 0:
+                errno_value: i64 = current_errno()
+                return close_two_error(directory, fd, negative_value(errno_value))
+            out_device <- read_stat_device(stat)
+            out_inode <- read_u64(stat, 8.usize())
             used: mutable usize = 0.usize()
             while used < capacity |output, used, capacity, fd|:
                 raw: mutable void& = (&output[used]).cast[mutable void&] can Unsafe.PointerCast
@@ -300,13 +314,14 @@ module PlatformNative:
                 if amount < 0:
                     errno_value: i64 = current_errno()
                     continue if errno_value == 4
-                    return close_error(fd, negative_value(errno_value))
+                    return close_two_error(directory, fd, negative_value(errno_value))
                 break if amount == 0
                 if amount > (capacity - used).i64():
-                    return close_error(fd, -75)
+                    return close_two_error(directory, fd, -75)
                 used <- used + amount.usize()
             close_status: i64 = native_close(fd)
-            return -5 if close_status != 0
+            directory_close: i64 = native_close(directory)
+            return -5 if close_status != 0 or directory_close != 0
             return -27 if used == capacity
             return used.i64()
 
@@ -540,6 +555,9 @@ module PlatformNative:
 
         def unlink(path: cstr) -> i64:
             return unlink_kind(path, 0)
+
+        def unlink_file_identity(path: cstr, device: u64, inode: u64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return unlink_verified_identity(path, device, inode)
 
         def rmdir(path: cstr) -> i64:
             return rmdir_secure(path)
@@ -784,7 +802,7 @@ module PlatformNative:
                 _ = native_execvp("/usr/bin/env", child_argv)
                 native_exit(127)
             elif pid > 0:
-                status: mutable i64 = 0
+                status: mutable i32 = 0
                 waited: i64 = waitpid_timeout(pid, &status, 10000)
                 result <- -110 if waited == -110
                 result <- waited if waited < 0 and waited != -110
@@ -1495,6 +1513,63 @@ module PlatformNative:
             return -5 if native_close(fd) != 0
             return result
 
+        # Remove only the regular-file inode previously returned by
+        # read_trusted_file_identity. The parent descriptor stays open across
+        # the final identity check and unlink, so callers never re-resolve the
+        # directory after validating the receipt-owned file.
+        def unlink_verified_identity(path: cstr, expected_device: u64, expected_inode: u64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            parent: mutable darray[u8] = []
+            leaf: mutable darray[u8] = []
+            return -22 if not split_parent_leaf(path, &parent, &leaf)
+            leaf_snapshot: mutable darray[u8] = []
+            for index in 0..<leaf.count |leaf_snapshot, leaf|:
+                leaf_snapshot.push(leaf[index])
+            parent_name: cstr = (&parent[0]).cast[cstr] can Unsafe.PointerCast
+            expected_uid: u64 = native_geteuid().u64()
+            directory: i64 = open_trusted_directory(parent_name, expected_uid)
+            return directory if directory < 0
+            leaf_c: mutable darray[u8] = []
+            for index in 0..<leaf_snapshot.count |leaf_c, leaf_snapshot|:
+                leaf_c.push(leaf_snapshot[index])
+            leaf_c.push(0)
+            leaf_name: cstr = (&leaf_c[0]).cast[cstr] can Unsafe.PointerCast
+            fd: i64 = native_openat(directory, leaf_name, flags_file_read())
+            open_errno: i64 = current_errno()
+            return close_error(directory, negative_value(open_errno)) if fd < 0
+            return close_two_error(directory, fd, -13) if not trusted_regular_fd(fd, expected_uid)
+            fd_stat: mutable darray[u8] = []
+            fd_stat.resize(144)
+            fd_stat_raw: mutable void& = (&fd_stat[0]).cast[mutable void&] can Unsafe.PointerCast
+            if native_fstat(fd, fd_stat_raw) != 0:
+                errno_value: i64 = current_errno()
+                return close_two_error(directory, fd, negative_value(errno_value))
+            fd_device: u64 = read_stat_device(fd_stat)
+            fd_inode: u64 = read_u64(fd_stat, 8.usize())
+            return close_two_error(directory, fd, -13) if fd_device != expected_device or fd_inode != expected_inode
+            path_stat: mutable darray[u8] = []
+            path_stat.resize(144)
+            path_stat_raw: mutable void& = (&path_stat[0]).cast[mutable void&] can Unsafe.PointerCast
+            if native_fstatat(directory, leaf_name, path_stat_raw, at_no_follow) != 0:
+                errno_value: i64 = current_errno()
+                return close_two_error(directory, fd, negative_value(errno_value))
+            path_mode: u64 = read_u16(path_stat, stat_mode_offset)
+            return close_two_error(directory, fd, -13) if (path_mode & 61440.u64()) != regular_mode
+            return close_two_error(directory, fd, -13) if read_stat_device(path_stat) != fd_device or read_u64(path_stat, 8.usize()) != fd_inode
+            # POSIX has no unlink-if-inode primitive: this is the narrowest
+            # descriptor-relative check available, but a same-UID actor can
+            # still replace the leaf between fstatat and unlinkat.
+            removed: i64 = native_unlinkat(directory, leaf_name, 0)
+            remove_errno: i64 = current_errno()
+            return close_two_error(directory, fd, negative_value(remove_errno)) if removed != 0
+            sync_status: i64 = native_fsync(directory)
+            sync_errno: i64 = current_errno()
+            if sync_status != 0:
+                return close_two_error(directory, fd, negative_value(sync_errno))
+            directory_close: i64 = native_close(directory)
+            fd_close: i64 = native_close(fd)
+            return -5 if directory_close != 0 or fd_close != 0
+            return 0
+
         def unlink_kind(path: cstr, flags: i64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             parent: mutable darray[u8] = []
             leaf: mutable darray[u8] = []
@@ -1624,6 +1699,15 @@ module PlatformNative:
 
         def read_u32(value: darray[u8]&, offset: usize) -> u64:
             return value[offset].u64() + value[offset + 1.usize()].u64() * 256.u64() + value[offset + 2.usize()].u64() * 65536.u64() + value[offset + 3.usize()].u64() * 16777216.u64()
+
+        def read_u64(value: darray[u8]&, offset: usize) -> u64:
+            return read_u32(value, offset) + read_u32(value, offset + 4.usize()) * 4294967296.u64()
+
+        def read_stat_device(value: darray[u8]&) -> u64:
+            static if ELISA_TARGET_OS_MACOS:
+                return read_u32(value, 0.usize())
+            static else:
+                return read_u64(value, 0.usize())
 
         def trusted_fd(fd: i64, expected_uid: u64, expected_kind: u64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             stat: mutable darray[u8] = []

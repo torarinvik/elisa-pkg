@@ -29,7 +29,7 @@ executable must be explicitly present and executable.
 | Capability | Current implementation | Evidence | Limitation |
 | --- | --- | --- | --- |
 | argv, stdout, stderr | Elisa wrappers | `scripts/test.sh` | Output streaming is intentionally small |
-| regular file read/write | Elisa plus direct libc FFI | Elisa probe and regression suite | Shared hostile directories need handle-based mutation |
+| regular file read/write | Elisa plus direct libc FFI | Elisa probe and regression suite | Same-UID mutation can still race the final inode check before unlink |
 | no-follow source read | `openat`/`O_NOFOLLOW` through the private Elisa platform module | Elisa platform probe | Explicit `..` path dependencies remain user-owned inputs |
 | sorted regular-file walk | bounded `opendir`/`readdir` traversal through the private Elisa platform module | package reproducibility tests | Extraction accepts regular files and creates only parent directories |
 | atomic file replacement | `mkstemp` + file fsync + rename + parent-directory fsync | lockfile fixtures | Filesystem durability guarantees still depend on the host filesystem |

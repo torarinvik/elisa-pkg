@@ -233,7 +233,9 @@ transport or publisher delegation. The current Seatbelt profile applies only
 to compiler children on macOS; output execution and project mutation are not
 sandboxed. Project mutation assumes a trusted, user-owned directory. Local
 installation enforces root/effective-user ownership and no-group/other-write
-permissions on its directory chain. macOS also rejects extended ACL allow
-entries and unknown tags, while Linux ACLs and same-UID pathname races remain
-outside this check. Handle-relative identity-checked removal remains required
-before hostile shared installation directories are supported.
+permissions on its directory chain. Uninstall reads each receipt-owned file
+through one trusted descriptor and compares its device/inode through that same
+parent directory immediately before `unlinkat`. macOS also rejects extended
+ACL allow entries and unknown tags, while Linux ACLs and a same-UID race between
+the final identity comparison and `unlinkat` remain. This narrows the pathname
+window but does not make concurrent hostile same-UID mutation safe.

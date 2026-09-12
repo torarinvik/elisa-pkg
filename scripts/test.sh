@@ -21,6 +21,7 @@ python3 "$ROOT/scripts/ffi_boundary_test.py"
 python3 "$ROOT/scripts/ffi_fifo_regression.py"
 python3 "$ROOT/scripts/install_lock_regression.py"
 python3 "$ROOT/scripts/install_transaction_regression.py"
+python3 "$ROOT/scripts/install_identity_regression.py"
 python3 "$ROOT/scripts/transaction_guard_regression.py"
 python3 "$ROOT/scripts/sandbox_policy_test.py"
 

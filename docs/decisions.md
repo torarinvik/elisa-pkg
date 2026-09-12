@@ -157,8 +157,11 @@ unknown tags while accepting deny-only entries; Linux ACL grants remain
 unchecked. A durable per-prefix journal records install or uninstall intent
 before changing the executable or receipt, and the next operation validates
 the journaled identity while holding the persistent prefix lock. Mismatched or
-malformed states fail closed and preserve their evidence. The check does not
-prevent same-UID pathname races, so handle-relative identity-checked removal
-remains a release gate for hostile shared directories. Fixtures cover writable
-prefixes and ancestors, symlinked components, writable binary or receipt
-directories, journal recovery states, and macOS ACL cases in `scripts/test.sh`.
+malformed states fail closed and preserve their evidence. Uninstall reads each
+verified file through one trusted descriptor and removes it through the same
+opened parent directory only when a final device/inode comparison still
+matches. A same-UID process can still race between that comparison and
+`unlinkat`, so hostile same-UID mutation remains a release limitation. Fixtures
+cover swapped inodes, writable prefixes and ancestors, symlinked components,
+writable binary or receipt directories, journal recovery states, and macOS ACL
+cases in `scripts/test.sh`.
