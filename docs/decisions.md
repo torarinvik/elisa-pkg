@@ -154,8 +154,11 @@ files. Every checked directory must be owned by root or the effective user and
 must not have group or other write bits; symlinks are rejected by the
 descriptor-relative walker. On macOS it rejects extended ACL allow entries and
 unknown tags while accepting deny-only entries; Linux ACL grants remain
-unchecked. The check does not
+unchecked. A durable per-prefix journal records install or uninstall intent
+before changing the executable or receipt, and the next operation validates
+the journaled identity while holding the persistent prefix lock. Mismatched or
+malformed states fail closed and preserve their evidence. The check does not
 prevent same-UID pathname races, so handle-relative identity-checked removal
 remains a release gate for hostile shared directories. Fixtures cover writable
 prefixes and ancestors, symlinked components, writable binary or receipt
-directories, and macOS ACL cases in `scripts/test.sh`.
+directories, journal recovery states, and macOS ACL cases in `scripts/test.sh`.

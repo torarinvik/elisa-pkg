@@ -28,6 +28,10 @@ the command layer, but delegates digesting and filesystem publication to the
 same platform and integrity primitives used by builds. Its receipt is treated
 as an ownership claim only after the executable bytes, package name, and exact
 destination match; remote installation remains behind `Security` and `Trust`.
+Before either file changes, the CLI writes a durable per-prefix transaction
+journal. The next operation recovers under the same prefix lock by checking the
+package name, version, executable digest, and exact derived receipt; unexpected
+or malformed state remains untouched and blocks mutation.
 
 The package writer asks `Platform` for a sorted, regular-file-only directory
 walk, then applies manifest include patterns and the `Archive` path policy in

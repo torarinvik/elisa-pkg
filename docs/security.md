@@ -37,7 +37,13 @@ checked for extended ACLs: deny-only entries are accepted, while allow entries
 and unknown tags fail closed. Linux ACL grants are not inspected. Neither mode
 nor ACL checks prevent pathname races by another process with the same user ID;
 handle-relative identity-checked removal remains required before hostile shared
-prefixes can be supported.
+prefixes can be supported. A durable per-prefix transaction journal records
+install or uninstall intent before the executable or receipt changes. The next
+locked operation validates the journal and both artifacts, then finishes or
+abandons only a state whose package identity, digest, and receipt match exactly;
+malformed or mismatched state stops with its evidence intact. The regression
+suite synthesizes each durable crash state, but does not yet kill the process at
+every filesystem syscall boundary.
 
 Before enabling remote packages, the implementation must use an established signed-metadata protocol and an audited cryptographic provider. The client must bootstrap a trusted root out of band, validate threshold-signed role metadata and namespace delegation, bind identity/version/registry/archive digest and size together, enforce expiry and monotonic rollback protection, and persist trusted metadata versions atomically. The local fixture takes this first step by requiring `ELISAPKG_REGISTRY_TRUST_ROOT` to point to an independently provisioned 32-byte key outside `ELISAPKG_REGISTRY_DIR`; registry contents cannot select their own trust root. The configured registry path must canonicalize successfully. The configured key path is checked against both the configured registry path and their canonical identities; a key path that cannot be resolved fails with `MissingTrustRoot`. The key and persisted trust files are opened once through descriptor-relative, no-follow paths. Every directory in those paths and each file must be owned by root or the effective user and must not be group- or world-writable. Symlinks and shared writable directories such as `/tmp` are rejected. On macOS, directory and regular-file checks also reject extended ACL allow entries and unknown ACL tags; deny-only entries are accepted. Linux ACL grants are not inspected. The Elisa `Trust` module already exposes fail-closed prechecks for those bindings, publisher attestation, thresholds, revocation, and clock rollback; these prechecks never substitute for cryptographic verification. Publisher authorization must cover the exact deterministic archive bytes. Unknown algorithms, missing thresholds, stale or replayed metadata, invalid signatures, revoked keys, and unauthorized namespaces are hard failures.
 
