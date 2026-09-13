@@ -50,7 +50,64 @@ module Solver:
         # otherwise unreachable package to the graph or make a satisfiable
         # graph unsatisfiable.
         def solve_with_preferences(candidates: darray[Candidate]&, roots: darray[Constraint]&, preferences: darray[Preference]&, selected: mutable darray[usize]&) -> SolveCode can[Memory.Allocate, Abort.Panic]:
+            failure_constraints: mutable darray[Constraint] = []
+            return solver_solve_with_preferences(candidates, roots, preferences, selected, &failure_constraints)
+
+        # The conflict companion records constraints from one actual failed
+        # search branch. Candidate dependencies from mutually exclusive
+        # versions must never be combined into a synthetic conflict.
+        def solve_with_preferences_and_conflict(candidates: darray[Candidate]&, roots: darray[Constraint]&, preferences: darray[Preference]&, selected: mutable darray[usize]&, conflict: mutable Conflict&) -> SolveCode can[Memory.Allocate, Abort.Panic]:
+            conflict.package.resize(0)
+            conflict.first_requirement.resize(0)
+            conflict.second_requirement.resize(0)
+            failure_constraints: mutable darray[Constraint] = []
+            result: SolveCode = solver_solve_with_preferences(candidates, roots, preferences, selected, &failure_constraints)
+            return result if result != SolveCode.Unsatisfiable
+            for first in 0..<failure_constraints.count |failure_constraints, candidates, conflict|:
+                if not solver_requirement_has_candidate(candidates, failure_constraints[first]):
+                    conflict.package.resize(0)
+                    conflict.first_requirement.resize(0)
+                    conflict.second_requirement.resize(0)
+                    for byte_index in 0..<failure_constraints[first].package.count |failure_constraints, conflict, first|:
+                        conflict.package.push(failure_constraints[first].package[byte_index])
+                    for byte_index in 0..<failure_constraints[first].requirement.count |failure_constraints, conflict, first|:
+                        conflict.first_requirement.push(failure_constraints[first].requirement[byte_index])
+                        conflict.second_requirement.push(failure_constraints[first].requirement[byte_index])
+                    return result
+            for first in 0..<failure_constraints.count |failure_constraints, candidates, conflict|:
+                comparisons: mutable usize = 0.usize()
+                for second in first + 1.usize()..<failure_constraints.count |failure_constraints, candidates, first, second, comparisons, conflict|:
+                    continue if not solver_equal(failure_constraints[first].package, failure_constraints[second].package)
+                    comparisons <- comparisons + 1.usize()
+                    continue if comparisons > 128.usize()
+                    if not solver_requirement_pair_has_candidate(candidates, failure_constraints[first], failure_constraints[second]):
+                        conflict.package.resize(0)
+                        conflict.first_requirement.resize(0)
+                        conflict.second_requirement.resize(0)
+                        for byte_index in 0..<failure_constraints[first].package.count |failure_constraints, conflict, first|:
+                            conflict.package.push(failure_constraints[first].package[byte_index])
+                        for byte_index in 0..<failure_constraints[first].requirement.count |failure_constraints, conflict, first|:
+                            conflict.first_requirement.push(failure_constraints[first].requirement[byte_index])
+                        for byte_index in 0..<failure_constraints[second].requirement.count |failure_constraints, conflict, second|:
+                            conflict.second_requirement.push(failure_constraints[second].requirement[byte_index])
+                        return result
+            return result
+
+        # Solve while retaining a bounded, deterministic explanation for an
+        # unsatisfiable graph. The original `solve` API remains unchanged for
+        # callers that only need a status; this companion records the first
+        # package whose requirements have no common candidate. A repeated
+        # requirement in both fields means that one range has no candidates at
+        # all. The explanation is diagnostic data only and never affects the
+        # selected graph or candidate ordering.
+        def solve_with_conflict(candidates: darray[Candidate]&, roots: darray[Constraint]&, selected: mutable darray[usize]&, conflict: mutable Conflict&) -> SolveCode can[Memory.Allocate, Abort.Panic]:
+            preferences: mutable darray[Preference] = []
+            return solve_with_preferences_and_conflict(candidates, roots, preferences, selected, conflict)
+
+    private:
+        def solver_solve_with_preferences(candidates: darray[Candidate]&, roots: darray[Constraint]&, preferences: darray[Preference]&, selected: mutable darray[usize]&, failure_constraints: mutable darray[Constraint]&) -> SolveCode can[Memory.Allocate, Abort.Panic]:
             selected.resize(0)
+            failure_constraints.resize(0)
             return SolveCode.Malformed if candidates.count == 0.usize() or candidates.count > 4096.usize() or roots.count > 4096.usize() or preferences.count > max_packages
             package_slots: mutable darray[usize] = []
             total_dependencies: mutable usize = 0.usize()
@@ -97,7 +154,7 @@ module Solver:
             for _index in 0..<package_slots.count |assigned|:
                 assigned.push(-1)
             decisions: mutable usize = 0.usize()
-            result: SolveCode = solver_search(candidates, package_slots, &constraints, ordered_preferences, &assigned, &decisions)
+            result: SolveCode = solver_search(candidates, package_slots, &constraints, ordered_preferences, &assigned, &decisions, failure_constraints)
             return result if result != SolveCode.Solved
             # A dependency edge can point at an already selected package, so
             # satisfiability alone does not rule out A -> B -> A (or A -> A).
@@ -110,77 +167,19 @@ module Solver:
                 selected.push(assigned[slot].usize()) if assigned[slot] >= 0
             return SolveCode.Solved
 
-        # Solve while retaining a bounded, deterministic explanation for an
-        # unsatisfiable graph. The original `solve` API remains unchanged for
-        # callers that only need a status; this companion records the first
-        # package whose requirements have no common candidate. A repeated
-        # requirement in both fields means that one range has no candidates at
-        # all. The explanation is diagnostic data only and never affects the
-        # selected graph or candidate ordering.
-        def solve_with_conflict(candidates: darray[Candidate]&, roots: darray[Constraint]&, selected: mutable darray[usize]&, conflict: mutable Conflict&) -> SolveCode can[Memory.Allocate, Abort.Panic]:
-            preferences: mutable darray[Preference] = []
-            return solve_with_preferences_and_conflict(candidates, roots, preferences, selected, conflict)
-
-        def solve_with_preferences_and_conflict(candidates: darray[Candidate]&, roots: darray[Constraint]&, preferences: darray[Preference]&, selected: mutable darray[usize]&, conflict: mutable Conflict&) -> SolveCode can[Memory.Allocate, Abort.Panic]:
-            conflict.package.resize(0)
-            conflict.first_requirement.resize(0)
-            conflict.second_requirement.resize(0)
-            result: SolveCode = solve_with_preferences(candidates, roots, preferences, selected)
-            return result if result != SolveCode.Unsatisfiable
-            # Keep this write path in the public entry point. The Elisa
-            # compiler currently has an unsafe lowering edge for passing a
-            # mutable struct containing three darrays through another helper;
-            # direct field writes preserve the ownership of every output
-            # buffer and keep diagnostics fail-closed.
-            constraints: mutable darray[Constraint] = []
-            for index in 0..<roots.count |constraints, roots|:
-                constraints.push(roots[index])
-            for candidate_index in 0..<candidates.count |constraints, candidates, candidate_index|:
-                for dependency_index in 0..<candidates[candidate_index].dependencies.count |constraints, candidates, candidate_index|:
-                    return result if constraints.count >= max_constraints
-                    constraints.push(candidates[candidate_index].dependencies[dependency_index])
-            for first in 0..<constraints.count |constraints, candidates, conflict|:
-                if not solver_requirement_has_candidate(candidates, constraints[first]):
-                    conflict.package.resize(0)
-                    conflict.first_requirement.resize(0)
-                    conflict.second_requirement.resize(0)
-                    for byte_index in 0..<constraints[first].package.count |constraints, conflict, first|:
-                        conflict.package.push(constraints[first].package[byte_index])
-                    for byte_index in 0..<constraints[first].requirement.count |constraints, conflict, first|:
-                        conflict.first_requirement.push(constraints[first].requirement[byte_index])
-                        conflict.second_requirement.push(constraints[first].requirement[byte_index])
-                    return result
-            for first in 0..<constraints.count |constraints, candidates, conflict|:
-                comparisons: mutable usize = 0.usize()
-                for second in first + 1.usize()..<constraints.count |constraints, candidates, first, second, comparisons, conflict|:
-                    continue if not solver_equal(constraints[first].package, constraints[second].package)
-                    comparisons <- comparisons + 1.usize()
-                    continue if comparisons > 128.usize()
-                    if not solver_requirement_pair_has_candidate(candidates, constraints[first], constraints[second]):
-                        conflict.package.resize(0)
-                        conflict.first_requirement.resize(0)
-                        conflict.second_requirement.resize(0)
-                        for byte_index in 0..<constraints[first].package.count |constraints, conflict, first|:
-                            conflict.package.push(constraints[first].package[byte_index])
-                        for byte_index in 0..<constraints[first].requirement.count |constraints, conflict, first|:
-                            conflict.first_requirement.push(constraints[first].requirement[byte_index])
-                        for byte_index in 0..<constraints[second].requirement.count |constraints, conflict, second|:
-                            conflict.second_requirement.push(constraints[second].requirement[byte_index])
-                        return result
-            return result
-
-    private:
         const max_decisions: usize = 16384
         const max_constraints: usize = 16384
         const max_packages: usize = 1024
 
-        def solver_search(candidates: darray[Candidate]&, package_slots: darray[usize]&, constraints: mutable darray[Constraint]&, preferences: darray[Preference]&, assigned: mutable darray[i64]&, decisions: mutable usize&) -> SolveCode can[Memory.Allocate, Abort.Panic]:
+        def solver_search(candidates: darray[Candidate]&, package_slots: darray[usize]&, constraints: mutable darray[Constraint]&, preferences: darray[Preference]&, assigned: mutable darray[i64]&, decisions: mutable usize&, failure_constraints: mutable darray[Constraint]&) -> SolveCode can[Memory.Allocate, Abort.Panic]:
             return SolveCode.ResourceLimit if decisions >= max_decisions or constraints.count > max_constraints
             for constraint_index in 0..<constraints.count |constraints, package_slots, candidates|:
-                return SolveCode.Unsatisfiable if solver_slot_for(constraints[constraint_index].package, package_slots, candidates) == package_slots.count
+                if solver_slot_for(constraints[constraint_index].package, package_slots, candidates) == package_slots.count:
+                    return solver_record_unsatisfiable(constraints, failure_constraints)
             for slot in 0..<assigned.count |assigned, candidates, package_slots, constraints|:
                 continue if assigned[slot] < 0
-                return SolveCode.Unsatisfiable if not solver_candidate_satisfies(candidates[assigned[slot].usize()], package_slots[slot], constraints, package_slots, candidates)
+                if not solver_candidate_satisfies(candidates[assigned[slot].usize()], package_slots[slot], constraints, package_slots, candidates):
+                    return solver_record_unsatisfiable(constraints, failure_constraints)
             best_slot: mutable usize = package_slots.count
             best_count: mutable usize = 18446744073709551615.usize()
             for slot in 0..<package_slots.count |package_slots, assigned, candidates, constraints, best_slot, best_count|:
@@ -193,7 +192,7 @@ module Solver:
                 for candidate_index in 0..<candidates.count |candidates, package_slots, slot, constraints, possible|:
                     continue if solver_slot_for(candidates[candidate_index].package, package_slots, candidates) != slot or candidates[candidate_index].yanked
                     possible <- possible + 1.usize() if solver_candidate_satisfies(candidates[candidate_index], package_slots[slot], constraints, package_slots, candidates)
-                return SolveCode.Unsatisfiable if possible == 0.usize()
+                return solver_record_unsatisfiable(constraints, failure_constraints) if possible == 0.usize()
                 if possible < best_count:
                     best_count <- possible
                     best_slot <- slot
@@ -201,7 +200,7 @@ module Solver:
                 # A cyclic assignment is a failed branch, not malformed
                 # solver input. Return Unsatisfiable here so search can
                 # backtrack to a version that forms an acyclic graph.
-                return SolveCode.Unsatisfiable if not solver_selected_graph_acyclic(candidates, package_slots, assigned)
+                return solver_record_unsatisfiable(constraints, failure_constraints) if not solver_selected_graph_acyclic(candidates, package_slots, assigned)
                 return SolveCode.Solved
 
             order: mutable darray[usize] = []
@@ -216,10 +215,16 @@ module Solver:
                 decisions <- decisions + 1.usize()
                 for dependency_index in 0..<candidates[candidate_index].dependencies.count |candidates, candidate_index, constraints|:
                     constraints.push(candidates[candidate_index].dependencies[dependency_index])
-                result: SolveCode = solver_search(candidates, package_slots, constraints, preferences, assigned, decisions)
+                result: SolveCode = solver_search(candidates, package_slots, constraints, preferences, assigned, decisions, failure_constraints)
                 return result if result == SolveCode.Solved or result == SolveCode.ResourceLimit or result == SolveCode.Malformed
                 constraints.resize(constraint_mark)
                 assigned[best_slot] <- -1
+            return SolveCode.Unsatisfiable
+
+        def solver_record_unsatisfiable(constraints: darray[Constraint]&, failure_constraints: mutable darray[Constraint]&) -> SolveCode can[Memory.Allocate, Abort.Panic]:
+            failure_constraints.resize(0)
+            for index in 0..<constraints.count |constraints, failure_constraints|:
+                failure_constraints.push(constraints[index])
             return SolveCode.Unsatisfiable
 
         def solver_requirement_has_candidate(candidates: darray[Candidate]&, constraint: Constraint) -> bool:
