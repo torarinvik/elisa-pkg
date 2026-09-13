@@ -2197,7 +2197,7 @@ module Cli:
             out.resize(cursor)
 
         def registry_security_status(code: Registry::ResultCode) -> bool:
-            return code == Registry::ResultCode.InvalidConfiguration or code == Registry::ResultCode.MalformedMetadata or code == Registry::ResultCode.MissingSignature or code == Registry::ResultCode.MissingTrustRoot or code == Registry::ResultCode.InvalidSignature or code == Registry::ResultCode.ExpiredMetadata or code == Registry::ResultCode.RollbackDetected or code == Registry::ResultCode.DigestMismatch or code == Registry::ResultCode.ResourceLimit or code == Registry::ResultCode.TrustStateUnavailable or code == Registry::ResultCode.TrustStateMalformed or code == Registry::ResultCode.ClockRollback or code == Registry::ResultCode.ClockUnavailable or code == Registry::ResultCode.ExpiryHorizon
+            return code == Registry::ResultCode.InvalidConfiguration or code == Registry::ResultCode.MalformedMetadata or code == Registry::ResultCode.MissingSignature or code == Registry::ResultCode.MissingTrustRoot or code == Registry::ResultCode.InvalidSignature or code == Registry::ResultCode.ExpiredMetadata or code == Registry::ResultCode.RollbackDetected or code == Registry::ResultCode.DigestMismatch or code == Registry::ResultCode.ResourceLimit or code == Registry::ResultCode.TrustStateUnavailable or code == Registry::ResultCode.TrustStateMalformed or code == Registry::ResultCode.ClockRollback or code == Registry::ResultCode.ClockUnavailable or code == Registry::ResultCode.ExpiryHorizon or code == Registry::ResultCode.TrustRootChanged
 
         def registry_candidate_matches(candidates: darray[Solver::Candidate]&, package: darray[u8]&, version: Model::Version) -> bool:
             for index in 0..<candidates.count |candidates, package, version|:
@@ -3448,6 +3448,7 @@ module Cli:
                 code <- Registry::ResultCode.Unsatisfiable if lock[0] == 18
                 code <- Registry::ResultCode.ClockUnavailable if lock[0] == 19
                 code <- Registry::ResultCode.ExpiryHorizon if lock[0] == 20
+                code <- Registry::ResultCode.TrustRootChanged if lock[0] == 21
                 write_error("error: ")
                 write_error(Registry::result_message(code))
                 if code == Registry::ResultCode.Unsatisfiable:
@@ -6473,6 +6474,21 @@ module Cli:
                     _ = Platform::pkg_close(compiler_stderr_fd)
                     compiler_stderr_fd <- raised_stderr_fd
                 compiler_stderr_name: cstr = (&stderr_template[0]).cast[cstr] can Unsafe.PointerCast
+                # Pin the private scratch directory by descriptor before fork.
+                # The compiler child must not inherit the package checkout as its
+                # cwd because Seatbelt deliberately denies that live tree.
+                sandbox_work_directory_fd: i64 = Platform::pkg_open_directory(canonical_sandbox_work_name)
+                if sandbox_work_directory_fd < 0:
+                    _ = Platform::pkg_close(compiler_stdout_fd)
+                    _ = Platform::pkg_close(compiler_stderr_fd)
+                    _ = Platform::pkg_unlink(compiler_stdout_name)
+                    _ = Platform::pkg_unlink(compiler_stderr_name)
+                    _ = Platform::pkg_unlink(temp_name)
+                    _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
+                    _ = remove_optional_build_aggregate(aggregate_source_name)
+                    _ = Platform::pkg_rmdir(sandbox_work_name)
+                    write_error("error: unable to open the private compiler scratch directory\n")
+                    return EXIT_BUILD
                 child_argv: mutable cstr&& = (&args[0]).cast[mutable cstr&&] can Unsafe.PointerCast
                 pid: i64 = Platform::pkg_fork()
                 if pid == 0:
@@ -6486,6 +6502,8 @@ module Cli:
                         Platform::pkg_process_exit(126)
                     if Platform::pkg_set_process_limits(1) != 0:
                         Platform::pkg_process_exit(126)
+                    if Platform::pkg_fchdir(sandbox_work_directory_fd) != 0:
+                        Platform::pkg_process_exit(126)
                     null_fd: i64 = Platform::pkg_open_null()
                     if null_fd < 0 or Platform::pkg_dup2(null_fd, 0) != 0 or Platform::pkg_dup2(compiler_stdout_fd, 1) != 1 or Platform::pkg_dup2(compiler_stderr_fd, 2) != 2:
                         Platform::pkg_process_exit(126)
@@ -6495,6 +6513,7 @@ module Cli:
                         Platform::pkg_process_exit(126)
                     _ = Platform::pkg_execvp("/usr/bin/sandbox-exec", child_argv)
                     Platform::pkg_process_exit(127)
+                _ = Platform::pkg_close(sandbox_work_directory_fd)
                 if pid < 0:
                     _ = Platform::pkg_close(compiler_stdout_fd)
                     _ = Platform::pkg_close(compiler_stderr_fd)

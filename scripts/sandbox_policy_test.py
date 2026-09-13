@@ -73,7 +73,7 @@ def run_sandbox_probe(
             "/usr/bin/sandbox-exec",
             "-D",
             f"CALLBACK_PATH={callback_path}",
-            "-p",
+            "-f",
             str(profile),
             str(executable),
             *args,
@@ -192,7 +192,6 @@ def run() -> int:
         callback_path = Path("/private/tmp") / f"elisapkg-policy-{os.getpid()}-{os.urandom(8).hex()}.c"
         callback_decoy_path = Path(f"{callback_path}.decoy")
         generated_paths = [
-            callback_decoy_path,
             Path(f"{callback_path}.sibling"),
             Path(f"{callback_path}.link"),
             Path(f"{callback_path}.renamed"),
@@ -369,64 +368,64 @@ def run() -> int:
         metadata_read_script = (
             'if IFS= read -r _ < "$ELISAPKG_TEST_SOURCE_FILE"; then\n'
             "  printf 'LIVE_SOURCE_READ_ALLOWED\\n'\n"
-            "  exit 83\\n"
+            "  exit 83\n"
             "fi\n"
             "printf 'LIVE_SOURCE_READ_DENIED\\n'\n"
             'if ! IFS= read -r _ < "$ELISAPKG_TEST_SNAPSHOT_FILE"; then\n'
             "  printf 'SNAPSHOT_SOURCE_READ_DENIED\\n'\n"
-            "  exit 91\\n"
+            "  exit 91\n"
             "fi\n"
             "printf 'SNAPSHOT_SOURCE_READ_ALLOWED\\n'\n"
             'if IFS= read -r _ < "$ELISAPKG_TEST_GIT_CONFIG"; then\n'
             "  printf 'GIT_CONFIG_READ_ALLOWED\\n'\n"
-            "  exit 84\\n"
+            "  exit 84\n"
             "fi\n"
             "printf 'GIT_CONFIG_READ_DENIED\\n'\n"
             'if IFS= read -r _ < "$ELISAPKG_TEST_GIT_CONFIG_WORKTREE"; then\n'
             "  printf 'GIT_CONFIG_WORKTREE_READ_ALLOWED\\n'\n"
-            "  exit 85\\n"
+            "  exit 85\n"
             "fi\n"
             "printf 'GIT_CONFIG_WORKTREE_READ_DENIED\\n'\n"
             'while IFS= read -r path; do\n'
             '  if IFS= read -r _ < "$path"; then\n'
             "    printf 'SOURCE_STATE_READ_ALLOWED\\n'\n"
-            "    exit 86\\n"
+            "    exit 86\n"
             "  fi\n"
             'done <<EOF\n$ELISAPKG_TEST_STALE_INPUTS\nEOF\n'
             "printf 'SOURCE_STATE_READ_DENIED\\n'\n"
             'if IFS= read -r _ < "$ELISAPKG_TEST_SNAPSHOT_CREDENTIAL"; then\n'
             "  printf 'SNAPSHOT_CREDENTIAL_READ_ALLOWED\\n'\n"
-            "  exit 92\\n"
+            "  exit 92\n"
             "fi\n"
             'if IFS= read -r _ < "$ELISAPKG_TEST_SNAPSHOT_GIT_STATE"; then\n'
             "  printf 'SNAPSHOT_GIT_STATE_READ_ALLOWED\\n'\n"
-            "  exit 93\\n"
+            "  exit 93\n"
             "fi\n"
             'if IFS= read -r _ < "$ELISAPKG_TEST_SNAPSHOT_RESERVED_STATE"; then\n'
             "  printf 'SNAPSHOT_RESERVED_STATE_READ_ALLOWED\\n'\n"
-            "  exit 94\\n"
+            "  exit 94\n"
             "fi\n"
             "printf 'SNAPSHOT_SECRET_AND_STATE_READ_DENIED\\n'\n"
             'if ! IFS= read -r _ < "$ELISAPKG_TEST_SNAPSHOT_NESTED_SOURCE"; then\n'
             "  printf 'SNAPSHOT_NESTED_SOURCE_READ_DENIED\\n'\n"
-            "  exit 95\\n"
+            "  exit 95\n"
             "fi\n"
             "printf 'SNAPSHOT_NESTED_SOURCE_READABLE\\n'\n"
             'if printf \'changed\\n\' >> "$ELISAPKG_TEST_SNAPSHOT_FILE"; then\n'
             "  printf 'SNAPSHOT_WRITE_ALLOWED\\n'\n"
-            "  exit 96\\n"
+            "  exit 96\n"
             "fi\n"
             "printf 'SNAPSHOT_WRITE_DENIED\\n'\n"
             'if printf \'new\\n\' > "$ELISAPKG_TEST_SNAPSHOT_FILE.new"; then\n'
             "  printf 'SNAPSHOT_CREATE_ALLOWED\\n'\n"
-            "  exit 97\\n"
+            "  exit 97\n"
             "fi\n"
             "printf 'SNAPSHOT_CREATE_DENIED\\n'\n"
             'if IFS= read -r _ < "$ELISAPKG_TEST_SCRATCH_SOURCE"; then\n'
             "  printf 'SANDBOX_SCRATCH_READ_ALLOWED\\n'\n"
             "else\n"
             "  printf 'SANDBOX_SCRATCH_READ_DENIED\\n'\n"
-            "  exit 87\\n"
+            "  exit 87\n"
             "fi\n"
         )
         unconfined_metadata_result = subprocess.run(

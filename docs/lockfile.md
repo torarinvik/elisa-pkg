@@ -19,9 +19,12 @@ identity, exact package/version, archive filename, byte size, archive SHA-256,
 and metadata SHA-256. The resolver verifies the signed metadata and archive
 before emitting these records. The lockfile remains untrusted input. `resolve`
 with `--locked` or `--frozen` validates its structure, root fingerprints, and
-direct version constraints without contacting a registry. `fetch` and online
-`build` revalidate registry records against freshly authenticated metadata;
-offline and frozen builds require matching cached signature and archive evidence.
+direct version constraints without contacting a registry. `fetch` revalidates
+registry records against freshly authenticated metadata and can cache their
+signed metadata and archives. Registry dependencies are not yet consumable by
+`build`, `run`, or `test`: every v3 build is rejected before compiler launch,
+even after `fetch` has verified and cached all artifacts. Offline and frozen
+`fetch` operations can validate matching cached signature and archive evidence.
 
 During a normal registry refresh, versions in the previous lock are soft
 candidate-order preferences: a still-valid locked version is tried first, but
@@ -38,10 +41,12 @@ After a registry archive is fetched, the content-addressed cache stores an immut
 receipt beside the blob, keyed by both archive and metadata digest. The exact signed metadata bytes are cached under their
 metadata digest, with the detached signature stored beside that snapshot. The receipt
 repeats the exact package, version, archive, sizes, archive and metadata digests, and
-expiry. `build --offline` and `build --frozen` re-hash the snapshot, verify its
-signature and dependency edges against the lock, then verify the archive and the
+expiry. Offline or frozen `fetch` re-hashes the snapshot, verifies its signature
+and dependency edges against the lock, then verifies the archive and the
 pre-existing trust-state record. Missing, changed, expired, or untrusted evidence
-fails closed and the lockfile is never rewritten.
+fails closed and the lockfile is never rewritten. This authenticates and caches
+package artifacts; it does not enable building a package graph that contains
+registry dependencies.
 
 Lock replacement uses an exclusive `mkstemp` file in the project directory, writes all bytes with short-write handling, calls `fsync`, closes the descriptor, and atomically renames the temporary file into place. A failed write or durability step leaves the previous lock untouched; the owner-only temporary evidence is retained for a later recovery or cleanup pass instead of unlinking a pathname that could have been replaced concurrently.
 

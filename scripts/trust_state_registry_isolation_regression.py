@@ -107,15 +107,14 @@ def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.
     return binary
 
 
-def create_registry(root: Path, private_key: Path, openssl: str) -> None:
+def write_index(root: Path, private_key: Path, openssl: str, generation: int) -> None:
     package_dir = root / "foo"
-    package_dir.mkdir(mode=0o700, parents=True)
     expires = int(time.time()) + 86400
     payload = (
         "elisapkg-index:1\n"
         f"registry:{root}\n"
         "package:foo\n"
-        "generation:1\n"
+        f"generation:{generation}\n"
         f"expires:{expires}\n"
         "versions:\n"
         "1.0.0\n"
@@ -131,6 +130,12 @@ def create_registry(root: Path, private_key: Path, openssl: str) -> None:
         timeout=10,
     )
     signature.chmod(0o600)
+
+
+def create_registry(root: Path, private_key: Path, openssl: str) -> None:
+    package_dir = root / "foo"
+    package_dir.mkdir(mode=0o700, parents=True)
+    write_index(root, private_key, openssl, 1)
 
 
 def main() -> None:
@@ -192,10 +197,15 @@ def main() -> None:
             f"@package:{hashlib.sha256(os.fsencode(str(registry_b))).hexdigest()}:foo",
         }
         recorded_identities = {record.split(" ", 1)[0] for record in records}
-        if not shared_state.read_bytes().startswith(b"elisapkg-trust-state:3\n"):
-            raise SystemExit("error: new trust state did not use schema version 3")
+        if not shared_state.read_bytes().startswith(b"elisapkg-trust-state:4\n"):
+            raise SystemExit("error: new trust state did not use schema version 4")
         if not expected.issubset(recorded_identities):
             raise SystemExit("error: shared trust state did not retain separate registry-scoped package histories")
+        public_fingerprint = hashlib.sha256(public_key.read_bytes()).hexdigest().encode("ascii")
+        for registry in (registry_a, registry_b):
+            root_key_identity = f"@root-key:{hashlib.sha256(os.fsencode(str(registry))).hexdigest()}".encode("ascii")
+            if root_key_identity + b" 0.0.0 " + public_fingerprint + b" " + public_fingerprint not in shared_state.read_bytes():
+                raise SystemExit("error: trust state did not pin the configured signing key to its registry path")
 
         def probe_environment(registry: Path, home: Path, state: Optional[Path] = None) -> dict[str, str]:
             environment = dict(os.environ)
@@ -242,10 +252,13 @@ def main() -> None:
             raise SystemExit(f"error: default v2 state could not migrate safely: {migrated.stderr!r}")
         migrated_bytes = migration_state.read_bytes()
         migrated_identity = f"@package:{hashlib.sha256(os.fsencode(str(registry_a))).hexdigest()}:foo".encode("ascii")
-        if not migrated_bytes.startswith(b"elisapkg-trust-state:3\n") or migrated_identity + b" 1.0.0 " not in migrated_bytes or migrated_identity + b" 2.0.0 " not in migrated_bytes:
-            raise SystemExit("error: higher-release update did not migrate and retain default v2 package history as scoped v3 records")
+        if not migrated_bytes.startswith(b"elisapkg-trust-state:4\n") or migrated_identity + b" 1.0.0 " not in migrated_bytes or migrated_identity + b" 2.0.0 " not in migrated_bytes:
+            raise SystemExit("error: higher-release update did not migrate and retain default v2 package history as scoped v4 records")
         if b"\nfoo 1.0.0 " in migrated_bytes:
             raise SystemExit("error: unscoped v2 package row survived default-state migration")
+        migrated_root_key_identity = f"@root-key:{scoped_root_hash}".encode("ascii")
+        if migrated_root_key_identity + b" 0.0.0 " + public_fingerprint + b" " + public_fingerprint not in migrated_bytes:
+            raise SystemExit("error: v2 migration did not pin the key that verified its first signed v4 update")
 
         # A v2 override may have accumulated rows from multiple registries, so
         # it cannot safely lend an unscoped record to any current root.
@@ -277,6 +290,37 @@ def main() -> None:
             or ambiguous_clock.read_bytes() != ambiguous_clock_bytes
         ):
             raise SystemExit("error: ambiguous unscoped v2 override history was recorded or rewritten")
+
+        # Replacing the configured key for the same registry path must not
+        # create a fresh rollback namespace. Even a higher signed generation
+        # under the new key is rejected without changing either durable file.
+        replacement_private = trust_dir / "replacement-private.pem"
+        replacement_der = trust_dir / "replacement-public.der"
+        replacement_public = trust_dir / "replacement-key"
+        subprocess.run([openssl, "genpkey", "-algorithm", "ED25519", "-out", str(replacement_private)], check=True, timeout=10)
+        replacement_private.chmod(0o600)
+        subprocess.run([openssl, "pkey", "-in", str(replacement_private), "-pubout", "-outform", "DER", "-out", str(replacement_der)], check=True, timeout=10)
+        replacement_bytes = replacement_der.read_bytes()
+        if len(replacement_bytes) != len(der_prefix) + 32 or not replacement_bytes.startswith(der_prefix):
+            raise SystemExit("error: OpenSSL emitted an unexpected replacement Ed25519 key encoding")
+        replacement_public.write_bytes(replacement_bytes[-32:])
+        replacement_public.chmod(0o600)
+        write_index(registry_a, replacement_private, openssl, 2)
+        prior_state = shared_state.read_bytes()
+        shared_clock = Path(f"{shared_state}.clock")
+        prior_clock = shared_clock.read_bytes()
+        replacement_environment = dict(os.environ)
+        replacement_environment["ELISAPKG_REGISTRY_DIR"] = str(registry_a)
+        replacement_environment["ELISAPKG_REGISTRY_TRUST_ROOT"] = str(replacement_public)
+        replacement_environment["ELISAPKG_TRUST_STATE"] = str(shared_state)
+        rejected_key = subprocess.run(
+            [str(probe_a)], cwd=ROOT, env=replacement_environment,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=10,
+        )
+        if rejected_key.returncode == 0 or b"without an authenticated rotation" not in rejected_key.stderr:
+            raise SystemExit(f"error: replacement signing key was not rejected with a clear trust-root error: {rejected_key.stderr!r}")
+        if shared_state.read_bytes() != prior_state or shared_clock.read_bytes() != prior_clock:
+            raise SystemExit("error: rejecting a replacement signing key changed trust state or clock")
 
     print("Elisa shared trust-state registry isolation regression passed")
 

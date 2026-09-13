@@ -138,6 +138,16 @@ def main() -> int:
         "src/nested/main.elisa": b"def main() -> i64:\n    return 0\n",
         "share/deep/message.txt": b"nested package data\n",
     }
+    # Every record adds 31 unique implicit directories and one regular file.
+    # The stream stays small while its extracted filesystem tree exceeds the
+    # native extractor's aggregate-node budget.
+    node_budget_entries = [
+        regular(
+            f"node{index:03d}/" + "/".join(["x"] * 30) + "/file",
+            b"x",
+        )
+        for index in range(129)
+    ]
 
     with tempfile.TemporaryDirectory(prefix="elisapkg-archive-extract-", dir=ROOT / "build") as temporary:
         work = Path(temporary)
@@ -194,6 +204,7 @@ def main() -> int:
                 [regular(name, payload) for name, payload in valid_payloads.items()],
                 False,
             ),
+            ("expanded-node-budget", node_budget_entries, False),
         ]
 
         fixtures = work / "fixtures"
@@ -233,7 +244,7 @@ def main() -> int:
         if compile_result.returncode != 0:
             raise SystemExit(f"error: could not compile archive extractor probe:\n{compile_result.stdout}")
 
-        run_result = subprocess.run([str(binary)], cwd=work, env=environment, timeout=30, check=False)
+        run_result = subprocess.run([str(binary)], cwd=work, env=environment, timeout=60, check=False)
         if run_result.returncode != 0:
             raise SystemExit(f"error: archive extractor probe returned {run_result.returncode}")
 

@@ -12,6 +12,8 @@ compiler_root = os.environ.get('ELISA_COMPILER_ROOT')
 if not compiler_root:
     raise SystemExit('error: set ELISA_COMPILER_ROOT to an Elisa compiler checkout')
 COMPILER = Path(compiler_root) / 'scripts/elisac_stage1.sh'
+CI_ENABLED = os.environ.get('CI', '').strip().lower() in {'1', 'true', 'yes'}
+REQUIRE_COMPILER_PROBE = os.environ.get('ELISAPKG_REQUIRE_SANDBOX_TESTS') == '1' or CI_ENABLED
 
 FNV_PRIME = 16777619
 FNV_MASK = 0xffffffff
@@ -341,12 +343,35 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
     lines.append('    return 0')
     source = work / 'probe.elisa'
     source.write_text('\n'.join(lines) + '\n')
-    run([COMPILER, '-emit', 'exe', '-o', work / 'probe', source])
+    compiler_result = subprocess.run(
+        [str(COMPILER), '-emit', 'exe', '-o', str(work / 'probe'), str(source)],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        timeout=120, check=False,
+    )
+    probe_built = compiler_result.returncode == 0
+    if not probe_built:
+        license_unaccepted = 'You have not agreed to the Xcode license agreements' in compiler_result.stdout
+        if license_unaccepted and not REQUIRE_COMPILER_PROBE:
+            print('review compiler probe skipped: host Xcode license is not accepted')
+        else:
+            raise SystemExit(
+                f'error: compiler review probe failed with exit {compiler_result.returncode}:\n'
+                f'{compiler_result.stdout}'
+            )
     empty_home = work / 'empty-home'
     empty_home.mkdir()
-    probe_environment = dict(os.environ, ELISAPKG_REGISTRY_DIR=str(work / 'missing-registry'), HOME=str(empty_home))
-    run([work / 'probe'], env=probe_environment)
-    assert not (empty_home / '.local').exists(), 'read-only trust verification created user state directories'
+    trust_key = work / 'registry-trust-key'
+    trust_key.write_bytes(bytes(range(32)))
+    trust_key.chmod(0o600)
+    probe_environment = dict(
+        os.environ,
+        ELISAPKG_REGISTRY_DIR=str(work / 'missing-registry'),
+        ELISAPKG_REGISTRY_TRUST_ROOT=str(trust_key),
+        HOME=str(empty_home),
+    )
+    if probe_built:
+        run([work / 'probe'], env=probe_environment)
+        assert not (empty_home / '.local').exists(), 'read-only trust verification created user state directories'
 
     run([BIN, 'init', work / 'project'], stdout=subprocess.DEVNULL)
     project = work / 'project'

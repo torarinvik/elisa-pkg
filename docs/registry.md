@@ -36,10 +36,14 @@ filename and size, archive digest, authenticated metadata digest, and metadata e
 It is created with exclusive publication and read back byte-for-byte. The
 signed metadata bytes are cached at the metadata digest's content-addressed blob path,
 and its raw detached signature is stored in a sibling `.sig` file with no-clobber
-semantics. A warm `build --offline` or `build --frozen` accepts a registry artifact
-only when the lockfile, receipt, metadata snapshot and signature, archive bytes,
-expiry, dependency edges, and previously persisted trust-state record all agree; it
-does not contact a provider or rewrite the lockfile.
+semantics. Offline or frozen `fetch` accepts cached registry artifacts only when
+the lockfile, receipt, metadata snapshot and signature, archive bytes, expiry,
+dependency edges, and previously persisted trust-state record all agree; it does
+not contact a provider or rewrite the lockfile. This verifies and caches artifacts
+for inspection and future implementation work. `build`, `run`, and `test` still
+reject every version 3 lock containing registry dependencies before launching a
+compiler, including when all those artifacts are cached. Local version 2 locks
+remain the only supported dependency graph for builds.
 
 The directory must be an absolute, symlink-free path. Its layout is:
 

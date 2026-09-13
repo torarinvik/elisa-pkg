@@ -99,15 +99,17 @@ def main() -> int:
         if package_names != sorted(package_names) or package_names != ["bridge", "leaf"]:
             raise SystemExit(f"local lock package records are not canonical: {package_names}")
         build = cli(root, "build", "--frozen")
-        sandbox_blocked = False
+        build_skipped = False
         if build.returncode != 0:
             denied = (
                 "sandbox_apply: Operation not permitted" in build.stdout
                 or "builds require the macOS Seatbelt sandbox" in build.stdout
             )
-            if denied:
-                print("local dependency build regression skipped: host denied Seatbelt")
-                sandbox_blocked = True
+            xcode_license_unaccepted = "You have not agreed to the Xcode license agreements" in build.stdout
+            if denied or (xcode_license_unaccepted and not REQUIRE_SANDBOX):
+                reason = "host denied Seatbelt" if denied else "host Xcode license is not accepted"
+                print(f"local dependency build regression skipped: {reason}")
+                build_skipped = True
             else:
                 raise SystemExit(
                     f"build transitive local graph failed with exit {build.returncode}:\n{build.stdout}"
@@ -256,12 +258,12 @@ def main() -> int:
         cross_edge_cycle = cli(root, "resolve")
         require(cross_edge_cycle, 3, "reject cross-edge local dependency cycle")
 
-        if sandbox_blocked and REQUIRE_SANDBOX:
+        if build_skipped and REQUIRE_SANDBOX:
             raise SystemExit("error: local dependency build regression requires Seatbelt")
-        if not sandbox_blocked:
+        if not build_skipped:
             print("transitive local dependency build regression passed")
         else:
-            print("local dependency fail-closed checks passed; executable build skipped without Seatbelt")
+            print("local dependency fail-closed checks passed; executable build skipped")
     return 0
 
 

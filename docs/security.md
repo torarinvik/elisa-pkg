@@ -103,10 +103,18 @@ The `Trust` module exposes metadata prechecks for expiry, rollback, namespace,
 and algorithm policy plus an exact-byte detached Ed25519 verification gate.
 Verified local-registry selections persist monotonic package/version/archive-
 digest/metadata-digest records outside the project in a user-owned trust-state
-file. Trust-state format v3 keys package history by registry-root hash and
+file. Trust-state format v4 keys package history by registry-root hash and
 package name, in addition to binding each version to its archive and signed
-metadata digests. Default per-registry paths safely migrate v2 unscoped package
-rows on the next state update; an explicit override containing any unscoped v2
+metadata digests. It also pins each registry path to the SHA-256 fingerprint
+of its configured Ed25519 key in the same rollback-protected state file; key
+changes fail closed instead of starting a fresh version-history namespace.
+When older v2/v3 state is next updated after a signed index verifies, its
+existing history is preserved and the currently configured key is recorded as
+the pin. Because those legacy formats contain no signing-key fingerprint, this
+first v4 enrollment is necessarily trust-on-first-use: it cannot detect that the
+configured key changed before enrollment. Deployments that require continuity
+across this migration must preserve and verify the expected key out of band.
+An explicit override containing any unscoped v2
 package rows fails closed because their registry provenance cannot be recovered.
 Legacy v1 records without metadata identity fail closed rather than being
 migrated. Updates hold a nonblocking
@@ -159,12 +167,15 @@ pathnames and receipts are never treated as proof of verification.
 Registry cache entries carry a separate immutable verification receipt. Its fields bind
 the exact lock selection to the archive name, size, archive digest, authenticated
 metadata digest, and expiry. The exact signed metadata bytes and detached signature
-are cached by metadata digest. Frozen or offline builds re-hash and signature-verify
-that snapshot, validate its dependency edges against the lock, then validate the
-receipt, content-addressed archive, and existing user-owned trust record without
-contacting a provider or mutating the lockfile. Missing, malformed, mismatched,
-expired, or untrusted evidence is a security failure; a cache pathname alone is never
-evidence.
+are cached by metadata digest. Frozen or offline `fetch` re-hashes and
+signature-verifies that snapshot, validates its dependency edges against the lock,
+then validates the receipt, content-addressed archive, and existing user-owned
+trust record without contacting a provider or mutating the lockfile. Registry
+artifact verification and caching does not enable registry dependency builds:
+`build`, `run`, and `test` reject a version 3 lock containing registry
+dependencies before launching a compiler, whether or not its artifacts are
+cached. Missing, malformed, mismatched, expired, or untrusted evidence is a
+security failure; a cache pathname alone is never evidence.
 
 Manifest bytes must be valid UTF-8 before field interpretation. The local
 target validator rejects absolute, parent, dot-prefixed, and

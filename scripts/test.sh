@@ -13,6 +13,7 @@ trap 'rm -rf -- "$TEST_TMP"' EXIT
 if [[ -n "${ELISA_COMPILER_ROOT:-}" ]]; then
   export ELISAPKG_COMPILER="${ELISAPKG_COMPILER:-$ELISA_COMPILER_ROOT/scripts/elisac_stage1.sh}"
   export ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_COMPILER_ROOT/build/runtime/elisacore_runtime.o}"
+  export ELISA_STAGE1_BIN="${ELISA_STAGE1_BIN:-$ELISA_COMPILER_ROOT/bin/elisac-stage1}"
 fi
 export ELISA_ALLOW_STALE_STAGE1="${ELISA_ALLOW_STALE_STAGE1:-0}"
 "$BIN" --version | grep -F 'elisapkg 0.1.0' >/dev/null
@@ -118,6 +119,9 @@ def main() -> i64:
     alpha: mutable darray[u8] = [49, 46, 48, 46, 48, 45, 97, 108, 112, 104, 97]
     beta: mutable darray[u8] = [49, 46, 48, 46, 48, 45, 98, 101, 116, 97]
     stable: mutable darray[u8] = [49, 46, 48, 46, 48]
+    alpha_version: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
+    beta_version: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
+    stable_version: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
     blank: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
     return 1 if not SemVer::parse_requirement(caret, &blank)
     return 2 if not SemVer::matches(blank, Model::Version{major: 1, minor: 9, patch: 0, prerelease: false})
@@ -133,6 +137,12 @@ def main() -> i64:
     return 12 if SemVer::compare_text(alpha, stable) != -1
     return 13 if SemVer::compare_text(beta, alpha) != 1
     return 14 if SemVer::compare_text(stable, alpha) != 1
+    return 16 if not SemVer::parse(alpha, &alpha_version) or not SemVer::parse(beta, &beta_version) or not SemVer::parse(stable, &stable_version)
+    # Model::Version intentionally discards prerelease identifiers. Do not
+    # claim same-core prereleases are equal; use compare_text for their order.
+    return 17 if SemVer::compare(alpha_version, beta_version) != SemVer::COMPARE_INCOMPARABLE
+    return 18 if SemVer::compare(alpha_version, stable_version) != -1
+    return 19 if SemVer::compare(stable_version, alpha_version) != 1
     empty_range: mutable darray[u8] = [62, 49, 46, 48, 46, 48, 46, 48, 32, 60, 61, 49, 46, 48, 46, 48]
     return 15 if SemVer::parse_requirement(empty_range, &blank)
     return 0
@@ -1149,7 +1159,7 @@ import os, sys
 
 os.chmod(sys.argv[1], 0o600)
 PY
-ELISAPKG_REGISTRY_DIR="$ROOT" ELISAPKG_TRUST_STATE="$TRUST_STATE_LEGACY_FILE" "$TRUST_STATE_LEGACY_BIN"
+ELISAPKG_REGISTRY_DIR="$REGISTRY_EXPIRY_ROOT" ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_EXPIRY_KEY" ELISAPKG_TRUST_STATE="$TRUST_STATE_LEGACY_FILE" "$TRUST_STATE_LEGACY_BIN"
 write_registry_index truststate 1 0.9.0,1.0.0,2.0.0
 ELISAPKG_REGISTRY_DIR="$REGISTRY_EXPIRY_ROOT" ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_EXPIRY_KEY" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_V1_BIN"
 cp "$TRUST_STATE_FILE" "$TRUST_STATE_V1_SNAPSHOT"
@@ -1705,6 +1715,31 @@ PY
     exit 1
   else
     test "$?" -eq 3
+  fi
+
+  # Authenticated or cached registry artifacts are fetchable, but the compiler
+  # must never receive a v3 registry graph until dependency build integration
+  # is implemented. Use a marker compiler to prove the CLI rejects it first.
+  registry_compiler_marker="$TEST_TMP/registry-compiler-was-invoked-$$"
+  registry_compiler="$TEST_TMP/registry-compiler-marker-$$.sh"
+  registry_build_log="$TEST_TMP/registry-build-rejection-$$.log"
+  cat > "$registry_compiler" <<EOF
+#!/bin/sh
+: > "$registry_compiler_marker"
+exit 99
+EOF
+  chmod 700 "$registry_compiler"
+  if env -u ELISAPKG_REGISTRY_DIR -u ELISAPKG_TRUST_STATE \
+    ELISAPKG_COMPILER="$registry_compiler" "$BIN" build --frozen > "$registry_build_log" 2>&1; then
+    echo "build unexpectedly accepted a registry dependency graph" >&2
+    exit 1
+  else
+    test "$?" -eq 6
+  fi
+  grep -F 'builds with registry dependencies are not supported' "$registry_build_log" >/dev/null
+  if [[ -e "$registry_compiler_marker" ]]; then
+    echo "compiler was invoked for a registry dependency graph" >&2
+    exit 1
   fi
 )
 
