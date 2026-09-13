@@ -19,12 +19,15 @@ export ELISA_ALLOW_STALE_STAGE1="${ELISA_ALLOW_STALE_STAGE1:-0}"
 "$BIN" doctor | grep -F 'local Ed25519 provider available' >/dev/null
 python3 "$ROOT/scripts/ffi_boundary_test.py"
 python3 "$ROOT/scripts/ffi_fifo_regression.py"
+python3 "$ROOT/scripts/crypto_provider_trust_regression.py"
 python3 "$ROOT/scripts/inherited_fd_regression.py"
 python3 "$ROOT/scripts/install_lock_regression.py"
 python3 "$ROOT/scripts/install_transaction_regression.py"
 python3 "$ROOT/scripts/install_identity_regression.py"
 python3 "$ROOT/scripts/transaction_guard_regression.py"
 python3 "$ROOT/scripts/sandbox_policy_test.py"
+python3 "$ROOT/scripts/archive_extract_regression.py"
+python3 "$ROOT/scripts/index_generation_race_regression.py"
 
 # Global output modes are strict: quiet suppresses human success text without
 # hiding JSON results, and color values are validated even though the current
@@ -1084,7 +1087,7 @@ TRUST_STATE_LEGACY_FILE="$TEST_TMP/trust-state-legacy-$$.state"
 cat > "$TRUST_STATE_V1_PROBE" <<EOF
 include "$ROOT/src/registry.elisa"
 def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
-    package: mutable darray[u8] = [97,112,112]
+    package: mutable darray[u8] = [116,114,117,115,116,115,116,97,116,101]
     version: mutable darray[u8] = [49,46,48,46,48]
     digest: mutable darray[u8] = []
     for _index in 0..<64 |digest|:
@@ -1101,7 +1104,7 @@ ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_COMPILER_ROOT/build/runtime/elisa
 cat > "$TRUST_STATE_VERIFY_V1_PROBE" <<EOF
 include "$ROOT/src/registry.elisa"
 def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
-    package: mutable darray[u8] = [97,112,112]
+    package: mutable darray[u8] = [116,114,117,115,116,115,116,97,116,101]
     version: mutable darray[u8] = [49,46,48,46,48]
     digest: mutable darray[u8] = []
     for _index in 0..<64 |digest|:
@@ -1139,11 +1142,12 @@ import os, sys
 os.chmod(sys.argv[1], 0o600)
 PY
 ELISAPKG_REGISTRY_DIR="$ROOT" ELISAPKG_TRUST_STATE="$TRUST_STATE_LEGACY_FILE" "$TRUST_STATE_LEGACY_BIN"
-ELISAPKG_REGISTRY_DIR="$ROOT" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_V1_BIN"
+write_registry_index truststate 1 0.9.0,1.0.0,2.0.0
+ELISAPKG_REGISTRY_DIR="$REGISTRY_EXPIRY_ROOT" ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_EXPIRY_KEY" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_V1_BIN"
 cp "$TRUST_STATE_FILE" "$TRUST_STATE_V1_SNAPSHOT"
 TRUST_STATE_CURRENT_HASH=$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$TRUST_STATE_FILE")
 printf 'clock:0\nstate-sha256:%s\n' "$TRUST_STATE_CURRENT_HASH" > "$TRUST_STATE_FILE.clock"
-ELISAPKG_REGISTRY_DIR="$ROOT" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_VERIFY_V1_BIN"
+ELISAPKG_REGISTRY_DIR="$REGISTRY_EXPIRY_ROOT" ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_EXPIRY_KEY" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_VERIFY_V1_BIN"
 python3 - "$TRUST_STATE_FILE" "$TRUST_STATE_FILE.clock" "$TRUST_STATE_CURRENT_HASH" <<'PY'
 from pathlib import Path
 import hashlib, sys
@@ -1160,7 +1164,7 @@ PY
 cat > "$TRUST_STATE_VERIFY_FAIL_PROBE" <<EOF
 include "$ROOT/src/registry.elisa"
 def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
-    package: mutable darray[u8] = [97,112,112]
+    package: mutable darray[u8] = [116,114,117,115,116,115,116,97,116,101]
     version: mutable darray[u8] = [49,46,48,46,48]
     digest: mutable darray[u8] = []
     metadata_digest: mutable darray[u8] = []
@@ -1178,12 +1182,12 @@ ELISA_ALLOW_STALE_STAGE1="${ELISA_ALLOW_STALE_STAGE1:-0}" \
 ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_COMPILER_ROOT/build/runtime/elisacore_runtime.o}" \
   "$ELISA_COMPILER_ROOT/scripts/elisac_stage1.sh" -emit exe -o "$TRUST_STATE_VERIFY_FAIL_BIN" "$TRUST_STATE_VERIFY_FAIL_PROBE"
 printf 'clock:0\nstate-sha256:%s\n' "$TRUST_STATE_CURRENT_HASH" > "$TRUST_STATE_FILE.clock"
-ELISAPKG_REGISTRY_DIR="$ROOT" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_VERIFY_FAIL_BIN"
+ELISAPKG_REGISTRY_DIR="$REGISTRY_EXPIRY_ROOT" ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_EXPIRY_KEY" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_VERIFY_FAIL_BIN"
 grep -Fx "clock:0" "$TRUST_STATE_FILE.clock" >/dev/null
 cat > "$TRUST_STATE_RECORD_EXPIRED_PROBE" <<EOF
 include "$ROOT/src/registry.elisa"
 def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
-    package: mutable darray[u8] = [97,112,112]
+    package: mutable darray[u8] = [116,114,117,115,116,115,116,97,116,101]
     version: mutable darray[u8] = [49,46,48,46,48]
     digest: mutable darray[u8] = []
     metadata_digest: mutable darray[u8] = []
@@ -1200,7 +1204,7 @@ ELISA_STAGE1_BIN="${ELISA_STAGE1_BIN:-$ELISA_COMPILER_ROOT/bin/elisac-stage1}" \
 ELISA_ALLOW_STALE_STAGE1="${ELISA_ALLOW_STALE_STAGE1:-0}" \
 ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_COMPILER_ROOT/build/runtime/elisacore_runtime.o}" \
   "$ELISA_COMPILER_ROOT/scripts/elisac_stage1.sh" -emit exe -o "$TRUST_STATE_RECORD_EXPIRED_BIN" "$TRUST_STATE_RECORD_EXPIRED_PROBE"
-ELISAPKG_REGISTRY_DIR="$ROOT" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_RECORD_EXPIRED_BIN"
+ELISAPKG_REGISTRY_DIR="$REGISTRY_EXPIRY_ROOT" ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_EXPIRY_KEY" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_RECORD_EXPIRED_BIN"
 grep -Fx "clock:0" "$TRUST_STATE_FILE.clock" >/dev/null
 cat > "$TRUST_STATE_PROBE" <<EOF
 include "$ROOT/src/registry.elisa"
@@ -1212,7 +1216,7 @@ def filled(value: u8) -> darray[u8]:
     return out
 
 def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
-    package: mutable darray[u8] = [97,112,112]
+    package: mutable darray[u8] = [116,114,117,115,116,115,116,97,116,101]
     v1: mutable darray[u8] = [49,46,48,46,48]
     v0: mutable darray[u8] = [48,46,57,46,48]
     v2: mutable darray[u8] = [50,46,48,46,48]
@@ -1232,11 +1236,11 @@ ELISA_STAGE1_BIN="${ELISA_STAGE1_BIN:-$ELISA_COMPILER_ROOT/bin/elisac-stage1}" \
 ELISA_ALLOW_STALE_STAGE1="${ELISA_ALLOW_STALE_STAGE1:-0}" \
 ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_COMPILER_ROOT/build/runtime/elisacore_runtime.o}" \
   "$ELISA_COMPILER_ROOT/scripts/elisac_stage1.sh" -emit exe -o "$TRUST_STATE_BIN" "$TRUST_STATE_PROBE"
-ELISAPKG_REGISTRY_DIR="$ROOT" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_BIN"
+ELISAPKG_REGISTRY_DIR="$REGISTRY_EXPIRY_ROOT" ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_EXPIRY_KEY" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_BIN"
 cat > "$TRUST_STATE_REPEAT_PROBE" <<EOF
 include "$ROOT/src/registry.elisa"
 def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
-    package: mutable darray[u8] = [97,112,112]
+    package: mutable darray[u8] = [116,114,117,115,116,115,116,97,116,101]
     digest: mutable darray[u8] = []
     for _index in 0..<64 |digest|:
         digest.push(98)
@@ -1250,73 +1254,73 @@ ELISA_STAGE1_BIN="${ELISA_STAGE1_BIN:-$ELISA_COMPILER_ROOT/bin/elisac-stage1}" \
 ELISA_ALLOW_STALE_STAGE1="${ELISA_ALLOW_STALE_STAGE1:-0}" \
 ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_COMPILER_ROOT/build/runtime/elisacore_runtime.o}" \
   "$ELISA_COMPILER_ROOT/scripts/elisac_stage1.sh" -emit exe -o "$TRUST_STATE_REPEAT_BIN" "$TRUST_STATE_REPEAT_PROBE"
-ELISAPKG_REGISTRY_DIR="$ROOT" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_REPEAT_BIN"
+ELISAPKG_REGISTRY_DIR="$REGISTRY_EXPIRY_ROOT" ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_EXPIRY_KEY" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_REPEAT_BIN"
 test -s "$TRUST_STATE_FILE"
 test -s "$TRUST_STATE_FILE.clock"
 cp "$TRUST_STATE_FILE" "$TRUST_STATE_V2_SNAPSHOT"
 cp "$TRUST_STATE_V1_SNAPSHOT" "$TRUST_STATE_FILE"
 chmod 600 "$TRUST_STATE_FILE"
-if ELISAPKG_REGISTRY_DIR="$ROOT" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_VERIFY_V1_BIN" >/dev/null 2>&1; then
+if ELISAPKG_REGISTRY_DIR="$REGISTRY_EXPIRY_ROOT" ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_EXPIRY_KEY" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_VERIFY_V1_BIN" >/dev/null 2>&1; then
   echo "restored old trust-state history was accepted by verification" >&2
   exit 1
 fi
-if ELISAPKG_REGISTRY_DIR="$ROOT" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
+if ELISAPKG_REGISTRY_DIR="$REGISTRY_EXPIRY_ROOT" ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_EXPIRY_KEY" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
   echo "restored old trust-state history was accepted by recording" >&2
   exit 1
 fi
 rm "$TRUST_STATE_FILE"
-if ELISAPKG_REGISTRY_DIR="$ROOT" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
+if ELISAPKG_REGISTRY_DIR="$REGISTRY_EXPIRY_ROOT" ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_EXPIRY_KEY" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
   echo "missing trust-state bytes with a retained clock were accepted" >&2
   exit 1
 fi
 cp "$TRUST_STATE_V2_SNAPSHOT" "$TRUST_STATE_FILE"
 chmod 600 "$TRUST_STATE_FILE"
 chmod 666 "$TRUST_STATE_FILE"
-if ELISAPKG_REGISTRY_DIR="$ROOT" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
+if ELISAPKG_REGISTRY_DIR="$REGISTRY_EXPIRY_ROOT" ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_EXPIRY_KEY" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
   echo "writable trust-state file was accepted" >&2
   exit 1
 fi
 chmod 600 "$TRUST_STATE_FILE"
 mkdir -m 777 "$TEST_TMP/trust-state-insecure"
-if ELISAPKG_REGISTRY_DIR="$ROOT" ELISAPKG_TRUST_STATE="$TEST_TMP/trust-state-insecure/state" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
+if ELISAPKG_REGISTRY_DIR="$REGISTRY_EXPIRY_ROOT" ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_EXPIRY_KEY" ELISAPKG_TRUST_STATE="$TEST_TMP/trust-state-insecure/state" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
   echo "trust state in a shared writable directory was accepted" >&2
   exit 1
 fi
 test ! -e "$TEST_TMP/trust-state-insecure/state"
 TRUST_STATE_CURRENT_HASH=$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$TRUST_STATE_FILE")
 printf 'clock:18446744073709551615\nstate-sha256:%s\n' "$TRUST_STATE_CURRENT_HASH" > "$TRUST_STATE_FILE.clock"
-if ELISAPKG_REGISTRY_DIR="$ROOT" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
+if ELISAPKG_REGISTRY_DIR="$REGISTRY_EXPIRY_ROOT" ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_EXPIRY_KEY" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
   echo "trust-state clock rollback was accepted" >&2
   exit 1
 fi
 rm -f "$TRUST_STATE_FILE.clock"
-if ELISAPKG_REGISTRY_DIR="$ROOT" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
+if ELISAPKG_REGISTRY_DIR="$REGISTRY_EXPIRY_ROOT" ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_EXPIRY_KEY" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
   echo "missing trust-state clock was accepted" >&2
   exit 1
 fi
 printf 'clock:0\n' > "$TRUST_STATE_FILE.clock"
-if ELISAPKG_REGISTRY_DIR="$ROOT" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
+if ELISAPKG_REGISTRY_DIR="$REGISTRY_EXPIRY_ROOT" ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_EXPIRY_KEY" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
   echo "legacy clock without state binding was accepted" >&2
   exit 1
 fi
 printf 'clock:0\nstate-sha256:%s\n' "$TRUST_STATE_CURRENT_HASH" > "$TRUST_STATE_FILE.clock"
 TRUST_STATE_LEGACY_LOCK_FILE="$TEST_TMP/trust-state-legacy-lock-$$.state"
 mkdir "$TRUST_STATE_LEGACY_LOCK_FILE.lock"
-if ELISAPKG_REGISTRY_DIR="$ROOT" ELISAPKG_TRUST_STATE="$TRUST_STATE_LEGACY_LOCK_FILE" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
+if ELISAPKG_REGISTRY_DIR="$REGISTRY_EXPIRY_ROOT" ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_EXPIRY_KEY" ELISAPKG_TRUST_STATE="$TRUST_STATE_LEGACY_LOCK_FILE" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
   echo "legacy trust-state directory lock was accepted" >&2
   exit 1
 fi
 rmdir "$TRUST_STATE_LEGACY_LOCK_FILE.lock"
-python3 "$ROOT/scripts/trust_state_lock_regression.py" "$TRUST_STATE_REPEAT_BIN" "$ROOT" "$TRUST_STATE_FILE"
+ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_EXPIRY_KEY" python3 "$ROOT/scripts/trust_state_lock_regression.py" "$TRUST_STATE_REPEAT_BIN" "$REGISTRY_EXPIRY_ROOT" "$TRUST_STATE_FILE"
 printf 'invalid trust state\n' > "$TRUST_STATE_FILE"
-if ELISAPKG_REGISTRY_DIR="$ROOT" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
+if ELISAPKG_REGISTRY_DIR="$REGISTRY_EXPIRY_ROOT" ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_EXPIRY_KEY" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
   echo "malformed trust state was accepted" >&2
   exit 1
 fi
 printf 'elisapkg-trust-state:1\napp 1.0.0 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' > "$TRUST_STATE_FILE"
 TRUST_STATE_TRUNCATED_HASH=$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$TRUST_STATE_FILE")
 printf 'clock:0\nstate-sha256:%s\n' "$TRUST_STATE_TRUNCATED_HASH" > "$TRUST_STATE_FILE.clock"
-if ELISAPKG_REGISTRY_DIR="$ROOT" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
+if ELISAPKG_REGISTRY_DIR="$REGISTRY_EXPIRY_ROOT" ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_EXPIRY_KEY" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
   echo "truncated trust state was accepted" >&2
   exit 1
 fi
@@ -1326,24 +1330,24 @@ fi
 # ELISAPKG_TRUST_STATE override is configured.
 DEFAULT_TRUST_HOME="$TEST_TMP/default-trust-home-$$"
 mkdir -p "$DEFAULT_TRUST_HOME"
-env -u ELISAPKG_TRUST_STATE HOME="$DEFAULT_TRUST_HOME/" ELISAPKG_REGISTRY_DIR="$ROOT" "$TRUST_STATE_BIN"
+env -u ELISAPKG_TRUST_STATE HOME="$DEFAULT_TRUST_HOME/" ELISAPKG_REGISTRY_DIR="$REGISTRY_EXPIRY_ROOT" ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_EXPIRY_KEY" "$TRUST_STATE_BIN"
 test -n "$(find "$DEFAULT_TRUST_HOME/.local/share/elisapkg/trust" -name '*.state' -type f -print -quit)"
 BAD_TRUST_HOME="$TEST_TMP/bad-trust-home-$$"
 BAD_TRUST_HOME="$BAD_TRUST_HOME"$'\n'x
-if env -u ELISAPKG_TRUST_STATE HOME="$BAD_TRUST_HOME" ELISAPKG_REGISTRY_DIR="$ROOT" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
+if env -u ELISAPKG_TRUST_STATE HOME="$BAD_TRUST_HOME" ELISAPKG_REGISTRY_DIR="$REGISTRY_EXPIRY_ROOT" ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_EXPIRY_KEY" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
   echo "control-byte HOME was accepted for trust state" >&2
   exit 1
 fi
 BAD_TRUST_HOME_PARENT="$TEST_TMP/home-parent-$$/../escape"
-if env -u ELISAPKG_TRUST_STATE HOME="$BAD_TRUST_HOME_PARENT" ELISAPKG_REGISTRY_DIR="$ROOT" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
+if env -u ELISAPKG_TRUST_STATE HOME="$BAD_TRUST_HOME_PARENT" ELISAPKG_REGISTRY_DIR="$REGISTRY_EXPIRY_ROOT" ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_EXPIRY_KEY" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
   echo "parent traversal HOME was accepted for trust state" >&2
   exit 1
 fi
-if ELISAPKG_TRUST_STATE="$TEST_TMP/trust-state-parent-$$/../escape.state" ELISAPKG_REGISTRY_DIR="$ROOT" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
+if ELISAPKG_TRUST_STATE="$TEST_TMP/trust-state-parent-$$/../escape.state" ELISAPKG_REGISTRY_DIR="$REGISTRY_EXPIRY_ROOT" ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_EXPIRY_KEY" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
   echo "parent traversal trust-state override was accepted" >&2
   exit 1
 fi
-if ELISAPKG_TRUST_STATE="$TEST_TMP/trust-state-dot-$$/./escape.state" ELISAPKG_REGISTRY_DIR="$ROOT" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
+if ELISAPKG_TRUST_STATE="$TEST_TMP/trust-state-dot-$$/./escape.state" ELISAPKG_REGISTRY_DIR="$REGISTRY_EXPIRY_ROOT" ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_EXPIRY_KEY" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
   echo "non-canonical trust-state override was accepted" >&2
   exit 1
 fi

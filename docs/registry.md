@@ -72,12 +72,17 @@ versions:
 The registry and package fields must match the configured registry and
 requested package. Generation and expiry are canonical unsigned decimal
 integers; generation must be positive. Versions must be unique, ascending,
-stable SemVer values, with at most 4096 entries. The resolver picks the highest
-version satisfying the requested exact, caret, tilde, or comparison
+stable SemVer values without build metadata, with at most 4096 entries. The
+resolver picks the highest version satisfying the requested exact, caret,
+tilde, or comparison
 requirement. The snapshot expires within 30 days, and its generation is stored
 in rollback-protected trust state under an identity bound to the registry and
 package. A lower generation is rejected; reusing a generation with different
-signed bytes is also rejected.
+signed bytes is also rejected. The resolver carries the exact generation and
+snapshot digest used for candidate enumeration through final version selection.
+Before it records release trust, it checks that evidence against the persisted
+index high-water mark under the same trust-state lock. If another process has
+advanced the index, the stale selection fails closed.
 
 The detached signature authenticates the publisher's declared complete
 version set and its freshness window. It cannot prove that a trusted publisher

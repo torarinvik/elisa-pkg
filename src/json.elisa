@@ -133,16 +133,23 @@ module Json:
             return true
 
         def unique_object_keys(raw: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            object_ids: mutable darray[usize] = []
-            seen_object_ids: mutable darray[usize] = []
+            # Keep each object's keys in a linked chain. Nested objects may
+            # interleave their keys with a parent's keys in the input, so a
+            # flat scan needlessly compares every key against unrelated
+            # objects as well.
+            object_last_keys: mutable darray[usize] = []
+            object_has_keys: mutable darray[bool] = []
             seen_hashes: mutable darray[u32] = []
             seen_starts: mutable darray[usize] = []
             seen_ends: mutable darray[usize] = []
-            next_object_id: mutable usize = 0.usize()
+            seen_previous_keys: mutable darray[usize] = []
+            seen_has_previous_keys: mutable darray[bool] = []
+            candidate_checks: mutable usize = 0.usize()
+            comparison_bytes: mutable usize = 0.usize()
             in_string: mutable bool = false
             escaped: mutable bool = false
             string_start: mutable usize = 0.usize()
-            for index in 0..<raw.count |raw, object_ids, seen_object_ids, seen_hashes, seen_starts, seen_ends, next_object_id, in_string, escaped, string_start|:
+            for index in 0..<raw.count |raw, object_last_keys, object_has_keys, seen_hashes, seen_starts, seen_ends, seen_previous_keys, seen_has_previous_keys, candidate_checks, comparison_bytes, in_string, escaped, string_start|:
                 byte: u8 = raw[index]
                 if in_string:
                     if escaped:
@@ -153,30 +160,40 @@ module Json:
                         after: mutable usize = index + 1.usize()
                         while after < raw.count and is_space(raw[after]) |raw, after|:
                             after <- after + 1.usize()
-                        if after < raw.count and raw[after] == 58 and object_ids.count > 0.usize():
-                            current_id: usize = object_ids[object_ids.count - 1.usize()]
-                            return false if duplicate_key(raw, string_start, index, current_id, seen_object_ids, seen_hashes, seen_starts, seen_ends)
-                            return false if seen_object_ids.count >= 4096.usize()
-                            seen_object_ids.push(current_id)
+                        if after < raw.count and raw[after] == 58 and object_last_keys.count > 0.usize():
+                            object_index: usize = object_last_keys.count - 1.usize()
+                            return false if duplicate_key(raw, string_start, index, object_last_keys[object_index], object_has_keys[object_index], seen_hashes, seen_starts, seen_ends, seen_previous_keys, seen_has_previous_keys, &candidate_checks, &comparison_bytes)
+                            return false if seen_hashes.count >= 4096.usize()
+                            key_index: usize = seen_hashes.count
+                            seen_previous_keys.push(object_last_keys[object_index])
+                            seen_has_previous_keys.push(object_has_keys[object_index])
                             seen_hashes.push(key_hash(raw, string_start, index))
                             seen_starts.push(string_start)
                             seen_ends.push(index)
+                            object_last_keys[object_index] <- key_index
+                            object_has_keys[object_index] <- true
                         in_string <- false
                     continue
                 if byte == 34:
                     in_string <- true
                     string_start <- index + 1.usize()
                 elif byte == 123:
-                    return false if object_ids.count >= 4096.usize()
-                    object_ids.push(next_object_id)
-                    next_object_id <- next_object_id + 1.usize()
+                    return false if object_last_keys.count >= 4096.usize()
+                    object_last_keys.push(0.usize())
+                    object_has_keys.push(false)
                 elif byte == 125:
-                    return false if object_ids.count == 0.usize()
-                    object_ids.resize(object_ids.count - 1.usize())
-            return false if in_string or escaped or object_ids.count != 0.usize()
+                    return false if object_last_keys.count == 0.usize()
+                    object_last_keys.resize(object_last_keys.count - 1.usize())
+                    object_has_keys.resize(object_has_keys.count - 1.usize())
+            return false if in_string or escaped or object_last_keys.count != 0.usize()
             return true
 
     private:
+        # This is exactly the maximum number of prior-key candidates for the
+        # existing 4096-key document limit, leaving that public limit intact.
+        const max_duplicate_key_candidates: usize = 8386560.usize()
+        const max_duplicate_key_comparison_bytes: usize = 65536.usize()
+
         def json_scalar(raw: darray[u8]&, start: usize, end: usize) -> bool:
             return false if start == end
             if end - start == 4.usize():
@@ -221,17 +238,29 @@ module Json:
         def is_space(byte: u8) -> bool:
             return byte == 32 or byte == 9 or byte == 10 or byte == 13
 
-        def duplicate_key(raw: darray[u8]&, start: usize, end: usize, object_id: usize, seen_object_ids: darray[usize]&, seen_hashes: darray[u32]&, seen_starts: darray[usize]&, seen_ends: darray[usize]&) -> bool:
+        def duplicate_key(raw: darray[u8]&, start: usize, end: usize, previous_key: usize, has_previous_key: bool, seen_hashes: darray[u32]&, seen_starts: darray[usize]&, seen_ends: darray[usize]&, seen_previous_keys: darray[usize]&, seen_has_previous_keys: darray[bool]&, candidate_checks: mutable usize&, comparison_bytes: mutable usize&) -> bool:
             return false if end < start
             current_hash: u32 = key_hash(raw, start, end)
-            for item in 0..<seen_object_ids.count |raw, seen_object_ids, seen_hashes, seen_starts, seen_ends, start, end, object_id, current_hash|:
-                continue if seen_object_ids[item] != object_id
-                continue if seen_hashes[item] != current_hash
-                prior_start: usize = seen_starts[item]
-                prior_end: usize = seen_ends[item]
-                continue if prior_end - prior_start != end - start
-                matches: mutable bool = true
-                for offset in 0..<(end - start) |raw, start, prior_start, matches|:
-                    matches <- false if raw[start + offset] != raw[prior_start + offset]
-                return true if matches
+            key_length: usize = end - start
+            item: mutable usize = previous_key
+            has_item: mutable bool = has_previous_key
+            while has_item |raw, seen_hashes, seen_starts, seen_ends, seen_previous_keys, seen_has_previous_keys, start, end, current_hash, key_length, item, has_item, candidate_checks, comparison_bytes|:
+                # Keep candidate traversal bounded independently of key length.
+                return true if candidate_checks >= max_duplicate_key_candidates
+                candidate_checks <- candidate_checks + 1.usize()
+                if seen_hashes[item] == current_hash:
+                    prior_start: usize = seen_starts[item]
+                    prior_end: usize = seen_ends[item]
+                    if prior_end - prior_start == key_length:
+                        # Only bytes actually compared consume this budget.
+                        # Fail closed before a deliberate low-width-hash
+                        # collision can turn equality checks quadratic.
+                        return true if key_length > max_duplicate_key_comparison_bytes - comparison_bytes
+                        comparison_bytes <- comparison_bytes + key_length
+                        matches: mutable bool = true
+                        for offset in 0..<key_length |raw, start, prior_start, matches|:
+                            matches <- false if raw[start + offset] != raw[prior_start + offset]
+                        return true if matches
+                has_item <- seen_has_previous_keys[item]
+                item <- seen_previous_keys[item]
             return false

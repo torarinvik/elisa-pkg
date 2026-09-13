@@ -61,8 +61,11 @@ module Registry:
         # bytes are bound to a signed, expiring per-package snapshot, whose
         # generation is recorded in the same rollback-protected user state as
         # selected release identities.
-        def read_index(package: darray[u8]&, out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+        def read_index(package: darray[u8]&, out: mutable darray[u8]&, generation_out: mutable u64&, snapshot_digest_out: mutable darray[u8]&, identity_out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out.resize(0)
+            generation_out <- 0
+            snapshot_digest_out.resize(0)
+            identity_out.resize(0)
             return ResultCode.InvalidConfiguration if not valid_package_path(package)
             root: mutable darray[u8] = []
             return ResultCode.NotConfigured if not configured_root(&root)
@@ -70,7 +73,7 @@ module Registry:
             key_path: mutable darray[u8] = []
             trust_root_status: ResultCode = configured_trust_root(root, &key_path)
             return trust_root_status if trust_root_status != ResultCode.Ok
-            return read_verified_index(root, package, key_path, out)
+            return read_verified_index(root, package, key_path, out, generation_out, snapshot_digest_out, identity_out)
 
         # Read one archive selected by authenticated metadata. The caller must
         # supply the exact version, archive leaf, digest, and size returned by
@@ -102,7 +105,40 @@ module Registry:
         # or restoring a project cannot reset rollback protection.
         def record_trusted(package: darray[u8]&, version: darray[u8]&, digest: darray[u8]&, metadata_digest: darray[u8]&, expires: u64) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             return ResultCode.InvalidConfiguration if not registry_valid_name(package)
-            return trust_state_record(package, version, digest, metadata_digest, expires)
+            now: i64 = Platform::pkg_wall_clock_seconds()
+            return ResultCode.ClockUnavailable if now < 0
+            expiry_status: ResultCode = metadata_expiry_status(expires, now.u64())
+            return expiry_status if expiry_status != ResultCode.Ok
+            versions: mutable darray[u8] = []
+            generation: mutable u64 = 0
+            index_digest: mutable darray[u8] = []
+            index_identity: mutable darray[u8] = []
+            index_status: ResultCode = read_index(package, &versions, &generation, &index_digest, &index_identity)
+            return index_status if index_status != ResultCode.Ok
+            return ResultCode.NoMatchingVersion if not registry_index_contains_version(versions, version)
+            return trust_state_record_at_index(package, version, digest, metadata_digest, expires, generation, index_digest, index_identity)
+
+        # Commit a selected release only while the exact authenticated index
+        # snapshot that authorized it is still the highest snapshot recorded
+        # for this registry/package. The check and package-history update share
+        # one trust-state lock acquisition, closing the gap between index read
+        # and package trust publication.
+        def record_trusted_at_index(package: darray[u8]&, version: darray[u8]&, digest: darray[u8]&, metadata_digest: darray[u8]&, expires: u64, generation: u64, index_digest: darray[u8]&, index_identity: darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            return ResultCode.InvalidConfiguration if not registry_valid_name(package) or generation == 0 or not valid_digest(index_digest)
+            return ResultCode.InvalidConfiguration if not valid_digest(metadata_digest) or not valid_digest(digest)
+            now: i64 = Platform::pkg_wall_clock_seconds()
+            return ResultCode.ClockUnavailable if now < 0
+            expiry_status: ResultCode = metadata_expiry_status(expires, now.u64())
+            return expiry_status if expiry_status != ResultCode.Ok
+            versions: mutable darray[u8] = []
+            current_generation: mutable u64 = 0
+            current_digest: mutable darray[u8] = []
+            current_identity: mutable darray[u8] = []
+            index_status: ResultCode = read_index(package, &versions, &current_generation, &current_digest, &current_identity)
+            return index_status if index_status != ResultCode.Ok
+            return ResultCode.RollbackDetected if current_generation != generation or not bytes_equal(current_digest, index_digest) or not bytes_equal(current_identity, index_identity)
+            return ResultCode.NoMatchingVersion if not registry_index_contains_version(versions, version)
+            return trust_state_record_at_index(package, version, digest, metadata_digest, expires, generation, index_digest, index_identity)
 
         # Check an identity against persisted signed metadata evidence and
         # advance the state-bound wall-clock floor while holding the same lock
@@ -115,13 +151,25 @@ module Registry:
         # Resolve one package and verify its detached metadata. The regular
         # entry also verifies the selected archive before exposing success.
         def resolve(package: darray[u8]&, requirement: darray[u8]&, previous_version: Model::Version, version_out: mutable darray[u8]&, archive_out: mutable darray[u8]&, digest_out: mutable darray[u8]&, archive_size_out: mutable u64&, metadata_out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            return resolve_internal(package, requirement, previous_version, version_out, archive_out, digest_out, archive_size_out, metadata_out, true)
+            generation: mutable u64 = 0
+            snapshot_digest: mutable darray[u8] = []
+            index_identity: mutable darray[u8] = []
+            return resolve_internal(package, requirement, previous_version, version_out, archive_out, digest_out, archive_size_out, metadata_out, true, &generation, &snapshot_digest, &index_identity)
+
+        # Resolution variant for callers that persist a selected artifact. The
+        # returned evidence is from the same verified index bytes whose version
+        # list was used to select the result.
+        def resolve_with_index_evidence(package: darray[u8]&, requirement: darray[u8]&, previous_version: Model::Version, version_out: mutable darray[u8]&, archive_out: mutable darray[u8]&, digest_out: mutable darray[u8]&, archive_size_out: mutable u64&, metadata_out: mutable darray[u8]&, generation_out: mutable u64&, snapshot_digest_out: mutable darray[u8]&, identity_out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return resolve_internal(package, requirement, previous_version, version_out, archive_out, digest_out, archive_size_out, metadata_out, true, generation_out, snapshot_digest_out, identity_out)
 
         # Candidate enumeration authenticates metadata without reading every
         # archive. This keeps a large signed index from forcing unbounded
         # archive I/O before the solver knows which versions are selected.
         def resolve_metadata(package: darray[u8]&, requirement: darray[u8]&, previous_version: Model::Version, version_out: mutable darray[u8]&, archive_out: mutable darray[u8]&, digest_out: mutable darray[u8]&, archive_size_out: mutable u64&, metadata_out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            return resolve_internal(package, requirement, previous_version, version_out, archive_out, digest_out, archive_size_out, metadata_out, false)
+            generation: mutable u64 = 0
+            snapshot_digest: mutable darray[u8] = []
+            index_identity: mutable darray[u8] = []
+            return resolve_internal(package, requirement, previous_version, version_out, archive_out, digest_out, archive_size_out, metadata_out, false, &generation, &snapshot_digest, &index_identity)
 
         # Resolve one candidate selected from the exact version-list bytes
         # returned by `read_index`. The caller verifies that snapshot once
@@ -201,12 +249,15 @@ module Registry:
             return ResultCode.Ok
 
     private:
-        def resolve_internal(package: darray[u8]&, requirement: darray[u8]&, previous_version: Model::Version, version_out: mutable darray[u8]&, archive_out: mutable darray[u8]&, digest_out: mutable darray[u8]&, archive_size_out: mutable u64&, metadata_out: mutable darray[u8]&, verify_archive: bool) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+        def resolve_internal(package: darray[u8]&, requirement: darray[u8]&, previous_version: Model::Version, version_out: mutable darray[u8]&, archive_out: mutable darray[u8]&, digest_out: mutable darray[u8]&, archive_size_out: mutable u64&, metadata_out: mutable darray[u8]&, verify_archive: bool, generation_out: mutable u64&, snapshot_digest_out: mutable darray[u8]&, identity_out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             version_out.resize(0)
             archive_out.resize(0)
             digest_out.resize(0)
             metadata_out.resize(0)
             archive_size_out <- 0
+            generation_out <- 0
+            snapshot_digest_out.resize(0)
+            identity_out.resize(0)
             return ResultCode.InvalidConfiguration if not valid_package_path(package)
             root: mutable darray[u8] = []
             return ResultCode.NotConfigured if not configured_root(&root)
@@ -215,7 +266,7 @@ module Registry:
             trust_root_status: ResultCode = configured_trust_root(root, &key_path)
             return trust_root_status if trust_root_status != ResultCode.Ok
             index: mutable darray[u8] = []
-            index_status: ResultCode = read_verified_index(root, package, key_path, &index)
+            index_status: ResultCode = read_verified_index(root, package, key_path, &index, generation_out, snapshot_digest_out, identity_out)
             return index_status if index_status != ResultCode.Ok
             selected: mutable darray[u8] = []
             return ResultCode.NoMatchingVersion if not Resolve::select_highest_version(index, requirement, &selected)
@@ -771,8 +822,11 @@ module Registry:
             out.resize(loaded.usize())
             return loaded
 
-        def read_verified_index(root: darray[u8]&, package: darray[u8]&, key_path: darray[u8]&, out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+        def read_verified_index(root: darray[u8]&, package: darray[u8]&, key_path: darray[u8]&, out: mutable darray[u8]&, generation_out: mutable u64&, snapshot_digest_out: mutable darray[u8]&, identity_out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             out.resize(0)
+            generation_out <- 0
+            snapshot_digest_out.resize(0)
+            identity_out.resize(0)
             index_path: mutable darray[u8] = []
             return ResultCode.InvalidConfiguration if not join_path_leaf(root, package, "index", &index_path)
             snapshot: mutable darray[u8] = []
@@ -804,10 +858,20 @@ module Registry:
             expiry_status: ResultCode = metadata_expiry_status(expires, now.u64())
             return expiry_status if expiry_status != ResultCode.Ok
 
-            state_status: ResultCode = record_index_generation(root, package, generation, snapshot, expires)
+            snapshot_digest_bytes: mutable darray[u8] = []
+            snapshot_digest: mutable darray[u8] = []
+            return ResultCode.TrustStateUnavailable if Integrity::sha256(snapshot, &snapshot_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(snapshot_digest_bytes, &snapshot_digest)
+            index_identity: mutable darray[u8] = []
+            return ResultCode.TrustStateUnavailable if not make_index_identity(root, package, &index_identity)
+            state_status: ResultCode = record_index_generation(index_identity, generation, snapshot_digest, expires)
             return state_status if state_status != ResultCode.Ok
             for index in 0..<versions.count |out, versions|:
                 out.push(versions[index])
+            generation_out <- generation
+            for index in 0..<snapshot_digest.count |snapshot_digest_out, snapshot_digest|:
+                snapshot_digest_out.push(snapshot_digest[index])
+            for index in 0..<index_identity.count |identity_out, index_identity|:
+                identity_out.push(index_identity[index])
             return ResultCode.Ok
 
         def parse_index_snapshot(raw: darray[u8]&, registry_out: mutable darray[u8]&, package_out: mutable darray[u8]&, generation_out: mutable u64&, expires_out: mutable u64&, versions_out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
@@ -925,18 +989,35 @@ module Registry:
                 cursor <- finish + 1
             return candidates > 0
 
-        def record_index_generation(root: darray[u8]&, package: darray[u8]&, generation: u64, snapshot: darray[u8]&, expires: u64) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+        def make_index_identity(root: darray[u8]&, package: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             root_digest_bytes: mutable darray[u8] = []
             root_digest: mutable darray[u8] = []
-            snapshot_digest_bytes: mutable darray[u8] = []
-            snapshot_digest: mutable darray[u8] = []
-            return ResultCode.TrustStateUnavailable if Integrity::sha256(root, &root_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(root_digest_bytes, &root_digest)
-            return ResultCode.TrustStateUnavailable if Integrity::sha256(snapshot, &snapshot_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(snapshot_digest_bytes, &snapshot_digest)
-            identity: mutable darray[u8] = []
-            registry_push_text(&identity, "@index:")
-            registry_push_array(&identity, root_digest)
-            identity.push(58)
-            registry_push_array(&identity, package)
+            out.resize(0)
+            return false if Integrity::sha256(root, &root_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(root_digest_bytes, &root_digest)
+            registry_push_text(out, "@index:")
+            registry_push_array(out, root_digest)
+            out.push(58)
+            registry_push_array(out, package)
+            return true
+
+        def registry_index_contains_version(versions: darray[u8]&, version: darray[u8]&) -> bool:
+            cursor: mutable usize = 0
+            while cursor < versions.count |versions, version, cursor|:
+                finish: mutable usize = cursor
+                while finish < versions.count and versions[finish] != 10 |versions, finish|:
+                    finish <- finish + 1
+                return false if finish == versions.count
+                return true if finish - cursor == version.count and bytes_equal_at(versions, cursor, finish, version)
+                cursor <- finish + 1
+            return false
+
+        def bytes_equal_at(raw: darray[u8]&, start: usize, finish: usize, expected: darray[u8]&) -> bool:
+            return false if finish < start or finish - start != expected.count
+            for offset in 0..<expected.count |raw, start, expected|:
+                return false if raw[start + offset] != expected[offset]
+            return true
+
+        def record_index_generation(identity: darray[u8]&, generation: u64, snapshot_digest: darray[u8]&, expires: u64) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             generation_version: mutable darray[u8] = []
             registry_push_text(&generation_version, "0.0.")
             registry_append_decimal(&generation_version, generation)
@@ -1423,12 +1504,28 @@ module Registry:
             sync_name: cstr = (&sync_path[0]).cast[cstr] can Unsafe.PointerCast
             return Platform::pkg_fsync_parent(sync_name) == 0
 
+        # The unguarded writer is private and is used only to persist the
+        # authenticated index's own high-water record. Package history must
+        # use the public guarded APIs above.
         def trust_state_record(package: darray[u8]&, version: darray[u8]&, digest: darray[u8]&, metadata_digest: darray[u8]&, expires: u64) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            empty_index_digest: mutable darray[u8] = []
+            empty_index_identity: mutable darray[u8] = []
+            return trust_state_record_internal(package, version, digest, metadata_digest, expires, false, 0, empty_index_digest, empty_index_identity)
+
+        def trust_state_record_at_index(package: darray[u8]&, version: darray[u8]&, digest: darray[u8]&, metadata_digest: darray[u8]&, expires: u64, generation: u64, index_digest: darray[u8]&, index_identity: darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            return trust_state_record_internal(package, version, digest, metadata_digest, expires, true, generation, index_digest, index_identity)
+
+        def trust_state_record_internal(package: darray[u8]&, version: darray[u8]&, digest: darray[u8]&, metadata_digest: darray[u8]&, expires: u64, guard_index: bool, index_generation: u64, index_digest: darray[u8]&, index_identity: darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             return ResultCode.InvalidConfiguration if not trust_state_identity_valid(package) or not Archive::is_safe_entry(version) or not valid_digest(digest) or not valid_digest(metadata_digest)
             parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
             return ResultCode.InvalidConfiguration if not SemVer::parse(version, &parsed) or parsed.prerelease
+            return ResultCode.InvalidConfiguration if guard_index and (index_generation == 0 or not valid_digest(index_digest) or not trust_state_identity_valid(index_identity))
             root: mutable darray[u8] = []
             return ResultCode.NotConfigured if not configured_root(&root)
+            if guard_index:
+                expected_index_identity: mutable darray[u8] = []
+                return ResultCode.TrustStateUnavailable if not make_index_identity(root, package, &expected_index_identity)
+                return ResultCode.InvalidConfiguration if not bytes_equal(expected_index_identity, index_identity)
             state_path: mutable darray[u8] = trust_state_path(root)
             return ResultCode.TrustStateUnavailable if state_path.count == 0
             return ResultCode.TrustStateUnavailable if state_path.count > 4090.usize()
@@ -1452,6 +1549,12 @@ module Registry:
             root_after_lock: mutable darray[u8] = []
             if not configured_root(&root_after_lock):
                 return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable)
+            if guard_index:
+                current_index_identity: mutable darray[u8] = []
+                if not make_index_identity(root_after_lock, package, &current_index_identity):
+                    return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable)
+                if not bytes_equal(current_index_identity, index_identity):
+                    return trust_state_finish(lock_fd, ResultCode.InvalidConfiguration)
             state_path <- trust_state_path(root_after_lock)
             if state_path.count == 0 or state_path.count > 4090.usize():
                 return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable)
@@ -1481,6 +1584,22 @@ module Registry:
             return trust_state_finish(lock_fd, ResultCode.ClockRollback) if observed_clock > now.u64()
             expiry_status: ResultCode = metadata_expiry_status(expires, now.u64())
             return trust_state_finish(lock_fd, expiry_status) if expiry_status != ResultCode.Ok
+            if guard_index:
+                expected_index_version: mutable darray[u8] = []
+                registry_push_text(&expected_index_version, "0.0.")
+                registry_append_decimal(&expected_index_version, index_generation)
+                observed_index_version: mutable darray[u8] = []
+                observed_index_digest: mutable darray[u8] = []
+                observed_index_metadata_digest: mutable darray[u8] = []
+                index_find_status: ResultCode = trust_state_find(state, index_identity, &observed_index_version, &observed_index_digest, &observed_index_metadata_digest) if state.count > 0 else ResultCode.Ok
+                return trust_state_finish(lock_fd, index_find_status) if index_find_status != ResultCode.Ok
+                return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if observed_index_version.count == 0
+                expected_index_parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
+                observed_index_parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
+                return trust_state_finish(lock_fd, ResultCode.TrustStateMalformed) if not SemVer::parse(expected_index_version, &expected_index_parsed) or not SemVer::parse(observed_index_version, &observed_index_parsed)
+                return trust_state_finish(lock_fd, ResultCode.RollbackDetected) if SemVer::compare(observed_index_parsed, expected_index_parsed) > 0
+                return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if SemVer::compare(observed_index_parsed, expected_index_parsed) < 0
+                return trust_state_finish(lock_fd, ResultCode.DigestMismatch) if not bytes_equal(observed_index_digest, index_digest) or not bytes_equal(observed_index_metadata_digest, index_digest)
             previous_version: mutable darray[u8] = []
             previous_digest: mutable darray[u8] = []
             previous_metadata_digest: mutable darray[u8] = []

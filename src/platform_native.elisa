@@ -76,6 +76,8 @@ static else:
     @link_name("__error")
     extern native_errno() -> mutable i32&
 static if ELISA_TARGET_OS_MACOS:
+    @link_name("getgrnam")
+    extern native_getgrnam(name: cstr) -> u8&?
     @link_name("acl_get_fd_np")
     extern native_acl_get_fd_np(fd: i32, kind: i32) -> u8&?
     @link_name("acl_get_entry")
@@ -122,13 +124,16 @@ static if ELISA_TARGET_OS_LINUX and ELISA_TARGET_ARCH_ARM64:
     # glibc places st_mode at offset 16 on Linux arm64.
     const stat_mode_offset: usize = 16
     const stat_uid_offset: usize = 24
+    const stat_gid_offset: usize = 28
 static elif ELISA_TARGET_OS_LINUX:
     # glibc places st_mode at offset 24 on Linux x86_64.
     const stat_mode_offset: usize = 24
     const stat_uid_offset: usize = 28
+    const stat_gid_offset: usize = 32
 static else:
     const stat_mode_offset: usize = 4
     const stat_uid_offset: usize = 16
+    const stat_gid_offset: usize = 20
 
 static if ELISA_TARGET_OS_LINUX:
     # Linux x86_64 and arm64 use the POSIX open flag values below.
@@ -370,6 +375,14 @@ module PlatformNative:
             return -5 if close_status != 0
             return -5 if size < 0
             return size
+
+        # Resolve a crypto provider only after every pathname component and
+        # the final executable have passed the same ownership, mode, and ACL
+        # checks used for trusted state. This is public within the native
+        # platform module so its filesystem trust policy can be regression
+        # tested directly; application code should use verify_ed25519.
+        def is_trusted_crypto_executable(path: cstr, expected_uid: u64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return trusted_crypto_executable_path(path, expected_uid)
 
         def is_directory(path: cstr) -> i64:
             fd: i64 = open_directory_path(path)
@@ -824,11 +837,11 @@ module PlatformNative:
             # filesystem wrapper does not accidentally select LibreSSL.
             resolved_openssl: mutable darray[u8] = []
             resolved_openssl.resize(4096)
-            if realpath("/opt/homebrew/opt/openssl@3/bin/openssl", &resolved_openssl) is canonical and access(canonical, 1) == 0:
+            if realpath("/opt/homebrew/opt/openssl@3/bin/openssl", &resolved_openssl) is canonical and is_trusted_crypto_executable(canonical, native_geteuid().u64()):
                 openssl <- canonical
-            elif realpath("/opt/homebrew/opt/openssl/bin/openssl", &resolved_openssl) is canonical and access(canonical, 1) == 0:
+            elif realpath("/opt/homebrew/opt/openssl/bin/openssl", &resolved_openssl) is canonical and is_trusted_crypto_executable(canonical, native_geteuid().u64()):
                 openssl <- canonical
-            elif realpath("/usr/bin/openssl", &resolved_openssl) is canonical and access(canonical, 1) == 0:
+            elif realpath("/usr/bin/openssl", &resolved_openssl) is canonical and is_trusted_crypto_executable(canonical, native_geteuid().u64()):
                 openssl <- canonical
             else:
                 _ = remove_temp_blob(public_path)
@@ -1780,6 +1793,36 @@ module PlatformNative:
             return false if (mode & 61440.u64()) != expected_kind or (owner != 0.u64() and owner != expected_uid)
             return (mode & 18.u64()) == 0.u64()
 
+        def trusted_crypto_executable_path(path: cstr, expected_uid: u64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            parent: mutable darray[u8] = []
+            leaf: mutable darray[u8] = []
+            return false if not split_parent_leaf(path, &parent, &leaf)
+            parent_name: cstr = (&parent[0]).cast[cstr] can Unsafe.PointerCast
+            directory: i64 = open_crypto_trusted_directory(parent_name, expected_uid)
+            return false if directory < 0
+            leaf_name: cstr = (&leaf[0]).cast[cstr] can Unsafe.PointerCast
+            fd: i64 = native_openat(directory, leaf_name, flags_file_read())
+            if fd < 0:
+                _ = native_close(directory)
+                return false
+            trusted: mutable bool = trusted_regular_fd(fd, expected_uid)
+            if trusted:
+                stat: mutable darray[u8] = []
+                stat.resize(144)
+                raw_stat: mutable void& = (&stat[0]).cast[mutable void&] can Unsafe.PointerCast
+                if native_fstat(fd, raw_stat) != 0:
+                    trusted <- false
+                else:
+                    mode: u64 = read_u16(stat, stat_mode_offset)
+                    # At least one execute bit must be present. This check is
+                    # performed on the opened inode, not on a path checked
+                    # earlier by access().
+                    trusted <- (mode & 73.u64()) != 0.u64()
+            file_close_status: i32 = native_close(fd)
+            directory_close_status: i32 = native_close(directory)
+            return false if file_close_status != 0 or directory_close_status != 0
+            return trusted
+
         def trusted_regular_fd(fd: i64, expected_uid: u64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return trusted_fd(fd, expected_uid, regular_mode) and trusted_acl_fd(fd)
 
@@ -1862,6 +1905,82 @@ module PlatformNative:
                 if not trusted_directory_fd(next, expected_uid):
                     return close_two_error(directory, next, -13)
                 return close_error(next, -5) if native_close(directory) != 0
+                directory <- next
+                break if finish == effective_length
+                start <- finish + 1.usize()
+                return close_error(directory, -22) if start == effective_length or path_copy[start] == 47
+            return directory
+
+        # Crypto providers may live below a Homebrew prefix whose euid-owned
+        # Cellar directories are group-writable (for example 0775). Permit
+        # that only for a non-root caller, and only when the owner is exactly
+        # that caller and the directory is not writable by other users. Root-
+        # owned ancestors retain the strict trusted-directory policy; root
+        # execution therefore never trusts a user-owned Homebrew tree.
+        def crypto_trusted_directory_fd(fd: i64, expected_uid: u64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            stat: mutable darray[u8] = []
+            stat.resize(144)
+            raw: mutable void& = (&stat[0]).cast[mutable void&] can Unsafe.PointerCast
+            return false if native_fstat(fd, raw) != 0
+            mode: u64 = read_u16(stat, stat_mode_offset)
+            owner: u64 = read_u32(stat, stat_uid_offset)
+            return false if (mode & 61440.u64()) != directory_mode
+            if owner == 0.u64():
+                return false if (mode & 18.u64()) != 0.u64()
+            else:
+                return false if expected_uid == 0.u64() or owner != expected_uid
+                return false if (mode & 2.u64()) != 0.u64()
+                if (mode & 16.u64()) != 0.u64():
+                    # Homebrew's default Apple Silicon Cellar may be group-
+                    # writable by macOS administrators. Accept that boundary
+                    # only for the well-known `admin` group; members can
+                    # already obtain root, while ordinary local accounts
+                    # cannot replace the provider through this directory.
+                    static if ELISA_TARGET_OS_MACOS:
+                        return false if read_u32(stat, stat_gid_offset) != macos_admin_gid()
+                    static else:
+                        return false
+            return trusted_acl_fd(fd)
+
+        def macos_admin_gid() -> u64:
+            static if ELISA_TARGET_OS_MACOS:
+                group_name: cstr = "admin"
+                if native_getgrnam(group_name) is group:
+                    raw: mutable u8& = group.cast[mutable u8&] can Unsafe.PointerCast
+                    return raw[16].u64() + raw[17].u64() * 256.u64() + raw[18].u64() * 65536.u64() + raw[19].u64() * 16777216.u64()
+            return 18446744073709551615
+
+        def open_crypto_trusted_directory(path: cstr, expected_uid: u64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            length: usize = native_strlen(path)
+            return -22 if length == 0 or length > 4096 or path[0].u8() != 47
+            path_copy: mutable darray[u8] = []
+            for index in 0..<length |path_copy, path|:
+                path_copy.push(path[index].u8())
+            path_copy.push(0)
+            effective_length: mutable usize = length
+            while effective_length > 1.usize() and path_copy[effective_length - 1.usize()] == 47:
+                effective_length <- effective_length - 1.usize()
+            directory: mutable i64 = native_open("/", flags_directory())
+            return -error_code() if directory < 0
+            if not crypto_trusted_directory_fd(directory, expected_uid):
+                return close_error(directory, -13)
+            start: mutable usize = 1.usize()
+            while start < effective_length:
+                finish: mutable usize = start
+                while finish < effective_length and path_copy[finish] != 47 |path_copy, finish|:
+                    finish <- finish + 1.usize()
+                return close_error(directory, -22) if finish == start
+                part_storage: mutable darray[u8] = []
+                for index in start..<finish |part_storage, path_copy|:
+                    part_storage.push(path_copy[index])
+                part_storage.push(0)
+                part: cstr = (&part_storage[0]).cast[cstr] can Unsafe.PointerCast
+                return close_error(directory, -22) if cstr_equal(part, ".") or cstr_equal(part, "..")
+                next: i64 = native_openat(directory, part, flags_directory() + flag_no_follow)
+                return close_error(directory, -error_code()) if next < 0
+                if not crypto_trusted_directory_fd(next, expected_uid):
+                    return close_two_error(directory, next, -13)
+                return close_error(directory, -5) if native_close(directory) != 0
                 directory <- next
                 break if finish == effective_length
                 start <- finish + 1.usize()

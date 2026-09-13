@@ -16,13 +16,29 @@ temporary insecure mode.
 The local registry version `index` is a signed, expiring snapshot. Its
 byte-for-byte Ed25519 signature binds the configured registry, package,
 positive generation, expiry, and complete declared version list. The list is
-bounded, sorted, unique, and limited to stable SemVer. Each package generation
-and snapshot digest are persisted in the clock-bound trust state; a lower
-generation or changed bytes at the same generation fail closed. Index files,
+bounded, sorted, unique, and limited to stable SemVer without build metadata.
+Each package generation and snapshot digest are persisted in the clock-bound
+trust state; a lower generation or changed bytes at the same generation fail
+closed. Index files,
 signatures, and trust roots use the same owner, mode, ACL, and no-follow checks
 as other trusted inputs. The signature authenticates the publisher's claim of
 completeness, but a first-use client cannot know about a newer unseen snapshot;
 the expiry bounds that replay window.
+
+The local Ed25519 verifier uses fixed OpenSSL candidates only. It resolves each
+candidate, opens its directory chain without following links, and checks the
+opened executable's owner, mode, ACL, and execute permission before use. The
+executable must be root-owned or owned by the effective user and must not be
+group- or world-writable. Directory components must be root-owned or
+effective-user-owned and protected from world writes. A non-root macOS process
+may use an effective-user-owned group-writable provider directory only when
+the owning group is the system `admin` group; that group is treated as
+privileged. A process running as root never trusts an effective-user-owned
+provider tree. If no candidate meets the policy or supports Ed25519, signature
+verification fails closed. Package trust records also require the version to
+appear in the currently authenticated index, and the exact generation and
+snapshot digest are rechecked under the trust-state lock before package
+history is written.
 Individual signed release metadata must also expire within 30 days of
 verification. Longer lifetimes fail as a distinct security error, bounding the
 replay window even when a signing key creates an accidentally far-future

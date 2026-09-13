@@ -2085,6 +2085,9 @@ module Cli:
                 current <- current + 1
             return false
 
+        def registry_evidence_field_at(values: darray[u8]&, record: usize, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            return registry_queue_field_at(values, record, out)
+
         def registry_append_decimal(out: mutable darray[u8]&, value: u64) -> void can[Memory.Allocate, Abort.Panic]:
             start: usize = out.count
             out.resize(start + 20.usize())
@@ -2121,6 +2124,25 @@ module Cli:
                 return true if bytes_equal(constraints[index].package, package)
             return false
 
+        # Candidate enumeration drives graph solving before the selected
+        # metadata is read a second time. Require the final signed dependency
+        # set to match that exact graph input so a concurrent metadata change
+        # cannot publish a lock for a different release graph.
+        def registry_dependency_sets_equal(left: darray[Solver::Constraint]&, right: darray[Solver::Constraint]&) -> bool:
+            return false if left.count != right.count
+            used: mutable darray[bool] = []
+            used.resize(right.count)
+            for left_index in 0..<left.count |left, right, used|:
+                found: mutable bool = false
+                for right_index in 0..<right.count |left, right, used, left_index, found|:
+                    continue if used[right_index]
+                    if bytes_equal(left[left_index].package, right[right_index].package) and bytes_equal(left[left_index].requirement, right[right_index].requirement):
+                        used[right_index] <- true
+                        found <- true
+                        break
+                return false if not found
+            return true
+
         def registry_preference_present(preferences: darray[Solver::Preference]&, package: darray[u8]&) -> bool:
             for index in 0..<preferences.count |preferences, package|:
                 return true if bytes_equal(preferences[index].package, package)
@@ -2150,6 +2172,9 @@ module Cli:
             return [] if not source_tree_digest_at(root, &root_source_digest)
 
             candidates: mutable darray[Solver::Candidate] = []
+            candidate_index_generations: mutable darray[u64] = []
+            candidate_index_digests: mutable darray[u8] = []
+            candidate_index_identities: mutable darray[u8] = []
             package_queue: mutable darray[u8] = []
             package_total: mutable usize = 0
             for index in 0..<roots.count |roots, package_queue, package_total|:
@@ -2161,7 +2186,10 @@ module Cli:
                 package: mutable darray[u8] = []
                 return [] if not registry_queue_field_at(package_queue, processed, &package)
                 index_data: mutable darray[u8] = []
-                index_status: Registry::ResultCode = Registry::read_index(package, &index_data)
+                index_generation: mutable u64 = 0
+                index_digest: mutable darray[u8] = []
+                index_identity: mutable darray[u8] = []
+                index_status: Registry::ResultCode = Registry::read_index(package, &index_data, &index_generation, &index_digest, &index_identity)
                 if index_status != Registry::ResultCode.Ok and persist_trust and registry_security_status(index_status):
                     out.push(index_status.u8() + 1.u8())
                     return out
@@ -2208,6 +2236,9 @@ module Cli:
                             package_total <- package_total + 1
                     candidate: Solver::Candidate = Solver::Candidate{package: candidate_package, version: parsed, dependencies: dependencies, yanked: false}
                     candidates.push(candidate)
+                    candidate_index_generations.push(index_generation)
+                    registry_queue_append(&candidate_index_digests, index_digest)
+                    registry_queue_append(&candidate_index_identities, index_identity)
                     return [] if candidates.count > 4096
                     cursor <- finish + 1
                 processed <- processed + 1
@@ -2271,6 +2302,10 @@ module Cli:
                 return [] if not found
                 candidate_index: usize = selected_indexes[selected_slot]
                 candidate: Solver::Candidate = candidates[candidate_index]
+                selected_index_generation: u64 = candidate_index_generations[candidate_index]
+                selected_index_digest: mutable darray[u8] = []
+                selected_index_identity: mutable darray[u8] = []
+                return [] if not registry_evidence_field_at(candidate_index_digests, candidate_index, &selected_index_digest) or not registry_evidence_field_at(candidate_index_identities, candidate_index, &selected_index_identity)
                 exact: mutable darray[u8] = []
                 Registry::exact_requirement(candidate.version, &exact)
                 selected_text: mutable darray[u8] = []
@@ -2278,11 +2313,19 @@ module Cli:
                 digest: mutable darray[u8] = []
                 metadata: mutable darray[u8] = []
                 archive_size: mutable u64 = 0
-                final_status: Registry::ResultCode = Registry::resolve(candidate.package, exact, Model::Version{major:0,minor:0,patch:0,prerelease:false}, &selected_text, &archive, &digest, &archive_size, &metadata)
+                verified_index_generation: mutable u64 = 0
+                verified_index_digest: mutable darray[u8] = []
+                verified_index_identity: mutable darray[u8] = []
+                final_status: Registry::ResultCode = Registry::resolve_with_index_evidence(candidate.package, exact, Model::Version{major:0,minor:0,patch:0,prerelease:false}, &selected_text, &archive, &digest, &archive_size, &metadata, &verified_index_generation, &verified_index_digest, &verified_index_identity)
                 if final_status != Registry::ResultCode.Ok and persist_trust and registry_security_status(final_status):
                     out.push(final_status.u8() + 1.u8())
                     return out
                 return [] if final_status != Registry::ResultCode.Ok
+                if verified_index_generation != selected_index_generation or not bytes_equal(verified_index_digest, selected_index_digest) or not bytes_equal(verified_index_identity, selected_index_identity):
+                    if persist_trust:
+                        out.push(Registry::ResultCode.RollbackDetected.u8() + 1.u8())
+                        return out
+                    return []
                 metadata_digest_bytes: mutable darray[u8] = []
                 metadata_digest: mutable darray[u8] = []
                 return [] if Integrity::sha256(metadata, &metadata_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(metadata_digest_bytes, &metadata_digest)
@@ -2299,14 +2342,14 @@ module Cli:
                 snapshot_expires: mutable u64 = 0
                 snapshot_dependencies: mutable darray[Solver::Constraint] = []
                 snapshot_status: Registry::ResultCode = Registry::verify_metadata_snapshot(candidate.package, selected_text, metadata_digest, metadata, metadata_signature, &snapshot_archive, &snapshot_digest, &snapshot_size, &snapshot_expires, &snapshot_dependencies)
-                if snapshot_status != Registry::ResultCode.Ok or not bytes_equal(snapshot_archive, archive) or not bytes_equal(snapshot_digest, digest) or snapshot_size != archive_size:
+                if snapshot_status != Registry::ResultCode.Ok or not bytes_equal(snapshot_archive, archive) or not bytes_equal(snapshot_digest, digest) or snapshot_size != archive_size or not registry_dependency_sets_equal(snapshot_dependencies, candidate.dependencies):
                     if persist_trust:
                         failure: Registry::ResultCode = snapshot_status if snapshot_status != Registry::ResultCode.Ok else Registry::ResultCode.DigestMismatch
                         out.push(failure.u8() + 1.u8())
                         return out
                     return []
                 if persist_trust:
-                    trust_status: Registry::ResultCode = Registry::record_trusted(candidate.package, selected_text, digest, metadata_digest, snapshot_expires)
+                    trust_status: Registry::ResultCode = Registry::record_trusted_at_index(candidate.package, selected_text, digest, metadata_digest, snapshot_expires, selected_index_generation, selected_index_digest, selected_index_identity)
                     if trust_status != Registry::ResultCode.Ok:
                         out.push(trust_status.u8() + 1.u8())
                         return out
@@ -3872,7 +3915,10 @@ module Cli:
                 resolved_digest: mutable darray[u8] = []
                 metadata: mutable darray[u8] = []
                 resolved_size: mutable u64 = 0
-                registry_status: Registry::ResultCode = Registry::resolve(package, exact, Model::Version{major:0,minor:0,patch:0,prerelease:false}, &selected, &resolved_archive, &resolved_digest, &resolved_size, &metadata)
+                selected_index_generation: mutable u64 = 0
+                selected_index_digest: mutable darray[u8] = []
+                selected_index_identity: mutable darray[u8] = []
+                registry_status: Registry::ResultCode = Registry::resolve_with_index_evidence(package, exact, Model::Version{major:0,minor:0,patch:0,prerelease:false}, &selected, &resolved_archive, &resolved_digest, &resolved_size, &metadata, &selected_index_generation, &selected_index_digest, &selected_index_identity)
                 if registry_status != Registry::ResultCode.Ok:
                     write_error("error: ")
                     write_error(Registry::result_message(registry_status))
@@ -3920,7 +3966,7 @@ module Cli:
                     write_error("\n")
                     return EXIT_SECURITY if registry_security_status(archive_status)
                     return EXIT_SOURCE
-                trust_status: Registry::ResultCode = Registry::record_trusted(package, version_text, digest, metadata_digest, snapshot_expires)
+                trust_status: Registry::ResultCode = Registry::record_trusted_at_index(package, version_text, digest, metadata_digest, snapshot_expires, selected_index_generation, selected_index_digest, selected_index_identity)
                 if trust_status != Registry::ResultCode.Ok:
                     write_error("error: ")
                     write_error(Registry::result_message(trust_status))
@@ -3992,7 +4038,10 @@ module Cli:
                 metadata: mutable darray[u8] = []
                 archive_size: mutable u64 = 0
                 previous_version: Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-                registry_status: Registry::ResultCode = Registry::resolve(package, requirement, previous_version, &selected, &archive, &digest, &archive_size, &metadata)
+                selected_index_generation: mutable u64 = 0
+                selected_index_digest: mutable darray[u8] = []
+                selected_index_identity: mutable darray[u8] = []
+                registry_status: Registry::ResultCode = Registry::resolve_with_index_evidence(package, requirement, previous_version, &selected, &archive, &digest, &archive_size, &metadata, &selected_index_generation, &selected_index_digest, &selected_index_identity)
                 if registry_status != Registry::ResultCode.Ok:
                     write_error("error: ")
                     write_error(Registry::result_message(registry_status))
@@ -4022,7 +4071,7 @@ module Cli:
                     write_error("\n")
                     return EXIT_SECURITY if registry_security_status(archive_status)
                     return EXIT_SOURCE
-                trust_status: Registry::ResultCode = Registry::record_trusted(package, selected, digest, metadata_digest, snapshot_expires)
+                trust_status: Registry::ResultCode = Registry::record_trusted_at_index(package, selected, digest, metadata_digest, snapshot_expires, selected_index_generation, selected_index_digest, selected_index_identity)
                 if trust_status != Registry::ResultCode.Ok:
                     write_error("error: ")
                     write_error(Registry::result_message(trust_status))

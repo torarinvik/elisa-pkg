@@ -13,6 +13,69 @@ if not compiler_root:
     raise SystemExit('error: set ELISA_COMPILER_ROOT to an Elisa compiler checkout')
 COMPILER = Path(compiler_root) / 'scripts/elisac_stage1.sh'
 
+FNV_PRIME = 16777619
+FNV_MASK = 0xffffffff
+FNV_PRIME_INVERSE = pow(FNV_PRIME, -1, 1 << 32)
+FNV_SAFE_BYTES = tuple(byte for byte in range(33, 127) if byte not in (34, 92))
+
+
+def fnv_step(state, byte):
+    return ((state ^ byte) * FNV_PRIME) & FNV_MASK
+
+
+def fnv_unstep(state, byte):
+    return ((state * FNV_PRIME_INVERSE) & FNV_MASK) ^ byte
+
+
+def fnv1a(value):
+    state = 2166136261
+    for byte in value:
+        state = fnv_step(state, byte)
+    return state
+
+
+def fnv_collision_prefixes(count, key_length):
+    """Build distinct, equal-length printable keys with one FNV-1a hash."""
+    first_prefix = b'k0000'
+    filler_length = key_length - len(first_prefix) - 4
+    first_filler = b'x' * filler_length
+    first_suffix = b'aaaa'
+    target = fnv1a(first_prefix + first_filler + first_suffix)
+    prefixes_and_suffixes = [(first_prefix, first_suffix)]
+
+    # Reverse the final two FNV steps once, then meet that table while trying
+    # printable first-half suffixes for each distinct prefix.
+    reverse_pairs = {}
+    for third in FNV_SAFE_BYTES:
+        for fourth in FNV_SAFE_BYTES:
+            middle = fnv_unstep(fnv_unstep(target, fourth), third)
+            reverse_pairs[middle] = (third, fourth)
+
+    candidate = 1
+    while len(prefixes_and_suffixes) < count:
+        prefix = f'k{candidate:04x}'.encode('ascii')
+        candidate += 1
+        prefix_hash = fnv1a(prefix + b'x' * (key_length - len(prefix) - 4))
+        found = None
+        for first in FNV_SAFE_BYTES:
+            first_hash = fnv_step(prefix_hash, first)
+            for second in FNV_SAFE_BYTES:
+                middle = fnv_step(first_hash, second)
+                if middle in reverse_pairs:
+                    found = bytes((first, second, *reverse_pairs[middle]))
+                    break
+            if found is not None:
+                break
+        if found is not None:
+            prefixes_and_suffixes.append((prefix, found))
+
+    keys = [prefix + b'x' * (key_length - len(prefix) - 4) + suffix
+            for prefix, suffix in prefixes_and_suffixes]
+    assert len(set(keys)) == count
+    assert len({len(key) for key in keys}) == 1
+    assert len({fnv1a(key) for key in keys}) == 1
+    return prefixes_and_suffixes
+
 
 def run(args, **kwargs):
     return subprocess.run([str(a) for a in args], timeout=120, check=True, **kwargs)
@@ -57,6 +120,27 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
                   '{"a":tru}', '{"a":1e}', '{"a":"\\q"}', '{"a\\u0062":1}',
                   '{"a":1,"\\u0061":2}', '[' * 66 + '0' + ']' * 66]:
         check(f'not Json::valid_document({data(value)})')
+
+    # Each key is distinct and valid JSON, but all keys collide in the
+    # validator's 32-bit FNV-1a index. The comparison-work guard must reject
+    # this input deterministically, without relying on a timing threshold.
+    collision_keys = fnv_collision_prefixes(8, 4096)
+    lines.append('    collision_document: mutable darray[u8] = [123]')
+    for key_index, (prefix, suffix) in enumerate(collision_keys):
+        if key_index > 0:
+            lines.append('    collision_document.push(44)')
+        lines.append('    collision_document.push(34)')
+        lines.extend(f'    collision_document.push({byte})' for byte in prefix)
+        lines.append(f'    for collision_fill_{key_index} in 0..<4087.usize() |collision_document|:')
+        lines.append('        collision_document.push(120)')
+        lines.extend(f'    collision_document.push({byte})' for byte in suffix)
+        lines.extend(['    collision_document.push(34)',
+                      '    collision_document.push(58)',
+                      '    collision_document.push(48)'])
+    lines.append('    collision_document.push(125)')
+    check('Json::valid_document(collision_document)')
+    check('not Json::unique_object_keys(collision_document)')
+
     lines.append('    req: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}')
     for value in ['>=1.5.0 <2.0.0', '<2.0.0 >=1.5.0']:
         check(f'SemVer::parse_requirement({data(value)}, &req)')
