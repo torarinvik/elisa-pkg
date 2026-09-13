@@ -19,6 +19,7 @@ export ELISA_ALLOW_STALE_STAGE1="${ELISA_ALLOW_STALE_STAGE1:-0}"
 "$BIN" doctor | grep -F 'local Ed25519 provider available' >/dev/null
 python3 "$ROOT/scripts/ffi_boundary_test.py"
 python3 "$ROOT/scripts/ffi_fifo_regression.py"
+python3 "$ROOT/scripts/access_regression.py"
 python3 "$ROOT/scripts/crypto_provider_trust_regression.py"
 python3 "$ROOT/scripts/inherited_fd_regression.py"
 python3 "$ROOT/scripts/process_group_regression.py"
@@ -29,6 +30,7 @@ python3 "$ROOT/scripts/transaction_guard_regression.py"
 python3 "$ROOT/scripts/sandbox_policy_test.py"
 python3 "$ROOT/scripts/archive_extract_regression.py"
 python3 "$ROOT/scripts/index_generation_race_regression.py"
+python3 "$ROOT/scripts/trust_state_registry_isolation_regression.py"
 
 # Global output modes are strict: quiet suppresses human success text without
 # hiding JSON results, and color values are validated even though the current

@@ -17,6 +17,71 @@ VERSION = b"1.2.3"
 DIGEST = hashlib.sha256(ARTIFACT).hexdigest().encode("ascii")
 
 
+def check_install_recovery_sync_order() -> None:
+    source = (ROOT / "src/main.elisa").read_text(encoding="utf-8")
+    recovery_start = source.find("def recover_local_install_transaction(")
+    recovery_end = source.find("def finish_local_install_error(", recovery_start)
+    if recovery_start < 0 or recovery_end < 0:
+        raise SystemExit("error: local install recovery implementation is missing")
+    recovery = source[recovery_start:recovery_end]
+    install_start = recovery.find('if bytes_equal_view(operation, "install"):')
+    uninstall_start = recovery.find("# Removal intent is durable", install_start)
+    copy_outputs_start = recovery.find("for index in 0..<operation.count", uninstall_start)
+    if install_start < 0 or uninstall_start < 0 or copy_outputs_start < 0:
+        raise SystemExit("error: local install recovery branches are missing")
+    install_branch = recovery[install_start:uninstall_start]
+    journal_retire = install_branch.rfind("remove_known_file(&transaction_path)")
+    install_sync = install_branch.rfind("sync_local_install_entry_parents(destination_name, receipt_name)")
+    if install_sync < 0 or install_sync >= journal_retire:
+        raise SystemExit("error: install recovery must sync both target directories before retiring its journal")
+
+    uninstall_branch = recovery[uninstall_start:copy_outputs_start]
+    retire_positions = []
+    cursor = 0
+    while True:
+        position = uninstall_branch.find("remove_known_file(&transaction_path)", cursor)
+        if position < 0:
+            break
+        retire_positions.append(position)
+        cursor = position + 1
+    if len(retire_positions) != 2:
+        raise SystemExit("error: uninstall recovery journal-retirement paths changed unexpectedly")
+    previous_retire = -1
+    for position in retire_positions:
+        sync = uninstall_branch.rfind(
+            "sync_local_install_entry_parents(destination_name, receipt_name)",
+            previous_retire + 1,
+            position,
+        )
+        if sync < 0:
+            raise SystemExit("error: uninstall recovery must sync both target directories before retiring its journal")
+        previous_retire = position
+
+    publish_start = source.find("def publish_local_install_receipt(")
+    publish_end = source.find("def recover_local_install_transaction(", publish_start)
+    if publish_start < 0 or publish_end < 0:
+        raise SystemExit("error: local receipt publication helper is missing")
+    publish = source[publish_start:publish_end]
+    matching_receipt = publish.find("return false if not bytes_equal(existing, receipt)")
+    parent_sync = publish.find("Platform::pkg_fsync_parent(path_name)")
+    if matching_receipt < 0 or parent_sync <= matching_receipt:
+        raise SystemExit("error: receipt publication must sync its parent before success")
+
+    for begin, end, label in (
+        ("def run_install_local(", "def run_install(", "install"),
+        ("def run_uninstall_local(", "def run_uninstall(", "uninstall"),
+    ):
+        start = source.find(begin)
+        stop = source.find(end, start)
+        if start < 0 or stop < 0:
+            raise SystemExit(f"error: normal local {label} implementation is missing")
+        operation = source[start:stop]
+        retire = operation.rfind("remove_known_file(&transaction_path)")
+        sync = operation.rfind("sync_local_install_entry_parents(destination_name, receipt_sync_name)" if label == "install" else "sync_local_install_entry_parents(destination_name, receipt_name)")
+        if sync < 0 or sync >= retire:
+            raise SystemExit(f"error: normal local {label} must sync target directories before retiring its journal")
+
+
 def run(args: list[str], prefix: Path, expected: int, label: str) -> subprocess.CompletedProcess[bytes]:
     environment = dict(os.environ)
     environment["ELISAPKG_INSTALL_PREFIX"] = str(prefix)
@@ -72,6 +137,7 @@ def write_install(prefix: Path) -> tuple[Path, Path, Path, bytes]:
 def main() -> int:
     if not BIN.is_file():
         raise SystemExit(f"error: built elisapkg binary is missing: {BIN}")
+    check_install_recovery_sync_order()
 
     with tempfile.TemporaryDirectory(prefix="elisapkg-install-transaction-", dir=ROOT / "build") as temporary:
         prefix = Path(temporary) / "prefix"

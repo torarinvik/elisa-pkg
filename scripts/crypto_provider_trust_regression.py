@@ -64,6 +64,15 @@ def main() -> int:
         fake_provider.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
         fake_provider.chmod(0o755)
 
+        fake_group_only_dir = work / "fake-group-only" / "bin"
+        fake_group_only_dir.mkdir(parents=True, mode=0o755)
+        fake_group_only_provider = fake_group_only_dir / "openssl"
+        fake_group_only_provider.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+        # The current uid owns the file and has read permission, but only the
+        # group execute bit is set. Effective-access checks must use the owner
+        # class and reject it for this process.
+        fake_group_only_provider.chmod(0o410)
+
         # When the regression itself runs as root, make the complete fake
         # provider subtree belong to a different uid while keeping the test
         # parent root-owned. This deterministically models a user-owned
@@ -130,6 +139,14 @@ def main() -> int:
             '    return 2 if not PlatformNative::is_trusted_crypto_executable(system_name, 0.u64())',
             '    has_current_provider: mutable bool = false',
         ]
+        if os.geteuid() != 0:
+            lines.extend(
+                [
+                    f'    group_only_path: mutable darray[u8] = [{elisa_bytes(fake_group_only_provider)}]',
+                    '    group_only_name: cstr = (&group_only_path[0]).cast[cstr] can Unsafe.PointerCast',
+                    f'    return 7 if PlatformNative::is_trusted_crypto_executable(group_only_name, {os.geteuid()}.u64())',
+                ]
+            )
         for index, candidate in enumerate(candidates):
             lines.extend(
                 [

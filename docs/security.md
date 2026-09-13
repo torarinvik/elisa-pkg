@@ -95,8 +95,13 @@ The `Trust` module exposes metadata prechecks for expiry, rollback, namespace,
 and algorithm policy plus an exact-byte detached Ed25519 verification gate.
 Verified local-registry selections persist monotonic package/version/archive-
 digest/metadata-digest records outside the project in a user-owned trust-state
-file. Trust-state format v2 is required; legacy records without metadata
-identity fail closed rather than being migrated. Updates hold a nonblocking
+file. Trust-state format v3 keys package history by registry-root hash and
+package name, in addition to binding each version to its archive and signed
+metadata digests. Default per-registry paths safely migrate v2 unscoped package
+rows on the next state update; an explicit override containing any unscoped v2
+package rows fails closed because their registry provenance cannot be recovered.
+Legacy v1 records without metadata identity fail closed rather than being
+migrated. Updates hold a nonblocking
 kernel `flock` on a persistent protected regular file at `<state>.lock`; the
 inode stays in place and the kernel releases ownership after a process crash.
 The complete state is published with a durable atomic rename. A pre-existing

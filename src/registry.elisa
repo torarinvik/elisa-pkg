@@ -608,6 +608,22 @@ module Registry:
 
         def trust_state_identity_valid(value: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
             return true if registry_valid_name(value)
+            package_prefix: cstr = "@package:"
+            package_prefix_length: usize = Platform::pkg_strlen(package_prefix)
+            if value.count > package_prefix_length + 65.usize():
+                package_identity: mutable bool = true
+                for index in 0..<package_prefix_length |value, package_prefix, package_identity|:
+                    package_identity <- false if value[index] != package_prefix[index].u8()
+                if package_identity:
+                    for index in 0..<64.usize() |value, package_prefix_length|:
+                        byte: u8 = value[package_prefix_length + index]
+                        package_identity <- false if (byte < 48 or byte > 57) and (byte < 97 or byte > 102)
+                    separator: usize = package_prefix_length + 64.usize()
+                    package_identity <- false if value[separator] != 58
+                    package: mutable darray[u8] = []
+                    for index in (separator + 1.usize())..<value.count |package, value|:
+                        package.push(value[index])
+                    return true if package_identity and registry_valid_name(package)
             prefix: cstr = "@index:"
             prefix_length: usize = Platform::pkg_strlen(prefix)
             return false if value.count <= prefix_length + 64.usize() + 1.usize()
@@ -622,6 +638,93 @@ module Registry:
             for index in (separator + 1.usize())..<value.count |package, value|:
                 package.push(value[index])
             return valid_package_path(package)
+
+        def make_package_identity(root: darray[u8]&, package: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            root_digest_bytes: mutable darray[u8] = []
+            root_digest: mutable darray[u8] = []
+            out.resize(0)
+            return false if not registry_valid_name(package)
+            return false if Integrity::sha256(root, &root_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(root_digest_bytes, &root_digest)
+            registry_push_text(out, "@package:")
+            registry_push_array(out, root_digest)
+            out.push(58)
+            registry_push_array(out, package)
+            return true
+
+        def trust_state_has_override() -> bool:
+            override: u8&? = Platform::pkg_getenv("ELISAPKG_TRUST_STATE")
+            return true if override is configured
+            return false
+
+        def trust_state_legacy_override_status(state: darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic]:
+            return ResultCode.Ok if not trust_state_is_v2(state)
+            return ResultCode.Ok if not trust_state_has_override()
+            empty_identity: mutable darray[u8] = []
+            unused_version: mutable darray[u8] = []
+            unused_digest: mutable darray[u8] = []
+            unused_metadata_digest: mutable darray[u8] = []
+            validation_status: ResultCode = trust_state_find(state, empty_identity, &unused_version, &unused_digest, &unused_metadata_digest)
+            return validation_status if validation_status != ResultCode.Ok
+            cursor: mutable usize = 23.usize()
+            while cursor < state.count:
+                finish: mutable usize = cursor
+                while finish < state.count and state[finish] != 10 |state, finish|:
+                    finish <- finish + 1.usize()
+                return ResultCode.TrustStateMalformed if finish == state.count
+                separator: mutable usize = cursor
+                while separator < finish and state[separator] != 32 |state, separator|:
+                    separator <- separator + 1.usize()
+                return ResultCode.TrustStateMalformed if separator == cursor or separator == finish
+                identity: mutable darray[u8] = []
+                for index in cursor..<separator |identity, state|:
+                    identity.push(state[index])
+                return ResultCode.TrustStateUnavailable if registry_valid_name(identity)
+                cursor <- finish + 1.usize()
+            return ResultCode.Ok
+
+        def trust_state_upgrade_to_v3(root: darray[u8]&, state: darray[u8]&, out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic]:
+            out.resize(0)
+            if state.count == 0:
+                registry_push_text(out, "elisapkg-trust-state:3\n")
+                return ResultCode.Ok
+            if trust_state_is_v3(state):
+                for index in 0..<state.count |out, state|:
+                    out.push(state[index])
+                return ResultCode.Ok
+            return ResultCode.TrustStateMalformed if not trust_state_is_v2(state)
+            empty_identity: mutable darray[u8] = []
+            unused_version: mutable darray[u8] = []
+            unused_digest: mutable darray[u8] = []
+            unused_metadata_digest: mutable darray[u8] = []
+            validation_status: ResultCode = trust_state_find(state, empty_identity, &unused_version, &unused_digest, &unused_metadata_digest)
+            return validation_status if validation_status != ResultCode.Ok
+            override_status: ResultCode = trust_state_legacy_override_status(state)
+            return override_status if override_status != ResultCode.Ok
+            registry_push_text(out, "elisapkg-trust-state:3\n")
+            cursor: mutable usize = 23.usize()
+            while cursor < state.count:
+                finish: mutable usize = cursor
+                while finish < state.count and state[finish] != 10 |state, finish|:
+                    finish <- finish + 1.usize()
+                return ResultCode.TrustStateMalformed if finish == state.count
+                separator: mutable usize = cursor
+                while separator < finish and state[separator] != 32 |state, separator|:
+                    separator <- separator + 1.usize()
+                return ResultCode.TrustStateMalformed if separator == cursor or separator == finish
+                identity: mutable darray[u8] = []
+                for index in cursor..<separator |identity, state|:
+                    identity.push(state[index])
+                if registry_valid_name(identity):
+                    scoped_identity: mutable darray[u8] = []
+                    return ResultCode.TrustStateUnavailable if not make_package_identity(root, identity, &scoped_identity)
+                    registry_push_array(out, scoped_identity)
+                else:
+                    registry_push_array(out, identity)
+                for index in separator..=finish |out, state|:
+                    out.push(state[index])
+                return ResultCode.TrustStateUnavailable if out.count > 1048576.usize()
+                cursor <- finish + 1.usize()
+            return ResultCode.Ok
 
         # HOME is an input boundary, even though it is normally populated by
         # the login environment. Reject control bytes and backslashes before
@@ -1377,18 +1480,27 @@ module Registry:
                 # must never reset rollback protection.
                 return ResultCode.Ok if read_status == -2
                 return ResultCode.TrustStateUnavailable
-            # Version 2 binds the exact signed metadata digest as well as the
-            # archive digest. Legacy v1 records cannot establish that identity
-            # and are deliberately rejected without migration.
-            return ResultCode.TrustStateMalformed if loaded.count == 0 or loaded.count > 1048576 or not bytes_starts_with_text(loaded, "elisapkg-trust-state:2\n")
+            # Version 2 is accepted only for safe migration. Version 3 scopes
+            # package identities to the registry root. Legacy v1 records
+            # cannot establish metadata identity and remain rejected.
+            return ResultCode.TrustStateMalformed if loaded.count == 0 or loaded.count > 1048576 or (not trust_state_is_v2(loaded) and not trust_state_is_v3(loaded))
             for index in 0..<loaded.count |out, loaded|:
                 out.push(loaded[index])
             return ResultCode.Ok
+
+        def trust_state_is_v2(state: darray[u8]&) -> bool:
+            return bytes_starts_with_text(state, "elisapkg-trust-state:2\n")
+
+        def trust_state_is_v3(state: darray[u8]&) -> bool:
+            return bytes_starts_with_text(state, "elisapkg-trust-state:3\n")
 
         def trust_state_find(state: darray[u8]&, package: darray[u8]&, version_out: mutable darray[u8]&, digest_out: mutable darray[u8]&, metadata_digest_out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic]:
             version_out.resize(0)
             digest_out.resize(0)
             metadata_digest_out.resize(0)
+            is_v2: bool = trust_state_is_v2(state)
+            is_v3: bool = trust_state_is_v3(state)
+            return ResultCode.TrustStateMalformed if not is_v2 and not is_v3
             cursor: mutable usize = 23.usize()
             found: mutable bool = false
             while cursor < state.count:
@@ -1414,6 +1526,8 @@ module Registry:
                 line_metadata_digest: mutable darray[u8] = []
                 for index in cursor..<first_separator |line_package, state|:
                     line_package.push(state[index])
+                return ResultCode.TrustStateMalformed if is_v2 and bytes_starts_with_text(line_package, "@package:")
+                return ResultCode.TrustStateMalformed if is_v3 and registry_valid_name(line_package)
                 for index in (first_separator + 1.usize())..<second_separator |line_version, state|:
                     line_version.push(state[index])
                 for index in (second_separator + 1.usize())..<third_separator |line_digest, state|:
@@ -1445,6 +1559,38 @@ module Registry:
                             metadata_digest_out.push(line_metadata_digest[index])
                     found <- true
                 cursor <- finish + 1.usize()
+            return ResultCode.Ok
+
+        # Package release history is scoped to the configured registry even
+        # when callers deliberately share one trust-state file. The default
+        # HOME-derived file was already registry-scoped; its older plain-name
+        # records can be read as migration history. An override may have mixed
+        # roots in one legacy record, so using that ambiguous history would
+        # either contaminate another registry or silently drop rollback
+        # protection. Fail closed for that one package until it is explicitly
+        # re-provisioned into a fresh scoped record.
+        def trust_state_find_package_history(state: darray[u8]&, root: darray[u8]&, package: darray[u8]&, version_out: mutable darray[u8]&, digest_out: mutable darray[u8]&, metadata_digest_out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic]:
+            scoped_identity: mutable darray[u8] = []
+            return ResultCode.TrustStateUnavailable if not make_package_identity(root, package, &scoped_identity)
+            scoped_status: ResultCode = trust_state_find(state, scoped_identity, version_out, digest_out, metadata_digest_out) if state.count > 0 else ResultCode.Ok
+            return scoped_status if scoped_status != ResultCode.Ok or version_out.count > 0
+            # V3 rows are exclusively scoped identities, so a missing scoped
+            # row is a genuinely new package for this registry. Only v2 can
+            # carry a legacy plain-name row that is eligible for safe default
+            # path migration.
+            return ResultCode.Ok if not trust_state_is_v2(state)
+            legacy_version: mutable darray[u8] = []
+            legacy_digest: mutable darray[u8] = []
+            legacy_metadata_digest: mutable darray[u8] = []
+            legacy_status: ResultCode = trust_state_find(state, package, &legacy_version, &legacy_digest, &legacy_metadata_digest) if state.count > 0 else ResultCode.Ok
+            return legacy_status if legacy_status != ResultCode.Ok or legacy_version.count == 0
+            return ResultCode.TrustStateUnavailable if trust_state_has_override()
+            for index in 0..<legacy_version.count |version_out, legacy_version|:
+                version_out.push(legacy_version[index])
+            for index in 0..<legacy_digest.count |digest_out, legacy_digest|:
+                digest_out.push(legacy_digest[index])
+            for index in 0..<legacy_metadata_digest.count |metadata_digest_out, legacy_metadata_digest|:
+                metadata_digest_out.push(legacy_metadata_digest[index])
             return ResultCode.Ok
 
         def bytes_starts_with_text(value: darray[u8]&, expected: cstr) -> bool:
@@ -1555,6 +1701,12 @@ module Registry:
                     return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable)
                 if not bytes_equal(current_index_identity, index_identity):
                     return trust_state_finish(lock_fd, ResultCode.InvalidConfiguration)
+            state_identity: mutable darray[u8] = []
+            if registry_valid_name(package):
+                if not make_package_identity(root_after_lock, package, &state_identity):
+                    return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable)
+            else:
+                registry_push_array(&state_identity, package)
             state_path <- trust_state_path(root_after_lock)
             if state_path.count == 0 or state_path.count > 4090.usize():
                 return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable)
@@ -1567,6 +1719,8 @@ module Registry:
             state: mutable darray[u8] = []
             read_status: ResultCode = trust_state_read(state_path, &state)
             return trust_state_finish(lock_fd, read_status) if read_status != ResultCode.Ok
+            legacy_override_status: ResultCode = trust_state_legacy_override_status(state)
+            return trust_state_finish(lock_fd, legacy_override_status) if legacy_override_status != ResultCode.Ok
             observed_clock: mutable u64 = 0
             clock_missing: mutable bool = false
             observed_state_digest: mutable darray[u8] = []
@@ -1603,7 +1757,12 @@ module Registry:
             previous_version: mutable darray[u8] = []
             previous_digest: mutable darray[u8] = []
             previous_metadata_digest: mutable darray[u8] = []
-            find_status: ResultCode = trust_state_find(state, package, &previous_version, &previous_digest, &previous_metadata_digest) if state.count > 0 else ResultCode.Ok
+            find_status: mutable ResultCode = ResultCode.Ok
+            if state.count > 0:
+                if registry_valid_name(package):
+                    find_status <- trust_state_find_package_history(state, root_after_lock, package, &previous_version, &previous_digest, &previous_metadata_digest)
+                else:
+                    find_status <- trust_state_find(state, package, &previous_version, &previous_digest, &previous_metadata_digest)
             return trust_state_finish(lock_fd, find_status) if find_status != ResultCode.Ok
             if previous_version.count > 0.usize():
                 previous: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
@@ -1617,11 +1776,13 @@ module Registry:
                     state_path.resize(clock_path_start)
                     return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if not clock_written
                     return trust_state_finish(lock_fd, ResultCode.Ok)
-            if state.count == 0:
-                registry_push_text(&state, "elisapkg-trust-state:2\n")
-            record_size: usize = package.count + version.count + digest.count + metadata_digest.count + 4.usize()
+            upgraded_state: mutable darray[u8] = []
+            upgrade_status: ResultCode = trust_state_upgrade_to_v3(root_after_lock, state, &upgraded_state)
+            return trust_state_finish(lock_fd, upgrade_status) if upgrade_status != ResultCode.Ok
+            state <- upgraded_state
+            record_size: usize = state_identity.count + version.count + digest.count + metadata_digest.count + 4.usize()
             return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if record_size > 1048576.usize() or state.count > 1048576.usize() - record_size
-            registry_push_array(&state, package)
+            registry_push_array(&state, state_identity)
             state.push(32)
             registry_push_array(&state, version)
             state.push(32)
@@ -1700,6 +1861,8 @@ module Registry:
             state: mutable darray[u8] = []
             read_status: ResultCode = trust_state_read(state_path, &state)
             return trust_state_finish(lock_fd, read_status) if read_status != ResultCode.Ok
+            legacy_override_status: ResultCode = trust_state_legacy_override_status(state)
+            return trust_state_finish(lock_fd, legacy_override_status) if legacy_override_status != ResultCode.Ok
             observed_clock: mutable u64 = 0
             clock_missing: mutable bool = false
             observed_state_digest: mutable darray[u8] = []
@@ -1720,7 +1883,7 @@ module Registry:
             previous_version: mutable darray[u8] = []
             previous_digest: mutable darray[u8] = []
             previous_metadata_digest: mutable darray[u8] = []
-            find_status: ResultCode = trust_state_find(state, package_value, &previous_version, &previous_digest, &previous_metadata_digest) if state.count > 0 else ResultCode.Ok
+            find_status: ResultCode = trust_state_find_package_history(state, root_after_lock, package_value, &previous_version, &previous_digest, &previous_metadata_digest)
             return trust_state_finish(lock_fd, find_status) if find_status != ResultCode.Ok
             return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if previous_version.count == 0.usize()
             previous: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}

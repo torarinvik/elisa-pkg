@@ -28,6 +28,7 @@ C_INT_RETURN_SYMBOLS = {
     "native_fchdir",
     "native_fstat",
     "native_fstatat",
+    "native_faccessat",
     "native_closedir",
     "native_fork",
     "native_execvp",

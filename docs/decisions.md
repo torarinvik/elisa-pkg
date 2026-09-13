@@ -146,14 +146,16 @@ fail closed. Owner, mode, no-follow, and supported ACL checks apply to the
 snapshot, signature, and trust root. The authorized signer asserts that the
 list is complete; a first-use client cannot know about a newer unseen signed
 generation, so expiry bounds replay. Same-user deletion or corruption can
-still deny service. Trust history
-format v2 binds package, version, archive digest, and metadata digest; legacy
-history without metadata identity fails closed. Successful offline
-verification advances the state-bound clock only after signed metadata and
-archive checks, and rechecks expiry using the time sampled while holding the
-trust-state lock. This fixture tests local trust-boundary behavior only; it
-does not implement TUF roles, threshold signatures, namespace delegation,
-production key rotation, or publisher build provenance.
+still deny service. Trust history format v3 keys package history by
+registry-root hash and package name, and binds version, archive digest, and
+metadata digest. Default per-registry paths safely migrate v2 unscoped package
+rows on the next state update; ambiguous unscoped rows in an explicit override
+fail closed. Legacy v1 history without metadata identity remains rejected.
+Successful offline verification advances the state-bound clock only after
+signed metadata and archive checks, and rechecks expiry using the time sampled
+while holding the trust-state lock. This fixture tests local trust-boundary
+behavior only; it does not implement TUF roles, threshold signatures, namespace
+delegation, production key rotation, or publisher build provenance.
 
 ## D-012: local installation directory trust
 
