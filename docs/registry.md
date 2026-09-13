@@ -135,16 +135,21 @@ also recorded in a user-owned trust-state file after archive verification. By
 default the file is
 `$HOME/.local/share/elisapkg/trust/<sha256-of-registry-root>.state`; set
 `ELISAPKG_TRUST_STATE` to an absolute path when an isolated state location is
-needed. The file is written through an exclusive lock directory, a temporary
-file, `fsync`, atomic rename, and parent-directory `fsync`. Each package's
+needed. Trust-state operations hold an exclusive, nonblocking kernel `flock`
+on a persistent protected regular file at `<state>.lock`; the inode is never
+removed, and the kernel releases the lock after process exit or a crash. A
+pre-existing legacy lock directory fails closed and requires manual removal
+after confirming no older elisapkg process is still using it. The state file
+is published through a temporary file, `fsync`, atomic rename, and
+parent-directory `fsync`. Each package's
 history is monotonic: a lower version is rejected, and a same-version digest
 change is rejected. Format v2 binds package, version, archive digest, and signed
 metadata digest together; changing either digest for an existing version is
 rejected. Legacy records without metadata identity fail closed and are not
 migrated. History is independent of the project lockfile, so
-restoring or deleting a project cannot reset rollback protection. A stale lock
-directory is left for manual recovery and causes a fail-closed trust-state
-error rather than being removed automatically. Beside the state file, elisapkg
+restoring or deleting a project cannot reset rollback protection. A stale
+directory from an older release is never removed automatically because an old
+process may still be active. Beside the state file, elisapkg
 durably records the greatest observed wall-clock value and the SHA-256 of the
 exact state bytes in `<state>.clock`, using the same exclusive temporary-file,
 `fsync`, atomic-rename, and parent-directory `fsync` sequence. Both recording

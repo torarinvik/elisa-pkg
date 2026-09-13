@@ -53,11 +53,14 @@ and algorithm policy plus an exact-byte detached Ed25519 verification gate.
 Verified local-registry selections persist monotonic package/version/archive-
 digest/metadata-digest records outside the project in a user-owned trust-state
 file. Trust-state format v2 is required; legacy records without metadata
-identity fail closed rather than being migrated. Updates hold an
-exclusive lock directory and publish the complete state with a durable atomic
-rename. Lower versions and same-version archive- or metadata-digest changes
-fail closed; malformed or unavailable state is a security error. The default
-path is
+identity fail closed rather than being migrated. Updates hold a nonblocking
+kernel `flock` on a persistent protected regular file at `<state>.lock`; the
+inode stays in place and the kernel releases ownership after a process crash.
+The complete state is published with a durable atomic rename. A pre-existing
+legacy lock directory fails closed and is never removed automatically while an
+older process might still be using it. Lower versions and same-version
+archive- or metadata-digest changes fail closed; malformed or unavailable
+state is a security error. The default path is
 `$HOME/.local/share/elisapkg/trust/<sha256-of-registry-root>.state`, with
 `ELISAPKG_TRUST_STATE` available for an explicit absolute path. Override paths
 must use canonical non-empty components; `.` and `..` are rejected before any

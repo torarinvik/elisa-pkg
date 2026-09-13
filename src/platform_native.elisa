@@ -553,6 +553,38 @@ module PlatformNative:
                 return close_error(fd, negative_value(lock_errno))
             return fd
 
+        def acquire_trust_state_lock(path: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            # Trust-state locks use a persistent regular-file inode just like
+            # install locks. The kernel releases flock ownership after process
+            # death, while retaining the inode prevents stale directory locks
+            # and lock splitting across concurrent readers and writers.
+            expected_uid: u64 = native_geteuid().u64()
+            parent: mutable darray[u8] = []
+            leaf: mutable darray[u8] = []
+            return -22 if not split_parent_leaf(path, &parent, &leaf)
+            leaf_snapshot: mutable darray[u8] = []
+            for index in 0..<leaf.count |leaf_snapshot, leaf|:
+                leaf_snapshot.push(leaf[index])
+            parent_name: cstr = (&parent[0]).cast[cstr] can Unsafe.PointerCast
+            directory: i64 = open_trusted_directory(parent_name, expected_uid)
+            return directory if directory < 0
+            leaf_buffer: mutable darray[u8] = []
+            for index in 0..<leaf_snapshot.count |leaf_buffer, leaf_snapshot|:
+                leaf_buffer.push(leaf_snapshot[index])
+            leaf_name: cstr = (&leaf_buffer[0]).cast[cstr] can Unsafe.PointerCast
+            flags: i64 = flag_read_write + flag_create + flag_no_follow + flag_close_on_exec + flag_nonblock
+            fd: i64 = native_openat(directory, leaf_name, flags, 384)
+            open_errno: i64 = current_errno()
+            directory_close: i64 = native_close(directory)
+            if fd < 0:
+                return negative_value(open_errno)
+            return close_error(fd, -5) if directory_close != 0
+            return close_error(fd, -13) if not trusted_regular_fd(fd, expected_uid)
+            if native_flock(fd, lock_operation_exclusive + lock_operation_nonblocking) != 0:
+                lock_errno: i64 = current_errno()
+                return close_error(fd, negative_value(lock_errno))
+            return fd
+
         def unlink(path: cstr) -> i64:
             return unlink_kind(path, 0)
 

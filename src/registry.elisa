@@ -1373,19 +1373,8 @@ module Registry:
                 return false if value[index] != expected[index].u8()
             return true
 
-        def trust_state_release(lock_path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            path_c: mutable darray[u8] = []
-            path_with_nul(lock_path, &path_c)
-            lock_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
-            result: i64 = Platform::pkg_rmdir(lock_name)
-            # A trust lock is acquired immediately before this call. Missing
-            # at release time indicates interference and must not be accepted
-            # as an idempotent success.
-            return result == 0
-
-        def trust_state_finish(lock_path: darray[u8]&, code: ResultCode) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            released: bool = trust_state_release(lock_path)
-            return ResultCode.TrustStateUnavailable if not released
+        def trust_state_finish(lock_fd: i64, code: ResultCode) -> ResultCode:
+            return ResultCode.TrustStateUnavailable if Platform::pkg_close(lock_fd) != 0
             return code
 
         def trust_state_write(path: darray[u8]&, value: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
@@ -1448,35 +1437,33 @@ module Registry:
                 lock_path.push(state_path[index])
             registry_push_text(&lock_path, ".lock")
             return ResultCode.TrustStateUnavailable if lock_path.count > 4096
-            # Preserve the exact directory created below in an independent
-            # Elisa-owned value. Cleanup never depends on a C-string or a path
-            # buffer used by later FFI calls.
-            release_path_snapshot: mutable darray[u8] = []
-            registry_push_array(&release_path_snapshot, lock_path)
+            # Keep the exact path independently: filesystem FFI calls can
+            # invalidate temporary C-string storage, but the lock inode is
+            # held by the descriptor and needs no pathname-based cleanup.
+            lock_path_snapshot: mutable darray[u8] = []
+            registry_push_array(&lock_path_snapshot, lock_path)
             lock_c: mutable darray[u8] = []
             path_with_nul(lock_path, &lock_c)
             lock_name: cstr = (&lock_c[0]).cast[cstr] can Unsafe.PointerCast
-            return ResultCode.TrustStateUnavailable if Platform::pkg_mkdir(lock_name, 448.u16()) != 0
+            lock_fd: i64 = Platform::pkg_acquire_trust_state_lock(lock_name)
+            return ResultCode.TrustStateUnavailable if lock_fd < 0
             # Rebuild path buffers after the filesystem call. The stage1 ABI
             # may invalidate caller-owned darrays across FFI boundaries.
             root_after_lock: mutable darray[u8] = []
             if not configured_root(&root_after_lock):
-                _ = trust_state_release(release_path_snapshot)
-                return ResultCode.TrustStateUnavailable
+                return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable)
             state_path <- trust_state_path(root_after_lock)
             if state_path.count == 0 or state_path.count > 4090.usize():
-                _ = trust_state_release(release_path_snapshot)
-                return ResultCode.TrustStateUnavailable
+                return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable)
             lock_path.resize(0)
             for index in 0..<state_path.count |lock_path, state_path|:
                 lock_path.push(state_path[index])
             registry_push_text(&lock_path, ".lock")
-            if not bytes_equal(lock_path, release_path_snapshot):
-                _ = trust_state_release(release_path_snapshot)
-                return ResultCode.TrustStateUnavailable
+            if not bytes_equal(lock_path, lock_path_snapshot):
+                return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable)
             state: mutable darray[u8] = []
             read_status: ResultCode = trust_state_read(state_path, &state)
-            return trust_state_finish(release_path_snapshot, read_status) if read_status != ResultCode.Ok
+            return trust_state_finish(lock_fd, read_status) if read_status != ResultCode.Ok
             observed_clock: mutable u64 = 0
             clock_missing: mutable bool = false
             observed_state_digest: mutable darray[u8] = []
@@ -1484,37 +1471,37 @@ module Registry:
             registry_push_text(&state_path, ".clock")
             clock_status: ResultCode = trust_clock_read(state_path, &observed_clock, &observed_state_digest, &clock_missing)
             state_path.resize(clock_path_start)
-            return trust_state_finish(release_path_snapshot, clock_status) if clock_status != ResultCode.Ok
-            return trust_state_finish(release_path_snapshot, ResultCode.TrustStateUnavailable) if clock_missing and state.count > 23.usize()
+            return trust_state_finish(lock_fd, clock_status) if clock_status != ResultCode.Ok
+            return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if clock_missing and state.count > 23.usize()
             current_state_digest: mutable darray[u8] = []
-            return trust_state_finish(release_path_snapshot, ResultCode.TrustStateUnavailable) if not trust_state_digest(state, &current_state_digest)
-            return trust_state_finish(release_path_snapshot, ResultCode.TrustStateUnavailable) if not clock_missing and not bytes_equal(observed_state_digest, current_state_digest)
+            return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if not trust_state_digest(state, &current_state_digest)
+            return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if not clock_missing and not bytes_equal(observed_state_digest, current_state_digest)
             now: i64 = Platform::pkg_wall_clock_seconds()
-            return trust_state_finish(release_path_snapshot, ResultCode.TrustStateUnavailable) if now < 0
-            return trust_state_finish(release_path_snapshot, ResultCode.ClockRollback) if observed_clock > now.u64()
+            return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if now < 0
+            return trust_state_finish(lock_fd, ResultCode.ClockRollback) if observed_clock > now.u64()
             expiry_status: ResultCode = metadata_expiry_status(expires, now.u64())
-            return trust_state_finish(release_path_snapshot, expiry_status) if expiry_status != ResultCode.Ok
+            return trust_state_finish(lock_fd, expiry_status) if expiry_status != ResultCode.Ok
             previous_version: mutable darray[u8] = []
             previous_digest: mutable darray[u8] = []
             previous_metadata_digest: mutable darray[u8] = []
             find_status: ResultCode = trust_state_find(state, package, &previous_version, &previous_digest, &previous_metadata_digest) if state.count > 0 else ResultCode.Ok
-            return trust_state_finish(release_path_snapshot, find_status) if find_status != ResultCode.Ok
+            return trust_state_finish(lock_fd, find_status) if find_status != ResultCode.Ok
             if previous_version.count > 0.usize():
                 previous: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-                return trust_state_finish(release_path_snapshot, ResultCode.TrustStateMalformed) if not SemVer::parse(previous_version, &previous)
-                return trust_state_finish(release_path_snapshot, ResultCode.RollbackDetected) if SemVer::compare(parsed, previous) < 0
-                return trust_state_finish(release_path_snapshot, ResultCode.DigestMismatch) if SemVer::compare(parsed, previous) == 0 and (not bytes_equal(previous_digest, digest) or not bytes_equal(previous_metadata_digest, metadata_digest))
+                return trust_state_finish(lock_fd, ResultCode.TrustStateMalformed) if not SemVer::parse(previous_version, &previous)
+                return trust_state_finish(lock_fd, ResultCode.RollbackDetected) if SemVer::compare(parsed, previous) < 0
+                return trust_state_finish(lock_fd, ResultCode.DigestMismatch) if SemVer::compare(parsed, previous) == 0 and (not bytes_equal(previous_digest, digest) or not bytes_equal(previous_metadata_digest, metadata_digest))
                 if SemVer::compare(parsed, previous) == 0:
-                    return trust_state_finish(release_path_snapshot, ResultCode.Ok) if observed_clock == now.u64()
+                    return trust_state_finish(lock_fd, ResultCode.Ok) if observed_clock == now.u64()
                     registry_push_text(&state_path, ".clock")
                     clock_written: bool = trust_clock_write(state_path, now.u64(), current_state_digest)
                     state_path.resize(clock_path_start)
-                    return trust_state_finish(release_path_snapshot, ResultCode.TrustStateUnavailable) if not clock_written
-                    return trust_state_finish(release_path_snapshot, ResultCode.Ok)
+                    return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if not clock_written
+                    return trust_state_finish(lock_fd, ResultCode.Ok)
             if state.count == 0:
                 registry_push_text(&state, "elisapkg-trust-state:2\n")
             record_size: usize = package.count + version.count + digest.count + metadata_digest.count + 4.usize()
-            return trust_state_finish(release_path_snapshot, ResultCode.TrustStateUnavailable) if record_size > 1048576.usize() or state.count > 1048576.usize() - record_size
+            return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if record_size > 1048576.usize() or state.count > 1048576.usize() - record_size
             registry_push_array(&state, package)
             state.push(32)
             registry_push_array(&state, version)
@@ -1524,16 +1511,16 @@ module Registry:
             registry_push_array(&state, metadata_digest)
             state.push(10)
             updated_state_digest: mutable darray[u8] = []
-            return trust_state_finish(release_path_snapshot, ResultCode.TrustStateUnavailable) if not trust_state_digest(state, &updated_state_digest)
+            return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if not trust_state_digest(state, &updated_state_digest)
             # Bind the proposed state bytes into the sidecar before publishing
             # the state. A crash between these atomic writes leaves a mismatch,
             # which fails closed instead of accepting either history.
             registry_push_text(&state_path, ".clock")
             clock_written: bool = trust_clock_write(state_path, now.u64(), updated_state_digest)
             state_path.resize(clock_path_start)
-            return trust_state_finish(release_path_snapshot, ResultCode.TrustStateUnavailable) if not clock_written
-            return trust_state_finish(release_path_snapshot, ResultCode.TrustStateUnavailable) if not trust_state_write(state_path, state)
-            return trust_state_finish(release_path_snapshot, ResultCode.Ok)
+            return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if not clock_written
+            return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if not trust_state_write(state_path, state)
+            return trust_state_finish(lock_fd, ResultCode.Ok)
 
         def trust_state_verify(package: darray[u8]&, version: darray[u8]&, digest: darray[u8]&, metadata_digest: darray[u8]&, expires: u64) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             return ResultCode.InvalidConfiguration if not trust_state_identity_valid(package) or not Archive::is_safe_entry(version) or not valid_digest(digest) or not valid_digest(metadata_digest)
@@ -1561,15 +1548,15 @@ module Registry:
             registry_push_array(&lock_path, state_path)
             registry_push_text(&lock_path, ".lock")
             return ResultCode.TrustStateUnavailable if lock_path.count > 4096
-            # Preserve the exact acquired lock path separately; all later
-            # exits release this snapshot, even if state-path rebuilding or
-            # another filesystem call invalidates temporary C-string storage.
-            release_path_snapshot: mutable darray[u8] = []
-            registry_push_array(&release_path_snapshot, lock_path)
+            # Preserve the path for the post-FFI configuration consistency
+            # check. Lock ownership itself is held by the returned descriptor.
+            lock_path_snapshot: mutable darray[u8] = []
+            registry_push_array(&lock_path_snapshot, lock_path)
             lock_c: mutable darray[u8] = []
             path_with_nul(lock_path, &lock_c)
             lock_name: cstr = (&lock_c[0]).cast[cstr] can Unsafe.PointerCast
-            return ResultCode.TrustStateUnavailable if Platform::pkg_mkdir(lock_name, 448.u16()) != 0
+            lock_fd: i64 = Platform::pkg_acquire_trust_state_lock(lock_name)
+            return ResultCode.TrustStateUnavailable if lock_fd < 0
             # FFI may invalidate caller-owned array headers. Rebuild the state
             # and lock paths after acquiring the lock before using either one.
             root_after_lock: mutable darray[u8] = []
@@ -1578,26 +1565,22 @@ module Registry:
                 root_value: cstr = configured_root_after_lock.cast[cstr]
                 root_length: usize = Platform::pkg_strlen(root_value)
                 if root_length == 0 or root_length > 4096:
-                    _ = trust_state_release(release_path_snapshot)
-                    return ResultCode.InvalidConfiguration
+                    return trust_state_finish(lock_fd, ResultCode.InvalidConfiguration)
                 for index in 0..<root_length |root_after_lock, root_value|:
                     root_after_lock.push(root_value[index].u8())
             state_path <- trust_state_path_readonly(root_after_lock)
             if state_path.count == 0 or state_path.count > 4090.usize():
-                _ = trust_state_release(release_path_snapshot)
-                return ResultCode.TrustStateUnavailable
+                return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable)
             lock_path.resize(0)
             registry_push_array(&lock_path, state_path)
             registry_push_text(&lock_path, ".lock")
             if lock_path.count > 4096:
-                _ = trust_state_release(release_path_snapshot)
-                return ResultCode.TrustStateUnavailable
-            if not bytes_equal(lock_path, release_path_snapshot):
-                _ = trust_state_release(release_path_snapshot)
-                return ResultCode.TrustStateUnavailable
+                return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable)
+            if not bytes_equal(lock_path, lock_path_snapshot):
+                return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable)
             state: mutable darray[u8] = []
             read_status: ResultCode = trust_state_read(state_path, &state)
-            return trust_state_finish(release_path_snapshot, read_status) if read_status != ResultCode.Ok
+            return trust_state_finish(lock_fd, read_status) if read_status != ResultCode.Ok
             observed_clock: mutable u64 = 0
             clock_missing: mutable bool = false
             observed_state_digest: mutable darray[u8] = []
@@ -1605,32 +1588,32 @@ module Registry:
             registry_push_array(&clock_path, state_path)
             registry_push_text(&clock_path, ".clock")
             clock_status: ResultCode = trust_clock_read(clock_path, &observed_clock, &observed_state_digest, &clock_missing)
-            return trust_state_finish(release_path_snapshot, clock_status) if clock_status != ResultCode.Ok
-            return trust_state_finish(release_path_snapshot, ResultCode.TrustStateUnavailable) if clock_missing and state.count > 23.usize()
+            return trust_state_finish(lock_fd, clock_status) if clock_status != ResultCode.Ok
+            return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if clock_missing and state.count > 23.usize()
             current_state_digest: mutable darray[u8] = []
-            return trust_state_finish(release_path_snapshot, ResultCode.TrustStateUnavailable) if not trust_state_digest(state, &current_state_digest)
-            return trust_state_finish(release_path_snapshot, ResultCode.TrustStateUnavailable) if not clock_missing and not bytes_equal(observed_state_digest, current_state_digest)
+            return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if not trust_state_digest(state, &current_state_digest)
+            return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if not clock_missing and not bytes_equal(observed_state_digest, current_state_digest)
             now: i64 = Platform::pkg_wall_clock_seconds()
-            return trust_state_finish(release_path_snapshot, ResultCode.TrustStateUnavailable) if now < 0
-            return trust_state_finish(release_path_snapshot, ResultCode.ClockRollback) if observed_clock > now.u64()
+            return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if now < 0
+            return trust_state_finish(lock_fd, ResultCode.ClockRollback) if observed_clock > now.u64()
             expiry_status: ResultCode = metadata_expiry_status(expires, now.u64())
-            return trust_state_finish(release_path_snapshot, expiry_status) if expiry_status != ResultCode.Ok
+            return trust_state_finish(lock_fd, expiry_status) if expiry_status != ResultCode.Ok
             previous_version: mutable darray[u8] = []
             previous_digest: mutable darray[u8] = []
             previous_metadata_digest: mutable darray[u8] = []
             find_status: ResultCode = trust_state_find(state, package_value, &previous_version, &previous_digest, &previous_metadata_digest) if state.count > 0 else ResultCode.Ok
-            return trust_state_finish(release_path_snapshot, find_status) if find_status != ResultCode.Ok
-            return trust_state_finish(release_path_snapshot, ResultCode.TrustStateUnavailable) if previous_version.count == 0.usize()
+            return trust_state_finish(lock_fd, find_status) if find_status != ResultCode.Ok
+            return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if previous_version.count == 0.usize()
             previous: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-            return trust_state_finish(release_path_snapshot, ResultCode.TrustStateMalformed) if not SemVer::parse(previous_version, &previous)
-            return trust_state_finish(release_path_snapshot, ResultCode.RollbackDetected) if SemVer::compare(parsed, previous) < 0
+            return trust_state_finish(lock_fd, ResultCode.TrustStateMalformed) if not SemVer::parse(previous_version, &previous)
+            return trust_state_finish(lock_fd, ResultCode.RollbackDetected) if SemVer::compare(parsed, previous) < 0
             if SemVer::compare(parsed, previous) == 0 and (not bytes_equal(previous_digest, digest_value) or not bytes_equal(previous_metadata_digest, metadata_digest_value)):
-                return trust_state_finish(release_path_snapshot, ResultCode.DigestMismatch)
-            return trust_state_finish(release_path_snapshot, ResultCode.TrustStateUnavailable) if SemVer::compare(parsed, previous) > 0
+                return trust_state_finish(lock_fd, ResultCode.DigestMismatch)
+            return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if SemVer::compare(parsed, previous) > 0
             if now.u64() > observed_clock:
                 clock_written: bool = trust_clock_write(clock_path, now.u64(), current_state_digest)
-                return trust_state_finish(release_path_snapshot, ResultCode.TrustStateUnavailable) if not clock_written
-            return trust_state_finish(release_path_snapshot, ResultCode.Ok)
+                return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if not clock_written
+            return trust_state_finish(lock_fd, ResultCode.Ok)
 
         def trust_clock_read(path: darray[u8]&, out: mutable u64&, state_digest: mutable darray[u8]&, missing: mutable bool&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out <- 0

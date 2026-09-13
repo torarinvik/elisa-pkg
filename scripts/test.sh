@@ -1171,12 +1171,14 @@ if ELISAPKG_REGISTRY_DIR="$ROOT" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUS
   exit 1
 fi
 printf 'clock:0\nstate-sha256:%s\n' "$TRUST_STATE_CURRENT_HASH" > "$TRUST_STATE_FILE.clock"
-mkdir "$TRUST_STATE_FILE.lock"
-if ELISAPKG_REGISTRY_DIR="$ROOT" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
-  echo "trust-state lock was ignored" >&2
+TRUST_STATE_LEGACY_LOCK_FILE="$TEST_TMP/trust-state-legacy-lock-$$.state"
+mkdir "$TRUST_STATE_LEGACY_LOCK_FILE.lock"
+if ELISAPKG_REGISTRY_DIR="$ROOT" ELISAPKG_TRUST_STATE="$TRUST_STATE_LEGACY_LOCK_FILE" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
+  echo "legacy trust-state directory lock was accepted" >&2
   exit 1
 fi
-rmdir "$TRUST_STATE_FILE.lock"
+rmdir "$TRUST_STATE_LEGACY_LOCK_FILE.lock"
+python3 "$ROOT/scripts/trust_state_lock_regression.py" "$TRUST_STATE_REPEAT_BIN" "$ROOT" "$TRUST_STATE_FILE"
 printf 'invalid trust state\n' > "$TRUST_STATE_FILE"
 if ELISAPKG_REGISTRY_DIR="$ROOT" ELISAPKG_TRUST_STATE="$TRUST_STATE_FILE" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
   echo "malformed trust state was accepted" >&2

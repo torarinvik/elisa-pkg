@@ -129,7 +129,10 @@ recomputes its digest before returning success. Registry file reads reject
 symlinked descendants by requiring `realpath` equality, and a no-argument
 locked fetch reauthenticates every v3 record before caching it. Each verified
 selection is persisted outside the project in a per-user monotonic trust-state
-file protected by an exclusive lock and durable atomic replacement. On macOS,
+file protected by a persistent regular-file `flock` and durable atomic
+replacement. The lock inode is never unlinked, and the kernel releases its
+ownership after process exit; pre-existing legacy lock directories fail closed
+for manual recovery. On macOS,
 ACL allow entries and unknown ACL tags on both trust directories and regular
 trust files are rejected; deny-only entries are accepted. A network
 transport and publisher delegation remain separate release gates. The local
