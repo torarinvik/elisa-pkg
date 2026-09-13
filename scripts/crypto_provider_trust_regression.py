@@ -54,6 +54,24 @@ def main() -> int:
         if not path.exists():
             raise SystemExit(f"error: {label} is missing: {path}; set ELISA_COMPILER_ROOT")
 
+    native_source = (ROOT / "src/platform_native.elisa").read_text(encoding="utf-8")
+    verifier_start = native_source.find("def verify_ed25519(")
+    verifier_end = native_source.find("    private:", verifier_start)
+    if verifier_start < 0 or verifier_end < 0:
+        raise SystemExit("error: could not locate the native Ed25519 verifier")
+    verifier = native_source[verifier_start:verifier_end]
+    child_start = verifier.find("if pid == 0:")
+    group_setup = verifier.find("if set_process_group() != 0:", child_start)
+    limits_setup = verifier.find("if set_process_limits(2) != 0:", child_start)
+    descriptor_close = verifier.find("if close_inherited_fds() != 0:", child_start)
+    provider_exec = verifier.find('native_execvp("/usr/bin/env", child_argv)', child_start)
+    if not (
+        0 <= child_start < group_setup < limits_setup < descriptor_close < provider_exec
+    ):
+        raise SystemExit(
+            "error: crypto provider launch must close inherited descriptors after child setup and before exec"
+        )
+
     (ROOT / "build").mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="elisapkg-provider-trust-", dir=ROOT / "build") as directory:
         work = Path(directory)
