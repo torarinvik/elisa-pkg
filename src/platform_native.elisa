@@ -2031,13 +2031,13 @@ module PlatformNative:
 
         def expected_non_file_errno(value: i64) -> bool:
             # ENOTDIR/EISDIR cover ordinary files and directories. ELOOP is
-            # returned when the descriptor-relative no-follow walker reaches a
-            # symlink. These are explicit skips; every other probe failure is
-            # an inaccessible package input and must abort collection.
+            # deliberately not an expected skip: source collection must fail
+            # closed on symlinks because the compiler's include reader follows
+            # them, while this walker cannot bind their targets into the digest.
             static if ELISA_TARGET_OS_MACOS:
-                return value == 20 or value == 21 or value == 62
+                return value == 20 or value == 21
             static elif ELISA_TARGET_OS_LINUX:
-                return value == 20 or value == 21 or value == 40
+                return value == 20 or value == 21
             return false
 
         def limit_bytes(value: i64) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
@@ -2208,7 +2208,22 @@ module PlatformNative:
             return length == 1 and raw[offset] == 46 or length == 2 and raw[offset] == 46 and raw[offset + 1] == 46
 
         def skip_directory(path: cstr) -> bool:
-            return path_has_component(path, ".git") or path_has_component(path, ".hg") or path_has_component(path, ".svn") or path_has_component(path, ".elisapkg") or path_has_component(path, "build") or path_has_component(path, "target")
+            # VCS metadata is excluded at any depth and separately denied by
+            # the compiler sandbox. Package state is excluded only at the
+            # package root; nested source directories named build/target (or
+            # .elisapkg) remain fingerprinted compiler inputs.
+            return path_has_component(path, ".git") or path_has_component(path, ".hg") or path_has_component(path, ".svn") or top_level_component_is(path, ".elisapkg") or top_level_component_is(path, "build") or top_level_component_is(path, "target")
+
+        def top_level_component_is(path: cstr, wanted: cstr) -> bool:
+            wanted_length: usize = native_strlen(wanted)
+            length: usize = native_strlen(path)
+            finish: mutable usize = 0
+            while finish < length and path[finish].u8() != 47:
+                finish <- finish + 1.usize()
+            return false if finish != wanted_length
+            for index in 0..<wanted_length |path, wanted|:
+                return false if path[index].u8() != wanted[index].u8()
+            return true
 
         def skip_file(path: cstr) -> bool:
             length: usize = native_strlen(path)

@@ -18,6 +18,7 @@ export ELISA_ALLOW_STALE_STAGE1="${ELISA_ALLOW_STALE_STAGE1:-0}"
 "$BIN" --version | grep -F 'elisapkg 0.1.0' >/dev/null
 "$BIN" doctor | grep -F 'local Ed25519 provider available' >/dev/null
 python3 "$ROOT/scripts/ffi_boundary_test.py"
+python3 "$ROOT/scripts/build_include_regression.py"
 python3 "$ROOT/scripts/ffi_fifo_regression.py"
 python3 "$ROOT/scripts/access_regression.py"
 python3 "$ROOT/scripts/crypto_provider_trust_regression.py"
@@ -2208,13 +2209,33 @@ PY
   "$BIN" resolve >/dev/null
   "$BIN" package >/dev/null
   ln -s main.elisa src/linked-main
-  "$BIN" resolve >/dev/null
-  "$BIN" package --list > "$TEST_TMP/package-files-symlink-check.txt"
-  if grep -F 'src/linked-main' "$TEST_TMP/package-files-symlink-check.txt" >/dev/null; then
-    echo "package listing included a symlinked source path" >&2
+  if "$BIN" resolve >/dev/null 2>&1; then
+    echo "resolution accepted a source symlink that the compiler could follow" >&2
+    exit 1
+  fi
+  if "$BIN" package --list >/dev/null 2>&1; then
+    echo "package listing accepted a source tree containing a symlink" >&2
     exit 1
   fi
   rm src/linked-main
+  "$BIN" resolve --frozen >/dev/null
+  for SOURCE_STATE_DIR in src/.elisapkg src/build src/target; do
+    mkdir -p "$SOURCE_STATE_DIR"
+    SOURCE_STATE_FILE="$SOURCE_STATE_DIR/fingerprinted-input.elisa"
+    printf '%s\n' 'nested package source must be fingerprinted' > "$SOURCE_STATE_FILE"
+    "$BIN" resolve >/dev/null
+    printf '%s\n' '# input mutation probe' >> "$SOURCE_STATE_FILE"
+    if "$BIN" resolve --frozen >/dev/null 2>&1; then
+      echo "frozen resolution omitted nested source input under $SOURCE_STATE_DIR" >&2
+      exit 1
+    else
+      test "$?" -eq 3
+    fi
+    printf '%s\n' 'nested package source must be fingerprinted' > "$SOURCE_STATE_FILE"
+    "$BIN" resolve --frozen >/dev/null
+  done
+  rm -rf src/.elisapkg src/build src/target
+  "$BIN" resolve >/dev/null
   "$BIN" resolve --frozen >/dev/null
   printf '%s' junk >> .elisapkg/package.receipt
   if "$BIN" cache verify >/dev/null 2>&1; then

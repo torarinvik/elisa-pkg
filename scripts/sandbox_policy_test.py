@@ -124,8 +124,9 @@ def run() -> int:
     try:
         project_root = base / "project"
         sandbox_build_root = project_root / ".elisapkg" / "build"
+        sandbox_work_root = sandbox_build_root / "scratch"
         tools_root = base / "tools"
-        sandbox_build_root.mkdir(parents=True)
+        sandbox_work_root.mkdir(parents=True)
         tools_root.mkdir()
         git_metadata_root = project_root / ".git"
         git_metadata_root.mkdir()
@@ -136,7 +137,28 @@ def run() -> int:
         source_file = project_root / "src" / "main.elisa"
         source_file.parent.mkdir()
         source_file.write_text("package source remains readable\n")
-        output_temp = sandbox_build_root / "output-probe"
+        hidden_state_files = (
+            project_root / ".elisapkg" / "stale-input.elisa",
+            project_root / "build" / "stale-input.elisa",
+            project_root / "target" / "stale-input.elisa",
+            project_root / "src" / ".hg",
+            project_root / "src" / ".svn",
+            project_root / "src" / "IMPLEMENTATION_PLAN.md",
+        )
+        for hidden_state_file in hidden_state_files:
+            hidden_state_file.parent.mkdir(parents=True, exist_ok=True)
+            hidden_state_file.write_text("must not become an untracked compiler input\n")
+        scratch_source = sandbox_work_root / "aggregate.elisa"
+        scratch_source.write_text("private generated build input remains readable\n")
+        nested_source_files = (
+            project_root / "src" / ".elisapkg" / "nested-source.elisa",
+            project_root / "src" / "build" / "nested-source.elisa",
+            project_root / "src" / "target" / "nested-source.elisa",
+        )
+        for nested_source_file in nested_source_files:
+            nested_source_file.parent.mkdir(parents=True, exist_ok=True)
+            nested_source_file.write_text("nested source state is fingerprinted\n")
+        output_temp = sandbox_work_root / "output-probe"
         output_temp.write_bytes(b"parent-owned output placeholder\n")
 
         callback_probe = tools_root / "sandbox-callback-probe"
@@ -175,7 +197,7 @@ def run() -> int:
         initial_decoy_stat = callback_decoy_path.lstat()
 
         env["ELISAPKG_TEST_PROJECT_ROOT"] = str(project_root.resolve())
-        env["ELISAPKG_TEST_BUILD_ROOT"] = str(sandbox_build_root.resolve())
+        env["ELISAPKG_TEST_BUILD_ROOT"] = str(sandbox_work_root.resolve())
         env["ELISAPKG_TEST_OUTPUT"] = str(output_temp.resolve())
         env["ELISAPKG_TEST_EXECUTABLE_ONE"] = "/bin/bash"
         env["ELISAPKG_TEST_EXECUTABLE_TWO"] = str(callback_probe.resolve())
@@ -184,6 +206,9 @@ def run() -> int:
         env["ELISAPKG_TEST_GIT_CONFIG"] = str(git_config)
         env["ELISAPKG_TEST_GIT_CONFIG_WORKTREE"] = str(git_config_worktree)
         env["ELISAPKG_TEST_SOURCE_FILE"] = str(source_file)
+        env["ELISAPKG_TEST_STALE_INPUTS"] = "\n".join(str(path) for path in hidden_state_files)
+        env["ELISAPKG_TEST_NESTED_INPUTS"] = "\n".join(str(path) for path in nested_source_files)
+        env["ELISAPKG_TEST_SCRATCH_SOURCE"] = str(scratch_source)
 
         profile_result = subprocess.run(
             [str(profile_probe)],
@@ -199,6 +224,19 @@ def run() -> int:
             raise RuntimeError("generated compiler profile omitted the network denial")
         if b'(allow file-write-data (literal (param "CALLBACK_PATH")))' not in profile_result.stdout:
             raise RuntimeError("generated compiler profile omitted the exact callback data-write rule")
+        for state_root in (
+            project_root / ".elisapkg",
+            project_root / "build",
+            project_root / "target",
+        ):
+            expected_deny = f'(deny file-read* (subpath "{state_root.resolve()}"))'.encode()
+            if expected_deny not in profile_result.stdout:
+                raise RuntimeError(f"generated compiler profile omitted source-state denial for {state_root.name}")
+        expected_scratch_allow = (
+            f'(allow file-read* (subpath "{sandbox_work_root.resolve()}"))'.encode()
+        )
+        if expected_scratch_allow not in profile_result.stdout:
+            raise RuntimeError("generated compiler profile omitted its exact private-scratch read rule")
         credential_rule = re.search(rb'\(deny file-read\* \(regex #"([^\"]+)"\)\)', profile_result.stdout)
         if credential_rule is None:
             raise RuntimeError("generated compiler profile omitted credential-path read denials")
@@ -210,6 +248,9 @@ def run() -> int:
             "/Users/test/.GIT-CREDENTIALS",
             "/Users/test/project/.git/config",
             "/Users/test/project/.git/config.worktree",
+            "/Users/test/project/src/.hg",
+            "/Users/test/project/src/.svn/wc.db",
+            "/Users/test/project/src/IMPLEMENTATION_PLAN.md",
             "/Users/test/id_ECDSA",
             "/Users/test/credentials-backup/token.txt",
             "/Users/test/.env.production/token.txt",
@@ -243,6 +284,22 @@ def run() -> int:
             "    exit 86\n"
             "  fi\n"
             "done\n"
+            'while IFS= read -r path; do\n'
+            '  if ! IFS= read -r _ < "$path"; then\n'
+            "    printf 'SOURCE_STATE_POSITIVE_CONTROL_FAILED\\n'\n"
+            "    exit 87\n"
+            "  fi\n"
+            'done <<EOF\n$ELISAPKG_TEST_STALE_INPUTS\nEOF\n'
+            'while IFS= read -r path; do\n'
+            '  if ! IFS= read -r _ < "$path"; then\n'
+            "    printf 'NESTED_SOURCE_POSITIVE_CONTROL_FAILED\\n'\n"
+            "    exit 89\n"
+            "  fi\n"
+            'done <<EOF\n$ELISAPKG_TEST_NESTED_INPUTS\nEOF\n'
+            'if ! IFS= read -r _ < "$ELISAPKG_TEST_SCRATCH_SOURCE"; then\n'
+            "  printf 'SCRATCH_POSITIVE_CONTROL_FAILED\\n'\n"
+            "  exit 88\n"
+            "fi\n"
             "printf 'PROJECT_FILES_READABLE\\n'\n"
         )
         metadata_read_script = (
@@ -262,6 +319,26 @@ def run() -> int:
             "  exit 85\n"
             "fi\n"
             "printf 'GIT_CONFIG_WORKTREE_READ_DENIED\\n'\n"
+            'while IFS= read -r path; do\n'
+            '  if IFS= read -r _ < "$path"; then\n'
+            "    printf 'SOURCE_STATE_READ_ALLOWED\\n'\n"
+            "    exit 86\n"
+            "  fi\n"
+            'done <<EOF\n$ELISAPKG_TEST_STALE_INPUTS\nEOF\n'
+            "printf 'SOURCE_STATE_READ_DENIED\\n'\n"
+            'while IFS= read -r path; do\n'
+            '  if IFS= read -r _ < "$path"; then\n'
+            "    printf 'NESTED_SOURCE_READ_DENIED\\n'\n"
+            "    exit 90\n"
+            "  fi\n"
+            'done <<EOF\n$ELISAPKG_TEST_NESTED_INPUTS\nEOF\n'
+            "printf 'NESTED_SOURCE_READABLE\\n'\n"
+            'if IFS= read -r _ < "$ELISAPKG_TEST_SCRATCH_SOURCE"; then\n'
+            "  printf 'SANDBOX_SCRATCH_READ_ALLOWED\\n'\n"
+            "else\n"
+            "  printf 'SANDBOX_SCRATCH_READ_DENIED\\n'\n"
+            "  exit 87\n"
+            "fi\n"
         )
         unconfined_metadata_result = subprocess.run(
             ["/bin/bash", "-c", metadata_positive_script],
@@ -334,8 +411,13 @@ def run() -> int:
             or b"SOURCE_READ_ALLOWED\n" not in metadata_output
             or b"GIT_CONFIG_READ_DENIED\n" not in metadata_output
             or b"GIT_CONFIG_WORKTREE_READ_DENIED\n" not in metadata_output
+            or b"SOURCE_STATE_READ_DENIED\n" not in metadata_output
+            or b"NESTED_SOURCE_READABLE\n" not in metadata_output
+            or b"SANDBOX_SCRATCH_READ_ALLOWED\n" not in metadata_output
             or b"GIT_CONFIG_READ_ALLOWED\n" in metadata_output
             or b"GIT_CONFIG_WORKTREE_READ_ALLOWED\n" in metadata_output
+            or b"SOURCE_STATE_READ_ALLOWED\n" in metadata_output
+            or b"NESTED_SOURCE_READ_DENIED\n" in metadata_output
         ):
             raise RuntimeError(
                 "Git metadata read denial probe failed: "
