@@ -151,6 +151,11 @@ On macOS, compiler children run under a deny-by-default Seatbelt profile with ne
 
 Build subprocesses receive a minimal environment through an `env -i` argv invocation, with only the selected compiler bootstrap values, selected Clang path, and isolated HOME/TMPDIR/cache paths. When `ELISAPKG_COMPILER` and `ELISA_STAGE1_BIN` resolve to the expected `scripts/elisac_stage1.sh` and sibling `bin/elisac-stage1` layout, elisapkg invokes stage1 directly because macOS blocks the wrapper's setuid `ps` memory poll in a sandbox. That path skips the wrapper's source-freshness and RSS-polling checks; the binary digest is recorded. Registry credentials and unrelated variables are excluded. Compiler and application children use private process groups, deadlines, CPU/file-size limits, and disabled core dumps. Memory use is not capped: macOS rejects the attempted data-segment/address-space limits for ordinary compiler processes, and its resident-size limit is not reliable. Before publication, compiler output bytes are copied to a fresh parent-owned file so a detached process holding the compiler's old output descriptor cannot modify the cached artifact. Seatbelt does not stop every possible detached descendant, so complete process cleanup remains an isolation requirement. Application processes launched by `run` and `test` do not use the build sandbox.
 
+The `run` and `test` parent terminates and checks remaining members of that
+private process group after the direct child exits or reaches its deadline. A
+descendant that creates a new session can leave the group and escape this
+cleanup.
+
 Builds also force `ELISA_STAGE1_SEMANTIC_GATE=1`; a semantic-check failure is a
 build failure and cannot be replaced by successful object emission. Build
 receipts include SHA-256 identities for the selected compiler, stage1 binary,

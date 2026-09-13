@@ -173,9 +173,11 @@ Compiler children have a ten-minute monotonic deadline; `run` and `test`
 children have a two-minute deadline. Each child enters a private process group,
 and refuses to execute if that group cannot be established. Build execution
 kills and checks the group after normal exit as well as after timeout or wait
-failure, before reading the output artifact. macOS Seatbelt still allows a
-forked child to create a new session, so process-group cleanup does not prove
-that every descendant has exited. The compiler-owned output is therefore
+failure, before reading the output artifact. `run` and `test` apply the same
+cleanup after their direct child exits, times out, or cannot be reaped.
+Process-group cleanup does not prove that every descendant has exited: a
+process can create a new session, and Seatbelt permits this for compiler
+children. The compiler-owned output is therefore
 copied to a fresh parent-owned inode after hashing; the old exact output path
 is unlinked before publication, preventing a retained output descriptor from
 changing the cached artifact. Detached descendants remain a resource/cleanup
