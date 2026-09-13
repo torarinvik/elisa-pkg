@@ -234,19 +234,35 @@ digest while allowing the compiler's include reader to follow them. The
 read-only snapshot root is also explicitly reallowed after its source-state
 and credential denials; writable scratch remains a separate sibling tree.
 
-Generic local package source reads currently open each path component with
-descriptor-relative `openat`, `O_NOFOLLOW`, and `O_NONBLOCK`, then check that
-the final descriptor is a regular file. This rejects symlinks and avoids
-blocking on FIFOs, but the regular-file check happens after `openat`: an
-existing character or block device can receive its device `open` operation
-before the client rejects it. The generic source walk also does not require
-each parent directory to be protected against mutation by another uid. Do not
-treat this path as safe for adversarial trees containing device nodes or for
-source paths inside hostile shared-writable directories. Before making local
-source trees an adversarial input boundary, add a descriptor-pinned
-pre-stat/open/post-identity check and a parent policy that preserves valid
-private temporary directories and elevated reads from user-owned trees; test
-sticky-directory behavior and races on both supported operating systems.
+Generic local package reads, executable checks, file-size checks, chmod, and
+snapshot copies now share a descriptor-relative regular-file opener. It checks
+the leaf with `fstatat(AT_SYMLINK_NOFOLLOW)` before opening, requires regular
+file type, and compares device/inode/type after opening. Every source parent
+is opened without following links and checked through its pinned descriptor;
+group/world-writable directories are rejected except root-owned sticky
+directories such as `/tmp`. On macOS the descriptor check also rejects ACL
+allow entries. Protected directories may be owned by the invoking user, so an
+elevated local install can still read a user's private source tree. `..` stays
+available for local dependencies outside the current package root. Executable
+checks retain the separate toolchain-directory policy, including its narrow
+euid-owned Homebrew `admin`-group exception; package-source reads do not inherit
+that exception.
+
+Linux uses `openat2(OPENAT2_REGULAR)` when supported. On older kernels it pins
+the leaf with `O_PATH`, checks the pinned inode, then reopens that inode through
+`/proc/self/fd`; it fails closed if procfs is unavailable. macOS has no
+equivalent metadata-only open, so it combines the pre-open no-follow stat,
+`O_NOFOLLOW|O_NONBLOCK`, and the post-open inode comparison. This closes the
+stable device-node case and prevents cross-user mutation through ordinary
+parents. POSIX macOS cannot make the pre-stat/open sequence atomic, so a
+same-uid actor or privileged actor able to replace an entry with a device node
+inside a writable sticky directory can still race the open. The local source
+regression covers regular files, symlinks, FIFOs, sockets, `/dev/null`,
+protected and shared-writable parents, sticky `/tmp`, and snapshot cleanup;
+it does not instrument the kernel to prove which vnode open hook ran. Treat
+that narrow macOS replacement race as an open hardening item for hostile
+multi-user ingestion, and keep remote package acquisition disabled until an
+independent review accepts the platform boundary.
 
 Before `exec`, the child also applies a platform resource profile: compiler
 children receive 600 seconds of CPU time and a 128 MiB per-file limit, while

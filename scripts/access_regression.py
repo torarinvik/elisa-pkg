@@ -16,7 +16,7 @@ WRAPPER = Path(os.environ.get("ELISA_COMPILER_WRAPPER", COMPILER_ROOT / "scripts
 RUNTIME = Path(os.environ.get("ELISA_RUNTIME_OBJ", COMPILER_ROOT / "build/runtime/elisacore_runtime.o"))
 
 
-def source_for(check_group_only: bool) -> str:
+def source_for(check_group_only: bool, selected_llvm: Path | None) -> str:
     lines = [
         f'include "{ROOT / "src/platform.elisa"}"',
         "",
@@ -26,6 +26,8 @@ def source_for(check_group_only: bool) -> str:
     ]
     if check_group_only:
         lines.append('    return 3 if Platform::pkg_access("group-only", 1) == 0')
+    if selected_llvm is not None:
+        lines.append(f'    return 4 if Platform::pkg_access("{selected_llvm}", 1) != 0')
     lines.append("    return 0")
     return "\n".join(lines) + "\n"
 
@@ -44,6 +46,13 @@ def main() -> int:
 
     (ROOT / "build").mkdir(parents=True, exist_ok=True)
     check_group_only = os.geteuid() != 0
+    selected_llvm = None
+    for candidate in (Path("/opt/homebrew/opt/llvm/bin/clang"), Path("/usr/local/opt/llvm/bin/clang")):
+        if candidate.exists():
+            resolved = candidate.resolve(strict=True)
+            if resolved.is_file() and os.access(resolved, os.X_OK):
+                selected_llvm = resolved
+                break
     with tempfile.TemporaryDirectory(prefix="elisapkg-access-", dir=ROOT / "build") as raw:
         work = Path(raw)
         executable = work / "exec-target"
@@ -61,7 +70,7 @@ def main() -> int:
 
         probe = work / "access_probe.elisa"
         binary = work / "access_probe"
-        probe.write_text(source_for(check_group_only), encoding="utf-8")
+        probe.write_text(source_for(check_group_only, selected_llvm), encoding="utf-8")
         environment = dict(os.environ)
         environment["ELISA_STAGE1_BIN"] = str(STAGE1)
         environment["ELISA_RUNTIME_OBJ"] = str(RUNTIME)
@@ -85,6 +94,8 @@ def main() -> int:
             raise SystemExit("error: execute access followed a final-component symlink")
         if result.returncode == 3:
             raise SystemExit("error: execute access accepted a group-only mode bit for its owner")
+        if result.returncode == 4:
+            raise SystemExit("error: execute access rejected the selected Homebrew LLVM executable")
         if result.returncode != 0:
             raise SystemExit(f"error: execute-access probe returned unexpected status {result.returncode}")
 

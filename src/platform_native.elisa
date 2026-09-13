@@ -153,6 +153,8 @@ static if ELISA_TARGET_OS_LINUX:
     const dirent_name_offset: usize = 19
     const monotonic_clock_id: i64 = 1
     const directory_not_empty_error: i64 = 39
+    const symlink_error: i64 = 40
+    const unsupported_file_type_error: i64 = 95
     const at_remove_directory: i64 = 512
     const at_no_follow: i64 = 256
     const access_effective_ids: i32 = 512
@@ -160,6 +162,9 @@ static if ELISA_TARGET_OS_LINUX:
     const crypto_key_template: cstr = "/tmp/elisapkg-key.XXXXXX"
     const crypto_message_template: cstr = "/tmp/elisapkg-message.XXXXXX"
     const crypto_signature_template: cstr = "/tmp/elisapkg-signature.XXXXXX"
+    const linux_open_path: i64 = 2097152
+    const linux_openat2_syscall: i64 = 437
+    const linux_openat2_regular: u64 = 4294967296.u64()
 static else:
     const flag_read_only: i64 = 0
     const flag_write_only: i64 = 1
@@ -175,6 +180,8 @@ static else:
     const dirent_name_offset: usize = 21
     const monotonic_clock_id: i64 = 6
     const directory_not_empty_error: i64 = 66
+    const symlink_error: i64 = 62
+    const unsupported_file_type_error: i64 = 45
     const at_remove_directory: i64 = 128
     const at_no_follow: i64 = 32
     const access_effective_ids: i32 = 16
@@ -335,9 +342,8 @@ module PlatformNative:
             for index in 0..<leaf_snapshot.count |leaf_c, leaf_snapshot|:
                 leaf_c.push(leaf_snapshot[index])
             leaf_name: cstr = (&leaf_c[0]).cast[cstr] can Unsafe.PointerCast
-            fd: i64 = native_openat(directory, leaf_name, flags_file_read())
-            open_error: i64 = current_errno()
-            return close_error(directory, negative_value(open_error)) if fd < 0
+            fd: i64 = open_regular_file_at(directory, leaf_name)
+            return close_error(directory, fd) if fd < 0
             return close_two_error(directory, fd, -13) if not trusted_regular_fd(fd, trusted_uid)
             stat: mutable darray[u8] = []
             stat.resize(144)
@@ -550,12 +556,11 @@ module PlatformNative:
                 leaf: mutable darray[u8] = []
                 return -22 if not split_parent_leaf(path, &parent, &leaf)
                 parent_name: cstr = (&parent[0]).cast[cstr] can Unsafe.PointerCast
-                directory: i64 = open_directory_path(parent_name)
+                directory: i64 = open_executable_directory_path(parent_name)
                 return directory if directory < 0
                 leaf_name: cstr = (&leaf[0]).cast[cstr] can Unsafe.PointerCast
-                fd: i64 = native_openat(directory, leaf_name, flags_file_read())
-                open_errno: i64 = current_errno()
-                return close_error(directory, negative_value(open_errno)) if fd < 0
+                fd: i64 = open_regular_file_at(directory, leaf_name)
+                return close_error(directory, fd) if fd < 0
 
                 access_status: i64 = effective_execute_at(directory, leaf_name, fd)
                 return close_two_error(directory, fd, access_status) if access_status != 0
@@ -574,17 +579,16 @@ module PlatformNative:
             for index in 0..<leaf.count |leaf_snapshot, leaf|:
                 leaf_snapshot.push(leaf[index])
             parent_name: cstr = (&parent[0]).cast[cstr] can Unsafe.PointerCast
-            directory: i64 = open_directory_path(parent_name)
+            directory: i64 = open_package_directory_path(parent_name)
             return directory if directory < 0
             leaf_c: mutable darray[u8] = []
             for index in 0..<leaf_snapshot.count |leaf_c, leaf_snapshot|:
                 leaf_c.push(leaf_snapshot[index])
             leaf_c.push(0)
             leaf_name: cstr = (&leaf_c[0]).cast[cstr] can Unsafe.PointerCast
-            fd: i64 = native_openat(directory, leaf_name, flags_read_no_follow())
-            open_error: i64 = current_errno()
+            fd: i64 = open_regular_file_at(directory, leaf_name)
             if fd < 0:
-                return close_error(directory, negative_value(open_error))
+                return close_error(directory, fd)
             return close_two_error(directory, fd, -21) if not regular_fd(fd)
             result: i64 = native_fchmod(fd, mode.i64())
             errno_value: i64 = current_errno()
@@ -1252,9 +1256,8 @@ module PlatformNative:
             for index in 0..<old_leaf_snapshot.count |old_leaf_c, old_leaf_snapshot|:
                 old_leaf_c.push(old_leaf_snapshot[index])
             old_leaf_name: cstr = (&old_leaf_c[0]).cast[cstr] can Unsafe.PointerCast
-            source_fd: i64 = native_openat(old_directory, old_leaf_name, flags_read_no_follow())
-            source_errno: i64 = current_errno()
-            return close_two_error(old_directory, new_directory, negative_value(source_errno)) if source_fd < 0
+            source_fd: i64 = open_regular_file_at(old_directory, old_leaf_name)
+            return close_two_error(old_directory, new_directory, -21 if source_fd == -unsupported_file_type_error else source_fd) if source_fd < 0
             source_regular: bool = trusted_regular_fd(source_fd, expected_uid)
             source_close_status: i64 = native_close(source_fd)
             return close_two_error(old_directory, new_directory, -5) if source_close_status != 0
@@ -1263,8 +1266,9 @@ module PlatformNative:
             for index in 0..<new_leaf_snapshot.count |new_leaf_c, new_leaf_snapshot|:
                 new_leaf_c.push(new_leaf_snapshot[index])
             new_leaf_name: cstr = (&new_leaf_c[0]).cast[cstr] can Unsafe.PointerCast
-            destination_fd: i64 = native_openat(new_directory, new_leaf_name, flags_read_no_follow())
-            destination_errno: i64 = error_code()
+            destination_fd: i64 = open_regular_file_at(new_directory, new_leaf_name)
+            destination_errno: mutable i64 = -destination_fd if destination_fd < 0 else 0
+            destination_errno <- 21 if destination_fd == -unsupported_file_type_error
             if destination_fd >= 0:
                 destination_regular: bool = trusted_regular_fd(destination_fd, expected_uid)
                 destination_close_status: i64 = native_close(destination_fd)
@@ -1546,6 +1550,198 @@ module PlatformNative:
         def flags_file_read() -> i64:
             return flag_read_only + flag_no_follow + flag_close_on_exec + flag_nonblock
 
+        # Pin a candidate without invoking a device driver's open operation.
+        # Linux uses OPENAT2_REGULAR where available and an O_PATH + procfs
+        # reopen fallback on older kernels. macOS has no O_PATH equivalent,
+        # so its protected-parent policy combines pre-stat, O_NOFOLLOW, and a
+        # post-open inode comparison.
+        def open_regular_file_at(directory: i64, leaf_name: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            before: mutable darray[u8] = []
+            before.resize(144)
+            before_raw: mutable void& = (&before[0]).cast[mutable void&] can Unsafe.PointerCast
+            if native_fstatat(directory, leaf_name, before_raw, at_no_follow) != 0:
+                return negative_errno()
+            before_mode: u64 = read_u16(before, stat_mode_offset) & 61440.u64()
+            return package_nonregular_file_error(before_mode) if before_mode != regular_mode
+            return open_regular_file_after_check(directory, leaf_name, before)
+
+        static if ELISA_TARGET_OS_LINUX:
+            def open_regular_file_after_check(directory: i64, leaf_name: cstr, before: darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+                how: mutable darray[u8] = []
+                how.resize(24)
+                for index in 0..<how.count |how|:
+                    how[index] <- 0
+                how_flags: u64 = linux_openat2_regular + flags_file_read().u64()
+                write_u64_le(&how, 0.usize(), how_flags)
+                how_raw: mutable void& = (&how[0]).cast[mutable void&] can Unsafe.PointerCast
+                opened: i64 = native_syscall(linux_openat2_syscall, directory, leaf_name, how_raw, 24)
+                if opened >= 0:
+                    after: mutable darray[u8] = []
+                    after.resize(144)
+                    after_raw: mutable void& = (&after[0]).cast[mutable void&] can Unsafe.PointerCast
+                    if native_fstat(opened, after_raw) != 0:
+                        errno_value: i64 = negative_errno()
+                        return close_error(opened, errno_value)
+                    if (read_u16(after, stat_mode_offset) & 61440.u64()) != regular_mode or read_stat_device(before) != read_stat_device(after) or read_u64(before, 8.usize()) != read_u64(after, 8.usize()):
+                        return close_error(opened, -13)
+                    return opened
+                open_errno: i64 = current_errno()
+                if open_errno != 38 and open_errno != 22:
+                    return negative_value(open_errno)
+                return open_regular_file_at_pinned(directory, leaf_name, before)
+
+        static else:
+            def open_regular_file_after_check(directory: i64, leaf_name: cstr, before: darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+                opened: i64 = native_openat(directory, leaf_name, flags_file_read())
+                return negative_errno() if opened < 0
+                after: mutable darray[u8] = []
+                after.resize(144)
+                after_raw: mutable void& = (&after[0]).cast[mutable void&] can Unsafe.PointerCast
+                if native_fstat(opened, after_raw) != 0:
+                    errno_value: i64 = negative_errno()
+                    return close_error(opened, errno_value)
+                after_mode: u64 = read_u16(after, stat_mode_offset) & 61440.u64()
+                if after_mode != regular_mode:
+                    return close_error(opened, package_nonregular_file_error(after_mode))
+                if read_stat_device(before) != read_stat_device(after) or read_u64(before, 8.usize()) != read_u64(after, 8.usize()):
+                    return close_error(opened, -13)
+                return opened
+
+        static if ELISA_TARGET_OS_LINUX:
+            def open_regular_file_at_pinned(directory: i64, leaf_name: cstr, before: darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+                pin_flags: i64 = linux_open_path + flag_no_follow + flag_close_on_exec
+                pinned: i64 = native_openat(directory, leaf_name, pin_flags)
+                return negative_errno() if pinned < 0
+                pinned_stat: mutable darray[u8] = []
+                pinned_stat.resize(144)
+                pinned_raw: mutable void& = (&pinned_stat[0]).cast[mutable void&] can Unsafe.PointerCast
+                if native_fstat(pinned, pinned_raw) != 0:
+                    errno_value: i64 = negative_errno()
+                    return close_error(pinned, errno_value)
+                pinned_mode: u64 = read_u16(pinned_stat, stat_mode_offset) & 61440.u64()
+                if pinned_mode != regular_mode:
+                    return close_error(pinned, package_nonregular_file_error(pinned_mode))
+                if read_stat_device(before) != read_stat_device(pinned_stat) or read_u64(before, 8.usize()) != read_u64(pinned_stat, 8.usize()):
+                    return close_error(pinned, -13)
+
+                descriptor_path: mutable darray[u8] = []
+                for byte in [47, 112, 114, 111, 99, 47, 115, 101, 108, 102, 47, 102, 100, 47]:
+                    descriptor_path.push(byte.u8())
+                digits: mutable darray[u8] = []
+                remaining: mutable u64 = pinned.u64()
+                if remaining == 0.u64():
+                    digits.push(48.u8())
+                while remaining > 0.u64() |digits, remaining|:
+                    digits.push(48 + (remaining % 10.u64()).u8())
+                    remaining <- remaining / 10.u64()
+                for index in 0..<digits.count |descriptor_path, digits|:
+                    descriptor_path.push(digits[digits.count - 1.usize() - index])
+                descriptor_path.push(0)
+                descriptor_name: cstr = (&descriptor_path[0]).cast[cstr] can Unsafe.PointerCast
+                reopened: i64 = native_open(descriptor_name, flag_read_only + flag_nonblock + flag_close_on_exec)
+                reopen_errno: i64 = current_errno()
+                if reopened < 0:
+                    close_status: i32 = native_close(pinned)
+                    return -5 if close_status != 0
+                    return negative_value(reopen_errno)
+                reopened_stat: mutable darray[u8] = []
+                reopened_stat.resize(144)
+                reopened_raw: mutable void& = (&reopened_stat[0]).cast[mutable void&] can Unsafe.PointerCast
+                if native_fstat(reopened, reopened_raw) != 0:
+                    errno_value: i64 = negative_errno()
+                    return close_two_error(pinned, reopened, errno_value)
+                same: bool = (read_u16(reopened_stat, stat_mode_offset) & 61440.u64()) == regular_mode and read_stat_device(pinned_stat) == read_stat_device(reopened_stat) and read_u64(pinned_stat, 8.usize()) == read_u64(reopened_stat, 8.usize())
+                close_status: i32 = native_close(pinned)
+                if not same or close_status != 0:
+                    _ = native_close(reopened)
+                    return -5 if close_status != 0 else -13
+                return reopened
+
+        def package_source_directory_fd(fd: i64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            stat: mutable darray[u8] = []
+            stat.resize(144)
+            raw: mutable void& = (&stat[0]).cast[mutable void&] can Unsafe.PointerCast
+            return false if native_fstat(fd, raw) != 0
+            mode: u64 = read_u16(stat, stat_mode_offset)
+            owner: u64 = read_u32(stat, stat_uid_offset)
+            return false if (mode & 61440.u64()) != directory_mode
+            if (mode & 18.u64()) != 0.u64():
+                # The only writable shared directory accepted for source
+                # traversal is a root-owned sticky directory (for example,
+                # /tmp). The sticky bit limits replacement to the owner of
+                # each entry; O_NOFOLLOW/nonblocking checks handle symlinks
+                # and FIFOs at the leaf.
+                return false if owner != 0.u64() or (mode & 512.u64()) == 0.u64()
+            return trusted_acl_fd(fd)
+
+        def executable_source_directory_fd(fd: i64, expected_uid: u64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return true if package_source_directory_fd(fd)
+            return crypto_trusted_directory_fd(fd, expected_uid)
+
+        def open_executable_directory_component(directory: i64, component: cstr, expected_uid: u64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            before: mutable darray[u8] = []
+            before.resize(144)
+            before_raw: mutable void& = (&before[0]).cast[mutable void&] can Unsafe.PointerCast
+            if native_fstatat(directory, component, before_raw, at_no_follow) != 0:
+                return negative_errno()
+            before_mode: u64 = read_u16(before, stat_mode_offset) & 61440.u64()
+            if before_mode != directory_mode:
+                return -symlink_error if before_mode == symlink_mode
+                return -20
+            next: i64 = native_openat(directory, component, flags_directory() + flag_no_follow)
+            return negative_errno() if next < 0
+            after: mutable darray[u8] = []
+            after.resize(144)
+            after_raw: mutable void& = (&after[0]).cast[mutable void&] can Unsafe.PointerCast
+            if native_fstat(next, after_raw) != 0:
+                errno_value: i64 = negative_errno()
+                return close_error(next, errno_value)
+            if (read_u16(after, stat_mode_offset) & 61440.u64()) != directory_mode or read_stat_device(before) != read_stat_device(after) or read_u64(before, 8.usize()) != read_u64(after, 8.usize()) or not executable_source_directory_fd(next, expected_uid):
+                return close_error(next, -13)
+            return next
+
+        def open_executable_directory_path(path: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            length: usize = native_strlen(path)
+            return -22 if length == 0 or length > 4096
+            path_copy: mutable darray[u8] = []
+            for index in 0..<length |path_copy, path|:
+                path_copy.push(path[index].u8())
+            path_copy.push(0)
+            absolute: bool = path_copy[0] == 47
+            expected_uid: u64 = native_geteuid().u64()
+            directory: mutable i64 = native_open("/" if absolute else ".", flags_directory())
+            return -error_code() if directory < 0
+            return close_error(directory, -13) if not executable_source_directory_fd(directory, expected_uid)
+            start: mutable usize = 0.usize()
+            while start < length and path_copy[start] == 47 |path_copy, start|:
+                start <- start + 1.usize()
+            while start < length:
+                finish: mutable usize = start
+                while finish < length and path_copy[finish] != 47 |path_copy, start, finish|:
+                    finish <- finish + 1.usize()
+                path_copy[finish] <- 0
+                component: cstr = (&path_copy[start]).cast[cstr] can Unsafe.PointerCast
+                if not cstr_equal(component, "."):
+                    next: i64 = open_executable_directory_component(directory, component, expected_uid)
+                    return close_error(directory, next) if next < 0
+                    return close_error(next, -5) if native_close(directory) != 0
+                    directory <- next
+                start <- finish + 1.usize()
+                while start < length and path_copy[start] == 47 |path_copy, start|:
+                    start <- start + 1.usize()
+            return directory
+
+        def package_nonregular_file_error(mode: u64) -> i64:
+            return -21 if mode == directory_mode
+            return -symlink_error if mode == symlink_mode
+            return -unsupported_file_type_error
+
+        def write_u64_le(value: mutable darray[u8]&, offset: usize, number: u64):
+            remaining: mutable u64 = number
+            for index in 0..<8 |value, offset, remaining|:
+                value[offset + index] <- (remaining % 256.u64()).u8()
+                remaining <- remaining / 256.u64()
+
         def flags_read_write_create_exclusive() -> i64:
             return flag_read_write + flag_create + flag_exclusive + flag_no_follow + flag_close_on_exec
 
@@ -1621,6 +1817,58 @@ module PlatformNative:
                     start <- start + 1.usize()
             return directory
 
+        def open_package_directory_component(directory: i64, component: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            before: mutable darray[u8] = []
+            before.resize(144)
+            before_raw: mutable void& = (&before[0]).cast[mutable void&] can Unsafe.PointerCast
+            if native_fstatat(directory, component, before_raw, at_no_follow) != 0:
+                return negative_errno()
+            before_mode: u64 = read_u16(before, stat_mode_offset) & 61440.u64()
+            if before_mode != directory_mode:
+                return -symlink_error if before_mode == symlink_mode
+                return -20
+            next: i64 = native_openat(directory, component, flags_directory() + flag_no_follow)
+            return negative_errno() if next < 0
+            after: mutable darray[u8] = []
+            after.resize(144)
+            after_raw: mutable void& = (&after[0]).cast[mutable void&] can Unsafe.PointerCast
+            if native_fstat(next, after_raw) != 0:
+                errno_value: i64 = negative_errno()
+                return close_error(next, errno_value)
+            if (read_u16(after, stat_mode_offset) & 61440.u64()) != directory_mode or read_stat_device(before) != read_stat_device(after) or read_u64(before, 8.usize()) != read_u64(after, 8.usize()) or not package_source_directory_fd(next):
+                return close_error(next, -13)
+            return next
+
+        def open_package_directory_path(path: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            length: usize = native_strlen(path)
+            return -22 if length == 0 or length > 4096
+            path_copy: mutable darray[u8] = []
+            for index in 0..<length |path_copy, path|:
+                path_copy.push(path[index].u8())
+            path_copy.push(0)
+            absolute: bool = path_copy[0] == 47
+            directory: mutable i64 = native_open("/" if absolute else ".", flags_directory())
+            return -error_code() if directory < 0
+            return close_error(directory, -13) if not package_source_directory_fd(directory)
+            start: mutable usize = 0.usize()
+            while start < length and path_copy[start] == 47 |path_copy, start|:
+                start <- start + 1.usize()
+            while start < length:
+                finish: mutable usize = start
+                while finish < length and path_copy[finish] != 47 |path_copy, start, finish|:
+                    finish <- finish + 1.usize()
+                path_copy[finish] <- 0
+                component: cstr = (&path_copy[start]).cast[cstr] can Unsafe.PointerCast
+                if not cstr_equal(component, "."):
+                    next: i64 = open_package_directory_component(directory, component)
+                    return close_error(directory, next) if next < 0
+                    return close_error(next, -5) if native_close(directory) != 0
+                    directory <- next
+                start <- finish + 1.usize()
+                while start < length and path_copy[start] == 47 |path_copy, start|:
+                    start <- start + 1.usize()
+            return directory
+
         def open_package_file(path: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             length: usize = native_strlen(path)
             return -22 if length == 0 or length > 4096
@@ -1631,6 +1879,7 @@ module PlatformNative:
             absolute: bool = path_copy[0] == 47
             directory: mutable i64 = native_open("/" if absolute else ".", flags_directory())
             return -error_code() if directory < 0
+            return close_error(directory, -13) if not package_source_directory_fd(directory)
             start: mutable usize = 0.usize()
             while start < length and path_copy[start] == 47 |path_copy, start|:
                 start <- start + 1.usize()
@@ -1641,19 +1890,22 @@ module PlatformNative:
                 had_slash: bool = finish < length
                 path_copy[finish] <- 0
                 part: cstr = (&path_copy[start]).cast[cstr] can Unsafe.PointerCast
-                # Package manifests may intentionally reference a local
-                # dependency outside the current project (for example,
-                # "../shared"), so this resolver accepts parent components.
-                # Every component is still opened descriptor-relatively with
-                # no-follow semantics; callers validate the resulting path
-                # against their package-root policy before using it.
                 return close_error(directory, -22) if cstr_equal(part, "")
-                flags: i64 = flags_file_read() + (flag_directory if had_slash else 0)
-                next: i64 = native_openat(directory, part, flags)
-                return close_error(directory, -error_code()) if next < 0
-                return close_error(next, -5) if native_close(directory) != 0
-                directory <- next
-                return directory if not had_slash
+                if had_slash:
+                    if not cstr_equal(part, "."):
+                        next: i64 = open_package_directory_component(directory, part)
+                        return close_error(directory, next) if next < 0
+                        return close_error(next, -5) if native_close(directory) != 0
+                        directory <- next
+                else:
+                    return close_result(directory, -21) if cstr_equal(part, ".")
+                    result: i64 = open_regular_file_at(directory, part)
+                    return close_error(directory, result) if result < 0
+                    close_status: i32 = native_close(directory)
+                    if close_status != 0:
+                        _ = native_close(result)
+                        return -5
+                    return result
                 start <- finish + 1.usize()
                 while start < length and path_copy[start] == 47 |path_copy, start|:
                     start <- start + 1.usize()
@@ -1688,9 +1940,8 @@ module PlatformNative:
                 leaf_c.push(leaf_snapshot[index])
             leaf_c.push(0)
             leaf_name: cstr = (&leaf_c[0]).cast[cstr] can Unsafe.PointerCast
-            fd: i64 = native_openat(directory, leaf_name, flags_file_read())
-            open_errno: i64 = current_errno()
-            return close_error(directory, negative_value(open_errno)) if fd < 0
+            fd: i64 = open_regular_file_at(directory, leaf_name)
+            return close_error(directory, fd) if fd < 0
             return close_two_error(directory, fd, -13) if not trusted_regular_fd(fd, expected_uid)
             fd_stat: mutable darray[u8] = []
             fd_stat.resize(144)
@@ -1788,9 +2039,8 @@ module PlatformNative:
             for index in 0..<old_leaf_snapshot.count |old_leaf_c, old_leaf_snapshot|:
                 old_leaf_c.push(old_leaf_snapshot[index])
             old_leaf_name: cstr = (&old_leaf_c[0]).cast[cstr] can Unsafe.PointerCast
-            source_fd: i64 = native_openat(old_directory, old_leaf_name, flags_read_no_follow())
-            source_errno: i64 = current_errno()
-            return close_two_error(old_directory, new_directory, negative_value(source_errno)) if source_fd < 0
+            source_fd: i64 = open_regular_file_at(old_directory, old_leaf_name)
+            return close_two_error(old_directory, new_directory, -21 if source_fd == -unsupported_file_type_error else source_fd) if source_fd < 0
             source_regular: bool = trusted_regular_fd(source_fd, expected_uid)
             source_close_status: i64 = native_close(source_fd)
             return close_two_error(old_directory, new_directory, -5) if source_close_status != 0
@@ -1889,7 +2139,7 @@ module PlatformNative:
             directory: i64 = open_crypto_trusted_directory(parent_name, expected_uid)
             return false if directory < 0
             leaf_name: cstr = (&leaf[0]).cast[cstr] can Unsafe.PointerCast
-            fd: i64 = native_openat(directory, leaf_name, flags_file_read())
+            fd: i64 = open_regular_file_at(directory, leaf_name)
             if fd < 0:
                 _ = native_close(directory)
                 return false
@@ -2174,7 +2424,7 @@ module PlatformNative:
             return -22 if not snapshot_path_leaf(source_name, &source_leaf) or not snapshot_path_leaf(destination_name, &destination_leaf)
             return -13 if PackagePathPolicy::credential_root_forbidden(source_name) or PackagePathPolicy::reserved_source_path_forbidden(source_leaf)
 
-            source_fd: mutable i64 = open_directory_path((&source_name[0]).cast[cstr] can Unsafe.PointerCast)
+            source_fd: mutable i64 = open_package_directory_path((&source_name[0]).cast[cstr] can Unsafe.PointerCast)
             return source_fd if source_fd < 0
             destination_fd: mutable i64 = open_directory_path((&destination_name[0]).cast[cstr] can Unsafe.PointerCast)
             if destination_fd < 0:
@@ -2216,7 +2466,7 @@ module PlatformNative:
             # the pinned descriptor. Copying itself remains anchored to the
             # original descriptor, so a replaced root can never redirect a
             # file open outside that tree.
-            current_source_fd: i64 = open_directory_path((&source_name[0]).cast[cstr] can Unsafe.PointerCast)
+            current_source_fd: i64 = open_package_directory_path((&source_name[0]).cast[cstr] can Unsafe.PointerCast)
             if current_source_fd < 0:
                 return close_two_error(source_fd, destination_fd, current_source_fd)
             current_source_stat: mutable darray[u8] = []
@@ -2280,12 +2530,11 @@ module PlatformNative:
             source_parent: i64 = snapshot_open_parent(source_root, relative, &source_parent_path, &source_leaf_offset, false, &source_created_directories)
             return source_parent if source_parent < 0
             source_leaf: cstr = (&source_parent_path[source_leaf_offset]).cast[cstr] can Unsafe.PointerCast
-            source_file: i64 = native_openat(source_parent, source_leaf, flags_file_read())
-            source_open_errno: i64 = negative_errno()
+            source_file: i64 = open_regular_file_at(source_parent, source_leaf)
             if source_file < 0:
                 close_status: i64 = native_close(source_parent)
                 return -5 if close_status != 0
-                return source_open_errno
+                return source_file
             regular: bool = regular_fd(source_file)
             if not regular:
                 return close_two_error(source_parent, source_file, -21)
@@ -2459,7 +2708,7 @@ module PlatformNative:
                         created_directories.push(0)
                     elif mkdir_errno != 17:
                         return close_error(directory, -mkdir_errno)
-                next: i64 = native_openat(directory, component, flags_directory() + flag_no_follow)
+                next: i64 = open_package_directory_component(directory, component) if not create_missing else native_openat(directory, component, flags_directory() + flag_no_follow)
                 if next < 0:
                     open_errno: i64 = negative_errno()
                     cleanup_status: i32 = native_unlinkat(directory, component, at_remove_directory) if created else 0
@@ -2545,7 +2794,7 @@ module PlatformNative:
             # Resolve the directory through the descriptor-relative no-follow
             # walker before enumeration. Opening `path` with `opendir` here
             # would re-follow a swapped symlink after the caller's probe.
-            directory_fd: i64 = open_directory_path(path)
+            directory_fd: i64 = open_package_directory_path(path)
             return false if directory_fd < 0
             duplicate: i64 = native_dup(directory_fd)
             if duplicate < 0:
@@ -2589,7 +2838,7 @@ module PlatformNative:
                         return directory_failure(stream) if not relative_path_under(root, child_name, &relative_policy_path)
                         continue if PackagePathPolicy::credential_path_forbidden(relative_policy_path)
                         continue if PackagePathPolicy::reserved_source_path_forbidden(relative_policy_path)
-                        directory_probe: i64 = open_directory_path(child_name)
+                        directory_probe: i64 = open_package_directory_path(child_name)
                         if directory_probe >= 0:
                             return directory_failure(stream) if native_close(directory_probe) != 0
                             return directory_failure(stream) if not collect_directory(root, child_name, out, depth + 1.usize(), visited_nodes)
