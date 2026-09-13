@@ -93,6 +93,12 @@ invalid signatures, revoked keys, and unauthorized namespaces through the
 complete selected TUF chain. Namespace authorization must cover the exact
 deterministic archive target bytes.
 
+The CI workflow now emits a GitHub provenance attestation for the tested
+main-branch candidate executable, manifest, archive, and checksum. This is a
+separate client-build identity record: the `Trust` module does not fetch or
+verify it, it does not authorize an Elisa package namespace or publication,
+and it does not replace the pending TUF and publisher-verification work.
+
 The `Trust` module exposes metadata prechecks for expiry, rollback, namespace,
 and algorithm policy plus an exact-byte detached Ed25519 verification gate.
 Verified local-registry selections persist monotonic package/version/archive-
