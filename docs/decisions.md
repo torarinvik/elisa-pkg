@@ -146,11 +146,15 @@ fail closed. Owner, mode, no-follow, and supported ACL checks apply to the
 snapshot, signature, and trust root. The authorized signer asserts that the
 list is complete; a first-use client cannot know about a newer unseen signed
 generation, so expiry bounds replay. Same-user deletion or corruption can
-still deny service. Trust history format v3 keys package history by
+still deny service. Trust history format v4 keys package history by
 registry-root hash and package name, and binds version, archive digest, and
-metadata digest. Default per-registry paths safely migrate v2 unscoped package
-rows on the next state update; ambiguous unscoped rows in an explicit override
-fail closed. Legacy v1 history without metadata identity remains rejected.
+metadata digest. It also pins each registry path to the SHA-256 fingerprint of
+the configured Ed25519 key. Default per-registry paths migrate v2/v3 history on
+the next state update; because these formats contain no key fingerprint, the
+first v4 pin is trust-on-first-use. Deployments that require signer continuity
+across this migration must preserve and verify the expected key out of band.
+Ambiguous unscoped rows in an explicit override fail closed. Legacy v1 history
+without metadata identity remains rejected.
 Successful offline verification advances the state-bound clock only after
 signed metadata and archive checks, and rechecks expiry using the time sampled
 while holding the trust-state lock. This fixture tests local trust-boundary

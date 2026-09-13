@@ -79,12 +79,16 @@ After archive verification, each signed registry selection is recorded in a
 user-owned trust-state file outside the project. The default location is
 `$HOME/.local/share/elisapkg/trust/<sha256-of-registry-root>.state`; set
 `ELISAPKG_TRUST_STATE` to an absolute path for an isolated location. Updates
-use an exclusive lock and durable atomic replacement. Trust-state format v3
+use an exclusive lock and durable atomic replacement. Trust-state format v4
 keys package history by registry-root hash and package name, and binds each
 package/version to both its archive and signed metadata digests; a lower
 version or same-version change to either digest is rejected even if the
-project lockfile is deleted or restored. Default per-registry paths safely
-migrate v2 package rows on the next state update. A v2 override containing
+project lockfile is deleted or restored. It also pins each registry path to
+the SHA-256 fingerprint of its configured Ed25519 key, so later key changes
+fail closed. Default per-registry paths migrate v2/v3 history on the next state
+update; because those formats contain no key fingerprint, the first v4 pin is
+trust-on-first-use. Preserve and verify the expected key out of band when
+migrating deployments that require signer continuity. A v2 override containing
 unscoped package rows fails closed because those rows do not identify their
 registry; v1 records without metadata identity remain rejected. The adjacent
 `.clock` sidecar durably records the greatest wall-clock value observed for the
