@@ -170,6 +170,20 @@ def same(value: darray[u8]&, expected: cstr) -> bool:
         return false if value[index] != expected[index].u8()
     return true
 
+def push_decimal(out: mutable darray[u8]&, value: u64) -> void can[Memory.Allocate, Abort.Panic]:
+    digits: mutable darray[u8] = []
+    number: mutable u64 = value
+    if number == 0:
+        digits.push(48)
+    while number > 0 |digits, number|:
+        digit: u8 = (48.u64() + number % 10.u64()).u8()
+        digits.push(digit)
+        number <- number / 10.u64()
+    cursor: mutable usize = digits.count
+    while cursor > 0.usize() |out, digits, cursor|:
+        cursor <- cursor - 1.usize()
+        out.push(digits[cursor])
+
 def main() -> i64:
     catalog: mutable darray[u8] = [49, 46, 48, 46, 48, 10, 49, 46, 53, 46, 48, 10, 49, 46, 53, 46, 48, 45, 97, 108, 112, 104, 97, 10, 50, 46, 48, 46, 48, 10]
     caret: mutable darray[u8] = [94, 49, 46, 48, 46, 48]
@@ -183,6 +197,19 @@ def main() -> i64:
     return 5 if Resolve::select_highest_version(duplicate, caret, &selected)
     invalid: mutable darray[u8] = [49, 46, 48, 10]
     return 6 if Resolve::select_highest_version(invalid, caret, &selected)
+    # Exercise the full documented catalog limit so duplicate tracking remains
+    # bounded at the largest metadata input, not only on short happy paths.
+    large_catalog: mutable darray[u8] = []
+    for minor in 0..<4096 |large_catalog|:
+        large_catalog.push(48)
+        large_catalog.push(46)
+        push_decimal(&large_catalog, minor.u64())
+        large_catalog.push(46)
+        large_catalog.push(48)
+        large_catalog.push(10)
+    at_least_zero: mutable darray[u8] = [62, 61, 48, 46, 48, 46, 48]
+    return 7 if not Resolve::select_highest_version(large_catalog, at_least_zero, &selected)
+    return 8 if not same(selected, "0.4095.0")
     return 0
 EOF
 ELISA_STAGE1_BIN="${ELISA_STAGE1_BIN:-$ELISA_COMPILER_ROOT/bin/elisac-stage1}" \

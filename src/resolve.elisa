@@ -21,7 +21,11 @@ module Resolve:
             found: mutable bool = false
             best_text: mutable darray[u8] = []
             best: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-            seen: mutable darray[u8] = []
+            seen_slots: mutable darray[usize] = []
+            seen_slots.resize(8192.usize())
+            seen_versions: mutable darray[u8] = []
+            seen_offsets: mutable darray[usize] = []
+            seen_hashes: mutable darray[u64] = []
             candidates: mutable usize = 0.usize()
             while cursor < catalog.count:
                 finish: mutable usize = cursor
@@ -35,10 +39,7 @@ module Resolve:
                     candidate_text.push(catalog[index])
                 candidate: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
                 return false if not SemVer::parse(candidate_text, &candidate)
-                return false if version_seen(seen, candidate_text)
-                for index in 0..<candidate_text.count |seen, candidate_text|:
-                    seen.push(candidate_text[index])
-                seen.push(0)
+                return false if not version_record_unique(&seen_slots, &seen_versions, &seen_offsets, &seen_hashes, candidate_text)
                 candidates <- candidates + 1.usize()
                 return false if candidates > 4096.usize()
                 if SemVer::matches(parsed_requirement, candidate) and (not found or SemVer::compare(candidate, best) > 0):
@@ -54,15 +55,46 @@ module Resolve:
             return found
 
     private:
-        def version_seen(seen: darray[u8]&, wanted: darray[u8]&) -> bool:
-            cursor: mutable usize = 0.usize()
-            while cursor < seen.count:
-                finish: mutable usize = cursor
-                while finish < seen.count and seen[finish] != 0 |seen, finish|:
-                    finish <- finish + 1.usize()
-                return true if finish - cursor == wanted.count and slice_equal(seen, cursor, finish, wanted)
-                cursor <- finish + 1.usize()
+        const version_hash_capacity: usize = 8192
+        const version_hash_probe_limit: usize = 32
+
+        # Bounded open addressing avoids rescanning every earlier catalog entry
+        # for each version. A deliberately collision-heavy catalog is rejected
+        # after a small fixed number of probes, so attacker-controlled text
+        # cannot turn this lookup back into an unbounded quadratic scan.
+        def version_record_unique(slots: mutable darray[usize]&, versions: mutable darray[u8]&, offsets: mutable darray[usize]&, hashes: mutable darray[u64]&, wanted: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            return false if slots.count != version_hash_capacity or offsets.count >= 4096.usize() or hashes.count != offsets.count
+            hash: u64 = version_hash(wanted)
+            slot: mutable usize = (hash & (version_hash_capacity - 1.usize()).u64()).usize()
+            probes: mutable usize = 0.usize()
+            while probes < version_hash_probe_limit:
+                existing_index: usize = slots[slot]
+                if existing_index == 0.usize():
+                    offsets.push(versions.count)
+                    hashes.push(hash)
+                    for index in 0..<wanted.count |versions, wanted|:
+                        versions.push(wanted[index])
+                    versions.push(0)
+                    slots[slot] <- offsets.count
+                    return true
+                seen_index: usize = existing_index - 1.usize()
+                return false if hashes[seen_index] == hash and version_text_equal(versions, offsets[seen_index], wanted)
+                slot <- (slot + 1.usize()) & (version_hash_capacity - 1.usize())
+                probes <- probes + 1.usize()
             return false
+
+        def version_text_equal(versions: darray[u8]&, start: usize, wanted: darray[u8]&) -> bool:
+            return false if start >= versions.count
+            finish: mutable usize = start
+            while finish < versions.count and versions[finish] != 0 |versions, finish|:
+                finish <- finish + 1.usize()
+            return slice_equal(versions, start, finish, wanted)
+
+        def version_hash(value: darray[u8]&) -> u64:
+            hash: mutable u64 = 14695981039346656037
+            for index in 0..<value.count |value, hash|:
+                hash <- (hash ^ value[index].u64()) * 1099511628211
+            return hash
 
         def slice_equal(value: darray[u8]&, start: usize, finish: usize, wanted: darray[u8]&) -> bool:
             return false if finish < start or finish - start != wanted.count
