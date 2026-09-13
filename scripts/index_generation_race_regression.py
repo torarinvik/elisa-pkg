@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prove that a stale selected release cannot commit after a newer index wins."""
+"""Check signer authorization and stale selections against signed index updates."""
 
 from __future__ import annotations
 
@@ -39,6 +39,18 @@ def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.
     index_digest: mutable darray[u8] = []
     index_identity: mutable darray[u8] = []
     status: Registry::ResultCode = Registry::read_index(package, &versions, &generation, &index_digest, &index_identity)
+    if Platform::pkg_cstr_equal("{mode}", "unauthorized"):
+        read_rejected: bool = status == Registry::ResultCode.InvalidSignature
+        selected: mutable darray[u8] = []
+        archive: mutable darray[u8] = []
+        digest: mutable darray[u8] = []
+        metadata: mutable darray[u8] = []
+        archive_size: mutable u64 = 0
+        requirement: mutable darray[u8] = [49,46,48,46,48]
+        previous: Model::Version = Model::Version{{major: 0, minor: 0, patch: 0, prerelease: false}}
+        resolved: Registry::ResultCode = Registry::resolve_metadata(package, requirement, previous, &selected, &archive, &digest, &archive_size, &metadata)
+        return 0 if read_rejected and resolved == Registry::ResultCode.InvalidSignature
+        return 11
     return 10 if status != Registry::ResultCode.Ok
 
     return 0 if Platform::pkg_cstr_equal("{mode}", "advance")
@@ -104,12 +116,16 @@ def main() -> int:
         trust_dir = work / "trust"
         trust_dir.mkdir(mode=0o700)
         private_key = trust_dir / "private.pem"
+        unauthorized_private_key = trust_dir / "unauthorized-private.pem"
         public_der = trust_dir / "public.der"
         public_key = trust_dir / "public.raw"
         state = trust_dir / "state"
         subprocess.run([OPENSSL, "genpkey", "-algorithm", "ED25519", "-out", str(private_key)],
                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         private_key.chmod(0o600)
+        subprocess.run([OPENSSL, "genpkey", "-algorithm", "ED25519", "-out", str(unauthorized_private_key)],
+                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        unauthorized_private_key.chmod(0o600)
         subprocess.run([OPENSSL, "pkey", "-in", str(private_key), "-pubout", "-outform", "DER",
                         "-out", str(public_der)], check=True, stdout=subprocess.DEVNULL,
                        stderr=subprocess.PIPE)
@@ -127,7 +143,7 @@ def main() -> int:
         compiler_env["ELISA_ALLOW_STALE_STAGE1"] = compiler_env.get("ELISA_ALLOW_STALE_STAGE1", "0")
         compiler_env["ELISA_RUNTIME_OBJ"] = compiler_env.get(
             "ELISA_RUNTIME_OBJ", str(COMPILER_ROOT / "build/runtime/elisacore_runtime.o"))
-        for mode in ("stale", "advance", "commit"):
+        for mode in ("unauthorized", "stale", "advance", "commit"):
             source = work / f"probe-{mode}.elisa"
             source.write_text(PROBE_SOURCE.format(
                 registry=(ROOT / "src/registry.elisa").as_posix(), mode=mode))
@@ -142,6 +158,16 @@ def main() -> int:
             "ELISAPKG_REGISTRY_TRUST_ROOT": str(public_key),
             "ELISAPKG_TRUST_STATE": str(state),
         })
+        sign_index(registry, unauthorized_private_key, 1, "1.0.0")
+        unauthorized = subprocess.run([str(binaries["unauthorized"])], env=environment,
+                                       capture_output=True, timeout=10, check=False)
+        if unauthorized.returncode != 0:
+            raise SystemExit(
+                "error: a valid signature from a key outside the configured trust root "
+                f"was accepted at the index or resolution boundary: {unauthorized.returncode}; "
+                f"{unauthorized.stderr!r}"
+            )
+
         sign_index(registry, private_key, 1, "1.0.0")
         stale = subprocess.Popen([str(binaries["stale"])], env=environment, stdin=subprocess.PIPE,
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -199,7 +225,7 @@ def main() -> int:
                 f"(exit {stale.returncode}; stderr={error!r})"
             )
 
-    print("signed index generation race regression passed")
+    print("signed index signer authorization and generation race regressions passed")
     return 0
 
 
