@@ -5,7 +5,8 @@ verifies local path sources against the lockfile. When `ELISAPKG_REGISTRY_DIR`
 is configured, `fetch PACKAGE REQUIREMENT` also verifies detached Ed25519
 metadata, expiry, archive size, and archive digest for a local registry
 artifact. Remote fetches, real `publish`, and remote `install NAME` fail with
-security status 5 until transport and publisher authorization are configured.
+security status 5 until the TUF verifier, provider, network transport, and
+publisher authorization are implemented and reviewed.
 `publish --dry-run` is a local validation-only preflight and does not cross that
 trust boundary.
 `install --local` is a separate, offline path
@@ -13,17 +14,16 @@ that only publishes the current package's verified build output under the
 user-selected prefix. This is an intentional fail-closed boundary, not a
 temporary insecure mode.
 
-The local registry version `index` is a signed, expiring snapshot. Its
+The file-backed registry's signed `index` is a local test fixture only. Its
 byte-for-byte Ed25519 signature binds the configured registry, package,
 positive generation, expiry, and complete declared version list. The list is
 bounded, sorted, unique, and limited to stable SemVer without build metadata.
 Each package generation and snapshot digest are persisted in the clock-bound
 trust state; a lower generation or changed bytes at the same generation fail
-closed. Index files,
-signatures, and trust roots use the same owner, mode, ACL, and no-follow checks
-as other trusted inputs. The signature authenticates the publisher's claim of
-completeness, but a first-use client cannot know about a newer unseen snapshot;
-the expiry bounds that replay window.
+closed. Index files, signatures, and trust roots use the same owner, mode, ACL,
+and no-follow checks as other trusted inputs. This custom index is not TUF, is
+not the production format, and must not be served over a network. Its signed
+completeness claim and first-use replay limitation apply only to the fixture.
 
 The local Ed25519 verifier uses fixed OpenSSL candidates only. It resolves each
 candidate, opens its directory chain without following links, and checks the
@@ -62,7 +62,34 @@ malformed or mismatched state stops with its evidence intact. The regression
 suite synthesizes each durable crash state, but does not yet kill the process at
 every filesystem syscall boundary.
 
-Before enabling remote packages, the implementation must use an established signed-metadata protocol and an audited cryptographic provider. The client must bootstrap a trusted root out of band, validate threshold-signed role metadata and namespace delegation, bind identity/version/registry/archive digest and size together, enforce expiry and monotonic rollback protection, and persist trusted metadata versions atomically. The local fixture takes this first step by requiring `ELISAPKG_REGISTRY_TRUST_ROOT` to point to an independently provisioned 32-byte key outside `ELISAPKG_REGISTRY_DIR`; registry contents cannot select their own trust root. The configured registry path must canonicalize successfully. The configured key path is checked against both the configured registry path and their canonical identities; a key path that cannot be resolved fails with `MissingTrustRoot`. The key and persisted trust files are opened once through descriptor-relative, no-follow paths. Every directory in those paths and each file must be owned by root or the effective user and must not be group- or world-writable. Symlinks and shared writable directories such as `/tmp` are rejected. On macOS, directory and regular-file checks also reject extended ACL allow entries and unknown ACL tags; deny-only entries are accepted. Linux ACL grants are not inspected. The Elisa `Trust` module already exposes fail-closed prechecks for those bindings, publisher attestation, thresholds, revocation, and clock rollback; these prechecks never substitute for cryptographic verification. Publisher authorization must cover the exact deterministic archive bytes. Unknown algorithms, missing thresholds, stale or replayed metadata, invalid signatures, revoked keys, and unauthorized namespaces are hard failures.
+Before enabling remote packages, the implementation must conform to the
+selected TUF v1.0.33 profile in [`decisions.md`](decisions.md) and
+[`tuf-profile.md`](tuf-profile.md), use an audited cryptographic provider,
+bootstrap roots out of band, enforce role thresholds and package-scoped
+delegation, bind exact target length and digest plus package identity, and
+persist expiry/rollback state atomically. The local fixture requires
+`ELISAPKG_REGISTRY_TRUST_ROOT` to point to an independently provisioned
+32-byte key outside `ELISAPKG_REGISTRY_DIR`; registry contents cannot select
+their own trust root. The configured registry path must canonicalize
+successfully. The configured key path is checked against both the configured
+registry path and their canonical identities; a key path that cannot be
+resolved fails with `MissingTrustRoot`. The key and persisted trust files are
+opened once through descriptor-relative, no-follow paths. Every directory in
+those paths and each file must be owned by root or the effective user and must
+not be group- or world-writable. Symlinks and shared writable directories such
+as `/tmp` are rejected. On macOS, directory and regular-file checks also
+reject extended ACL allow entries and unknown ACL tags; deny-only entries are
+accepted. Linux ACL grants are not inspected.
+
+`Trust::precheck_threshold`, `precheck_revocation`, and
+`precheck_publisher_attestation` validate caller-supplied policy facts; they do
+not count TUF role signatures, discover revoked keys, or verify build
+provenance. Only `Trust::verify_detached` currently invokes the local exact-byte
+Ed25519 provider, and that path is not a TUF implementation. Remote use must
+reject unknown algorithms, missing thresholds, stale or mixed metadata,
+invalid signatures, revoked keys, and unauthorized namespaces through the
+complete selected TUF chain. Namespace authorization must cover the exact
+deterministic archive target bytes.
 
 The `Trust` module exposes metadata prechecks for expiry, rollback, namespace,
 and algorithm policy plus an exact-byte detached Ed25519 verification gate.
@@ -250,8 +277,9 @@ unavailable toolchain identity disables reuse rather than silently trusting a
 stale artifact.
 
 These changes supply detached Ed25519 verification and persistent rollback
-state for the local registry fixture, but do not supply the planned remote
-transport or publisher delegation. The current Seatbelt profile applies only
+state for the local registry fixture, but do not supply the selected TUF
+verifier, remote transport, or production publisher/delegation operations. The
+current Seatbelt profile applies only
 to compiler children on macOS; output execution and project mutation are not
 sandboxed. Project mutation assumes a trusted, user-owned directory. Local
 installation enforces root/effective-user ownership and no-group/other-write

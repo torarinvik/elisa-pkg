@@ -39,12 +39,12 @@ inode/mtime checks in `scripts/test.sh`.
 
 ## D-005: trust boundary
 
-Remote operations remain fail-closed until an established signed-metadata
-protocol, trusted-root bootstrap, publisher authorization, expiry/rollback
-state, signed expiring index snapshots with persisted monotonic generations,
-and audited cryptographic binding are implemented together. SHA-256 is an
-integrity primitive only. No URL, checksum, or lockfile entry enables a remote
-source by itself.
+Remote operations remain fail-closed until the TUF profile in D-013,
+trusted-root bootstrap, namespace-scoped publisher authorization,
+expiry/rollback state, and audited cryptographic binding are implemented
+together. The local fixture's signed version index is not part of the
+production protocol. SHA-256 is an integrity primitive only. No URL, checksum,
+or lockfile entry enables a remote source by itself.
 
 ## D-006: source and archive policy
 
@@ -119,8 +119,10 @@ implemented. Fixture: package receipt and corrupted-blob cases in
 
 ## D-011: registry verification before use
 
-The local registry fixture uses a detached Ed25519 signature over the exact
-metadata bytes. The trust root is an independently provisioned 32-byte file
+The local-only registry test fixture uses a detached Ed25519 signature over
+the exact metadata bytes. Its custom index and metadata wire formats are not
+TUF, are not the production protocol, and must not be exposed through a network
+transport. The trust root is an independently provisioned 32-byte file
 selected through `ELISAPKG_REGISTRY_TRUST_ROOT`, outside the mutable registry
 directory; metadata binds the
 registry path, package, selected SemVer, archive relative path, byte size, and
@@ -134,8 +136,8 @@ replacement. The lock inode is never unlinked, and the kernel releases its
 ownership after process exit; pre-existing legacy lock directories fail closed
 for manual recovery. On macOS,
 ACL allow entries and unknown ACL tags on both trust directories and regular
-trust files are rejected; deny-only entries are accepted. A network
-transport and publisher delegation remain separate release gates. The local
+trust files are rejected; deny-only entries are accepted. A network transport
+and the TUF verifier/delegation implementation remain release gates. The local
 version index is an exact-byte Ed25519-signed snapshot binding the registry,
 package, generation, expiry, and complete declared stable-version list. Its
 generation and payload digest are persisted in the same checksum-bound trust
@@ -149,7 +151,9 @@ format v2 binds package, version, archive digest, and metadata digest; legacy
 history without metadata identity fails closed. Successful offline
 verification advances the state-bound clock only after signed metadata and
 archive checks, and rechecks expiry using the time sampled while holding the
-trust-state lock.
+trust-state lock. This fixture tests local trust-boundary behavior only; it
+does not implement TUF roles, threshold signatures, namespace delegation,
+production key rotation, or publisher build provenance.
 
 ## D-012: local installation directory trust
 
@@ -171,3 +175,53 @@ matches. A same-UID process can still race between that comparison and
 cover swapped inodes, writable prefixes and ancestors, symlinked components,
 writable binary or receipt directories, journal recovery states, and macOS ACL
 cases in `scripts/test.sh`.
+
+## D-013: production registry metadata protocol
+
+Production registry metadata will use The Update Framework (TUF), pinned to
+[Specification v1.0.33](https://theupdateframework.github.io/specification/v1.0.33/)
+and its required TAP 6, TAP 9, TAP 10, and TAP 11 behavior. The elisapkg wire
+and role profile is recorded in
+[`tuf-profile.md`](tuf-profile.md). This decision selects a protocol and trust
+model; it does not enable network access or approve a cryptographic provider.
+
+Every configured registry has a trusted root provisioned with the client or
+through an authenticated out-of-band enrollment process. Root updates follow
+TUF's sequential root-rotation procedure and its old-root/new-root signature
+requirements. Persist each validated intermediate root; intermediate root
+expiry alone does not stop the chain, but the final trusted root must be valid
+at the fixed update start time. Registry and mirror responses cannot introduce
+or replace a trust root. Each registry is an independent TUF repository; package metadata
+from separate repositories is never merged into one authority.
+
+Root, top-level Targets, package-scoped delegated Targets, Snapshot, and
+Timestamp metadata form the trust chain. Top-level Targets cannot directly
+list package targets. A terminating delegation for each disjoint package path
+restricts release authority to the corresponding Targets role; a valid
+signature from any other key does not authorize that package. TUF target length
+and SHA-256 bind the exact deterministic archive bytes. An authenticated elisapkg custom target
+object binds registry identity, normalized package name, exact version,
+dependency declarations, compiler requirements, and archive format to that
+target. Role thresholds, expiry bounds, key custody, recovery operators, and
+publication identities must be explicitly configured and reviewed before
+production deployment.
+
+The production client must use a TUF-conformant implementation for metadata
+parsing, canonical signed bytes, threshold counting, delegation traversal,
+role updates, and target verification. No hand-rolled detached-signature or
+index format may substitute for this chain. Algorithm policy is pinned by the
+elisapkg profile and cannot be negotiated or downgraded using repository input.
+Trusted metadata versions and hashes are persisted atomically outside project
+state. Expired active metadata, rolled-back, mixed, malformed, under-threshold,
+unsupported-algorithm, revoked, or unauthorized metadata fails closed, subject
+to TUF's rule allowing an expired intermediate root during a valid sequential
+rotation. Signatures by unknown or unauthorized keys never count toward a
+role's threshold.
+
+The fixture in D-011 remains a local implementation test only. Its custom
+single-key index and signed metadata are not a compatible TUF implementation
+or a network protocol. TUF authenticates release authorization and exact
+target bytes; it does not prove that package code is safe or independently
+attest how a build was produced. Build provenance, operational key custody,
+provider approval, and all D-005/M0/M5 security gates remain separate release
+requirements.

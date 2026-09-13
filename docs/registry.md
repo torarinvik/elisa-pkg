@@ -1,11 +1,20 @@
-# Local authenticated registry fixture
+# Local-only authenticated registry fixture
+
+This document specifies the file-backed fixture used by tests and local
+development. Its detached Ed25519 signatures and custom `index`/JSON formats
+are not the production registry protocol and must never be exposed as a
+network API. Production remote metadata uses the TUF profile in
+[`tuf-profile.md`](tuf-profile.md); only generic archive verification and
+content-addressed cache behavior may be reused after TUF authenticates the
+target metadata and exact bytes.
 
 `elisapkg fetch PACKAGE VERSION` reads a deterministic file-backed registry
 when `ELISAPKG_REGISTRY_DIR` is set. `elisapkg fetch` with no package arguments
 walks every registry record in a validated lockfile v3 and verifies/caches the
-exact locked bytes. This provider is the transport-neutral
-boundary for future network transports: all metadata is read with bounded Elisa
-FFI file operations and verified before archive bytes are returned. The exact
+exact locked bytes. This provider is an isolated local test seam: metadata is
+read with bounded Elisa FFI file operations and verified before archive bytes
+are returned. A future network provider must implement the selected TUF profile
+and may reuse only generic archive and cache APIs after authentication. The exact
 archive is then rechecked and published to the project content-addressed cache
 at `.elisapkg/cache/sha256/<first-two-hex>/<digest>`. Existing entries are
 rehash-verified; corrupt entries are quarantined before replacement. Quarantine
@@ -135,7 +144,7 @@ descriptor-relative no-follow operations for every parent. The entry limit
 keeps the verifier's and extractor's flat duplicate-name scans bounded even
 for long common prefixes.
 Network/TLS transport and publisher authorization are still disabled until
-their independent security review gates are complete. Signed selections are
+the TUF verifier and independent security review gates are complete. Signed selections are
 also recorded in a user-owned trust-state file after archive verification. By
 default the file is
 `$HOME/.local/share/elisapkg/trust/<sha256-of-registry-root>.state`; set

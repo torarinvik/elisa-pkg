@@ -53,16 +53,17 @@ operation quarantines a corrupted active blob before republishing its verified
 replacement. Quarantine publication is exclusive; if the deterministic evidence
 name already exists, the operation fails closed instead of replacing prior evidence.
 
-Project commands accept `--manifest-path PATH`; PATH may name the project directory or its `elisapkg.json`, including dependency mutations such as `add`, `remove`, and `update`. Local path resolution walks the dependency graph transitively, sorts package records by canonical name, normalizes relative paths, records SHA-256 manifest and complete sanitized source-tree digests, and rejects conflicting duplicate package identities. Target paths are resolved with `realpath` and must remain below their package root, including when a symlink is present. `build` selects the first target by default or a named target with `--bin NAME`, `--lib NAME`, or `--test NAME`; executable and test artifacts use the target name under `.elisapkg/build/`, while libraries use the same name with an `.o` suffix. Build receipts and cache validation bind the target kind and artifact name, while `run --bin NAME` and `install --local --bin NAME` reject library targets before attempting execution or publication. `test --test NAME` selects a named test target. `clean` removes known build artifacts plus `.elisapkg/package.tar`, `.elisapkg/package.receipt`, and empty build directories. Registry dependency declarations are syntax-checked locally, including exact, caret, tilde, and comparison SemVer ranges. Registry-only graphs use the signed local `primary` provider described in [`docs/registry.md`](docs/registry.md), produce lockfile version 3, and can be cached with `fetch PACKAGE VERSION`; mixed local/registry graphs and network transport remain fail-closed.
+Project commands accept `--manifest-path PATH`; PATH may name the project directory or its `elisapkg.json`, including dependency mutations such as `add`, `remove`, and `update`. Local path resolution walks the dependency graph transitively, sorts package records by canonical name, normalizes relative paths, records SHA-256 manifest and complete sanitized source-tree digests, and rejects conflicting duplicate package identities. Target paths are resolved with `realpath` and must remain below their package root, including when a symlink is present. `build` selects the first target by default or a named target with `--bin NAME`, `--lib NAME`, or `--test NAME`; executable and test artifacts use the target name under `.elisapkg/build/`, while libraries use the same name with an `.o` suffix. Build receipts and cache validation bind the target kind and artifact name, while `run --bin NAME` and `install --local --bin NAME` reject library targets before attempting execution or publication. `test --test NAME` selects a named test target. `clean` removes known build artifacts plus `.elisapkg/package.tar`, `.elisapkg/package.receipt`, and empty build directories. Registry dependency declarations are syntax-checked locally, including exact, caret, tilde, and comparison SemVer ranges. Registry-only graphs use the local test fixture described in [`docs/registry.md`](docs/registry.md), produce lockfile version 3, and can be cached with `fetch PACKAGE VERSION`; mixed local/registry graphs and network transport remain fail-closed. Production registry trust is selected as TUF v1.0.33 but is not implemented; see [`docs/tuf-profile.md`](docs/tuf-profile.md).
 
-The local provider's version index is a byte-for-byte Ed25519-signed snapshot
+The local test fixture's version index is a byte-for-byte Ed25519-signed snapshot
 that binds the registry, package, generation, expiry, and complete declared
 version list. The list is bounded, sorted, unique stable SemVer. The client
 persists each package's generation in rollback-protected trust state and rejects
 lower generations or changed bytes at the same generation. Owner, mode, no-follow,
 and supported ACL checks still protect every path component. A trusted publisher
 signature asserts completeness; a first-use client cannot know about a newer
-unseen snapshot, so the bounded expiry limits that replay window.
+unseen snapshot, so the bounded expiry limits that replay window. This format
+is not TUF and cannot be used by a network provider.
 
 Fetched registry blobs have immutable receipts beside their content-addressed cache
 objects. The exact signed metadata bytes and detached signature are cached by metadata
@@ -138,11 +139,13 @@ with the other network operations.
 Remote packages are not accepted unsigned. `fetch` and remote `install NAME`
 currently exit with the security status and explain that no trusted source
 provider is configured. This is deliberate: checksums, TLS, and a registry URL
-alone do not authenticate a publisher. The implementation plan requires a
-reviewed signed-metadata protocol, trusted-root bootstrap, publisher
+alone do not authenticate a publisher. Remote support requires a conformant
+implementation of the selected TUF profile, trusted-root bootstrap, publisher
 delegation, expiry and rollback protection, safe archive extraction, credential
 redaction, key rotation/revocation, adversarial fixtures, and independent
-security review before remote support is enabled.
+security review before it can be enabled. Tracked details are in
+[`docs/security.md`](docs/security.md) and
+[`docs/tuf-profile.md`](docs/tuf-profile.md).
 
 On macOS, compiler children run under a deny-by-default Seatbelt profile with network access denied and a per-build scratch directory. Compiler output, including stage1's intermediate object, stays in scratch; the child can write there, to `/dev/null`, and to the already-created callback C file through its existing inode. It cannot create, chmod, or unlink that callback path. The parent validates and copies the output to a new inode before publishing it. Compiler stdin is `/dev/null`; stdout and stderr go to private scratch files and are forwarded by the parent only after the compiler process group has stopped. Builds fail closed when Seatbelt is absent or rejects the profile. Project and locked local dependency trees plus selected compiler/toolchain directories remain readable to the compiler, so this is constrained build isolation rather than a complete credential boundary. `run` and `test` execute the resulting artifact as the invoking user. Arbitrary dependency build scripts, plugins, and automatic native dependency installation remain disabled. `doctor` reports whether `sandbox-exec` is present; an actual build validates profile application.
 

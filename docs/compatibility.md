@@ -42,7 +42,7 @@ executable must be explicitly present and executable.
 | JSON grammar | bounded iterative validator | manifest and regression fixtures | No decoded value tree or source locations |
 | deterministic graph solver | bounded in-memory backtracking module | solver fixture in `scripts/regression_test.py` | CLI still resolves local paths through its existing graph walker |
 | TLS, registry transport | disabled | fail-closed command tests | Requires reviewed transport adapter |
-| signed metadata | file-backed `primary` fixture provider | Ed25519, expiry, identity, archive, transitive graph, and persistent trust-state fixtures | Requires publisher authorization and protocol review before network use |
+| signed metadata | local-only `primary` test fixture; production protocol selected as TUF v1.0.33 | Ed25519 fixture tests cover expiry, identity, archive, transitive graph, and persistent trust state | TUF client, audited provider, namespace delegation, key operations, and release security review are not implemented; network use stays disabled |
 | archive extraction | bounded staged primitive | descriptor-relative no-follow ustar extraction with exclusive regular-file creation and directory fsync | Callers must provide a private empty staging directory |
 | local publish preflight | `publish --dry-run` validates and hashes deterministic archive bytes in memory | human/JSON output and repeated-archive regression fixtures | Authenticated upload and publisher signatures remain disabled |
 
