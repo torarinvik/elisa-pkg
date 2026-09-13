@@ -17,8 +17,8 @@ whatever compiler happens to be installed on the runner:
 
 | Input | Pinned identity |
 | --- | --- |
-| Elisa compiler | `083ee932be0713918418607e5c5f47b153d49422` |
-| Elisa core / stage0 | `bff39311695af94e14d5aff4fe41a1e0fdc1207e` |
+| Elisa compiler | `7b1b33e193e5092ffac12c77109ff33ee59c4df7` |
+| Elisa core / stage0 | `e33dbd60f8c3fb0316114917265e4113d686495b` |
 | Go | `1.25.0`, required by the pinned core `go.mod` |
 | LLVM | `23.1.1`, checked after Homebrew installation |
 | `actions/checkout` | `9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0` |

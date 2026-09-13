@@ -157,6 +157,13 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
     check('solver_selected.count == 1.usize()')
     check('solver_selected[0] == 1.usize()')
     lines.extend([
+        '    solver_preference: mutable darray[Solver::Preference] = []',
+        '    solver_preference.push(Solver::Preference{package: solver_name, version: Model::Version{major: 1, minor: 0, patch: 0, prerelease: false}})',
+        '    solver_preferred_selected: mutable darray[usize] = []',
+        '    solver_preferred_result: Solver::SolveCode = Solver::solve_with_preferences(solver_candidates, solver_roots, solver_preference, &solver_preferred_selected)',
+    ])
+    check('solver_preferred_result == Solver::SolveCode.Solved and solver_preferred_selected.count == 1.usize() and solver_preferred_selected[0] == 0.usize()')
+    lines.extend([
         '    solver_bad_requirement: mutable darray[u8] = [49,46,48]',
         '    solver_bad_roots: mutable darray[Solver::Constraint] = []',
         '    solver_bad_roots.push(Solver::Constraint{package: solver_name, requirement: solver_bad_requirement})',

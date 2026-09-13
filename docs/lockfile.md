@@ -23,6 +23,13 @@ direct version constraints without contacting a registry. `fetch` and online
 `build` revalidate registry records against freshly authenticated metadata;
 offline and frozen builds require matching cached signature and archive evidence.
 
+During a normal registry refresh, versions in the previous lock are soft
+candidate-order preferences: a still-valid locked version is tried first, but
+the preference never adds a package constraint. The new lock contains only
+packages reachable from the current root requirements and the dependencies of
+the selected versions. `fetch` applies the same preferences while
+reconstructing the lock, then checks the exact authenticated records and graph.
+
 Offline and frozen validation also checks every direct registry requirement
 against its locked SemVer. A structurally valid record with an out-of-range
 version is rejected before cached bytes are used.

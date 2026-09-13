@@ -127,6 +127,15 @@ def run() -> int:
         tools_root = base / "tools"
         sandbox_build_root.mkdir(parents=True)
         tools_root.mkdir()
+        git_metadata_root = project_root / ".git"
+        git_metadata_root.mkdir()
+        git_config = git_metadata_root / "config"
+        git_config.write_text("[http]\n\textraHeader = Authorization: Bearer test-secret\n")
+        git_config_worktree = git_metadata_root / "config.worktree"
+        git_config_worktree.write_text("[remote \"origin\"]\n\turl = https://user:test-secret@example.invalid/repo\n")
+        source_file = project_root / "src" / "main.elisa"
+        source_file.parent.mkdir()
+        source_file.write_text("package source remains readable\n")
         output_temp = sandbox_build_root / "output-probe"
         output_temp.write_bytes(b"parent-owned output placeholder\n")
 
@@ -172,6 +181,9 @@ def run() -> int:
         env["ELISAPKG_TEST_EXECUTABLE_TWO"] = str(callback_probe.resolve())
         env["ELISAPKG_TEST_CALLBACK_PATH"] = str(callback_path)
         env["ELISAPKG_TEST_DECOY_PATH"] = str(callback_decoy_path)
+        env["ELISAPKG_TEST_GIT_CONFIG"] = str(git_config)
+        env["ELISAPKG_TEST_GIT_CONFIG_WORKTREE"] = str(git_config_worktree)
+        env["ELISAPKG_TEST_SOURCE_FILE"] = str(source_file)
 
         profile_result = subprocess.run(
             [str(profile_probe)],
@@ -196,6 +208,8 @@ def run() -> int:
             "/Users/test/.TERRAFORM.D/state",
             "/Users/test/.CONFIG/GH/hosts.yml",
             "/Users/test/.GIT-CREDENTIALS",
+            "/Users/test/project/.git/config",
+            "/Users/test/project/.git/config.worktree",
             "/Users/test/id_ECDSA",
             "/Users/test/credentials-backup/token.txt",
             "/Users/test/.env.production/token.txt",
@@ -221,6 +235,46 @@ def run() -> int:
         available, reason = sandbox_apply_available()
         if not available:
             return unavailable(reason)
+
+        metadata_positive_script = (
+            'for path in "$ELISAPKG_TEST_SOURCE_FILE" "$ELISAPKG_TEST_GIT_CONFIG" "$ELISAPKG_TEST_GIT_CONFIG_WORKTREE"; do\n'
+            '  if ! IFS= read -r _ < "$path"; then\n'
+            "    printf 'PROJECT_FILE_READ_FAILED\\n'\n"
+            "    exit 86\n"
+            "  fi\n"
+            "done\n"
+            "printf 'PROJECT_FILES_READABLE\\n'\n"
+        )
+        metadata_read_script = (
+            'if IFS= read -r _ < "$ELISAPKG_TEST_SOURCE_FILE"; then\n'
+            "  printf 'SOURCE_READ_ALLOWED\\n'\n"
+            "else\n"
+            "  printf 'SOURCE_READ_DENIED\\n'\n"
+            "  exit 83\n"
+            "fi\n"
+            'if IFS= read -r _ < "$ELISAPKG_TEST_GIT_CONFIG"; then\n'
+            "  printf 'GIT_CONFIG_READ_ALLOWED\\n'\n"
+            "  exit 84\n"
+            "fi\n"
+            "printf 'GIT_CONFIG_READ_DENIED\\n'\n"
+            'if IFS= read -r _ < "$ELISAPKG_TEST_GIT_CONFIG_WORKTREE"; then\n'
+            "  printf 'GIT_CONFIG_WORKTREE_READ_ALLOWED\\n'\n"
+            "  exit 85\n"
+            "fi\n"
+            "printf 'GIT_CONFIG_WORKTREE_READ_DENIED\\n'\n"
+        )
+        unconfined_metadata_result = subprocess.run(
+            ["/bin/bash", "-c", metadata_positive_script],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+        if (
+            unconfined_metadata_result.returncode != 0
+            or b"PROJECT_FILES_READABLE\n" not in unconfined_metadata_result.stdout
+        ):
+            raise RuntimeError("unconfined project metadata positive control failed")
 
         network_script = (
             'if exec 3<>"/dev/tcp/127.0.0.1/$ELISAPKG_TEST_PORT"; then\n'
@@ -270,6 +324,23 @@ def run() -> int:
             )
         if accepted.is_set():
             raise RuntimeError("the sandboxed compiler probe connected to a loopback listener")
+
+        metadata_result = run_sandbox_probe(
+            Path("/bin/bash"), profile_path, callback_path, env, ("-c", metadata_read_script)
+        )
+        metadata_output = metadata_result.stdout + metadata_result.stderr
+        if (
+            metadata_result.returncode != 0
+            or b"SOURCE_READ_ALLOWED\n" not in metadata_output
+            or b"GIT_CONFIG_READ_DENIED\n" not in metadata_output
+            or b"GIT_CONFIG_WORKTREE_READ_DENIED\n" not in metadata_output
+            or b"GIT_CONFIG_READ_ALLOWED\n" in metadata_output
+            or b"GIT_CONFIG_WORKTREE_READ_ALLOWED\n" in metadata_output
+        ):
+            raise RuntimeError(
+                "Git metadata read denial probe failed: "
+                f"exit={metadata_result.returncode}, output={metadata_output.decode(errors='replace')}"
+            )
 
         callback_script = (
             'if ! printf \'SAX\' >> "$ELISAPKG_TEST_CALLBACK_PATH"; then\n'

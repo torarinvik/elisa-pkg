@@ -19,6 +19,7 @@ export ELISA_ALLOW_STALE_STAGE1="${ELISA_ALLOW_STALE_STAGE1:-0}"
 "$BIN" doctor | grep -F 'local Ed25519 provider available' >/dev/null
 python3 "$ROOT/scripts/ffi_boundary_test.py"
 python3 "$ROOT/scripts/ffi_fifo_regression.py"
+python3 "$ROOT/scripts/inherited_fd_regression.py"
 python3 "$ROOT/scripts/install_lock_regression.py"
 python3 "$ROOT/scripts/install_transaction_regression.py"
 python3 "$ROOT/scripts/install_identity_regression.py"
@@ -818,6 +819,134 @@ else
   test "$?" -eq 5
 fi
 test ! -e "$REGISTRY_EXPIRY_LONG_APP/elisapkg.lock"
+
+# A previous lock choice must remain a soft preference. If an older candidate
+# has a dependency that the newly selected candidate no longer has, resolution
+# must not retain that old dependency as a disconnected package record.
+REGISTRY_GRAPH_CASE="$TEST_TMP/registry-graph-preference-regression"
+REGISTRY_GRAPH_ROOT="$REGISTRY_GRAPH_CASE/registry"
+REGISTRY_GRAPH_KEY="$REGISTRY_GRAPH_CASE/trust/key"
+REGISTRY_GRAPH_PRIVATE="$REGISTRY_GRAPH_CASE/test-private.pem"
+REGISTRY_GRAPH_SOURCE="$REGISTRY_EXPIRY_SOURCE/.elisapkg/package.tar"
+REGISTRY_GRAPH_APP="$REGISTRY_GRAPH_CASE/app"
+REGISTRY_GRAPH_STATE="$REGISTRY_GRAPH_CASE/trust/state"
+mkdir -m 700 -p "$REGISTRY_GRAPH_ROOT" "$REGISTRY_GRAPH_CASE/trust"
+cp "$REGISTRY_EXPIRY_PRIVATE" "$REGISTRY_GRAPH_PRIVATE"
+cp "$REGISTRY_EXPIRY_KEY" "$REGISTRY_GRAPH_KEY"
+chmod 600 "$REGISTRY_GRAPH_PRIVATE" "$REGISTRY_GRAPH_KEY"
+python3 - "$REGISTRY_GRAPH_ROOT" "$REGISTRY_GRAPH_SOURCE" "$REGISTRY_GRAPH_PRIVATE" "$OPENSSL_BIN" <<'PY'
+from pathlib import Path
+import hashlib, json, os, subprocess, sys, time
+
+root = Path(sys.argv[1])
+archive = Path(sys.argv[2]).read_bytes()
+private_key = sys.argv[3]
+openssl = sys.argv[4]
+digest = hashlib.sha256(archive).hexdigest()
+expires = int(time.time()) + 3600
+
+def write_signed(path, data):
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.write_bytes(data)
+    path.chmod(0o600)
+    signature = path.with_name("metadata.sig" if path.name == "metadata.json" else "index.sig")
+    subprocess.run([openssl, "pkeyutl", "-sign", "-rawin", "-inkey", private_key,
+                    "-in", str(path), "-out", str(signature)], check=True)
+    signature.chmod(0o600)
+
+for package, version, dependencies in (
+        ("foo", "1.0.0", {"bar": {"registry": "primary", "version": "^1.0.0"}}),
+        ("foo", "2.0.0", {}),
+        ("bar", "1.0.0", {})):
+    version_dir = root / package / version
+    version_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    version_dir.chmod(0o700)
+    (version_dir / "archive.tar").write_bytes(archive)
+    (version_dir / "archive.tar").chmod(0o600)
+    metadata = {
+        "schema-version": 1,
+        "algorithm": "ed25519",
+        "registry": str(root),
+        "package": package,
+        "version": version,
+        "archive": "archive.tar",
+        "archive-size": len(archive),
+        "archive-digest": digest,
+        "expires": expires,
+    }
+    if dependencies:
+        metadata["dependencies"] = dependencies
+    metadata_path = version_dir / "metadata.json"
+    write_signed(metadata_path, (json.dumps(metadata, separators=(",", ":")) + "\n").encode())
+
+for package, versions in (("foo", ("1.0.0", "2.0.0")), ("bar", ("1.0.0",))):
+    index = (
+        "elisapkg-index:1\n"
+        f"registry:{root}\n"
+        f"package:{package}\n"
+        "generation:1\n"
+        f"expires:{expires}\n"
+        "versions:\n"
+        + "".join(f"{version}\n" for version in versions)
+    ).encode("ascii")
+    write_signed(root / package / "index", index)
+PY
+"$BIN" init "$REGISTRY_GRAPH_APP" >/dev/null
+python3 - "$REGISTRY_GRAPH_APP/elisapkg.json" <<'PY'
+from pathlib import Path
+import json, sys
+
+path = Path(sys.argv[1])
+manifest = json.loads(path.read_text(encoding="utf-8"))
+manifest["dependencies"] = {"foo": {"version": "^1.0.0", "registry": "primary"}}
+path.write_text(json.dumps(manifest, separators=(",", ":")) + "\n", encoding="utf-8")
+PY
+(
+  cd "$REGISTRY_GRAPH_APP"
+  ELISAPKG_REGISTRY_DIR="$REGISTRY_GRAPH_ROOT" \
+  ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_GRAPH_KEY" \
+  ELISAPKG_TRUST_STATE="$REGISTRY_GRAPH_STATE" \
+    "$BIN" resolve >/dev/null
+)
+python3 - "$REGISTRY_GRAPH_APP/elisapkg.lock" <<'PY'
+from pathlib import Path
+import json, sys
+
+lock = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+selected = {record["name"]: record["version"] for record in lock["packages"]}
+if selected != {"bar": "1.0.0", "foo": "1.0.0"}:
+    raise SystemExit(f"initial dependency graph was not locked: {selected!r}")
+PY
+python3 - "$REGISTRY_GRAPH_APP/elisapkg.json" <<'PY'
+from pathlib import Path
+import json, sys
+
+path = Path(sys.argv[1])
+manifest = json.loads(path.read_text(encoding="utf-8"))
+manifest["dependencies"]["foo"]["version"] = "^2.0.0"
+path.write_text(json.dumps(manifest, separators=(",", ":")) + "\n", encoding="utf-8")
+PY
+(
+  cd "$REGISTRY_GRAPH_APP"
+  ELISAPKG_REGISTRY_DIR="$REGISTRY_GRAPH_ROOT" \
+  ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_GRAPH_KEY" \
+  ELISAPKG_TRUST_STATE="$REGISTRY_GRAPH_STATE" \
+    "$BIN" resolve >/dev/null
+  ELISAPKG_REGISTRY_DIR="$REGISTRY_GRAPH_ROOT" \
+  ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_GRAPH_KEY" \
+  ELISAPKG_TRUST_STATE="$REGISTRY_GRAPH_STATE" \
+    "$BIN" fetch >/dev/null
+)
+python3 - "$REGISTRY_GRAPH_APP/elisapkg.lock" <<'PY'
+from pathlib import Path
+import json, sys
+
+lock = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+selected = {record["name"]: record["version"] for record in lock["packages"]}
+if selected != {"foo": "2.0.0"}:
+    raise SystemExit(f"stale lock preference added unreachable packages: {selected!r}")
+PY
+echo "registry lock preference regression passed"
 
 # A writable package directory must be rejected as a security failure before
 # it can replace a signed snapshot or its detached signature.

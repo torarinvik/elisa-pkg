@@ -18,6 +18,7 @@ C_INT_RETURN_SYMBOLS = {
     "native_renameat",
     "native_linkat",
     "native_close",
+    "native_getdtablesize",
     "native_dup",
     "native_dup2",
     "native_fcntl",

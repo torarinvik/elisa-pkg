@@ -2121,9 +2121,14 @@ module Cli:
                 return true if bytes_equal(constraints[index].package, package)
             return false
 
-        def append_registry_lock_preferences(lock: darray[u8]&, unlock: darray[u8]&, candidates: darray[Solver::Candidate]&, constraints: mutable darray[Solver::Constraint]&) -> void can[Memory.Allocate, Abort.Panic]:
+        def registry_preference_present(preferences: darray[Solver::Preference]&, package: darray[u8]&) -> bool:
+            for index in 0..<preferences.count |preferences, package|:
+                return true if bytes_equal(preferences[index].package, package)
+            return false
+
+        def append_registry_lock_preferences(lock: darray[u8]&, unlock: darray[u8]&, candidates: darray[Solver::Candidate]&, constraints: darray[Solver::Constraint]&, preferences: mutable darray[Solver::Preference]&) -> void can[Memory.Allocate, Abort.Panic]:
             return if lock.count == 0.usize() or not Json::valid_document(lock) or not Json::unique_object_keys(lock) or not lock_version_is(lock, 3)
-            for index in 0..<lock.count |lock, unlock, candidates, constraints|:
+            for index in 0..<lock.count |lock, unlock, candidates, constraints, preferences|:
                 continue if lock[index] != 123
                 object_end: usize = json_object_end(lock, index)
                 continue if object_end <= index
@@ -2133,10 +2138,8 @@ module Cli:
                 continue if unlock.count > 0.usize() and bytes_equal(package, unlock)
                 parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
                 continue if not SemVer::parse(version_text, &parsed) or parsed.prerelease
-                continue if not registry_candidate_matches(candidates, package, parsed) or registry_constraint_present(constraints, package)
-                exact: mutable darray[u8] = []
-                Registry::exact_requirement(parsed, &exact)
-                constraints.push(Solver::Constraint{package: package, requirement: exact})
+                continue if not registry_candidate_matches(candidates, package, parsed) or registry_constraint_present(constraints, package) or registry_preference_present(preferences, package)
+                preferences.push(Solver::Preference{package: package, version: parsed})
 
         def canonical_registry_lock(name: darray[u8]&, version: darray[u8]&, raw: darray[u8]&, root: darray[u8]&, roots: darray[Solver::Constraint]&, preferred_lock: darray[u8]&, unlock: darray[u8]&, persist_trust: bool) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             out: mutable darray[u8] = []
@@ -2214,22 +2217,14 @@ module Cli:
             solve_constraints: mutable darray[Solver::Constraint] = []
             for index in 0..<roots.count |roots, solve_constraints|:
                 solve_constraints.push(roots[index])
-            append_registry_lock_preferences(preferred_lock, unlock, candidates, &solve_constraints)
+            lock_preferences: mutable darray[Solver::Preference] = []
+            append_registry_lock_preferences(preferred_lock, unlock, candidates, solve_constraints, &lock_preferences)
             solve_status: mutable Solver::SolveCode = Solver::SolveCode.Malformed
             conflict: mutable Solver::Conflict = Solver::Conflict{package: [], first_requirement: [], second_requirement: []}
             if persist_trust:
-                solve_status <- Solver::solve_with_conflict(candidates, solve_constraints, &selected_indexes, &conflict)
+                solve_status <- Solver::solve_with_preferences_and_conflict(candidates, solve_constraints, lock_preferences, &selected_indexes, &conflict)
             else:
-                solve_status <- Solver::solve(candidates, solve_constraints, &selected_indexes)
-            # A stale locked choice must not make an otherwise solvable graph appear
-            # unsatisfiable. Retry without preferences when a pinned candidate no
-            # longer satisfies the current manifest or its transitive metadata.
-            if solve_status == Solver::SolveCode.Unsatisfiable and solve_constraints.count > roots.count:
-                selected_indexes.resize(0)
-                if persist_trust:
-                    solve_status <- Solver::solve_with_conflict(candidates, roots, &selected_indexes, &conflict)
-                else:
-                    solve_status <- Solver::solve(candidates, roots, &selected_indexes)
+                solve_status <- Solver::solve_with_preferences(candidates, solve_constraints, lock_preferences, &selected_indexes)
             if solve_status == Solver::SolveCode.Unsatisfiable and persist_trust:
                 # A one-byte status sentinel is reserved for ordinary provider
                 # failures. Include three NUL-delimited, already validated
@@ -2346,6 +2341,13 @@ module Cli:
                 empty_unlock: mutable darray[u8] = []
                 return canonical_registry_lock(name, version, raw, root, registry_roots, empty_lock, empty_unlock, false)
             return canonical_transitive_local_lock(name, version, raw, root)
+
+        def canonical_registry_lock_for_existing_lock(name: darray[u8]&, version: darray[u8]&, raw: darray[u8]&, root: darray[u8]&, preferred_lock: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            registry_roots: mutable darray[Solver::Constraint] = []
+            has_local_dependency: mutable bool = false
+            return [] if not collect_registry_roots(raw, &registry_roots, &has_local_dependency) or has_local_dependency or registry_roots.count == 0.usize()
+            empty_unlock: mutable darray[u8] = []
+            return canonical_registry_lock(name, version, raw, root, registry_roots, preferred_lock, empty_unlock, false)
 
         def canonical_lock_for_manifest_with_options(name: darray[u8]&, version: darray[u8]&, raw: darray[u8]&, root: darray[u8]&, options: Model::CommandOptions, preferred_lock: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             registry_roots: mutable darray[Solver::Constraint] = []
@@ -3806,7 +3808,7 @@ module Cli:
             # registry metadata and compare bytes before any cache mutation. This
             # rejects duplicate, omitted, reordered, or otherwise hand-edited records
             # that could make fetch operate on a graph different from resolution.
-            expected_lock: darray[u8] = canonical_lock_for_manifest(root_name, root_version, manifest, start)
+            expected_lock: darray[u8] = canonical_registry_lock_for_existing_lock(root_name, root_version, manifest, start, lock)
             return EXIT_SECURITY if expected_lock.count == 0.usize()
             return EXIT_RESOLVE if not bytes_equal(expected_lock, lock)
             lock_end: usize = json_object_end(lock, 0)
@@ -5827,6 +5829,8 @@ module Cli:
                     Platform::pkg_process_exit(126)
                 if null_fd > 2:
                     _ = Platform::pkg_close(null_fd)
+                if Platform::pkg_close_inherited_fds() != 0:
+                    Platform::pkg_process_exit(126)
                 _ = Platform::pkg_execvp("/usr/bin/sandbox-exec", child_argv)
                 Platform::pkg_process_exit(127)
             if pid < 0:

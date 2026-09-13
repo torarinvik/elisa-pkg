@@ -31,12 +31,27 @@ module Solver:
             dependencies: mutable darray[Constraint]
             yanked: mutable bool
 
+        # A preference changes deterministic search order only. Unlike a
+        # constraint, it never makes a package reachable or rules out a
+        # candidate that otherwise satisfies the graph.
+        struct Preference:
+            package: mutable darray[u8]
+            version: mutable Model::Version
+
         # Candidates are expected to have been checked against authenticated
         # metadata before entering this API. `selected` receives candidate
         # indexes in canonical package-name order.
         def solve(candidates: darray[Candidate]&, roots: darray[Constraint]&, selected: mutable darray[usize]&) -> SolveCode can[Memory.Allocate, Abort.Panic]:
+            preferences: mutable darray[Preference] = []
+            return solve_with_preferences(candidates, roots, preferences, selected)
+
+        # Apply existing lock choices as soft ordering hints. A preference may
+        # rank one candidate first for its package, but it cannot add an
+        # otherwise unreachable package to the graph or make a satisfiable
+        # graph unsatisfiable.
+        def solve_with_preferences(candidates: darray[Candidate]&, roots: darray[Constraint]&, preferences: darray[Preference]&, selected: mutable darray[usize]&) -> SolveCode can[Memory.Allocate, Abort.Panic]:
             selected.resize(0)
-            return SolveCode.Malformed if candidates.count == 0.usize() or candidates.count > 4096.usize() or roots.count > 4096.usize()
+            return SolveCode.Malformed if candidates.count == 0.usize() or candidates.count > 4096.usize() or roots.count > 4096.usize() or preferences.count > max_packages
             package_slots: mutable darray[usize] = []
             total_dependencies: mutable usize = 0.usize()
             for candidate_index in 0..<candidates.count |candidates, package_slots, total_dependencies|:
@@ -66,6 +81,14 @@ module Solver:
                 return SolveCode.Malformed if not solver_valid_name(roots[root_index].package) or roots[root_index].requirement.count == 0.usize()
                 root_requirement: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
                 return SolveCode.Malformed if not SemVer::parse_requirement(roots[root_index].requirement, &root_requirement)
+            for preference_index in 0..<preferences.count |preferences|:
+                return SolveCode.Malformed if not solver_valid_name(preferences[preference_index].package) or preferences[preference_index].version.prerelease
+                for previous in 0..<preference_index |preferences, preference_index|:
+                    return SolveCode.Malformed if solver_equal(preferences[previous].package, preferences[preference_index].package)
+            ordered_preferences: mutable darray[Preference] = []
+            for preference_index in 0..<preferences.count |preferences, ordered_preferences|:
+                ordered_preferences.push(preferences[preference_index])
+            solver_sort_preferences(&ordered_preferences)
             solver_sort_slots(&package_slots, candidates)
             constraints: mutable darray[Constraint] = []
             for index in 0..<roots.count |constraints, roots|:
@@ -74,7 +97,7 @@ module Solver:
             for _index in 0..<package_slots.count |assigned|:
                 assigned.push(-1)
             decisions: mutable usize = 0.usize()
-            result: SolveCode = solver_search(candidates, package_slots, &constraints, &assigned, &decisions)
+            result: SolveCode = solver_search(candidates, package_slots, &constraints, ordered_preferences, &assigned, &decisions)
             return result if result != SolveCode.Solved
             # A dependency edge can point at an already selected package, so
             # satisfiability alone does not rule out A -> B -> A (or A -> A).
@@ -95,10 +118,14 @@ module Solver:
         # all. The explanation is diagnostic data only and never affects the
         # selected graph or candidate ordering.
         def solve_with_conflict(candidates: darray[Candidate]&, roots: darray[Constraint]&, selected: mutable darray[usize]&, conflict: mutable Conflict&) -> SolveCode can[Memory.Allocate, Abort.Panic]:
+            preferences: mutable darray[Preference] = []
+            return solve_with_preferences_and_conflict(candidates, roots, preferences, selected, conflict)
+
+        def solve_with_preferences_and_conflict(candidates: darray[Candidate]&, roots: darray[Constraint]&, preferences: darray[Preference]&, selected: mutable darray[usize]&, conflict: mutable Conflict&) -> SolveCode can[Memory.Allocate, Abort.Panic]:
             conflict.package.resize(0)
             conflict.first_requirement.resize(0)
             conflict.second_requirement.resize(0)
-            result: SolveCode = solve(candidates, roots, selected)
+            result: SolveCode = solve_with_preferences(candidates, roots, preferences, selected)
             return result if result != SolveCode.Unsatisfiable
             # Keep this write path in the public entry point. The Elisa
             # compiler currently has an unsafe lowering edge for passing a
@@ -147,7 +174,7 @@ module Solver:
         const max_constraints: usize = 16384
         const max_packages: usize = 1024
 
-        def solver_search(candidates: darray[Candidate]&, package_slots: darray[usize]&, constraints: mutable darray[Constraint]&, assigned: mutable darray[i64]&, decisions: mutable usize&) -> SolveCode can[Memory.Allocate, Abort.Panic]:
+        def solver_search(candidates: darray[Candidate]&, package_slots: darray[usize]&, constraints: mutable darray[Constraint]&, preferences: darray[Preference]&, assigned: mutable darray[i64]&, decisions: mutable usize&) -> SolveCode can[Memory.Allocate, Abort.Panic]:
             return SolveCode.ResourceLimit if decisions >= max_decisions or constraints.count > max_constraints
             for constraint_index in 0..<constraints.count |constraints, package_slots, candidates|:
                 return SolveCode.Unsatisfiable if solver_slot_for(constraints[constraint_index].package, package_slots, candidates) == package_slots.count
@@ -181,7 +208,7 @@ module Solver:
             for candidate_index in 0..<candidates.count |candidates, package_slots, best_slot, constraints, order|:
                 continue if solver_slot_for(candidates[candidate_index].package, package_slots, candidates) != best_slot or candidates[candidate_index].yanked
                 order.push(candidate_index) if solver_candidate_satisfies(candidates[candidate_index], package_slots[best_slot], constraints, package_slots, candidates)
-            solver_sort_candidates(&order, candidates)
+            solver_sort_candidates(&order, candidates, preferences)
             for order_index in 0..<order.count |order, candidates, package_slots, best_slot, constraints, assigned, decisions|:
                 candidate_index: usize = order[order_index]
                 assigned[best_slot] <- candidate_index.i64()
@@ -189,7 +216,7 @@ module Solver:
                 decisions <- decisions + 1.usize()
                 for dependency_index in 0..<candidates[candidate_index].dependencies.count |candidates, candidate_index, constraints|:
                     constraints.push(candidates[candidate_index].dependencies[dependency_index])
-                result: SolveCode = solver_search(candidates, package_slots, constraints, assigned, decisions)
+                result: SolveCode = solver_search(candidates, package_slots, constraints, preferences, assigned, decisions)
                 return result if result == SolveCode.Solved or result == SolveCode.ResourceLimit or result == SolveCode.Malformed
                 constraints.resize(constraint_mark)
                 assigned[best_slot] <- -1
@@ -266,20 +293,47 @@ module Solver:
                     cursor <- cursor - 1.usize()
                 slots[cursor] <- value
 
-        def solver_sort_candidates(order: mutable darray[usize]&, candidates: darray[Candidate]&) -> void:
+        def solver_sort_candidates(order: mutable darray[usize]&, candidates: darray[Candidate]&, preferences: darray[Preference]&) -> void:
             for index in 1..<order.count |order, candidates, index|:
                 value: usize = order[index]
                 cursor: mutable usize = index
-                while cursor > 0.usize() and solver_candidate_before(value, order[cursor - 1.usize()], candidates):
+                while cursor > 0.usize() and solver_candidate_before(value, order[cursor - 1.usize()], candidates, preferences):
                     order[cursor] <- order[cursor - 1.usize()]
                     cursor <- cursor - 1.usize()
                 order[cursor] <- value
 
-        def solver_candidate_before(left: usize, right: usize, candidates: darray[Candidate]&) -> bool:
+        def solver_sort_preferences(preferences: mutable darray[Preference]&) -> void:
+            for index in 1..<preferences.count |preferences, index|:
+                value: Preference = preferences[index]
+                cursor: mutable usize = index
+                while cursor > 0.usize() and solver_less(value.package, preferences[cursor - 1.usize()].package):
+                    preferences[cursor] <- preferences[cursor - 1.usize()]
+                    cursor <- cursor - 1.usize()
+                preferences[cursor] <- value
+
+        def solver_candidate_before(left: usize, right: usize, candidates: darray[Candidate]&, preferences: darray[Preference]&) -> bool:
+            preference_index: usize = solver_preference_index(preferences, candidates[left].package)
+            if preference_index < preferences.count:
+                left_preferred: bool = SemVer::compare(candidates[left].version, preferences[preference_index].version) == 0
+                right_preferred: bool = SemVer::compare(candidates[right].version, preferences[preference_index].version) == 0
+                return true if left_preferred and not right_preferred
+                return false if right_preferred and not left_preferred
             comparison: i64 = SemVer::compare(candidates[left].version, candidates[right].version)
             return true if comparison > 0
             return false if comparison < 0
             return solver_less(candidates[left].package, candidates[right].package)
+
+        def solver_preference_index(preferences: darray[Preference]&, package: darray[u8]&) -> usize:
+            lower: mutable usize = 0.usize()
+            upper: mutable usize = preferences.count
+            while lower < upper |preferences, package, lower, upper|:
+                middle: usize = lower + (upper - lower) / 2.usize()
+                if solver_less(preferences[middle].package, package):
+                    lower <- middle + 1.usize()
+                else:
+                    upper <- middle
+            return preferences.count if lower >= preferences.count or not solver_equal(preferences[lower].package, package)
+            return lower
 
         def solver_valid_name(value: darray[u8]&) -> bool:
             return false if value.count == 0.usize() or value.count > 64.usize()

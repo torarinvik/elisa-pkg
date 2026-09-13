@@ -29,6 +29,11 @@ extern native_read(fd: i64, buffer: mutable void&, count: usize) -> i64
 extern native_write(fd: i64, buffer: void&, count: usize) -> i64
 @link_name("close")
 extern native_close(fd: i64) -> i32
+@link_name("getdtablesize")
+extern native_getdtablesize() -> i32
+static if ELISA_TARGET_OS_LINUX:
+    @link_name("syscall")
+    extern native_syscall(number: i64, ...) -> i64
 @link_name("dup")
 extern native_dup(fd: i64) -> i32
 @link_name("dup2")
@@ -237,6 +242,30 @@ module PlatformNative:
             return native_open("/dev/null", 0)
         def close(fd: i64) -> i64:
             return native_close(fd)
+        # Run only in a post-fork child. Linux uses close_range; older kernels
+        # fall back to the descriptor-table limit. macOS uses that same checked
+        # fallback. Any close error other than EBADF aborts the child before
+        # exec, so unknown handles cannot
+        # cross the compiler boundary silently.
+        def close_inherited_fds() -> i64:
+            static if ELISA_TARGET_OS_LINUX:
+                while true:
+                    close_range_status: i64 = native_syscall(436, 3, 4294967295, 0)
+                    return 0 if close_range_status == 0
+                    errno_value: i64 = current_errno()
+                    continue if errno_value == 4
+                    break if errno_value == 38
+                    return negative_value(errno_value)
+            descriptor_limit: i64 = native_getdtablesize().i64()
+            return -5 if descriptor_limit < 3
+            fd: mutable i64 = 3
+            while fd < descriptor_limit |fd, descriptor_limit|:
+                close_status: i64 = native_close(fd)
+                if close_status != 0:
+                    errno_value: i64 = current_errno()
+                    return negative_value(errno_value) if errno_value != 9
+                fd <- fd + 1
+            return 0
         def fsync(fd: i64) -> i64:
             return native_fsync(fd)
         def waitpid(pid: i64, status: mutable i32&, options: i64) -> i64:
