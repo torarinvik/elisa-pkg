@@ -6181,6 +6181,39 @@ module Cli:
             out.push(null)
             return out.count.i64() - 1
 
+        # The common parser has already copied these modes into `options` or
+        # process-local output state. Remove them before dispatch so handlers
+        # that inspect argv see only command-specific flags and positionals.
+        # Keep everything after `--` intact because run/test forward that tail
+        # to the selected program.
+        def compact_validated_global_options(argc: i64, slots: mutable cstr&&, out: mutable darray[cstr]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            out.resize(0)
+            return -1 if argc < 2
+            out.push(slots[0].cast[cstr])
+            out.push(slots[1].cast[cstr])
+            index: mutable i64 = 2
+            separator_seen: mutable bool = false
+            while index < argc |slots, out, index, separator_seen|:
+                argument: cstr = slots[index].cast[cstr]
+                if not separator_seen and cstr_equal(argument, "--"):
+                    separator_seen <- true
+                    out.push(argument)
+                    index <- index + 1
+                    continue
+                if not separator_seen and (cstr_equal(argument, "--locked") or cstr_equal(argument, "--offline") or cstr_equal(argument, "--frozen") or cstr_equal(argument, "--json") or cstr_equal(argument, "--verbose") or cstr_equal(argument, "--quiet")):
+                    index <- index + 1
+                    continue
+                if not separator_seen and cstr_equal(argument, "--color"):
+                    index <- index + 2
+                    continue
+                if not separator_seen and cstr_equal(argument, "--manifest-path"):
+                    index <- index + 2
+                    continue
+                out.push(argument)
+                index <- index + 1
+            out.push(null)
+            return out.count.i64() - 1
+
         # ---------- command line --------------------------------------------------------------
 
         def cli_main(argc: i64, argv: mutable void&) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -6311,6 +6344,11 @@ module Cli:
             if not flags_ok:
                 write_error("error: unknown option; run `elisapkg --help`\n")
                 return EXIT_USAGE
+            parsed_options: mutable darray[cstr] = []
+            parsed_argc: i64 = compact_validated_global_options(effective_argc, effective_slots, &parsed_options)
+            return EXIT_USAGE if parsed_argc < 0
+            effective_argc <- parsed_argc
+            effective_slots <- (&parsed_options[0]).cast[mutable cstr&&] can Unsafe.PointerCast
             if cstr_equal(command, "check-manifest"):
                 return run_check(&start, options)
             if cstr_equal(command, "resolve"):

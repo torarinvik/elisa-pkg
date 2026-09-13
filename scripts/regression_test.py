@@ -373,6 +373,38 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
     after = lock.stat()
     assert (before.st_ino, before.st_mtime_ns) == (after.st_ino, after.st_mtime_ns)
 
+    quiet_cache_verify = subprocess.run(
+        [BIN, 'cache', 'verify', '--quiet'], cwd=project,
+        capture_output=True, text=True, timeout=120, check=False)
+    assert quiet_cache_verify.returncode == 0, quiet_cache_verify
+    assert quiet_cache_verify.stdout == ''
+    quiet_cache_gc = subprocess.run(
+        [BIN, 'cache', 'gc', '--dry-run', '--quiet'], cwd=project,
+        capture_output=True, text=True, timeout=120, check=False)
+    assert quiet_cache_gc.returncode == 0, quiet_cache_gc
+    assert quiet_cache_gc.stdout == ''
+
+    fetch_environment = dict(os.environ)
+    fetch_environment.pop('ELISAPKG_REGISTRY_DIR', None)
+    fetch_environment.pop('ELISAPKG_REGISTRY_TRUST_ROOT', None)
+    colored_fetch = subprocess.run(
+        [BIN, 'fetch', 'foo', '1.0.0', '--color', 'always'], cwd=project,
+        env=fetch_environment, capture_output=True, text=True, timeout=120,
+        check=False)
+    assert colored_fetch.returncode == 3, colored_fetch
+    assert 'registry is not configured' in colored_fetch.stderr
+
+    library = work / 'library'
+    run([BIN, 'init', library, '--lib'], stdout=subprocess.DEVNULL)
+    install_environment = dict(
+        os.environ, ELISAPKG_INSTALL_PREFIX=str(work / 'install-prefix'))
+    quiet_library_install = subprocess.run(
+        [BIN, 'install', '--local', '--quiet'], cwd=library,
+        env=install_environment, capture_output=True, text=True, timeout=120,
+        check=False)
+    assert quiet_library_install.returncode == 7, quiet_library_install
+    assert 'requires a binary target' in quiet_library_install.stderr
+
     external = work / 'external'
     external.mkdir()
     (external / 'src').mkdir()
