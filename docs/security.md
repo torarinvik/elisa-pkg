@@ -234,6 +234,20 @@ digest while allowing the compiler's include reader to follow them. The
 read-only snapshot root is also explicitly reallowed after its source-state
 and credential denials; writable scratch remains a separate sibling tree.
 
+Generic local package source reads currently open each path component with
+descriptor-relative `openat`, `O_NOFOLLOW`, and `O_NONBLOCK`, then check that
+the final descriptor is a regular file. This rejects symlinks and avoids
+blocking on FIFOs, but the regular-file check happens after `openat`: an
+existing character or block device can receive its device `open` operation
+before the client rejects it. The generic source walk also does not require
+each parent directory to be protected against mutation by another uid. Do not
+treat this path as safe for adversarial trees containing device nodes or for
+source paths inside hostile shared-writable directories. Before making local
+source trees an adversarial input boundary, add a descriptor-pinned
+pre-stat/open/post-identity check and a parent policy that preserves valid
+private temporary directories and elevated reads from user-owned trees; test
+sticky-directory behavior and races on both supported operating systems.
+
 Before `exec`, the child also applies a platform resource profile: compiler
 children receive 600 seconds of CPU time and a 128 MiB per-file limit, while
 run/test children receive 120 seconds of CPU time and a 64 MiB per-file limit;

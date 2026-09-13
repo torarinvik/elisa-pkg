@@ -255,6 +255,19 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
         '    solver_preferred_result: Solver::SolveCode = Solver::solve_with_preferences(solver_candidates, solver_roots, solver_preference, &solver_preferred_selected)',
     ])
     check('solver_preferred_result == Solver::SolveCode.Solved and solver_preferred_selected.count == 1.usize() and solver_preferred_selected[0] == 0.usize()')
+    # These individually bounded inputs create millions of candidate/range
+    # comparisons in the solver. The aggregate deterministic work cap must
+    # stop the operation with ResourceLimit instead of spending unbounded CPU.
+    lines.extend([
+        '    solver_budget_candidates: mutable darray[Solver::Candidate] = []',
+        '    solver_budget_roots: mutable darray[Solver::Constraint] = []',
+        '    for solver_budget_index in 0..<2048 |solver_budget_candidates, solver_budget_roots|:',
+        '        solver_budget_candidates.push(Solver::Candidate{package: solver_name, version: Model::Version{major: 1, minor: solver_budget_index.u64(), patch: 0, prerelease: false}, dependencies: solver_dependencies, yanked: false})',
+        '        solver_budget_roots.push(Solver::Constraint{package: solver_name, requirement: solver_requirement})',
+        '    solver_budget_selected: mutable darray[usize] = []',
+        '    solver_budget_result: Solver::SolveCode = Solver::solve(solver_budget_candidates, solver_budget_roots, &solver_budget_selected)',
+    ])
+    check('solver_budget_result == Solver::SolveCode.ResourceLimit and solver_budget_selected.count == 0.usize()')
     lines.extend([
         '    solver_bad_requirement: mutable darray[u8] = [49,46,48]',
         '    solver_bad_roots: mutable darray[Solver::Constraint] = []',
