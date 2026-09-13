@@ -188,6 +188,13 @@ is unlinked before publication, preventing a retained output descriptor from
 changing the cached artifact. Detached descendants remain a resource/cleanup
 limitation and are a release gate for hostile remote builds.
 
+Immediately before `exec`, compiler, `run`, and `test` children close every
+inherited descriptor numbered 3 or higher, preserving only standard input,
+output, and error. A close failure stops execution. This prevents a caller's
+open files, sockets, and credential-agent descriptors from becoming ambient
+capabilities in package code. The compiler and shared `run`/`test` launch paths
+are covered by `scripts/inherited_fd_regression.py`.
+
 Before `exec`, the child also applies a platform resource profile: compiler
 children receive 600 seconds of CPU time and a 128 MiB per-file limit, while
 run/test children receive 120 seconds of CPU time and a 64 MiB per-file limit;

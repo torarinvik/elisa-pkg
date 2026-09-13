@@ -20,8 +20,8 @@ object and `ELISA_STAGE1_SEMANTIC_GATE=1` supplied by the package manager's
 child build environment. Filesystem traversal, archive extraction, and process
 policy are compiled from Elisa; only direct libc/POSIX primitives cross the
 private FFI boundary. The errno accessor is selected at compile time for the
-target (`__error` on Apple/FreeBSD and `__errno_location` on Linux), so a
-Linux build does not depend on the Darwin symbol. The wrapper and stage1
+target (`__error` on Apple and `__errno_location` on Linux), so a Linux build
+does not depend on the Darwin symbol. The wrapper and stage1
 executable must be explicitly present and executable.
 
 ## Capability matrix

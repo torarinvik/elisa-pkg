@@ -30,6 +30,28 @@ def main() -> int:
     if stdio_setup < 0 or not stdio_setup < child_setup < descriptor_close < compiler_exec:
         raise SystemExit("error: compiler launch must close inherited descriptors after stdio setup and before exec")
 
+    program_start = source.find("def run_program(")
+    program_end = source.find("def compact_manifest_args(", program_start)
+    if program_start < 0 or program_end < 0:
+        raise SystemExit("error: could not locate the shared run/test program launcher")
+    program_launcher = source[program_start:program_end]
+    program_child = program_launcher.find("if pid == 0:")
+    program_group = program_launcher.find("Platform::pkg_set_process_group()", program_child)
+    program_limits = program_launcher.find("Platform::pkg_set_process_limits(2)", program_child)
+    program_close = program_launcher.find("Platform::pkg_close_inherited_fds()", program_child)
+    program_close_guard = program_launcher.find("if Platform::pkg_close_inherited_fds() != 0:", program_child)
+    program_close_exit = program_launcher.find("Platform::pkg_process_exit(126)", program_close_guard)
+    program_exec = program_launcher.find('Platform::pkg_execvp("/usr/bin/env", child_argv)', program_child)
+    if not (
+        0 <= program_child < program_group < program_limits < program_close
+        and program_close_guard > program_limits
+        and program_close > program_close_guard
+        and program_close_exit < program_exec
+    ):
+        raise SystemExit(
+            "error: run/test launch must close inherited descriptors after child setup and before exec"
+        )
+
     (ROOT / "build").mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="elisapkg-fd-cleanup-", dir=ROOT / "build") as directory:
         work = Path(directory)
