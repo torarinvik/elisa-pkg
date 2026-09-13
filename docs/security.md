@@ -65,7 +65,7 @@ syncing the binary and receipt directories, then syncs the prefix directory so
 the journal removal is durable too.
 
 Before enabling remote packages, the implementation must conform to the
-selected TUF v1.0.33 profile in [`decisions.md`](decisions.md) and
+selected TUF v1.0.36 profile in [`decisions.md`](decisions.md) and
 [`tuf-profile.md`](tuf-profile.md), use an audited cryptographic provider,
 bootstrap roots out of band, enforce role thresholds and package-scoped
 delegation, bind exact target length and digest plus package identity, and

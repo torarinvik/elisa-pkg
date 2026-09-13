@@ -2,7 +2,7 @@
 
 `elisapkg` treats package metadata, source archives, manifests, lockfiles, and registry responses as hostile input. The current implementation has no enabled remote source provider. `fetch` fails closed with exit status 5, and `publish`/remote `install NAME` are not enabled. `install --local` remains an offline, receipt-backed deployment of the current build and does not consume registry data. Remote support stays disabled while the selected TUF verifier, provider, and key operations remain unimplemented and under review.
 
-The selected production trust protocol is TUF Specification v1.0.33. Its
+The selected production trust protocol is TUF Specification v1.0.36. Its
 elisapkg profile and remaining implementation gates are documented in
 [`docs/decisions.md`](docs/decisions.md) (D-013),
 [`docs/tuf-profile.md`](docs/tuf-profile.md), and

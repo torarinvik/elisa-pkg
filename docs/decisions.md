@@ -185,11 +185,14 @@ cases in `scripts/test.sh`.
 ## D-013: production registry metadata protocol
 
 Production registry metadata will use The Update Framework (TUF), pinned to
-[Specification v1.0.33](https://theupdateframework.github.io/specification/v1.0.33/)
+[Specification v1.0.36](https://theupdateframework.github.io/specification/v1.0.36/)
 and its required TAP 6, TAP 9, TAP 10, and TAP 11 behavior. The elisapkg wire
 and role profile is recorded in
 [`tuf-profile.md`](tuf-profile.md). This decision selects a protocol and trust
 model; it does not enable network access or approve a cryptographic provider.
+The specification version is the normative baseline. Metadata `spec_version`
+acceptance is limited to stable `1.0.P` values where `0 <= P <= 36`; role
+thresholds must be positive integers, and impossible thresholds are rejected.
 
 Every configured registry has a trusted root provisioned with the client or
 through an authenticated out-of-band enrollment process. Root updates follow

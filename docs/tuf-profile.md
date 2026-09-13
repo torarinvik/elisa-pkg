@@ -7,10 +7,15 @@ registry support is implemented or ready to enable.
 ## Specification and interoperability
 
 - Implement
-  [TUF Specification v1.0.33](https://theupdateframework.github.io/specification/v1.0.33/),
-  including TAP 6, TAP 9, TAP 10, and TAP 11. The version in every metadata
-  document must be exactly `1.0.33`. A future TUF specification requires an
-  explicit compatibility review and a new decision before it is accepted.
+  [TUF Specification v1.0.36](https://theupdateframework.github.io/specification/v1.0.36/),
+  including TAP 6, TAP 9, TAP 10, and TAP 11. TUF permits adopters to define
+  how metadata `spec_version` matches the expected version ([specification
+  rule](https://theupdateframework.github.io/specification/v1.0.36/#file-formats-root)).
+  Elisapkg accepts only stable versions `1.0.P` where the numeric patch `P` is
+  between 0 and 36 inclusive. Reject malformed versions, prerelease or build
+  suffixes, any other major/minor version, and a patch above 36. A later patch
+  or any other TUF specification requires an explicit compatibility review
+  and a new decision before it is accepted.
 - Use the TUF JSON metadata format and the canonical signed-byte rules defined
   by that specification. A conformant client may implement role, delegation,
   and state policy in Elisa; signature primitives must come from a reviewed
@@ -25,7 +30,9 @@ registry support is implemented or ready to enable.
   configured size, role-count, delegation-depth, or target-count bounds before
   it can affect trust state. Preserve and authenticate fields as required by
   TUF. In `custom.elisapkg`, accept only fields defined by its schema version;
-  reject unknown fields that could alter package semantics.
+  reject unknown fields that could alter package semantics. Require every role
+  threshold to be a positive integer and reject thresholds larger than the
+  number of distinct authorized key IDs.
 - Initially accept only TUF `ed25519` signing keys and signatures and SHA-256
   target digests. Do not negotiate algorithms from server input. Supporting an
   additional signature or digest algorithm requires a reviewed profile change,
@@ -57,7 +64,7 @@ registry support is implemented or ready to enable.
 ## Roles, package authority, and target identity
 
 - Validate root, timestamp, snapshot, top-level targets, and each required
-  delegated targets role using the ordered client workflow in TUF v1.0.33.
+  delegated targets role using the ordered client workflow in TUF v1.0.36.
   Require signed expiry, monotonic metadata versions, snapshot references, and
   hashes/lengths so stale, mixed, or rollback metadata cannot be accepted.
 - Package release authority is a delegated Targets role scoped to the
@@ -134,7 +141,13 @@ boundaries, but production trust must come from the full TUF chain above.
 
 Before network support is enabled, fixtures must cover:
 
+- run the official TUF conformance suite against the exact client build and
+  pinned specification version; require every applicable security test to pass,
+  with skips or expected failures individually justified and reviewed;
 - known-good metadata generated independently by a conformant TUF tool;
+- `spec_version` values `1.0.0`, `1.0.31`, and `1.0.36` accepted, while `1.0.37`,
+  `1.1.0`, `2.0.0`, malformed versions, prerelease versions, and build-metadata
+  suffixes are rejected;
 - root bootstrap, sequential root rotation, old/new threshold failures, and
   recovery from revoked or compromised role keys;
 - valid signatures from unauthorized keys and valid delegated signatures
