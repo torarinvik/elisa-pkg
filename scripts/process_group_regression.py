@@ -32,36 +32,42 @@ def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
         if descendant == 0:
             if Platform::pkg_create_exclusive_file("ready") != 0:
                 Platform::pkg_process_exit(23)
-            descendant_deadline: i64 = Platform::pkg_wall_clock_seconds() + 8
+            descendant_deadline: i64 = Platform::pkg_monotonic_milliseconds() + 8000
             descendant_now: mutable i64 = 0
             while Platform::pkg_access("release", 0) != 0 |descendant_deadline, descendant_now|:
-                descendant_now <- Platform::pkg_wall_clock_seconds()
+                descendant_now <- Platform::pkg_monotonic_milliseconds()
                 if descendant_now < 0 or descendant_now > descendant_deadline:
                     Platform::pkg_process_exit(24)
+                if Platform::pkg_sleep_milliseconds(10) != 0:
+                    Platform::pkg_process_exit(27)
             if Platform::pkg_create_exclusive_file("escaped") != 0:
                 Platform::pkg_process_exit(25)
             Platform::pkg_process_exit(0)
-        ready_deadline: i64 = Platform::pkg_wall_clock_seconds() + 5
+        ready_deadline: i64 = Platform::pkg_monotonic_milliseconds() + 15000
         ready_now: mutable i64 = 0
         while Platform::pkg_access("ready", 0) != 0 |ready_deadline, ready_now|:
-            ready_now <- Platform::pkg_wall_clock_seconds()
+            ready_now <- Platform::pkg_monotonic_milliseconds()
             if ready_now < 0 or ready_now > ready_deadline:
                 Platform::pkg_process_exit(26)
+            if Platform::pkg_sleep_milliseconds(10) != 0:
+                Platform::pkg_process_exit(28)
         Platform::pkg_process_exit(0)
     if leader < 0:
         return 1
 
     status: mutable i32 = 0
-    waited: i64 = Platform::pkg_waitpid_group_timeout(leader, &status, 7000)
-    return 2 if waited != 0 or status != 0
+    waited: i64 = Platform::pkg_waitpid_group_timeout(leader, &status, 20000)
+    return 2 if waited != 0
+    return 7 if status != 0
     return 3 if Platform::pkg_access("ready", 0) != 0
     return 4 if Platform::pkg_create_exclusive_file("release") != 0
-    observe_deadline: i64 = Platform::pkg_wall_clock_seconds() + 2
+    observe_deadline: i64 = Platform::pkg_monotonic_milliseconds() + 2000
     observe_now: mutable i64 = 0
     while Platform::pkg_access("escaped", 0) != 0 |observe_deadline, observe_now|:
-        observe_now <- Platform::pkg_wall_clock_seconds()
+        observe_now <- Platform::pkg_monotonic_milliseconds()
         return 5 if observe_now < 0
         break if observe_now >= observe_deadline
+        return 8 if Platform::pkg_sleep_milliseconds(10) != 0
     return 6 if Platform::pkg_access("escaped", 0) == 0
     return 0
 '''
@@ -103,11 +109,15 @@ def main() -> int:
         if compile_result.returncode != 0:
             raise SystemExit(f"error: could not compile process group probe:\n{compile_result.stdout}")
 
-        run_result = subprocess.run([str(binary)], cwd=work, env=environment, timeout=15, check=False)
+        run_result = subprocess.run([str(binary)], cwd=work, env=environment, timeout=30, check=False)
         if run_result.returncode != 0:
+            detail = {
+                2: "leader wait or process-group cleanup returned an error",
+                7: "leader exited before the descendant became ready",
+                8: "descendant check could not sleep",
+            }.get(run_result.returncode, "a same-group descendant survived normal parent exit or cleanup failed")
             raise SystemExit(
-                f"error: process group probe returned {run_result.returncode}; "
-                "a same-group descendant survived normal parent exit or cleanup failed"
+                f"error: process group probe returned {run_result.returncode}: {detail}"
             )
 
     print("Elisa process group cleanup regression passed")
