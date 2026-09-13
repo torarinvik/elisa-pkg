@@ -122,7 +122,7 @@ def run() -> int:
     callback_decoy_path: Optional[Path] = None
     generated_paths: list[Path] = []
     try:
-        project_root = base / "project"
+        project_root = base / "project.with.dots"
         sandbox_build_root = project_root / ".elisapkg" / "build"
         sandbox_work_root = sandbox_build_root / "scratch"
         tools_root = base / "tools"
@@ -237,10 +237,18 @@ def run() -> int:
         )
         if expected_scratch_allow not in profile_result.stdout:
             raise RuntimeError("generated compiler profile omitted its exact private-scratch read rule")
-        credential_rule = re.search(rb'\(deny file-read\* \(regex #"([^\"]+)"\)\)', profile_result.stdout)
-        if credential_rule is None:
+        denial_patterns = [
+            re.compile(pattern.decode("ascii"))
+            for pattern in re.findall(rb'\(deny file-read\* \(regex #"([^\"]+)"\)\)', profile_result.stdout)
+        ]
+        if not denial_patterns:
             raise RuntimeError("generated compiler profile omitted credential-path read denials")
-        credential_pattern = re.compile(credential_rule.group(1).decode("ascii"))
+        credential_pattern = next(
+            (pattern for pattern in denial_patterns if pattern.match("/Users/test/.AZURE/credentials.json")),
+            None,
+        )
+        if credential_pattern is None:
+            raise RuntimeError("generated compiler profile omitted its credential-path matcher")
         credential_paths = (
             "/Users/test/.AZURE/credentials.json",
             "/Users/test/.TERRAFORM.D/state",
@@ -251,6 +259,8 @@ def run() -> int:
             "/Users/test/project/src/.hg",
             "/Users/test/project/src/.svn/wc.db",
             "/Users/test/project/src/IMPLEMENTATION_PLAN.md",
+            "/Users/test/project/src/implementation_plan.md",
+            "/Users/test/project/src/ImPlEmEnTaTiOn_PlAn.Md/child.elisa",
             "/Users/test/id_ECDSA",
             "/Users/test/credentials-backup/token.txt",
             "/Users/test/.env.production/token.txt",
@@ -270,6 +280,28 @@ def run() -> int:
         for path in ordinary_paths:
             if credential_pattern.match(path) is not None:
                 raise RuntimeError(f"compiler profile credential rule unexpectedly denied {path}")
+        root_state_sample = str(project_root.resolve() / ".ELISAPKG" / "unhashed-input.elisa")
+        root_state_patterns = [
+            pattern for pattern in denial_patterns if pattern.match(root_state_sample) is not None
+        ]
+        if not root_state_patterns:
+            raise RuntimeError("compiler profile omitted case-insensitive root-state denials")
+        for state_name in (".ELISAPKG", "BUILD", "TaRgEt"):
+            path = str(project_root.resolve() / state_name / "unhashed-input.elisa")
+            if not any(pattern.match(path) is not None for pattern in root_state_patterns):
+                raise RuntimeError(f"compiler profile omitted case-insensitive state denial for {state_name}")
+        nested_state_paths = (
+            project_root / "src" / ".ELISAPKG" / "nested-source.elisa",
+            project_root / "src" / ".BUILD" / "nested-source.elisa",
+            project_root / "src" / ".TARGET" / "nested-source.elisa",
+        )
+        for path in nested_state_paths:
+            if any(pattern.match(str(path)) is not None for pattern in root_state_patterns):
+                raise RuntimeError(f"compiler profile unexpectedly denied nested source input {path}")
+        sibling_root = project_root.parent / "projectXwithXdots"
+        sibling_state_path = str(sibling_root / "BUILD" / "unhashed-input.elisa")
+        if any(pattern.match(sibling_state_path) is not None for pattern in root_state_patterns):
+            raise RuntimeError("compiler state denial regex treated project-root dots as wildcards")
         profile_path = base / "compiler.sb"
         profile_path.write_bytes(profile_result.stdout)
 

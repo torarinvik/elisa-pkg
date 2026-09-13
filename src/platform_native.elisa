@@ -2131,10 +2131,10 @@ module PlatformNative:
                         relative_policy_path: mutable darray[u8] = []
                         return directory_failure(stream) if not relative_path_under(root, child_name, &relative_policy_path)
                         continue if PackagePathPolicy::credential_path_forbidden(relative_policy_path)
+                        continue if PackagePathPolicy::reserved_source_path_forbidden(relative_policy_path)
                         directory_probe: i64 = open_directory_path(child_name)
                         if directory_probe >= 0:
                             return directory_failure(stream) if native_close(directory_probe) != 0
-                            continue if skip_directory_under(root, child_name)
                             return directory_failure(stream) if not collect_directory(root, child_name, out, depth + 1.usize())
                         else:
                             file_probe: i64 = open_package_file(child_name)
@@ -2144,7 +2144,6 @@ module PlatformNative:
                             regular: bool = regular_fd(file_probe)
                             close_status: i64 = native_close(file_probe)
                             return directory_failure(stream) if not regular or close_status != 0
-                            continue if skip_file(child_name)
                             return directory_failure(stream) if out.count + child_length + 1.usize() > 16777216.usize()
                             for index in 0..<child_length |out, child_name|:
                                 out.push(child_name[index].u8())
@@ -2162,20 +2161,6 @@ module PlatformNative:
 
         def path_length(path: cstr) -> usize:
             return native_strlen(path)
-
-        def skip_directory_under(root: cstr, path: cstr) -> bool:
-            # Ignore policy directories relative to the package root. When a
-            # dependency root is canonicalized to an absolute path, an ancestor
-            # checkout directory named `build` must not hide the package's own
-            # source tree.
-            return skip_directory(path) if cstr_equal(root, ".")
-            root_length: usize = native_strlen(root)
-            path_length_value: usize = native_strlen(path)
-            return skip_directory(path) if root_length == 0 or path_length_value <= root_length or path[root_length].u8() != 47
-            for index in 0..<root_length |root, path|:
-                return false if root[index].u8() != path[index].u8()
-            relative: cstr = (&path[root_length + 1.usize()]).cast[cstr] can Unsafe.PointerCast
-            return skip_directory(relative)
 
         def relative_path_under(root: cstr, path: cstr, out: mutable darray[u8]&) -> bool:
             out.resize(0)
@@ -2206,47 +2191,3 @@ module PlatformNative:
 
         def name_is_dot(raw: mutable u8&, offset: usize, length: usize) -> bool:
             return length == 1 and raw[offset] == 46 or length == 2 and raw[offset] == 46 and raw[offset + 1] == 46
-
-        def skip_directory(path: cstr) -> bool:
-            # VCS metadata is excluded at any depth and separately denied by
-            # the compiler sandbox. Package state is excluded only at the
-            # package root; nested source directories named build/target (or
-            # .elisapkg) remain fingerprinted compiler inputs.
-            return path_has_component(path, ".git") or path_has_component(path, ".hg") or path_has_component(path, ".svn") or top_level_component_is(path, ".elisapkg") or top_level_component_is(path, "build") or top_level_component_is(path, "target")
-
-        def top_level_component_is(path: cstr, wanted: cstr) -> bool:
-            wanted_length: usize = native_strlen(wanted)
-            length: usize = native_strlen(path)
-            finish: mutable usize = 0
-            while finish < length and path[finish].u8() != 47:
-                finish <- finish + 1.usize()
-            return false if finish != wanted_length
-            for index in 0..<wanted_length |path, wanted|:
-                return false if path[index].u8() != wanted[index].u8()
-            return true
-
-        def skip_file(path: cstr) -> bool:
-            length: usize = native_strlen(path)
-            leaf_start: mutable usize = length
-            while leaf_start > 0 and path[leaf_start - 1].u8() != 47:
-                leaf_start <- leaf_start - 1.usize()
-            leaf: cstr = (&path[leaf_start]).cast[cstr] can Unsafe.PointerCast
-            return cstr_equal(leaf, "IMPLEMENTATION_PLAN.md") or cstr_equal(leaf, ".git") or cstr_equal(leaf, ".hg") or cstr_equal(leaf, ".svn")
-
-        def path_has_component(path: cstr, wanted: cstr) -> bool:
-            wanted_length: usize = native_strlen(wanted)
-            length: usize = native_strlen(path)
-            start: mutable usize = 0
-            while start < length:
-                while start < length and path[start].u8() == 47:
-                    start <- start + 1.usize()
-                finish: mutable usize = start
-                while finish < length and path[finish].u8() != 47:
-                    finish <- finish + 1.usize()
-                if finish - start == wanted_length:
-                    matches: mutable bool = true
-                    for index in 0..<wanted_length |path, wanted, start, matches|:
-                        matches <- false if path[start + index].u8() != wanted[index].u8()
-                    return true if matches
-                start <- finish + 1.usize()
-            return false

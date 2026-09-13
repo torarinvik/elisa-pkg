@@ -196,11 +196,13 @@ capabilities in package code. The compiler and shared `run`/`test` launch paths
 are covered by `scripts/inherited_fd_regression.py`.
 
 Build profiles deny reads from root-level `.elisapkg`, `build`, and `target`
-directories inside the root package and every locked local dependency. The
+directories inside the root package and every locked local dependency,
+including ASCII case variants on case-insensitive filesystems. The
 source walker excludes those directories only at the package root, so nested
 source directories with the same names remain fingerprinted and readable.
-VCS metadata (`.git`, `.hg`, `.svn`) and `IMPLEMENTATION_PLAN.md` are excluded
-from the digest and denied to the compiler at any depth. Only the unique
+VCS metadata components (`.git`, `.hg`, `.svn`) and every file or directory
+named `IMPLEMENTATION_PLAN.md` are excluded from the digest and denied to the
+compiler at any depth, with ASCII case-insensitive matching. Only the unique
 private scratch directory and its exact compiler output are reallowed. The
 source walker also fails closed on symlinks instead of omitting them from the
 digest while allowing the compiler's include reader to follow them.

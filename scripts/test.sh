@@ -19,6 +19,7 @@ export ELISA_ALLOW_STALE_STAGE1="${ELISA_ALLOW_STALE_STAGE1:-0}"
 "$BIN" doctor | grep -F 'local Ed25519 provider available' >/dev/null
 python3 "$ROOT/scripts/ffi_boundary_test.py"
 python3 "$ROOT/scripts/build_include_regression.py"
+python3 "$ROOT/scripts/package_path_policy_regression.py"
 python3 "$ROOT/scripts/ffi_fifo_regression.py"
 python3 "$ROOT/scripts/access_regression.py"
 python3 "$ROOT/scripts/crypto_provider_trust_regression.py"
@@ -2149,12 +2150,38 @@ PY
   printf '%s' marker > .git
   printf '%s' marker > .hg
   printf '%s' marker > .svn
+  mkdir -p BUILD TARGET src/.GIT src/.Hg src/.SVN src/.BUILD src/docs/IMPLEMENTATION_PLAN.MD
+  printf '%s\n' secret > BUILD/cached-output.elisa
+  printf '%s\n' secret > TARGET/stale-output.elisa
+  printf '%s\n' secret > src/.GIT/config
+  printf '%s\n' secret > src/.Hg/hgrc
+  printf '%s\n' secret > src/.SVN/wc.db
+  printf '%s\n' 'ignored plan metadata' > src/implementation_plan.MD
+  printf '%s\n' 'ignored plan directory child' > src/docs/IMPLEMENTATION_PLAN.MD/child.elisa
+  printf '%s\n' 'nested build-named source remains a package input' > src/.BUILD/nested-source.elisa
   "$BIN" package --list > package-files-vcs.txt
-  if grep -E '(^|/)(\.git|\.hg|\.svn)$' package-files-vcs.txt >/dev/null; then
-    echo "package listing included a VCS marker file" >&2
+  if grep -Ei '(^|/)(\.git|\.hg|\.svn)(/|$)|(^|/)implementation_plan\.md(/|$)|^(\.elisapkg|build|target)(/|$)' package-files-vcs.txt >/dev/null; then
+    echo "package listing included VCS metadata, ignored plan data, or root package state" >&2
     exit 1
   fi
-  rm -f .git .hg .svn package-files-vcs.txt
+  if ! grep -F 'src/.BUILD/nested-source.elisa' package-files-vcs.txt >/dev/null; then
+    echo "package listing omitted a nested source directory named like package state" >&2
+    exit 1
+  fi
+  "$BIN" resolve >/dev/null
+  "$BIN" package >/dev/null
+  if tar -tf .elisapkg/package.tar | grep -Ei '(^|/)(\.git|\.hg|\.svn)(/|$)|(^|/)implementation_plan\.md(/|$)|^(\.elisapkg|build|target)(/|$)' >/dev/null; then
+    echo "package archive included case-varied VCS metadata, plan data, or root state" >&2
+    exit 1
+  fi
+  if ! tar -tf .elisapkg/package.tar | grep -F 'src/.BUILD/nested-source.elisa' >/dev/null; then
+    echo "package archive omitted a nested source directory named like package state" >&2
+    exit 1
+  fi
+  rm -rf BUILD TARGET src/.GIT src/.Hg src/.SVN src/.BUILD src/docs/IMPLEMENTATION_PLAN.MD
+  rm -f .git .hg .svn src/implementation_plan.MD package-files-vcs.txt
+  "$BIN" resolve >/dev/null
+  "$BIN" package >/dev/null
   printf '%s' secret > src/.env
   printf '%s' secret > src/config.env
   printf '%s' secret > src/private.pem
