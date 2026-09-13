@@ -1,0 +1,95 @@
+name: macOS ARM64 CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-arm64-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Seeded toolchain and required sandbox tests
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      ELISA_COMPILER_SHA: 083ee932be0713918418607e5c5f47b153d49422
+      ELISA_CORE_SHA: bff39311695af94e14d5aff4fe41a1e0fdc1207e
+      ELISA_LLVM_VERSION: 23.1.1
+      ELISAPKG_REQUIRE_SANDBOX_TESTS: "1"
+      GOFLAGS: -mod=readonly
+      GOTOOLCHAIN: local
+
+    steps:
+      - name: Check out elisapkg
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+
+      - name: Select pinned Go toolchain
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e0
+        with:
+          go-version: 1.25.0
+          cache: false
+
+      - name: Fetch pinned Elisa compiler and core sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain_root="$RUNNER_TEMP/elisapkg-toolchain"
+          mkdir -p "$toolchain_root"
+          printf 'ELISA_COMPILER_ROOT=%s\n' "$toolchain_root/Elisa-compiler" >> "$GITHUB_ENV"
+          printf 'ELISA_CORE=%s\n' "$toolchain_root/Elisa-core" >> "$GITHUB_ENV"
+          printf 'ELISACORE_BIN=%s\n' "$toolchain_root/Elisa-core/compiler/bin/elisac" >> "$GITHUB_ENV"
+          printf 'ELISA_RUNTIME_OBJ=%s\n' "$toolchain_root/Elisa-compiler/build/runtime/elisacore_runtime.o" >> "$GITHUB_ENV"
+          printf 'ELISA_STAGE1_BIN=%s\n' "$toolchain_root/Elisa-compiler/bin/elisac-stage1" >> "$GITHUB_ENV"
+          printf 'ELISA_COMPILER_WRAPPER=%s\n' "$toolchain_root/Elisa-compiler/scripts/elisac_stage1.sh" >> "$GITHUB_ENV"
+
+          git init --quiet "$toolchain_root/Elisa-compiler"
+          git -C "$toolchain_root/Elisa-compiler" remote add origin https://github.com/torarinvik/Elisa-compiler.git
+          git -C "$toolchain_root/Elisa-compiler" fetch --no-tags --depth=1 origin "$ELISA_COMPILER_SHA"
+          git -C "$toolchain_root/Elisa-compiler" checkout --quiet --detach FETCH_HEAD
+          test "$(git -C "$toolchain_root/Elisa-compiler" rev-parse HEAD)" = "$ELISA_COMPILER_SHA"
+
+          git init --quiet "$toolchain_root/Elisa-core"
+          git -C "$toolchain_root/Elisa-core" remote add origin https://github.com/torarinvik/Elisa-core.git
+          git -C "$toolchain_root/Elisa-core" fetch --no-tags --depth=1 origin "$ELISA_CORE_SHA"
+          git -C "$toolchain_root/Elisa-core" checkout --quiet --detach FETCH_HEAD
+          test "$(git -C "$toolchain_root/Elisa-core" rev-parse HEAD)" = "$ELISA_CORE_SHA"
+
+      - name: Install and verify LLVM
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install llvm
+          llvm_prefix="$(brew --prefix llvm)"
+          llvm_config="$llvm_prefix/bin/llvm-config"
+          llvm_clang="$llvm_prefix/bin/clang"
+          actual_version="$("$llvm_config" --version)"
+          test "$actual_version" = "$ELISA_LLVM_VERSION"
+          printf 'LLVM_CONFIG=%s\n' "$llvm_config" >> "$GITHUB_ENV"
+          printf 'ELISA_CLANG=%s\n' "$llvm_clang" >> "$GITHUB_ENV"
+          printf 'ELISA_LLVM_BIN_DIR=%s/bin\n' "$llvm_prefix" >> "$GITHUB_ENV"
+          go version
+          "$llvm_config" --version
+          xcodebuild -version
+
+      - name: Build stage0 compiler
+        run: make -C "$ELISA_CORE/compiler" build
+
+      - name: Seed stage1 compiler
+        run: '"$ELISA_COMPILER_ROOT/scripts/elisac_stage1.sh" --seed'
+
+      - name: Build runtime from pinned Elisa sources
+        run: '"$ELISA_COMPILER_ROOT/scripts/build_runtime_object.sh"'
+
+      - name: Run package-manager build and full regression suite
+        env:
+          ELISA_ALLOW_STALE_STAGE1: "0"
+        run: ./scripts/test.sh

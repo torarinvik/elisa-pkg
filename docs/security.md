@@ -165,12 +165,14 @@ no old installer is still running. `scripts/install_lock_regression.py` checks
 contending processes, crash release, persistent inode behavior, and rejection of
 symlinks, FIFOs, and directories.
 
-Binary and receipt publication still occurs as two separate hard-link
-operations. A crash between them can leave a binary without its ownership
-receipt; the client fails closed and does not guess whether a partial artifact
-is stale. Add a durable transaction journal and identity-checked recovery before
-treating local install as crash-safe. Same-UID pathname races and Linux ACL
-grants also remain outside the current protection.
+Install and uninstall write a durable per-prefix transaction journal before
+changing a binary or receipt. The next operation recovers under the persistent
+kernel lock only when the journal, package identity, digest, receipt, and
+on-disk artifact agree; malformed or externally changed state fails closed
+with its evidence preserved. `scripts/install_transaction_regression.py`
+synthesizes recovery states but does not yet kill a process at every filesystem
+syscall boundary. Same-UID pathname races and Linux ACL grants also remain
+outside the current protection.
 
 The local package writer emits only regular files in sorted ustar order with
 zero timestamps and normalized ownership, with a maximum of 512 selected files
