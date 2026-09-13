@@ -60,7 +60,9 @@ locked operation validates the journal and both artifacts, then finishes or
 abandons only a state whose package identity, digest, and receipt match exactly;
 malformed or mismatched state stops with its evidence intact. The regression
 suite synthesizes each durable crash state, but does not yet kill the process at
-every filesystem syscall boundary.
+every filesystem syscall boundary. Retirement removes the journal only after
+syncing the binary and receipt directories, then syncs the prefix directory so
+the journal removal is durable too.
 
 Before enabling remote packages, the implementation must conform to the
 selected TUF v1.0.33 profile in [`decisions.md`](decisions.md) and

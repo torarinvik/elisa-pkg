@@ -19,6 +19,16 @@ DIGEST = hashlib.sha256(ARTIFACT).hexdigest().encode("ascii")
 
 def check_install_recovery_sync_order() -> None:
     source = (ROOT / "src/main.elisa").read_text(encoding="utf-8")
+    retire_start = source.find("def retire_local_install_transaction(")
+    retire_end = source.find("def remove_empty_directory(", retire_start)
+    if retire_start < 0 or retire_end < 0:
+        raise SystemExit("error: durable local install transaction retirement helper is missing")
+    retire = source[retire_start:retire_end]
+    unlink = retire.find("remove_known_file(&path_snapshot)")
+    journal_parent_sync = retire.find("Platform::pkg_fsync_parent(path_name)")
+    if unlink < 0 or journal_parent_sync <= unlink:
+        raise SystemExit("error: transaction journal retirement must sync its parent after unlink")
+
     recovery_start = source.find("def recover_local_install_transaction(")
     recovery_end = source.find("def finish_local_install_error(", recovery_start)
     if recovery_start < 0 or recovery_end < 0:
@@ -30,7 +40,7 @@ def check_install_recovery_sync_order() -> None:
     if install_start < 0 or uninstall_start < 0 or copy_outputs_start < 0:
         raise SystemExit("error: local install recovery branches are missing")
     install_branch = recovery[install_start:uninstall_start]
-    journal_retire = install_branch.rfind("remove_known_file(&transaction_path)")
+    journal_retire = install_branch.rfind("retire_local_install_transaction(transaction_path)")
     install_sync = install_branch.rfind("sync_local_install_entry_parents(destination_name, receipt_name)")
     if install_sync < 0 or install_sync >= journal_retire:
         raise SystemExit("error: install recovery must sync both target directories before retiring its journal")
@@ -39,7 +49,7 @@ def check_install_recovery_sync_order() -> None:
     retire_positions = []
     cursor = 0
     while True:
-        position = uninstall_branch.find("remove_known_file(&transaction_path)", cursor)
+        position = uninstall_branch.find("retire_local_install_transaction(transaction_path)", cursor)
         if position < 0:
             break
         retire_positions.append(position)
@@ -76,7 +86,7 @@ def check_install_recovery_sync_order() -> None:
         if start < 0 or stop < 0:
             raise SystemExit(f"error: normal local {label} implementation is missing")
         operation = source[start:stop]
-        retire = operation.rfind("remove_known_file(&transaction_path)")
+        retire = operation.rfind("retire_local_install_transaction(transaction_path)")
         sync = operation.rfind("sync_local_install_entry_parents(destination_name, receipt_sync_name)" if label == "install" else "sync_local_install_entry_parents(destination_name, receipt_name)")
         if sync < 0 or sync >= retire:
             raise SystemExit(f"error: normal local {label} must sync target directories before retiring its journal")
