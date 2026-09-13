@@ -59,10 +59,15 @@ install or uninstall intent before the executable or receipt changes. The next
 locked operation validates the journal and both artifacts, then finishes or
 abandons only a state whose package identity, digest, and receipt match exactly;
 malformed or mismatched state stops with its evidence intact. The regression
-suite synthesizes each durable crash state, but does not yet kill the process at
-every filesystem syscall boundary. Retirement removes the journal only after
-syncing the binary and receipt directories, then syncs the prefix directory so
-the journal removal is durable too.
+suite synthesizes reachable durable states and uses
+`scripts/install_killpoint_regression.py` to kill an instrumented copy of the
+Elisa binary after each install and uninstall transaction boundary. It then
+checks recovery with the production binary. Test controls are inserted only in
+a temporary source copy. These tests cover process death between transaction
+operations, but not interruption inside an FFI filesystem helper or physical
+power loss. Retirement removes the journal only after syncing the binary and
+receipt directories, then syncs the prefix directory so the journal removal is
+durable too.
 
 Before enabling remote packages, the implementation must conform to the
 selected TUF v1.0.36 profile in [`decisions.md`](decisions.md) and
@@ -261,9 +266,12 @@ changing a binary or receipt. The next operation recovers under the persistent
 kernel lock only when the journal, package identity, digest, receipt, and
 on-disk artifact agree; malformed or externally changed state fails closed
 with its evidence preserved. `scripts/install_transaction_regression.py`
-synthesizes recovery states but does not yet kill a process at every filesystem
-syscall boundary. Same-UID pathname races and Linux ACL grants also remain
-outside the current protection.
+synthesizes recovery states; `scripts/install_killpoint_regression.py` adds
+process kills after each transaction-level install/uninstall operation and
+validates recovery with the production binary. Fault controls exist only in a
+temporary copied source tree. The tests do not interrupt inside FFI filesystem
+helpers or simulate power loss. Same-UID pathname races and Linux ACL grants
+also remain outside the current protection.
 
 The local package writer emits only regular files in sorted ustar order with
 zero timestamps and normalized ownership, with a maximum of 512 selected files
