@@ -70,7 +70,7 @@ using whatever compiler happens to be installed on the runner:
 | Go | `1.25.0`, required by the pinned core `go.mod` |
 | LLVM | `23.1.1`, checked after Homebrew installation |
 | `actions/checkout` | `9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0` |
-| `actions/setup-go` | `b7ad1dad31e06c5925ef5d2fc7ad053ef454303e0` |
+| `actions/setup-go` | `b7ad1dad31e06c5925ef5d2fc7ad053ef454303e` (v7.0.0) |
 | `actions/upload-artifact` | `043fb46d1a93c77aae656e7c1c64a875d1fc6a0a` (v7.0.1) |
 | `actions/download-artifact` | `634f93cb2916e3fdff6788551b99b062d0335ce0` (v5.0.0) |
 | `actions/attest` | `1e69f48acb82d1966a394da916b4c1698aa569d6` (v4.2.2) |
