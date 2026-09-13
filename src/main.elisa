@@ -7,6 +7,7 @@
 # present; no command silently falls back to an insecure mode.
 
 include "./platform.elisa"
+include "./install_faults.elisa"
 include "./sandbox.elisa"
 include "./model.elisa"
 include "./trust.elisa"
@@ -625,10 +626,11 @@ module Cli:
         # A local install transaction is recoverable state. Its unlink is not
         # complete until the containing prefix directory records that removal;
         # otherwise a power loss could resurrect an old intent after success.
-        def retire_local_install_transaction(path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+        def retire_local_install_transaction(path: darray[u8]&) -> bool can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             path_snapshot: mutable darray[u8] = []
             bytes_push_array(&path_snapshot, path)
             return false if not remove_known_file(&path_snapshot)
+            InstallFaults::transaction_boundary("transaction.journal.unlinked")
             path_c: mutable darray[u8] = []
             path_with_nul_into(&path_snapshot, &path_c)
             path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
@@ -4613,7 +4615,8 @@ module Cli:
             if version.count > MAX_INSTALL_VERSION_BYTES:
                 write_error("error: local install package versions exceed the bounded receipt limit\n")
                 return EXIT_USAGE
-            return EXIT_BUILD if run_build(start, options) != EXIT_OK
+            if not InstallFaults::use_test_prebuilt_artifact():
+                return EXIT_BUILD if run_build(start, options) != EXIT_OK
             artifact: mutable darray[u8] = []
             target_name_c: mutable darray[u8] = []
             path_with_nul_into(&target_name, &target_name_c)
@@ -4679,6 +4682,7 @@ module Cli:
             transaction_name: cstr = (&transaction_c[0]).cast[cstr] can Unsafe.PointerCast
             if not write_cstr_file_noclobber(transaction_name, &transaction):
                 return finish_local_install_error(lock_fd, "error: could not durably record the local installation transaction\n")
+            InstallFaults::transaction_boundary("install.journal.durable")
             destination.resize(0)
             bytes_push_array(&destination, destination_snapshot)
             destination_c: mutable darray[u8] = []
@@ -4686,6 +4690,7 @@ module Cli:
             destination_name: mutable cstr = (&destination_c[0]).cast[cstr] can Unsafe.PointerCast
             if not write_cstr_file_noclobber(destination_name, &artifact_bytes):
                 return finish_local_install_error(lock_fd, "error: could not publish the local installation binary; recovery will inspect the durable transaction\n")
+            InstallFaults::transaction_boundary("install.binary.durable")
             destination.resize(0)
             bytes_push_array(&destination, destination_snapshot)
             destination_c.resize(0)
@@ -4693,15 +4698,18 @@ module Cli:
             destination_name <- (&destination_c[0]).cast[cstr] can Unsafe.PointerCast
             if Platform::pkg_chmod(destination_name, 493.u16()) != 0:
                 return finish_local_install_error(lock_fd, "error: could not set local installation permissions; recovery will inspect the durable transaction\n")
+            InstallFaults::transaction_boundary("install.binary.mode.durable")
             receipt_path.resize(0)
             bytes_push_array(&receipt_path, receipt_snapshot)
             if not publish_local_install_receipt(receipt_path, receipt):
                 return finish_local_install_error(lock_fd, "error: could not publish the local installation receipt; recovery will inspect the durable transaction\n")
+            InstallFaults::transaction_boundary("install.receipt.durable")
             receipt_sync_c: mutable darray[u8] = []
             path_with_nul_into(&receipt_path, &receipt_sync_c)
             receipt_sync_name: cstr = (&receipt_sync_c[0]).cast[cstr] can Unsafe.PointerCast
             if not sync_local_install_entry_parents(destination_name, receipt_sync_name):
                 return finish_local_install_error(lock_fd, "error: could not sync local installation directories; recovery will inspect the durable transaction\n")
+            InstallFaults::transaction_boundary("install.targets.synced")
             return finish_local_install_error(lock_fd, "error: the local installation was published but its transaction journal could not be retired\n") if not retire_local_install_transaction(transaction_path)
             return 7 if not release_install_lock(lock_fd)
             write_ok("installed ")
@@ -4841,16 +4849,20 @@ module Cli:
             transaction_name: cstr = (&transaction_c[0]).cast[cstr] can Unsafe.PointerCast
             if not write_cstr_file_noclobber(transaction_name, &transaction):
                 return finish_local_install_error(lock_fd, "error: could not durably record the local uninstallation transaction\n")
+            InstallFaults::transaction_boundary("uninstall.journal.durable")
             destination.resize(0)
             bytes_push_array(&destination, destination_snapshot)
             if not remove_trusted_install_file_identity(destination, artifact_device, artifact_inode):
                 return finish_local_install_error(lock_fd, "error: could not remove the local installation; recovery will inspect the durable transaction\n")
+            InstallFaults::transaction_boundary("uninstall.binary.removed")
             receipt_path.resize(0)
             bytes_push_array(&receipt_path, receipt_snapshot)
             if not remove_trusted_install_file_identity(receipt_path, receipt_device, receipt_inode):
                 return finish_local_install_error(lock_fd, "error: could not remove the local installation receipt; recovery will inspect the durable transaction\n")
+            InstallFaults::transaction_boundary("uninstall.receipt.removed")
             if not sync_local_install_entry_parents(destination_name, receipt_name):
                 return finish_local_install_error(lock_fd, "error: could not sync local installation directories; recovery will inspect the durable transaction\n")
+            InstallFaults::transaction_boundary("uninstall.targets.synced")
             if not retire_local_install_transaction(transaction_path):
                 return finish_local_install_error(lock_fd, "error: the local installation was removed but its transaction journal could not be retired\n")
             return 7 if not release_install_lock(lock_fd)
