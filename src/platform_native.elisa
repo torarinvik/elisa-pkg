@@ -683,7 +683,9 @@ module PlatformNative:
         def collect_files(root: cstr, output: mutable u8&, capacity: usize) -> i64 can[Memory.Allocate, Unsafe.PointerCast]:
             return -22 if native_strlen(root) == 0.usize() or native_strlen(root) > 4096.usize() or capacity == 0.usize()
             paths: mutable darray[u8] = []
-            if not collect_directory(root, root, &paths, 0.usize()):
+            visited_nodes: mutable usize = 1.usize()
+            if not collect_directory(root, root, &paths, 0.usize(), &visited_nodes):
+                return -75 if visited_nodes > max_collect_traversal_nodes
                 return -5
             rows: mutable darray[darray[u8]] = []
             cursor: mutable usize = 0.usize()
@@ -696,22 +698,34 @@ module PlatformNative:
                 rows.push(row)
                 return -75 if rows.count > 4096.usize()
                 cursor <- cursor + 1.usize()
-            used_rows: mutable darray[bool] = []
-            used_rows.resize(rows.count)
+            ordered_rows: mutable darray[usize] = []
+            for row_index in 0..<rows.count |ordered_rows|:
+                ordered_rows.push(row_index)
+            collect_sort_path_rows(&ordered_rows, rows)
             used: mutable usize = 0.usize()
-            for _item in 0..<rows.count |rows, used_rows, output, used, capacity|:
-                best: mutable usize = rows.count
-                for candidate in 0..<rows.count |rows, used_rows, best, candidate|:
-                    continue if used_rows[candidate]
-                    best <- candidate if best == rows.count or path_less(rows[candidate], rows[best])
-                return -7 if best == rows.count or used + rows[best].count + 1.usize() > capacity
-                for index in 0..<rows[best].count |output, rows, best, used|:
-                    output[used + index] <- rows[best][index]
-                used <- used + rows[best].count
+            for sorted_index in 0..<ordered_rows.count |rows, ordered_rows, output, used, capacity|:
+                row_index: usize = ordered_rows[sorted_index]
+                return -7 if used + rows[row_index].count + 1.usize() > capacity
+                for index in 0..<rows[row_index].count |output, rows, row_index, used|:
+                    output[used + index] <- rows[row_index][index]
+                used <- used + rows[row_index].count
                 output[used] <- 0
                 used <- used + 1.usize()
-                used_rows[best] <- true
             return used.i64()
+
+        # Copy the policy-filtered package source tree into an existing 0700
+        # staging directory. Source files are opened exactly once each with
+        # O_NOFOLLOW and read only through that descriptor. The destination
+        # root is left in place on success and on failure; any entries written
+        # before a failure are removed before the error is returned.
+        def snapshot_package_tree(source_root: cstr, destination: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return snapshot_package_tree_into(source_root, destination)
+
+        # Remove all contents below a private snapshot root without following
+        # symlinks. The verified root itself remains empty for its caller to
+        # remove with the normal private-staging-directory cleanup path.
+        def cleanup_package_snapshot(destination: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return cleanup_package_snapshot_contents(destination)
 
         def mkstemp(template_path: mutable darray[u8]&) -> i64 can[Memory.Allocate, Unsafe.PointerCast]:
             return -22 if template_path.count == 0 or template_path.count > 4096.usize() or template_path[template_path.count - 1.usize()] != 0
@@ -903,6 +917,8 @@ module PlatformNative:
             return result
 
     private:
+        const max_collect_traversal_nodes: usize = 16384.usize()
+
         def write_temp_blob(prefix: cstr, value: darray[u8]&, path_out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             path_out.resize(0)
             return false if value.count > 67108864.usize()
@@ -1786,6 +1802,13 @@ module PlatformNative:
             return -5 if left_status != 0 or right_status != 0
             return errno_value
 
+        def close_three_error(first: i64, second: i64, third: i64, errno_value: i64) -> i64:
+            first_status: i32 = native_close(first)
+            second_status: i32 = native_close(second)
+            third_status: i32 = native_close(third)
+            return -5 if first_status != 0 or second_status != 0 or third_status != 0
+            return errno_value
+
         def close_two_result(left: i64, right: i64, result: i64) -> i64:
             left_status: i64 = native_close(left)
             right_status: i64 = native_close(right)
@@ -2086,7 +2109,397 @@ module PlatformNative:
                 out <- out + (value[offset + index].u64() << (index * 8.usize()))
             return out.i64()
 
-        def collect_directory(root: cstr, path: cstr, out: mutable darray[u8]&, depth: usize) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+        const snapshot_max_entries: usize = 512.usize()
+        const snapshot_collection_entries: usize = snapshot_max_entries + 2.usize()
+        const snapshot_max_path_bytes: usize = 4096.usize()
+        const snapshot_max_total_bytes: usize = 67108864.usize()
+        const snapshot_io_buffer_bytes: usize = 65536.usize()
+
+        def snapshot_package_tree_into(source_root: cstr, destination: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            source_length: usize = native_strlen(source_root)
+            destination_length: usize = native_strlen(destination)
+            return -22 if not snapshot_absolute_path_safe(source_root, source_length) or not snapshot_absolute_path_safe(destination, destination_length)
+
+            source_name: mutable darray[u8] = []
+            for index in 0..<source_length |source_name, source_root|:
+                source_name.push(source_root[index].u8())
+            source_name.push(0)
+            destination_name: mutable darray[u8] = []
+            for index in 0..<destination_length |destination_name, destination|:
+                destination_name.push(destination[index].u8())
+            destination_name.push(0)
+            source_leaf: mutable darray[u8] = []
+            destination_leaf: mutable darray[u8] = []
+            return -22 if not snapshot_path_leaf(source_name, &source_leaf) or not snapshot_path_leaf(destination_name, &destination_leaf)
+            return -13 if PackagePathPolicy::credential_root_forbidden(source_name) or PackagePathPolicy::reserved_source_path_forbidden(source_leaf)
+
+            source_fd: mutable i64 = open_directory_path((&source_name[0]).cast[cstr] can Unsafe.PointerCast)
+            return source_fd if source_fd < 0
+            destination_fd: mutable i64 = open_directory_path((&destination_name[0]).cast[cstr] can Unsafe.PointerCast)
+            if destination_fd < 0:
+                return close_error(source_fd, destination_fd)
+            if not private_staging_directory_fd(destination_fd, native_geteuid().u64()):
+                return close_two_error(source_fd, destination_fd, -13)
+            if not directory_empty(destination_fd):
+                return close_two_error(source_fd, destination_fd, -directory_not_empty_error)
+
+            source_stat: mutable darray[u8] = []
+            destination_stat: mutable darray[u8] = []
+            source_stat.resize(144)
+            destination_stat.resize(144)
+            source_stat_raw: mutable void& = (&source_stat[0]).cast[mutable void&] can Unsafe.PointerCast
+            destination_stat_raw: mutable void& = (&destination_stat[0]).cast[mutable void&] can Unsafe.PointerCast
+            if native_fstat(source_fd, source_stat_raw) != 0 or native_fstat(destination_fd, destination_stat_raw) != 0:
+                return close_two_error(source_fd, destination_fd, -5)
+            return close_two_error(source_fd, destination_fd, -22) if snapshot_same_inode(source_stat, destination_stat)
+            if snapshot_path_is_descendant(source_name, destination_name):
+                destination_relative: mutable darray[u8] = []
+                for index in (source_length + 1.usize())..<destination_length |destination_relative, destination_name|:
+                    destination_relative.push(destination_name[index])
+                if not PackagePathPolicy::reserved_source_path_forbidden(destination_relative):
+                    return close_two_error(source_fd, destination_fd, -22)
+
+            # collect_files supplies the shared reserved-path and credential
+            # filters and emits deterministic absolute paths. Its own walker
+            # is bounded at 4096 entries and 16 MiB; this stricter output bound
+            # limits this API to 512 files with paths no longer than 4096 bytes.
+            paths: mutable darray[u8] = []
+            paths.resize(snapshot_collection_entries * (snapshot_max_path_bytes + 1.usize()))
+            paths_raw: mutable u8& = (&paths[0]).cast[mutable u8&] can Unsafe.PointerCast
+            source_c: cstr = (&source_name[0]).cast[cstr] can Unsafe.PointerCast
+            collected: i64 = collect_files(source_c, paths_raw, paths.count)
+            if collected < 0:
+                return close_two_error(source_fd, destination_fd, collected)
+
+            # Re-open the named root after collection and compare its inode to
+            # the pinned descriptor. Copying itself remains anchored to the
+            # original descriptor, so a replaced root can never redirect a
+            # file open outside that tree.
+            current_source_fd: i64 = open_directory_path((&source_name[0]).cast[cstr] can Unsafe.PointerCast)
+            if current_source_fd < 0:
+                return close_two_error(source_fd, destination_fd, current_source_fd)
+            current_source_stat: mutable darray[u8] = []
+            current_source_stat.resize(144)
+            current_source_raw: mutable void& = (&current_source_stat[0]).cast[mutable void&] can Unsafe.PointerCast
+            same_source: mutable bool = native_fstat(current_source_fd, current_source_raw) == 0 and snapshot_same_inode(source_stat, current_source_stat)
+            current_close: i32 = native_close(current_source_fd)
+            if not same_source or current_close != 0:
+                return close_two_error(source_fd, destination_fd, -13)
+
+            copied_paths: mutable darray[u8] = []
+            created_directories: mutable darray[u8] = []
+            cursor: mutable usize = 0.usize()
+            entries: mutable usize = 0.usize()
+            total_bytes: mutable usize = 0.usize()
+            copy_result: mutable i64 = 0
+            while cursor < collected.usize() |paths, source_name, source_fd, destination_fd, copied_paths, cursor, entries, total_bytes, copy_result|:
+                path_start: usize = cursor
+                while cursor < collected.usize() and paths[cursor] != 0:
+                    cursor <- cursor + 1.usize()
+                return snapshot_copy_failure(source_fd, destination_fd, copied_paths, created_directories, -5) if cursor >= collected.usize() or cursor == path_start
+                full_length: usize = cursor - path_start
+                cursor <- cursor + 1.usize()
+                root_length: usize = source_length
+                return snapshot_copy_failure(source_fd, destination_fd, copied_paths, created_directories, -22) if full_length <= root_length + 1.usize() or full_length > snapshot_max_path_bytes
+                for index in 0..<root_length |paths, source_name, path_start|:
+                    return snapshot_copy_failure(source_fd, destination_fd, copied_paths, created_directories, -22) if paths[path_start + index] != source_name[index]
+                return snapshot_copy_failure(source_fd, destination_fd, copied_paths, created_directories, -22) if paths[path_start + root_length] != 47
+
+                relative: mutable darray[u8] = []
+                for index in root_length + 1.usize()..<full_length |relative, paths, path_start|:
+                    relative.push(paths[path_start + index])
+                if snapshot_root_control_file(relative):
+                    continue
+                entries <- entries + 1.usize()
+                if entries > snapshot_max_entries or not snapshot_relative_path_safe(relative):
+                    return snapshot_copy_failure(source_fd, destination_fd, copied_paths, created_directories, -22)
+                if PackagePathPolicy::credential_path_forbidden(relative) or PackagePathPolicy::reserved_source_path_forbidden(relative):
+                    return snapshot_copy_failure(source_fd, destination_fd, copied_paths, created_directories, -13)
+
+                copy_result <- snapshot_copy_one(source_fd, destination_fd, relative, &copied_paths, &created_directories, &total_bytes)
+                if copy_result != 0:
+                    return snapshot_copy_failure(source_fd, destination_fd, copied_paths, created_directories, copy_result)
+
+            if native_fsync(destination_fd) != 0:
+                return snapshot_copy_failure(source_fd, destination_fd, copied_paths, created_directories, negative_errno())
+            source_close: i32 = native_close(source_fd)
+            if source_close != 0:
+                return snapshot_copy_failure(-1, destination_fd, copied_paths, created_directories, -5)
+            destination_close: i32 = native_close(destination_fd)
+            if destination_close != 0:
+                cleanup_status: i64 = cleanup_package_snapshot_contents((&destination_name[0]).cast[cstr] can Unsafe.PointerCast)
+                return -5 if cleanup_status != 0
+                return -5
+            return total_bytes.i64()
+
+        def snapshot_copy_one(source_root: i64, destination_root: i64, relative: darray[u8]&, copied_paths: mutable darray[u8]&, created_directories: mutable darray[u8]&, total_bytes: mutable usize&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            source_parent_path: mutable darray[u8] = []
+            source_leaf_offset: mutable usize = 0.usize()
+            source_created_directories: mutable darray[u8] = []
+            source_parent: i64 = snapshot_open_parent(source_root, relative, &source_parent_path, &source_leaf_offset, false, &source_created_directories)
+            return source_parent if source_parent < 0
+            source_leaf: cstr = (&source_parent_path[source_leaf_offset]).cast[cstr] can Unsafe.PointerCast
+            source_file: i64 = native_openat(source_parent, source_leaf, flags_file_read())
+            source_open_errno: i64 = negative_errno()
+            if source_file < 0:
+                close_status: i64 = native_close(source_parent)
+                return -5 if close_status != 0
+                return source_open_errno
+            regular: bool = regular_fd(source_file)
+            if not regular:
+                return close_two_error(source_parent, source_file, -21)
+
+            destination_parent_path: mutable darray[u8] = []
+            destination_leaf_offset: mutable usize = 0.usize()
+            destination_parent: i64 = snapshot_open_parent(destination_root, relative, &destination_parent_path, &destination_leaf_offset, true, created_directories)
+            if destination_parent < 0:
+                close_status: i64 = close_two_error(source_parent, source_file, 0)
+                return -5 if close_status != 0
+                return destination_parent
+            destination_leaf: cstr = (&destination_parent_path[destination_leaf_offset]).cast[cstr] can Unsafe.PointerCast
+            destination_file: i64 = native_openat(destination_parent, destination_leaf, flags_write_create_exclusive(), 384)
+            destination_open_errno: i64 = negative_errno()
+            if destination_file < 0:
+                close_status: i64 = close_three_error(source_parent, source_file, destination_parent, 0)
+                return -5 if close_status != 0
+                return destination_open_errno
+
+            for index in 0..<relative.count |copied_paths, relative|:
+                copied_paths.push(relative[index])
+            copied_paths.push(0)
+
+            buffer: mutable darray[u8] = []
+            buffer.resize(snapshot_io_buffer_bytes)
+            buffer_raw: mutable void& = (&buffer[0]).cast[mutable void&] can Unsafe.PointerCast
+            failed: mutable i64 = 0
+            while true |buffer_raw, source_file, destination_file, total_bytes, failed|:
+                amount: i64 = native_read(source_file, buffer_raw, buffer.count)
+                if amount < 0:
+                    errno_value: i64 = current_errno()
+                    continue if errno_value == 4
+                    failed <- negative_value(errno_value)
+                    break
+                break if amount == 0
+                if amount > buffer.count.i64() or amount.usize() > snapshot_max_total_bytes - total_bytes:
+                    failed <- -75
+                    break
+                written: mutable usize = 0.usize()
+                while written < amount.usize() |buffer_raw, destination_file, written, amount|:
+                    raw: void& = (&buffer[written]).cast[void&] can Unsafe.PointerCast
+                    wrote: i64 = native_write(destination_file, raw, amount.usize() - written)
+                    if wrote < 0:
+                        errno_value: i64 = current_errno()
+                        continue if errno_value == 4
+                        failed <- negative_value(errno_value)
+                        break
+                    if wrote == 0 or wrote > amount - written.i64():
+                        failed <- -5
+                        break
+                    written <- written + wrote.usize()
+                break if failed != 0
+                total_bytes <- total_bytes + amount.usize()
+
+            if failed == 0 and native_fsync(destination_file) != 0:
+                failed <- negative_errno()
+            source_close: i32 = native_close(source_file)
+            destination_close: i32 = native_close(destination_file)
+            if failed == 0 and (source_close != 0 or destination_close != 0):
+                failed <- -5
+            if failed == 0 and native_fsync(destination_parent) != 0:
+                failed <- negative_errno()
+            source_parent_close: i32 = native_close(source_parent)
+            destination_parent_close: i32 = native_close(destination_parent)
+            if source_parent_close != 0 or destination_parent_close != 0:
+                failed <- -5 if failed == 0
+            return failed
+
+        def snapshot_copy_failure(source_root: i64, destination_root: i64, copied_paths: darray[u8]&, created_directories: darray[u8]&, original_error: i64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            cleanup_status: mutable i64 = 0
+            if destination_root >= 0:
+                cleanup_ok: mutable bool = cleanup_archive_files(destination_root, copied_paths)
+                cleanup_ok <- cleanup_archive_directories(destination_root, created_directories) and cleanup_ok
+                cleanup_ok <- native_fsync(destination_root) == 0 and cleanup_ok
+                cleanup_status <- -5 if not cleanup_ok
+            source_close: i32 = native_close(source_root) if source_root >= 0 else 0
+            destination_close: i32 = native_close(destination_root) if destination_root >= 0 else 0
+            return -5 if cleanup_status != 0 or source_close != 0 or destination_close != 0
+            return original_error if original_error != 0 else -5
+
+        def cleanup_package_snapshot_contents(destination: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            length: usize = native_strlen(destination)
+            return -22 if not snapshot_absolute_path_safe(destination, length)
+            root: i64 = open_directory_path(destination)
+            return root if root < 0
+            if not private_staging_directory_fd(root, native_geteuid().u64()):
+                return close_error(root, -13)
+            names: mutable darray[u8] = []
+            names.resize(snapshot_collection_entries * (snapshot_max_path_bytes + 1.usize()))
+            names_raw: mutable u8& = (&names[0]).cast[mutable u8&] can Unsafe.PointerCast
+            collected: i64 = collect_files(destination, names_raw, names.count)
+            return close_error(root, collected) if collected < 0
+            copied_paths: mutable darray[u8] = []
+            cursor: mutable usize = 0.usize()
+            entry_count: mutable usize = 0.usize()
+            while cursor < collected.usize() |names, destination, length, copied_paths, cursor, entry_count|:
+                path_start: usize = cursor
+                while cursor < collected.usize() and names[cursor] != 0:
+                    cursor <- cursor + 1.usize()
+                return close_error(root, -22) if cursor == path_start or cursor >= collected.usize()
+                path_length: usize = cursor - path_start
+                cursor <- cursor + 1.usize()
+                return close_error(root, -22) if path_length <= length + 1.usize()
+                for index in 0..<length |names, destination, path_start|:
+                    return close_error(root, -22) if names[path_start + index] != destination[index].u8()
+                return close_error(root, -22) if names[path_start + length] != 47
+                relative: mutable darray[u8] = []
+                for index in length + 1.usize()..<path_length |relative, names, path_start|:
+                    relative.push(names[path_start + index])
+                return close_error(root, -22) if not snapshot_relative_path_safe(relative)
+                entry_count <- entry_count + 1.usize()
+                return close_error(root, -75) if entry_count > snapshot_max_entries
+                for index in 0..<relative.count |copied_paths, relative|:
+                    copied_paths.push(relative[index])
+                copied_paths.push(0)
+
+            return close_error(root, -5) if not cleanup_archive_files(root, copied_paths)
+            directory_depth: mutable usize = 64.usize()
+            while directory_depth > 0.usize() |names, copied_paths, root, directory_depth|:
+                directories: mutable darray[u8] = []
+                file_cursor: mutable usize = 0.usize()
+                while file_cursor < copied_paths.count |copied_paths, directories, file_cursor, directory_depth|:
+                    file_end: mutable usize = file_cursor
+                    while file_end < copied_paths.count and copied_paths[file_end] != 0:
+                        file_end <- file_end + 1.usize()
+                    return close_error(root, -22) if file_end == file_cursor or file_end >= copied_paths.count
+                    component_depth: mutable usize = 0.usize()
+                    for index in file_cursor..<file_end |copied_paths, directories, component_depth, file_end, directory_depth|:
+                        if copied_paths[index] == 47:
+                            component_depth <- component_depth + 1.usize()
+                            if component_depth == directory_depth:
+                                for prefix_index in file_cursor..<index |directories, copied_paths|:
+                                    directories.push(copied_paths[prefix_index])
+                                directories.push(0)
+                    file_cursor <- file_end + 1.usize()
+                return close_error(root, -5) if directories.count > 0.usize() and not cleanup_archive_directories(root, directories)
+                directory_depth <- directory_depth - 1.usize()
+            return close_error(root, -5) if not directory_empty(root)
+            if native_fsync(root) != 0:
+                return close_error(root, negative_errno())
+            return close_result(root, 0)
+
+        def snapshot_open_parent(root: i64, relative: darray[u8]&, path_out: mutable darray[u8]&, leaf_offset: mutable usize&, create_missing: bool, created_directories: mutable darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return -22 if not snapshot_relative_path_safe(relative)
+            path_out.resize(0)
+            for index in 0..<relative.count |path_out, relative|:
+                path_out.push(relative[index])
+            path_out.push(0)
+            slash: mutable usize = 0.usize()
+            for index in 0..<relative.count |path_out, slash|:
+                slash <- index + 1.usize() if path_out[index] == 47
+            leaf_offset <- slash
+            return -22 if leaf_offset >= relative.count
+            directory: mutable i64 = native_dup(root)
+            return negative_errno() if directory < 0
+            start: mutable usize = 0.usize()
+            while start < leaf_offset:
+                finish: mutable usize = start
+                while finish < leaf_offset and path_out[finish] != 47:
+                    finish <- finish + 1.usize()
+                path_out[finish] <- 0
+                component: cstr = (&path_out[start]).cast[cstr] can Unsafe.PointerCast
+                created: mutable bool = false
+                if create_missing:
+                    mkdir_status: i32 = native_mkdirat(directory, component, 448)
+                    mkdir_errno: i64 = current_errno()
+                    if mkdir_status == 0:
+                        created <- true
+                        for path_index in 0..<finish |created_directories, relative|:
+                            created_directories.push(relative[path_index])
+                        created_directories.push(0)
+                    elif mkdir_errno != 17:
+                        return close_error(directory, -mkdir_errno)
+                next: i64 = native_openat(directory, component, flags_directory() + flag_no_follow)
+                if next < 0:
+                    open_errno: i64 = negative_errno()
+                    cleanup_status: i32 = native_unlinkat(directory, component, at_remove_directory) if created else 0
+                    close_status: i32 = native_close(directory)
+                    return -5 if cleanup_status != 0 or close_status != 0
+                    return open_errno
+                if created and native_fsync(directory) != 0:
+                    return close_two_error(directory, next, negative_errno())
+                return close_error(next, -5) if native_close(directory) != 0
+                directory <- next
+                start <- finish + 1.usize()
+            return directory
+
+        def snapshot_relative_path_safe(path: darray[u8]&) -> bool:
+            return false if path.count == 0.usize() or path.count > snapshot_max_path_bytes or path[0] == 47 or path[path.count - 1.usize()] == 47
+            segment_start: mutable usize = 0.usize()
+            for index in 0..=path.count |path, segment_start|:
+                if index < path.count and path[index] != 47:
+                    return false if path[index] < 32 or path[index] >= 127 or path[index] == 92 or path[index] == 58
+                    continue
+                segment_length: usize = index - segment_start
+                return false if segment_length == 0.usize() or segment_length > 255.usize()
+                return false if segment_length == 1.usize() and path[segment_start] == 46
+                return false if segment_length == 2.usize() and path[segment_start] == 46 and path[segment_start + 1.usize()] == 46
+                segment_start <- index + 1.usize()
+            return true
+
+        def snapshot_absolute_path_safe(path: cstr, length: usize) -> bool:
+            return false if length < 2.usize() or length > 4096.usize() or path[0].u8() != 47 or path[length - 1.usize()].u8() == 47
+            segment_start: mutable usize = 1.usize()
+            for index in 1..<length |path, segment_start|:
+                byte: u8 = path[index].u8()
+                if byte == 47:
+                    segment_length: usize = index - segment_start
+                    return false if segment_length == 0.usize() or segment_length > 255.usize()
+                    return false if segment_length == 1.usize() and path[segment_start].u8() == 46
+                    return false if segment_length == 2.usize() and path[segment_start].u8() == 46 and path[segment_start + 1.usize()].u8() == 46
+                    segment_start <- index + 1.usize()
+                else:
+                    return false if byte < 32 or byte == 127
+            final_length: usize = length - segment_start
+            return false if final_length == 0.usize() or final_length > 255.usize()
+            return false if final_length == 1.usize() and path[segment_start].u8() == 46
+            return false if final_length == 2.usize() and path[segment_start].u8() == 46 and path[segment_start + 1.usize()].u8() == 46
+            return true
+
+        def snapshot_path_leaf(path: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            out.resize(0)
+            end: usize = path.count - 1.usize()
+            start: mutable usize = end
+            while start > 0.usize() and path[start - 1.usize()] != 47:
+                start <- start - 1.usize()
+            return false if start >= end
+            for index in start..<end |out, path|:
+                out.push(path[index])
+            return true
+
+        def snapshot_root_control_file(path: darray[u8]&) -> bool:
+            return snapshot_path_equals(path, "elisapkg.json") or snapshot_path_equals(path, "elisapkg.lock")
+
+        def snapshot_path_equals(path: darray[u8]&, wanted: cstr) -> bool:
+            length: usize = native_strlen(wanted)
+            return false if path.count != length
+            for index in 0..<length |path, wanted|:
+                return false if path[index] != wanted[index].u8()
+            return true
+
+        def snapshot_same_inode(left: darray[u8]&, right: darray[u8]&) -> bool:
+            return read_stat_device(left) == read_stat_device(right) and read_u64(left, 8.usize()) == read_u64(right, 8.usize())
+
+        def snapshot_path_is_descendant(root: darray[u8]&, candidate: darray[u8]&) -> bool:
+            return false if candidate.count <= root.count
+            for index in 0..<root.count |root, candidate|:
+                left: u8 = root[index]
+                right: u8 = candidate[index]
+                left <- left + 32.u8() if left >= 65 and left <= 90
+                right <- right + 32.u8() if right >= 65 and right <= 90
+                return false if left != right
+            return candidate[root.count] == 47
+
+        def collect_directory(root: cstr, path: cstr, out: mutable darray[u8]&, depth: usize, visited_nodes: mutable usize&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return false if depth > 64.usize()
             # Resolve the directory through the descriptor-relative no-follow
             # walker before enumeration. Opening `path` with `opendir` here
@@ -2106,12 +2519,15 @@ module PlatformNative:
                     _ = native_close(duplicate)
                 return false
             if directory is stream:
-                while true |stream, out, path, depth|:
+                while true |stream, out, path, depth, visited_nodes|:
                     native_errno()[0] <- 0
                     entry: mutable heap void&? = native_readdir(stream)
                     if entry is record:
                         raw: mutable u8& = record.cast[mutable u8&] can Unsafe.PointerCast
                         name_length: usize = dirent_name_length(raw)
+                        if not name_is_dot(raw, dirent_name_offset, name_length):
+                            visited_nodes <- visited_nodes + 1.usize()
+                            return directory_failure(stream) if visited_nodes > max_collect_traversal_nodes
                         continue if name_length == 0 or name_length > 255.usize()
                         # Some filesystems report DT_UNKNOWN. Credential
                         # exclusions must therefore not depend on d_type.
@@ -2135,7 +2551,7 @@ module PlatformNative:
                         directory_probe: i64 = open_directory_path(child_name)
                         if directory_probe >= 0:
                             return directory_failure(stream) if native_close(directory_probe) != 0
-                            return directory_failure(stream) if not collect_directory(root, child_name, out, depth + 1.usize())
+                            return directory_failure(stream) if not collect_directory(root, child_name, out, depth + 1.usize(), visited_nodes)
                         else:
                             file_probe: i64 = open_package_file(child_name)
                             if file_probe < 0:
@@ -2188,6 +2604,35 @@ module PlatformNative:
                 return true if left[index] < right[index]
                 return false if left[index] > right[index]
             return left.count < right.count
+
+        # Sort row indices in O(n log n) without moving owned darray values.
+        # The collector remains bounded at 4096 emitted files; heap sort avoids
+        # making a large source tree quadratic in filename comparisons.
+        def collect_sort_path_rows(order: mutable darray[usize]&, rows: darray[darray[u8]]&) -> void:
+            start: mutable usize = order.count / 2.usize()
+            while start > 0.usize() |order, rows, start|:
+                start <- start - 1.usize()
+                collect_sift_path_heap(order, rows, order.count, start)
+            heap_size: mutable usize = order.count
+            while heap_size > 1.usize() |order, rows, heap_size|:
+                heap_size <- heap_size - 1.usize()
+                root_value: usize = order[0]
+                order[0] <- order[heap_size]
+                order[heap_size] <- root_value
+                collect_sift_path_heap(order, rows, heap_size, 0.usize())
+
+        def collect_sift_path_heap(order: mutable darray[usize]&, rows: darray[darray[u8]]&, heap_size: usize, start: usize) -> void:
+            root: mutable usize = start
+            while true |order, rows, heap_size, root|:
+                child: mutable usize = root * 2.usize() + 1.usize()
+                break if child >= heap_size
+                if child + 1.usize() < heap_size and path_less(rows[order[child]], rows[order[child + 1.usize()]]):
+                    child <- child + 1.usize()
+                break if not path_less(rows[order[root]], rows[order[child]])
+                root_value: usize = order[root]
+                order[root] <- order[child]
+                order[child] <- root_value
+                root <- child
 
         def name_is_dot(raw: mutable u8&, offset: usize, length: usize) -> bool:
             return length == 1 and raw[offset] == 46 or length == 2 and raw[offset] == 46 and raw[offset + 1] == 46

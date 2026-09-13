@@ -227,3 +227,20 @@ target bytes; it does not prove that package code is safe or independently
 attest how a build was produced. Build provenance, operational key custody,
 provider approval, and all D-005/M0/M5 security gates remain separate release
 requirements.
+
+## D-014: local dependency compilation
+
+The build adapter compiles only version 2 local-path graphs. It reconstructs
+the canonical local roots from the lock, revalidates each package identity,
+manifest digest, source-tree digest, and unique library target, then emits one
+bounded aggregate Elisa source in private scratch. A deterministic
+dependency-first walk uses reverse-edge counters, binary-searched package
+identities, and package-name ordering. The graph is capped at 65,536 edges and
+the aggregate at 32 MiB. An absent or ambiguous library target, missing edge,
+cycle, registry record, or mixed source graph fails closed. The receipt binds
+the ordered logical dependency target paths along with the lock and source
+digests. The separately emitted aggregate of verified snapshot paths is
+compared byte-for-byte after the compiler exits and before publication.
+Registry build support remains disabled
+until authenticated source acquisition, cache extraction, and graph-wide
+compilation are integrated. Fixture: `scripts/local_dependency_build_regression.py`.

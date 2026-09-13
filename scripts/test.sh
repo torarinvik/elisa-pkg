@@ -18,7 +18,9 @@ export ELISA_ALLOW_STALE_STAGE1="${ELISA_ALLOW_STALE_STAGE1:-0}"
 "$BIN" --version | grep -F 'elisapkg 0.1.0' >/dev/null
 "$BIN" doctor | grep -F 'local Ed25519 provider available' >/dev/null
 python3 "$ROOT/scripts/ffi_boundary_test.py"
+python3 "$ROOT/scripts/collect_files_budget_regression.py"
 python3 "$ROOT/scripts/build_include_regression.py"
+python3 "$ROOT/scripts/local_dependency_build_regression.py"
 python3 "$ROOT/scripts/package_path_policy_regression.py"
 python3 "$ROOT/scripts/ffi_fifo_regression.py"
 python3 "$ROOT/scripts/access_regression.py"
@@ -1764,7 +1766,7 @@ EOF
         printf '\n' >> "$mutation_target"
         ;;
       dependency)
-        printf '%s\n' 'def main() -> i64:' '    return 9' > "$mutation_target"
+        printf '%s\n' 'module LocalUtil:' '    public:' '        def answer() -> i64:' '            return 9' > "$mutation_target"
         ;;
       toolchain)
         printf '%s\n' '# changed while the compiler was running' >> "$mutation_target"
@@ -1791,8 +1793,8 @@ EOF
     test "$?" -eq 2
   fi
   mkdir -p local-util/src nested-util/src
-  printf '%s\n' 'def main() -> i64:' '    return 0' > local-util/src/main.elisa
-  printf '%s\n' 'def main() -> i64:' '    return 0' > nested-util/src/main.elisa
+  printf '%s\n' 'module LocalUtil:' '    public:' '        def answer() -> i64:' '            return NestedUtil::answer()' > local-util/src/main.elisa
+  printf '%s\n' 'module NestedUtil:' '    public:' '        def answer() -> i64:' '            return 42' > nested-util/src/main.elisa
   printf '%s\n' '{"schema-version":1,"package":{"name":"nested-util","version":"0.4.0"},"targets":[{"name":"nested-util","kind":"lib","entry":"src/main.elisa"}],"dependencies":{}}' > nested-util/elisapkg.json
   printf '%s\n' '{"schema-version":1,"package":{"name":"local-util","version":"1.2.3"},"targets":[{"name":"local-util","kind":"lib","entry":"src/main.elisa"}],"dependencies":{"nested-util":{"path":"../nested-util"}}}' > local-util/elisapkg.json
   if "$BIN" add local-util --path local-util --color invalid >/dev/null 2>&1; then
@@ -1970,7 +1972,7 @@ EOF
     exit 1
   fi
   cp local-util/src/main.elisa local-util/src/main.elisa.good
-  printf '%s\n' 'def main() -> i64:' '    return 1' > local-util/src/main.elisa
+  printf '%s\n' 'module LocalUtil:' '    public:' '        def answer() -> i64:' '            return 1' > local-util/src/main.elisa
   dependency_rebuild_output="$("$BIN" build)"
   case "$dependency_rebuild_output" in
     *"(cached)"*)

@@ -125,8 +125,10 @@ def run() -> int:
         project_root = base / "project.with.dots"
         sandbox_build_root = project_root / ".elisapkg" / "build"
         sandbox_work_root = sandbox_build_root / "scratch"
+        source_snapshot_root = sandbox_build_root / "source-snapshots"
         tools_root = base / "tools"
         sandbox_work_root.mkdir(parents=True)
+        source_snapshot_root.mkdir()
         tools_root.mkdir()
         git_metadata_root = project_root / ".git"
         git_metadata_root.mkdir()
@@ -137,6 +139,20 @@ def run() -> int:
         source_file = project_root / "src" / "main.elisa"
         source_file.parent.mkdir()
         source_file.write_text("package source remains readable\n")
+        snapshot_file = source_snapshot_root / "root" / "src" / "main.elisa"
+        snapshot_file.parent.mkdir(parents=True)
+        snapshot_file.write_text("verified source snapshot remains readable\n")
+        snapshot_credential = source_snapshot_root / "root" / ".env"
+        snapshot_credential.write_text("snapshot credential must remain denied\n")
+        snapshot_git_state = source_snapshot_root / "root" / ".git" / "config"
+        snapshot_git_state.parent.mkdir()
+        snapshot_git_state.write_text("snapshot VCS state must remain denied\n")
+        snapshot_reserved_state = source_snapshot_root / "build" / "stale-input.elisa"
+        snapshot_reserved_state.parent.mkdir()
+        snapshot_reserved_state.write_text("snapshot build state must remain denied\n")
+        snapshot_nested_source = source_snapshot_root / "root" / "src" / ".build" / "nested-source.elisa"
+        snapshot_nested_source.parent.mkdir()
+        snapshot_nested_source.write_text("nested package source remains readable\n")
         hidden_state_files = (
             project_root / ".elisapkg" / "stale-input.elisa",
             project_root / "build" / "stale-input.elisa",
@@ -198,6 +214,7 @@ def run() -> int:
 
         env["ELISAPKG_TEST_PROJECT_ROOT"] = str(project_root.resolve())
         env["ELISAPKG_TEST_BUILD_ROOT"] = str(sandbox_work_root.resolve())
+        env["ELISAPKG_TEST_SOURCE_SNAPSHOT"] = str(source_snapshot_root.resolve())
         env["ELISAPKG_TEST_OUTPUT"] = str(output_temp.resolve())
         env["ELISAPKG_TEST_EXECUTABLE_ONE"] = "/bin/bash"
         env["ELISAPKG_TEST_EXECUTABLE_TWO"] = str(callback_probe.resolve())
@@ -206,6 +223,11 @@ def run() -> int:
         env["ELISAPKG_TEST_GIT_CONFIG"] = str(git_config)
         env["ELISAPKG_TEST_GIT_CONFIG_WORKTREE"] = str(git_config_worktree)
         env["ELISAPKG_TEST_SOURCE_FILE"] = str(source_file)
+        env["ELISAPKG_TEST_SNAPSHOT_FILE"] = str(snapshot_file.resolve())
+        env["ELISAPKG_TEST_SNAPSHOT_CREDENTIAL"] = str(snapshot_credential.resolve())
+        env["ELISAPKG_TEST_SNAPSHOT_GIT_STATE"] = str(snapshot_git_state.resolve())
+        env["ELISAPKG_TEST_SNAPSHOT_RESERVED_STATE"] = str(snapshot_reserved_state.resolve())
+        env["ELISAPKG_TEST_SNAPSHOT_NESTED_SOURCE"] = str(snapshot_nested_source.resolve())
         env["ELISAPKG_TEST_STALE_INPUTS"] = "\n".join(str(path) for path in hidden_state_files)
         env["ELISAPKG_TEST_NESTED_INPUTS"] = "\n".join(str(path) for path in nested_source_files)
         env["ELISAPKG_TEST_SCRATCH_SOURCE"] = str(scratch_source)
@@ -237,6 +259,16 @@ def run() -> int:
         )
         if expected_scratch_allow not in profile_result.stdout:
             raise RuntimeError("generated compiler profile omitted its exact private-scratch read rule")
+        expected_snapshot_allow = (
+            f'(allow file-read* (subpath "{source_snapshot_root.resolve()}"))'.encode()
+        )
+        expected_snapshot_deny_write = (
+            f'(deny file-write* (subpath "{source_snapshot_root.resolve()}"))'.encode()
+        )
+        if expected_snapshot_allow not in profile_result.stdout:
+            raise RuntimeError("generated compiler profile omitted its exact verified-source read rule")
+        if expected_snapshot_deny_write not in profile_result.stdout:
+            raise RuntimeError("generated compiler profile omitted the verified-source write denial")
         denial_patterns = [
             re.compile(pattern.decode("ascii"))
             for pattern in re.findall(rb'\(deny file-read\* \(regex #"([^\"]+)"\)\)', profile_result.stdout)
@@ -310,7 +342,7 @@ def run() -> int:
             return unavailable(reason)
 
         metadata_positive_script = (
-            'for path in "$ELISAPKG_TEST_SOURCE_FILE" "$ELISAPKG_TEST_GIT_CONFIG" "$ELISAPKG_TEST_GIT_CONFIG_WORKTREE"; do\n'
+            'for path in "$ELISAPKG_TEST_SOURCE_FILE" "$ELISAPKG_TEST_GIT_CONFIG" "$ELISAPKG_TEST_GIT_CONFIG_WORKTREE" "$ELISAPKG_TEST_SNAPSHOT_FILE" "$ELISAPKG_TEST_SNAPSHOT_CREDENTIAL" "$ELISAPKG_TEST_SNAPSHOT_GIT_STATE" "$ELISAPKG_TEST_SNAPSHOT_RESERVED_STATE" "$ELISAPKG_TEST_SNAPSHOT_NESTED_SOURCE"; do\n'
             '  if ! IFS= read -r _ < "$path"; then\n'
             "    printf 'PROJECT_FILE_READ_FAILED\\n'\n"
             "    exit 86\n"
@@ -336,40 +368,65 @@ def run() -> int:
         )
         metadata_read_script = (
             'if IFS= read -r _ < "$ELISAPKG_TEST_SOURCE_FILE"; then\n'
-            "  printf 'SOURCE_READ_ALLOWED\\n'\n"
-            "else\n"
-            "  printf 'SOURCE_READ_DENIED\\n'\n"
-            "  exit 83\n"
+            "  printf 'LIVE_SOURCE_READ_ALLOWED\\n'\n"
+            "  exit 83\\n"
             "fi\n"
+            "printf 'LIVE_SOURCE_READ_DENIED\\n'\n"
+            'if ! IFS= read -r _ < "$ELISAPKG_TEST_SNAPSHOT_FILE"; then\n'
+            "  printf 'SNAPSHOT_SOURCE_READ_DENIED\\n'\n"
+            "  exit 91\\n"
+            "fi\n"
+            "printf 'SNAPSHOT_SOURCE_READ_ALLOWED\\n'\n"
             'if IFS= read -r _ < "$ELISAPKG_TEST_GIT_CONFIG"; then\n'
             "  printf 'GIT_CONFIG_READ_ALLOWED\\n'\n"
-            "  exit 84\n"
+            "  exit 84\\n"
             "fi\n"
             "printf 'GIT_CONFIG_READ_DENIED\\n'\n"
             'if IFS= read -r _ < "$ELISAPKG_TEST_GIT_CONFIG_WORKTREE"; then\n'
             "  printf 'GIT_CONFIG_WORKTREE_READ_ALLOWED\\n'\n"
-            "  exit 85\n"
+            "  exit 85\\n"
             "fi\n"
             "printf 'GIT_CONFIG_WORKTREE_READ_DENIED\\n'\n"
             'while IFS= read -r path; do\n'
             '  if IFS= read -r _ < "$path"; then\n'
             "    printf 'SOURCE_STATE_READ_ALLOWED\\n'\n"
-            "    exit 86\n"
+            "    exit 86\\n"
             "  fi\n"
             'done <<EOF\n$ELISAPKG_TEST_STALE_INPUTS\nEOF\n'
             "printf 'SOURCE_STATE_READ_DENIED\\n'\n"
-            'while IFS= read -r path; do\n'
-            '  if IFS= read -r _ < "$path"; then\n'
-            "    printf 'NESTED_SOURCE_READ_DENIED\\n'\n"
-            "    exit 90\n"
-            "  fi\n"
-            'done <<EOF\n$ELISAPKG_TEST_NESTED_INPUTS\nEOF\n'
-            "printf 'NESTED_SOURCE_READABLE\\n'\n"
+            'if IFS= read -r _ < "$ELISAPKG_TEST_SNAPSHOT_CREDENTIAL"; then\n'
+            "  printf 'SNAPSHOT_CREDENTIAL_READ_ALLOWED\\n'\n"
+            "  exit 92\\n"
+            "fi\n"
+            'if IFS= read -r _ < "$ELISAPKG_TEST_SNAPSHOT_GIT_STATE"; then\n'
+            "  printf 'SNAPSHOT_GIT_STATE_READ_ALLOWED\\n'\n"
+            "  exit 93\\n"
+            "fi\n"
+            'if IFS= read -r _ < "$ELISAPKG_TEST_SNAPSHOT_RESERVED_STATE"; then\n'
+            "  printf 'SNAPSHOT_RESERVED_STATE_READ_ALLOWED\\n'\n"
+            "  exit 94\\n"
+            "fi\n"
+            "printf 'SNAPSHOT_SECRET_AND_STATE_READ_DENIED\\n'\n"
+            'if ! IFS= read -r _ < "$ELISAPKG_TEST_SNAPSHOT_NESTED_SOURCE"; then\n'
+            "  printf 'SNAPSHOT_NESTED_SOURCE_READ_DENIED\\n'\n"
+            "  exit 95\\n"
+            "fi\n"
+            "printf 'SNAPSHOT_NESTED_SOURCE_READABLE\\n'\n"
+            'if printf \'changed\\n\' >> "$ELISAPKG_TEST_SNAPSHOT_FILE"; then\n'
+            "  printf 'SNAPSHOT_WRITE_ALLOWED\\n'\n"
+            "  exit 96\\n"
+            "fi\n"
+            "printf 'SNAPSHOT_WRITE_DENIED\\n'\n"
+            'if printf \'new\\n\' > "$ELISAPKG_TEST_SNAPSHOT_FILE.new"; then\n'
+            "  printf 'SNAPSHOT_CREATE_ALLOWED\\n'\n"
+            "  exit 97\\n"
+            "fi\n"
+            "printf 'SNAPSHOT_CREATE_DENIED\\n'\n"
             'if IFS= read -r _ < "$ELISAPKG_TEST_SCRATCH_SOURCE"; then\n'
             "  printf 'SANDBOX_SCRATCH_READ_ALLOWED\\n'\n"
             "else\n"
             "  printf 'SANDBOX_SCRATCH_READ_DENIED\\n'\n"
-            "  exit 87\n"
+            "  exit 87\\n"
             "fi\n"
         )
         unconfined_metadata_result = subprocess.run(
@@ -440,21 +497,40 @@ def run() -> int:
         metadata_output = metadata_result.stdout + metadata_result.stderr
         if (
             metadata_result.returncode != 0
-            or b"SOURCE_READ_ALLOWED\n" not in metadata_output
+            or b"LIVE_SOURCE_READ_DENIED\n" not in metadata_output
+            or b"SNAPSHOT_SOURCE_READ_ALLOWED\n" not in metadata_output
             or b"GIT_CONFIG_READ_DENIED\n" not in metadata_output
             or b"GIT_CONFIG_WORKTREE_READ_DENIED\n" not in metadata_output
             or b"SOURCE_STATE_READ_DENIED\n" not in metadata_output
-            or b"NESTED_SOURCE_READABLE\n" not in metadata_output
+            or b"SNAPSHOT_SECRET_AND_STATE_READ_DENIED\n" not in metadata_output
+            or b"SNAPSHOT_NESTED_SOURCE_READABLE\n" not in metadata_output
+            or b"SNAPSHOT_WRITE_DENIED\n" not in metadata_output
+            or b"SNAPSHOT_CREATE_DENIED\n" not in metadata_output
             or b"SANDBOX_SCRATCH_READ_ALLOWED\n" not in metadata_output
+            or b"LIVE_SOURCE_READ_ALLOWED\n" in metadata_output
             or b"GIT_CONFIG_READ_ALLOWED\n" in metadata_output
             or b"GIT_CONFIG_WORKTREE_READ_ALLOWED\n" in metadata_output
             or b"SOURCE_STATE_READ_ALLOWED\n" in metadata_output
-            or b"NESTED_SOURCE_READ_DENIED\n" in metadata_output
+            or b"SNAPSHOT_CREDENTIAL_READ_ALLOWED\n" in metadata_output
+            or b"SNAPSHOT_GIT_STATE_READ_ALLOWED\n" in metadata_output
+            or b"SNAPSHOT_RESERVED_STATE_READ_ALLOWED\n" in metadata_output
+            or b"SNAPSHOT_WRITE_ALLOWED\n" in metadata_output
+            or b"SNAPSHOT_CREATE_ALLOWED\n" in metadata_output
         ):
             raise RuntimeError(
                 "Git metadata read denial probe failed: "
                 f"exit={metadata_result.returncode}, output={metadata_output.decode(errors='replace')}"
             )
+        snapshot_stat = snapshot_file.lstat()
+        if snapshot_file.read_text() != "verified source snapshot remains readable\n":
+            raise RuntimeError("the sandbox modified verified package source bytes")
+        if (snapshot_stat.st_dev, snapshot_stat.st_ino) != (
+            snapshot_file.stat().st_dev,
+            snapshot_file.stat().st_ino,
+        ):
+            raise RuntimeError("the sandbox replaced the verified package source inode")
+        if os.path.lexists(Path(f"{snapshot_file}.new")):
+            raise RuntimeError("the sandbox created a file inside the read-only source snapshot")
 
         callback_script = (
             'if ! printf \'SAX\' >> "$ELISAPKG_TEST_CALLBACK_PATH"; then\n'

@@ -17,6 +17,7 @@ include "./package_identity.elisa"
 include "./integrity.elisa"
 include "./json.elisa"
 include "./package_path_policy.elisa"
+include "./build.elisa"
 include "./cache.elisa"
 include "./resolve.elisa"
 include "./solver.elisa"
@@ -35,11 +36,26 @@ module Cli:
         const PROGRAM_TIMEOUT_MS: i64 = 120000
         const MAX_DEPENDENCIES: usize = 4096
         const MAX_TARGETS: usize = 4096
+        const MAX_BUILD_GRAPH_EDGES: usize = 65536.usize()
+        const MAX_BUILD_AGGREGATE_BYTES: usize = 33554432.usize()
+        const MAX_BUILD_SNAPSHOT_BYTES: usize = 268435456.usize()
         # Keep install metadata bounded by the manifest reader while leaving
         # space for absolute paths, package names, and their fixed field labels.
         const MAX_INSTALL_PREFIX_BYTES: usize = 4006.usize()
         const MAX_INSTALL_VERSION_BYTES: usize = 1048576.usize()
         const MAX_INSTALL_METADATA_BYTES: usize = 1056768.usize()
+
+        struct LocalBuildPackage:
+            name: mutable darray[u8]
+            root: mutable darray[u8]
+            entry: mutable darray[u8]
+            relative_entry: mutable darray[u8]
+            source_digest: mutable darray[u8]
+            snapshot_entry: mutable darray[u8]
+            dependency_names: mutable darray[u8]
+            dependents: mutable darray[usize]
+            remaining_dependencies: mutable usize
+            emitted: mutable bool
 
         const O_READ: cstr = "rb"
         # Output policy is process-local state set once by the CLI parser. Keep
@@ -54,6 +70,20 @@ module Cli:
             for index in 0..<length |out, value|:
                 byte: u8 = value[index].u8()
                 out.push(byte)
+
+        def bytes_push_i64(out: mutable darray[u8]&, value: i64) -> void can[Memory.Allocate, Abort.Panic]:
+            negative: bool = value < 0
+            unsigned: mutable u64 = (0.u64() - value.u64()) if negative else value.u64()
+            digits: mutable darray[u8] = []
+            while unsigned > 0.u64() |digits, unsigned|:
+                digits.push((48.u64() + (unsigned % 10.u64())).u8())
+                unsigned <- unsigned / 10.u64()
+            digits.push(48) if digits.count == 0.usize()
+            out.push(45) if negative
+            cursor: mutable usize = digits.count
+            while cursor > 0.usize() |out, digits, cursor|:
+                cursor <- cursor - 1.usize()
+                out.push(digits[cursor])
 
         def bytes_push_cstr(out: mutable darray[u8]&, value: cstr) -> void can[Memory.Allocate, Abort.Panic]:
             index: mutable usize = 0.usize()
@@ -1787,35 +1817,70 @@ module Cli:
                 queue.push(value[index])
             queue.push(0)
 
-        def queue_append_record(queue: mutable darray[u8]&, path: darray[u8]&, name: darray[u8]&, version: darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
+        def queue_append_record(queue: mutable darray[u8]&, record_starts: mutable darray[usize]&, path: darray[u8]&, name: darray[u8]&, version: darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
+            record_starts.push(queue.count)
             queue_append_field(queue, path)
             queue_append_field(queue, name)
             queue_append_field(queue, version)
 
-        def queue_field_at(queue: darray[u8]&, record: usize, field: usize, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+        def queue_field_at(queue: darray[u8]&, record_starts: darray[usize]&, record: usize, field: usize, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
             out.resize(0)
-            cursor: mutable usize = 0.usize()
-            current_record: mutable usize = 0.usize()
-            while cursor < queue.count |queue, cursor, current_record, out|:
-                for current_field in 0..<3 |queue, cursor, current_record, current_field, out|:
-                    end: mutable usize = cursor
-                    while end < queue.count and queue[end] != 0 |queue, end|:
-                        end <- end + 1.usize()
-                    if current_record == record and current_field == field:
-                        for index in cursor..<end |queue, out|:
-                            out.push(queue[index])
-                        return true
-                    cursor <- end + 1.usize()
-                current_record <- current_record + 1.usize()
+            return false if record >= record_starts.count or field >= 3.usize()
+            cursor: mutable usize = record_starts[record]
+            for current_field in 0..<3 |queue, record_starts, record, field, current_field, cursor, out|:
+                return false if cursor >= queue.count
+                end: mutable usize = cursor
+                while end < queue.count and queue[end] != 0 |queue, end|:
+                    end <- end + 1.usize()
+                return false if end >= queue.count
+                if current_field == field:
+                    for index in cursor..<end |queue, out|:
+                        out.push(queue[index])
+                    return true
+                cursor <- end + 1.usize()
             return false
 
-        def queue_name_record(queue: darray[u8]&, total: usize, wanted: darray[u8]&) -> usize can[Memory.Allocate, Abort.Panic]:
-            for record in 0..<total |queue, wanted|:
+        def queue_name_record(queue: darray[u8]&, record_starts: darray[usize]&, sorted_records: darray[usize]&, total: usize, wanted: darray[u8]&, insertion_out: mutable usize&) -> usize can[Memory.Allocate, Abort.Panic]:
+            insertion_out <- total + 1.usize()
+            return total if sorted_records.count != total
+            lower: mutable usize = 0.usize()
+            upper: mutable usize = sorted_records.count
+            while lower < upper |queue, record_starts, sorted_records, wanted, lower, upper|:
+                middle: usize = lower + (upper - lower) / 2.usize()
+                record: usize = sorted_records[middle]
+                return total if record >= record_starts.count
                 candidate: mutable darray[u8] = []
-                return record if queue_field_at(queue, record, 1, &candidate) and bytes_equal(candidate, wanted)
+                if not queue_field_at(queue, record_starts, record, 1, &candidate):
+                    return total
+                if bytes_less(candidate, wanted):
+                    lower <- middle + 1.usize()
+                else:
+                    upper <- middle
+            insertion_out <- lower
+            return total if lower >= sorted_records.count
+            record: usize = sorted_records[lower]
+            if record >= record_starts.count:
+                insertion_out <- total + 1.usize()
+                return total
+            candidate: mutable darray[u8] = []
+            if not queue_field_at(queue, record_starts, record, 1, &candidate):
+                insertion_out <- total + 1.usize()
+                return total
+            return record if bytes_equal(candidate, wanted)
             return total
 
-        def append_local_dependency_records(raw: darray[u8]&, package_root: darray[u8]&, queue: mutable darray[u8]&, parents: mutable darray[usize]&, total: mutable usize&, parent: usize) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+        def queue_insert_sorted_record(sorted_records: mutable darray[usize]&, insertion: usize, record: usize) -> bool can[Memory.Allocate, Abort.Panic]:
+            return false if insertion > sorted_records.count
+            previous_count: usize = sorted_records.count
+            sorted_records.resize(previous_count + 1.usize())
+            cursor: mutable usize = previous_count
+            while cursor > insertion |sorted_records, cursor|:
+                sorted_records[cursor] <- sorted_records[cursor - 1.usize()]
+                cursor <- cursor - 1.usize()
+            sorted_records[insertion] <- record
+            return true
+
+        def append_local_dependency_records(raw: darray[u8]&, package_root: darray[u8]&, queue: mutable darray[u8]&, record_starts: mutable darray[usize]&, sorted_records: mutable darray[usize]&, edges: mutable darray[usize]&, edge_count: mutable usize&, total: mutable usize&, parent: usize) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             dependency_start: usize = json_key_value_offset(raw, "dependencies")
             return true if dependency_start >= raw.count
             dependency_end: usize = json_object_end(raw, dependency_start)
@@ -1825,7 +1890,7 @@ module Cli:
             string_start: mutable usize = 0.usize()
             braces: mutable i64 = 1
             brackets: mutable i64 = 0
-            for index in (dependency_start + 1.usize())..<dependency_end |raw, package_root, queue, total, in_string, escaped, string_start, braces, brackets|:
+            for index in (dependency_start + 1.usize())..<dependency_end |raw, package_root, queue, record_starts, sorted_records, edges, edge_count, total, in_string, escaped, string_start, braces, brackets|:
                 byte: u8 = raw[index]
                 if not in_string:
                     if byte == 34:
@@ -1848,6 +1913,8 @@ module Cli:
                     while after < dependency_end and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
                         after <- after + 1.usize()
                     if braces == 1 and brackets == 0 and after < dependency_end and raw[after] == 58:
+                        return false if edge_count >= MAX_BUILD_GRAPH_EDGES
+                        edge_count <- edge_count + 1.usize()
                         alias: mutable darray[u8] = []
                         for key_index in string_start..<index |alias, raw|:
                             alias.push(raw[key_index])
@@ -1875,27 +1942,50 @@ module Cli:
                         child_version: mutable darray[u8] = []
                         return false if not load_package_at(&child_root, &child_name, &child_version)
                         return false if not bytes_equal(alias, child_name)
-                        ancestor: mutable usize = parent
-                        while ancestor < total |queue, parents, total, ancestor, child_root|:
-                            ancestor_path: mutable darray[u8] = []
-                            return false if not queue_field_at(queue, ancestor, 0, &ancestor_path)
-                            return false if bytes_equal(ancestor_path, child_root)
-                            return false if ancestor >= parents.count
-                            ancestor <- parents[ancestor]
-                        existing: usize = queue_name_record(queue, total, child_name)
+                        insertion: mutable usize = 0.usize()
+                        existing: usize = queue_name_record(queue, record_starts, sorted_records, total, child_name, &insertion)
+                        return false if insertion > sorted_records.count
                         if existing < total:
                             existing_path: mutable darray[u8] = []
                             existing_version: mutable darray[u8] = []
-                            return false if not queue_field_at(queue, existing, 0, &existing_path) or not queue_field_at(queue, existing, 2, &existing_version)
+                            return false if not queue_field_at(queue, record_starts, existing, 0, &existing_path) or not queue_field_at(queue, record_starts, existing, 2, &existing_version)
                             return false if not bytes_equal(existing_path, child_root) or not bytes_equal(existing_version, child_version)
+                            edges.push(existing) if parent < total
                             in_string <- false
                             continue
                         return false if total >= 4096.usize()
-                        queue_append_record(queue, &child_root, child_name, child_version)
-                        parents.push(parent)
+                        queue_append_record(queue, record_starts, &child_root, child_name, child_version)
+                        return false if not queue_insert_sorted_record(sorted_records, insertion, total)
+                        edges.push(total) if parent < total
                         total <- total + 1.usize()
                     in_string <- false
             return true
+
+        def local_dependency_graph_is_acyclic(total: usize, edges: darray[usize]&, edge_offsets: darray[usize]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            return false if edge_offsets.count != total + 1.usize()
+            indegrees: mutable darray[usize] = []
+            indegrees.resize(total)
+            for index in 0..<total |indegrees|:
+                indegrees[index] <- 0.usize()
+            for source in 0..<total |edge_offsets, edges, indegrees|:
+                return false if edge_offsets[source + 1.usize()] < edge_offsets[source] or edge_offsets[source + 1.usize()] > edges.count
+                for edge_index in edge_offsets[source]..<edge_offsets[source + 1.usize()] |edges, indegrees|:
+                    target: usize = edges[edge_index]
+                    return false if target >= total
+                    indegrees[target] <- indegrees[target] + 1.usize()
+            ready: mutable darray[usize] = []
+            for index in 0..<total |indegrees, ready|:
+                ready.push(index) if indegrees[index] == 0.usize()
+            ready_cursor: mutable usize = 0.usize()
+            while ready_cursor < ready.count |ready, ready_cursor, edges, edge_offsets, indegrees|:
+                source: usize = ready[ready_cursor]
+                for edge_index in edge_offsets[source]..<edge_offsets[source + 1.usize()] |edges, indegrees, ready|:
+                    target: usize = edges[edge_index]
+                    return false if indegrees[target] == 0.usize()
+                    indegrees[target] <- indegrees[target] - 1.usize()
+                    ready.push(target) if indegrees[target] == 0.usize()
+                ready_cursor <- ready_cursor + 1.usize()
+            return ready.count == total
 
         def canonical_transitive_local_lock(name: darray[u8]&, version: darray[u8]&, raw: darray[u8]&, root: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out: mutable darray[u8] = []
@@ -1915,16 +2005,21 @@ module Cli:
             bytes_push_array(&out, root_source_digest)
             bytes_push_view(&out, "\"\n  },\n  \"packages\": [")
             queue: mutable darray[u8] = []
-            parents: mutable darray[usize] = []
+            record_starts: mutable darray[usize] = []
+            sorted_records: mutable darray[usize] = []
+            edges: mutable darray[usize] = []
+            edge_count: mutable usize = 0.usize()
             total: mutable usize = 0.usize()
-            return [] if not append_local_dependency_records(raw, root, &queue, &parents, &total, 18446744073709551615.usize())
+            return [] if not append_local_dependency_records(raw, root, &queue, &record_starts, &sorted_records, &edges, &edge_count, &total, 18446744073709551615.usize())
             if total == 0.usize():
                 bytes_push_view(&out, "]\n}\n")
                 return out
+            edge_offsets: mutable darray[usize] = []
+            edge_offsets.push(0.usize())
             processed: mutable usize = 0.usize()
-            while processed < total |queue, processed, total, root|:
+            while processed < total |queue, record_starts, sorted_records, edges, edge_count, edge_offsets, processed, total, root|:
                 package_root: mutable darray[u8] = []
-                return [] if not queue_field_at(queue, processed, 0, &package_root)
+                return [] if not queue_field_at(queue, record_starts, processed, 0, &package_root)
                 manifest_path: mutable darray[u8] = []
                 path_join_into(&package_root, "elisapkg.json", &manifest_path)
                 child_raw: mutable darray[u8] = []
@@ -1935,30 +2030,21 @@ module Cli:
                 return [] if bytes_equal(child_name, name)
                 queued_name: mutable darray[u8] = []
                 queued_version: mutable darray[u8] = []
-                return [] if not queue_field_at(queue, processed, 1, &queued_name) or not queue_field_at(queue, processed, 2, &queued_version)
+                return [] if not queue_field_at(queue, record_starts, processed, 1, &queued_name) or not queue_field_at(queue, record_starts, processed, 2, &queued_version)
                 return [] if not bytes_equal(queued_name, child_name) or not bytes_equal(queued_version, child_version)
-                return [] if not append_local_dependency_records(child_raw, &package_root, &queue, &parents, &total, processed)
+                return [] if not append_local_dependency_records(child_raw, &package_root, &queue, &record_starts, &sorted_records, &edges, &edge_count, &total, processed)
                 processed <- processed + 1.usize()
-            emitted: mutable darray[u8] = []
+                edge_offsets.push(edges.count)
+            return [] if not local_dependency_graph_is_acyclic(total, edges, edge_offsets)
             first: mutable bool = true
-            for _step in 0..<total |queue, emitted, out, first|:
-                found: mutable bool = false
-                selected: mutable usize = total
+            return [] if sorted_records.count != total
+            for sorted_position in 0..<total |queue, record_starts, sorted_records, out, first|:
+                selected: usize = sorted_records[sorted_position]
+                return [] if selected >= record_starts.count
                 selected_name: mutable darray[u8] = []
-                for candidate in 0..<total |queue, emitted, found, selected, selected_name|:
-                    candidate_name: mutable darray[u8] = []
-                    continue if not queue_field_at(queue, candidate, 1, &candidate_name)
-                    continue if emitted_contains_slice(emitted, candidate_name, 0, candidate_name.count)
-                    if not found or bytes_less(candidate_name, selected_name):
-                        selected <- candidate
-                        selected_name.resize(0)
-                        for index in 0..<candidate_name.count |selected_name, candidate_name|:
-                            selected_name.push(candidate_name[index])
-                        found <- true
-                break if not found
                 selected_path: mutable darray[u8] = []
                 selected_version: mutable darray[u8] = []
-                return [] if not queue_field_at(queue, selected, 0, &selected_path) or not queue_field_at(queue, selected, 2, &selected_version)
+                return [] if not queue_field_at(queue, record_starts, selected, 0, &selected_path) or not queue_field_at(queue, record_starts, selected, 1, &selected_name) or not queue_field_at(queue, record_starts, selected, 2, &selected_version)
                 selected_manifest_path: mutable darray[u8] = []
                 path_join_into(&selected_path, "elisapkg.json", &selected_manifest_path)
                 selected_manifest: mutable darray[u8] = []
@@ -1981,9 +2067,6 @@ module Cli:
                 bytes_push_view(&out, "\",\"source-digest\":\"sha256:")
                 bytes_push_array(&out, selected_source_digest)
                 bytes_push_view(&out, "\"}")
-                for index in 0..<selected_name.count |emitted, selected_name|:
-                    emitted.push(selected_name[index])
-                emitted.push(0)
                 first <- false
             bytes_push_view(&out, "\n  ]\n}\n")
             return out
@@ -5431,7 +5514,330 @@ module Cli:
                 count <- count + 1.usize()
             return true
 
+        def canonical_existing_path(path: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            out.resize(0)
+            return false if path.count == 0.usize() or path.count > 4096.usize()
+            path_c: mutable darray[u8] = []
+            path_with_nul_into(path, &path_c)
+            resolved: mutable darray[u8] = []
+            resolved.resize(4096)
+            path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
+            if Platform::pkg_realpath(path_name, &resolved) is canonical:
+                length: usize = Platform::pkg_strlen(canonical)
+                return false if length == 0.usize() or length >= 4096.usize()
+                for index in 0..<length |out, canonical|:
+                    out.push(canonical[index].u8())
+                return true
+            return false
+
+        def append_local_dependency_names(raw: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            out.resize(0)
+            dependency_start: usize = json_key_value_offset(raw, "dependencies")
+            return true if dependency_start >= raw.count
+            dependency_end: usize = json_object_end(raw, dependency_start)
+            return false if dependency_end <= dependency_start or raw[dependency_start] != 123
+            in_string: mutable bool = false
+            escaped: mutable bool = false
+            string_start: mutable usize = 0.usize()
+            braces: mutable i64 = 1
+            brackets: mutable i64 = 0
+            for index in (dependency_start + 1.usize())..<dependency_end |raw, out, in_string, escaped, string_start, braces, brackets|:
+                byte: u8 = raw[index]
+                if not in_string:
+                    if byte == 34:
+                        in_string <- true
+                        string_start <- index + 1.usize()
+                    elif byte == 123:
+                        braces <- braces + 1
+                    elif byte == 125:
+                        braces <- braces - 1
+                    elif byte == 91:
+                        brackets <- brackets + 1
+                    elif byte == 93:
+                        brackets <- brackets - 1
+                elif escaped:
+                    escaped <- false
+                elif byte == 92:
+                    escaped <- true
+                elif byte == 34:
+                    after: mutable usize = index + 1.usize()
+                    while after < dependency_end and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
+                        after <- after + 1.usize()
+                    if braces == 1 and brackets == 0 and after < dependency_end and raw[after] == 58:
+                        alias: mutable darray[u8] = []
+                        for key_index in string_start..<index |alias, raw|:
+                            alias.push(raw[key_index])
+                        return false if not valid_package_name(alias)
+                        object_start: mutable usize = after + 1.usize()
+                        while object_start < dependency_end and (raw[object_start] == 32 or raw[object_start] == 9 or raw[object_start] == 10 or raw[object_start] == 13) |raw, object_start|:
+                            object_start <- object_start + 1.usize()
+                        object_end: usize = json_object_end(raw, object_start)
+                        return false if object_start >= dependency_end or object_end <= object_start or object_end > dependency_end or raw[object_start] != 123
+                        path_key: mutable darray[u8] = [112, 97, 116, 104]
+                        return false if not object_has_direct_key(raw, object_start, object_end, path_key)
+                        for key_index in 0..<alias.count |out, alias|:
+                            out.push(alias[key_index])
+                        out.push(0)
+                    in_string <- false
+            return true
+
+        def local_build_package_index(packages: darray[LocalBuildPackage]&, wanted: darray[u8]&) -> usize:
+            lower: mutable usize = 0.usize()
+            upper: mutable usize = packages.count
+            while lower < upper |packages, wanted, lower, upper|:
+                middle: usize = lower + (upper - lower) / 2.usize()
+                return middle if bytes_equal(packages[middle].name, wanted)
+                if bytes_less(packages[middle].name, wanted):
+                    lower <- middle + 1.usize()
+                else:
+                    upper <- middle
+            return packages.count
+
+        def select_unique_library_entry(raw: darray[u8]&, package_root: darray[u8]&, out: mutable darray[u8]&, relative_out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            out.resize(0)
+            relative_out.resize(0)
+            targets_start: usize = json_key_value_offset(raw, "targets")
+            return false if targets_start >= raw.count or raw[targets_start] != 91
+            targets_end: usize = json_array_end(raw, targets_start)
+            return false if targets_end <= targets_start
+            cursor: mutable usize = targets_start + 1.usize()
+            libraries: mutable usize = 0.usize()
+            selected_entry: mutable darray[u8] = []
+            while cursor < targets_end:
+                while cursor < targets_end and (raw[cursor] == 32 or raw[cursor] == 9 or raw[cursor] == 10 or raw[cursor] == 13 or raw[cursor] == 44):
+                    cursor <- cursor + 1.usize()
+                break if cursor >= targets_end or raw[cursor] == 93
+                return false if raw[cursor] != 123
+                object_end: usize = json_object_end(raw, cursor)
+                return false if object_end <= cursor or object_end >= targets_end
+                kind: mutable darray[u8] = []
+                if not object_string_value(raw, cursor, object_end, "kind", &kind):
+                    return false
+                if bytes_equal_view(kind, "lib"):
+                    libraries <- libraries + 1.usize()
+                    return false if libraries > 1.usize()
+                    return false if not object_string_value(raw, cursor, object_end, "entry", &selected_entry)
+                cursor <- object_end + 1.usize()
+            return false if libraries != 1.usize()
+            for index in 0..<selected_entry.count |relative_out, selected_entry|:
+                relative_out.push(selected_entry[index])
+            entry_c: mutable darray[u8] = []
+            path_with_nul_into(&selected_entry, &entry_c)
+            entry_name: cstr = (&entry_c[0]).cast[cstr] can Unsafe.PointerCast
+            joined: mutable darray[u8] = []
+            path_join_into(package_root, entry_name, &joined)
+            return canonical_existing_path(joined, out)
+
+        def build_local_dependency_aggregate[@r](lock: darray[u8]&, start: darray[u8]&, root_entry: cstr, aggregate: mutable darray[u8]&, has_dependencies: mutable bool&, packages: mutable darray[LocalBuildPackage]& @r, order: mutable darray[usize]& @r) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            aggregate.resize(0)
+            has_dependencies <- false
+            packages.resize(0)
+            order.resize(0)
+            return false if not lock_version_is(lock, 2)
+            packages_start: usize = json_key_value_offset(lock, "packages")
+            packages_end: usize = json_array_end(lock, packages_start)
+            return false if packages_start >= lock.count or packages_end <= packages_start or lock[packages_start] != 91
+            root_path: mutable darray[u8] = []
+            return false if not canonical_existing_path(start, &root_path)
+            total_graph_edges: mutable usize = 0.usize()
+            cursor: mutable usize = packages_start + 1.usize()
+            while cursor < packages_end:
+                while cursor < packages_end and (lock[cursor] == 32 or lock[cursor] == 9 or lock[cursor] == 10 or lock[cursor] == 13):
+                    cursor <- cursor + 1.usize()
+                break if cursor >= packages_end or lock[cursor] == 93
+                return false if lock[cursor] != 123 or packages.count >= MAX_DEPENDENCIES
+                record_end: usize = json_object_end(lock, cursor)
+                return false if record_end <= cursor or record_end >= packages_end
+                package_name: mutable darray[u8] @r = []
+                package_version: mutable darray[u8] = []
+                source_start: mutable usize = 0.usize()
+                source_end: mutable usize = 0.usize()
+                return false if not object_string_value(lock, cursor, record_end, "name", &package_name) or not valid_package_name(package_name)
+                return false if not object_string_value(lock, cursor, record_end, "version", &package_version)
+                return false if not object_object_value_span(lock, cursor, record_end, "source", &source_start, &source_end)
+                source_type: mutable darray[u8] = []
+                relative_path: mutable darray[u8] = []
+                return false if not object_string_value(lock, source_start, source_end, "type", &source_type) or not bytes_equal_view(source_type, "path")
+                return false if not object_string_value(lock, source_start, source_end, "path", &relative_path) or not valid_dependency_path(relative_path)
+                return false if packages.count > 0.usize() and not bytes_less(packages[packages.count - 1.usize()].name, package_name)
+                relative_c: mutable darray[u8] = []
+                path_with_nul_into(&relative_path, &relative_c)
+                relative_name: cstr = (&relative_c[0]).cast[cstr] can Unsafe.PointerCast
+                joined_root: mutable darray[u8] = []
+                path_join_into(root_path, relative_name, &joined_root)
+                canonical_root: mutable darray[u8] @r = []
+                return false if not canonical_existing_path(joined_root, &canonical_root)
+                manifest_path: mutable darray[u8] = []
+                path_join_into(canonical_root, "elisapkg.json", &manifest_path)
+                package_manifest: mutable darray[u8] = []
+                return false if not read_package_file_into(manifest_path, &package_manifest)
+                actual_name: mutable darray[u8] = []
+                actual_version: mutable darray[u8] = []
+                return false if not validate_manifest_at(package_manifest, canonical_root, &actual_name, &actual_version)
+                return false if not bytes_equal(actual_name, package_name) or not bytes_equal(actual_version, package_version)
+                manifest_digest_bytes: mutable darray[u8] = []
+                manifest_digest: mutable darray[u8] = []
+                return false if Integrity::sha256(package_manifest, &manifest_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(manifest_digest_bytes, &manifest_digest)
+                return false if not object_sha256_equals(lock, cursor, record_end, "manifest-digest", manifest_digest)
+                source_digest: mutable darray[u8] @r = []
+                return false if not source_tree_digest_at(canonical_root, &source_digest)
+                return false if not object_sha256_equals(lock, cursor, record_end, "source-digest", source_digest)
+                registry_roots: mutable darray[Solver::Constraint] = []
+                has_local_dependency: mutable bool = false
+                return false if not collect_registry_roots(package_manifest, &registry_roots, &has_local_dependency) or registry_roots.count != 0.usize()
+                library_entry: mutable darray[u8] @r = []
+                relative_entry: mutable darray[u8] @r = []
+                return false if not select_unique_library_entry(package_manifest, canonical_root, &library_entry, &relative_entry)
+                dependency_names: mutable darray[u8] @r = []
+                return false if not append_local_dependency_names(package_manifest, &dependency_names)
+                package_edges: mutable usize = 0.usize()
+                edge_cursor: mutable usize = 0.usize()
+                while edge_cursor < dependency_names.count:
+                    edge_end: mutable usize = edge_cursor
+                    while edge_end < dependency_names.count and dependency_names[edge_end] != 0 |dependency_names, edge_end|:
+                        edge_end <- edge_end + 1.usize()
+                    return false if edge_end == edge_cursor
+                    package_edges <- package_edges + 1.usize()
+                    return false if package_edges > MAX_DEPENDENCIES
+                    edge_cursor <- edge_end + 1.usize()
+                return false if package_edges > MAX_BUILD_GRAPH_EDGES - total_graph_edges
+                total_graph_edges <- total_graph_edges + package_edges
+                snapshot_entry: mutable darray[u8] @r = []
+                dependents: mutable darray[usize] @r = []
+                packages.push(LocalBuildPackage{name: package_name, root: canonical_root, entry: library_entry, relative_entry: relative_entry, source_digest: source_digest, snapshot_entry: snapshot_entry, dependency_names: dependency_names, dependents: dependents, remaining_dependencies: 0, emitted: false})
+                cursor <- record_end + 1.usize()
+                while cursor < packages_end and (lock[cursor] == 32 or lock[cursor] == 9 or lock[cursor] == 10 or lock[cursor] == 13) |lock, cursor|:
+                    cursor <- cursor + 1.usize()
+                if cursor < packages_end:
+                    return false if lock[cursor] != 44
+                    cursor <- cursor + 1.usize()
+            if packages.count == 0.usize():
+                return true
+            has_dependencies <- true
+            for package_index in 0..<packages.count |packages|:
+                dependency_cursor: mutable usize = 0.usize()
+                while dependency_cursor < packages[package_index].dependency_names.count:
+                    dependency_end: mutable usize = dependency_cursor
+                    while dependency_end < packages[package_index].dependency_names.count and packages[package_index].dependency_names[dependency_end] != 0 |packages, dependency_end|:
+                        dependency_end <- dependency_end + 1.usize()
+                    dependency_name: mutable darray[u8] = []
+                    for byte_index in dependency_cursor..<dependency_end |dependency_name, packages|:
+                        dependency_name.push(packages[package_index].dependency_names[byte_index])
+                    dependency_index: usize = local_build_package_index(packages, dependency_name)
+                    return false if dependency_end == dependency_cursor or dependency_index >= packages.count
+                    packages[package_index].remaining_dependencies <- packages[package_index].remaining_dependencies + 1.usize()
+                    packages[dependency_index].dependents.push(package_index)
+                    dependency_cursor <- dependency_end + 1.usize()
+            completed: mutable usize = 0.usize()
+            while completed < packages.count |packages, completed, aggregate|:
+                selected: mutable usize = packages.count
+                for candidate in 0..<packages.count |packages, selected|:
+                    if not packages[candidate].emitted and packages[candidate].remaining_dependencies == 0.usize():
+                        selected <- candidate
+                        break
+                return false if selected >= packages.count
+                return false if not Build::append_include_path(packages[selected].entry, aggregate)
+                order.push(selected)
+                packages[selected].emitted <- true
+                completed <- completed + 1.usize()
+                return false if aggregate.count > MAX_BUILD_AGGREGATE_BYTES
+                for dependent_index in 0..<packages[selected].dependents.count |packages, selected, dependent_index|:
+                    dependent: usize = packages[selected].dependents[dependent_index]
+                    return false if packages[dependent].remaining_dependencies == 0.usize()
+                    packages[dependent].remaining_dependencies <- packages[dependent].remaining_dependencies - 1.usize()
+            root_entry_bytes: mutable darray[u8] = []
+            root_entry_length: usize = Platform::pkg_strlen(root_entry)
+            return false if root_entry_length == 0.usize() or root_entry_length > 4096.usize()
+            for index in 0..<root_entry_length |root_entry_bytes, root_entry|:
+                root_entry_bytes.push(root_entry[index].u8())
+            return false if not Build::append_include_path(root_entry_bytes, aggregate) or aggregate.count > MAX_BUILD_AGGREGATE_BYTES
+            return true
+
+        def remove_optional_build_aggregate(path_name: cstr) -> bool can[Unsafe.PointerCast]:
+            return true if path_name[0].u8() == 0
+            status: i64 = Platform::pkg_unlink(path_name)
+            return status == 0 or status == -2
+
+        def remove_optional_build_snapshots(container_name: cstr, package_roots: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return true if container_name[0].u8() == 0
+            cleanup_ok: mutable bool = true
+            cursor: mutable usize = 0.usize()
+            while cursor < package_roots.count |package_roots, cursor, cleanup_ok|:
+                end: mutable usize = cursor
+                while end < package_roots.count and package_roots[end] != 0 |package_roots, end|:
+                    end <- end + 1.usize()
+                if end == cursor or end >= package_roots.count:
+                    cleanup_ok <- false
+                    break
+                path: mutable darray[u8] = []
+                for index in cursor..<end |package_roots, path|:
+                    path.push(package_roots[index])
+                path.push(0)
+                path_name: cstr = (&path[0]).cast[cstr] can Unsafe.PointerCast
+                cleanup_status: i64 = Platform::pkg_cleanup_package_snapshot(path_name)
+                cleanup_ok <- false if cleanup_status != 0
+                remove_status: i64 = Platform::pkg_rmdir(path_name)
+                cleanup_ok <- false if remove_status != 0 and remove_status != -2
+                cursor <- end + 1.usize()
+            container_status: i64 = Platform::pkg_rmdir(container_name)
+            cleanup_ok <- false if container_status != 0 and container_status != -2
+            return cleanup_ok
+
+        def create_verified_build_snapshot(container: darray[u8]&, source_root: darray[u8]&, label: cstr,
+                                           expected_digest: darray[u8]&, relative_entry: darray[u8]&,
+                                           package_roots: mutable darray[u8]&, total_bytes: mutable usize&,
+                                           out_root: mutable darray[u8]&, out_entry: mutable darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            out_root.resize(0)
+            out_entry.resize(0)
+            return -84 if not Archive::is_safe_entry(relative_entry) or publish_path_forbidden(relative_entry)
+            template: mutable darray[u8] = []
+            bytes_push_array(&template, container)
+            if template.count == 0.usize() or template[template.count - 1.usize()] != 47:
+                template.push(47)
+            bytes_push_cstr(&template, label)
+            bytes_push_view(&template, "-XXXXXX")
+            template.push(0)
+            mkdtemp_status: i64 = Platform::pkg_mkdtemp(&template)
+            return mkdtemp_status if mkdtemp_status != 0
+            snapshot_length: usize = Platform::pkg_strlen((&template[0]).cast[cstr] can Unsafe.PointerCast)
+            if snapshot_length == 0.usize() or snapshot_length >= 4096.usize():
+                cleanup_status: i64 = Platform::pkg_rmdir((&template[0]).cast[cstr] can Unsafe.PointerCast)
+                return -5 if cleanup_status != 0
+                return -36
+            for index in 0..<snapshot_length |out_root, template|:
+                out_root.push(template[index])
+            for index in 0..<out_root.count |package_roots, out_root|:
+                package_roots.push(out_root[index])
+            package_roots.push(0)
+            source_c: mutable darray[u8] = []
+            path_with_nul_into(source_root, &source_c)
+            source_name: cstr = (&source_c[0]).cast[cstr] can Unsafe.PointerCast
+            destination_name: cstr = (&template[0]).cast[cstr] can Unsafe.PointerCast
+            copied_bytes: i64 = Platform::pkg_snapshot_package_tree(source_name, destination_name)
+            return copied_bytes if copied_bytes < 0
+            return -75 if copied_bytes.usize() > MAX_BUILD_SNAPSHOT_BYTES - total_bytes
+            total_bytes <- total_bytes + copied_bytes.usize()
+            copied_digest: mutable darray[u8] = []
+            return -86 if not source_tree_digest_at(out_root, &copied_digest)
+            return -87 if not bytes_equal(copied_digest, expected_digest)
+            relative_c: mutable darray[u8] = []
+            path_with_nul_into(relative_entry, &relative_c)
+            relative_name: cstr = (&relative_c[0]).cast[cstr] can Unsafe.PointerCast
+            entry_path: mutable darray[u8] = []
+            path_join_into(out_root, relative_name, &entry_path)
+            return -88 if not canonical_existing_path(entry_path, out_entry)
+            return 0
+
         def run_build(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            aggregate_source_name: mutable cstr = ""
+            source_snapshot_container_name: mutable cstr = ""
+            source_snapshot_container_storage: mutable darray[u8] = []
+            source_snapshot_roots: mutable darray[u8] = []
+            source_snapshot_root: mutable darray[u8] = []
+            root_snapshot_entry: mutable darray[u8] = []
+            root_snapshot_root: mutable darray[u8] = []
+            compiler_dependency_aggregate: mutable darray[u8] = []
+            snapshot_total_bytes: mutable usize = 0.usize()
             if not Sandbox::build_sandbox_available():
                 write_error("error: compiler builds require the macOS Seatbelt sandbox; builds fail closed on this platform\n")
                 return EXIT_BUILD
@@ -5478,585 +5884,825 @@ module Cli:
             return EXIT_BUILD if not bytes_equal(manifest_after_resolve, manifest_raw)
             return EXIT_BUILD if not lock_matches_manifest(manifest_raw, lock_raw, root_name, root_version, start)
             if lock_version_is(lock_raw, 3):
-                fetch_status: i64 = fetch_registry_lock_offline(manifest_raw, lock_raw, root_name, root_version, start) if options.offline or options.frozen else fetch_registry_lock(manifest_raw, lock_raw, root_name, root_version, start)
-                return fetch_status if fetch_status != EXIT_OK
+                write_error("error: builds with registry dependencies are not supported; local dependency builds require a version 2 local lock\n")
+                return EXIT_BUILD
             lock_digest_bytes: mutable darray[u8] = []
             lock_digest: mutable darray[u8] = []
             return EXIT_BUILD if Integrity::sha256(lock_raw, &lock_digest_bytes) != Integrity::DigestCode.Ok
             return EXIT_BUILD if not Integrity::hex_digest(lock_digest_bytes, &lock_digest)
             source_tree_digest: mutable darray[u8] = []
             return EXIT_BUILD if not source_tree_digest_into(&source_tree_digest)
-            target_source: mutable darray[u8] = []
-            target_source_size: i64 = Platform::pkg_package_file_size(target_entry_raw)
-            return EXIT_BUILD if target_source_size < 0 or target_source_size > 67108864
-            target_source.resize(target_source_size.usize() + 1.usize())
-            target_source_raw: mutable u8& = (&target_source[0]).cast[mutable u8&] can Unsafe.PointerCast
-            target_source_read: i64 = Platform::pkg_read_package_file(target_entry_raw, target_source_raw, target_source.count)
-            return EXIT_BUILD if target_source_read < 0 or target_source_read != target_source_size
-            target_source.resize(target_source_read.usize())
-            source_digest_bytes: mutable darray[u8] = []
-            source_digest: mutable darray[u8] = []
-            return EXIT_BUILD if Integrity::sha256(target_source, &source_digest_bytes) != Integrity::DigestCode.Ok
-            return EXIT_BUILD if not Integrity::hex_digest(source_digest_bytes, &source_digest)
-            build_dir: mutable darray[u8] = []
-            artifact: mutable darray[u8] = []
-            receipt_path: mutable darray[u8] = []
-            base_build_dir: mutable darray[u8] = []
-            path_join_into(start, ".elisapkg/build", &base_build_dir)
-            if cstr_equal(options.profile, "release"):
-                path_join_into(base_build_dir, "release", &build_dir)
-            else:
-                for index in 0..<base_build_dir.count |build_dir, base_build_dir|:
-                    build_dir.push(base_build_dir[index])
-            artifact_leaf_storage: mutable darray[u8] = []
-            for index in 0..<target_name.count |artifact_leaf_storage, target_name|:
-                artifact_leaf_storage.push(target_name[index])
-            artifact_leaf_storage.push(0)
-            artifact_leaf: mutable cstr = (&artifact_leaf_storage[0]).cast[cstr] can Unsafe.PointerCast
-            emit_kind: mutable cstr = "exe"
-            artifact_access_mode: mutable i64 = 1
-            if is_library:
-                artifact_leaf_storage.resize(artifact_leaf_storage.count - 1.usize())
-                artifact_leaf_storage.push(46)
-                artifact_leaf_storage.push(111)
-                artifact_leaf_storage.push(0)
-                artifact_leaf <- (&artifact_leaf_storage[0]).cast[cstr] can Unsafe.PointerCast
-                emit_kind <- "obj"
-                artifact_access_mode <- 0
-            artifact_label: mutable darray[u8] = []
-            bytes_push_cstr(&artifact_label, artifact_leaf)
-            path_join_into(build_dir, artifact_leaf, &artifact)
-            receipt_leaf_storage: mutable darray[u8] = []
-            for index in 0..<target_name.count |receipt_leaf_storage, target_name|:
-                receipt_leaf_storage.push(target_name[index])
-            bytes_push_view(&receipt_leaf_storage, ".receipt")
-            receipt_leaf_storage.push(0)
-            receipt_leaf: cstr = (&receipt_leaf_storage[0]).cast[cstr] can Unsafe.PointerCast
-            path_join_into(build_dir, receipt_leaf, &receipt_path)
-            return EXIT_BUILD if not make_directory(&build_dir)
-            compiler: mutable cstr = "elisac-stage1"
-            if Platform::pkg_getenv("ELISAPKG_COMPILER") is configured:
-                compiler <- configured.cast[cstr]
-            return EXIT_BUILD if not valid_compiler_argument(compiler)
-            # Capture only the compiler settings needed by the wrapper. The child is
-            # started with a scrubbed environment so registry credentials and unrelated
-            # user variables cannot reach compile-time execution.
-            stage1_bin: mutable cstr = ""
-            runtime_obj: mutable cstr = ""
-            allow_stale: mutable cstr = ""
-            clang_tool: mutable cstr = ""
-            if Platform::pkg_getenv("ELISA_STAGE1_BIN") is configured_stage1:
-                stage1_bin <- configured_stage1.cast[cstr]
-            if Platform::pkg_getenv("ELISA_RUNTIME_OBJ") is configured_runtime:
-                runtime_obj <- configured_runtime.cast[cstr]
-            if Platform::pkg_getenv("ELISA_ALLOW_STALE_STAGE1") is configured_stale:
-                allow_stale <- configured_stale.cast[cstr]
-            if Platform::pkg_getenv("ELISA_CLANG") is configured_clang:
-                clang_tool <- configured_clang.cast[cstr]
-            return EXIT_BUILD if not valid_toolchain_value(stage1_bin, 4096.usize()) or not valid_toolchain_value(runtime_obj, 4096.usize()) or not valid_toolchain_value(allow_stale, 64.usize()) or not valid_toolchain_value(clang_tool, 4096.usize())
-            compiler_executable: mutable cstr = compiler
-            compiler_is_stage1_wrapper: bool = stage1_wrapper_pair_matches(compiler, stage1_bin)
-            if compiler_is_stage1_wrapper and stage1_bin[0].u8() != 0:
-                compiler_executable <- stage1_bin
-            home_name: mutable cstr = ""
-            if Platform::pkg_getenv("HOME") is configured_home:
-                home_name <- configured_home.cast[cstr]
-            else:
-                write_error("error: HOME must name an existing directory to construct the build sandbox\n")
-                return EXIT_BUILD
-            dependency_roots: mutable darray[u8] = []
-            return EXIT_BUILD if not sandbox_dependency_roots(lock_raw, start, &dependency_roots)
-            tool_paths: mutable darray[cstr] = []
-            if not compiler_is_stage1_wrapper:
-                tool_paths.push(compiler)
-            tool_paths.push(stage1_bin)
-            tool_paths.push(runtime_obj)
-            executable_paths: mutable darray[cstr] = []
-            if not compiler_is_stage1_wrapper:
-                executable_paths.push(compiler)
-            executable_paths.push(stage1_bin)
-            if clang_tool[0].u8() != 0:
-                tool_paths.push(clang_tool)
-                executable_paths.push(clang_tool)
-            for candidate_index in 0..<3 |tool_paths, executable_paths|:
-                if clang_tool[0].u8() == 0:
-                    candidate: mutable cstr = "/opt/homebrew/opt/llvm/bin/clang"
-                    if candidate_index == 1:
-                        candidate <- "/usr/local/opt/llvm/bin/clang"
-                    elif candidate_index == 2:
-                        candidate <- "/usr/bin/clang"
-                    candidate_real: mutable darray[u8] = []
-                    candidate_real.resize(4096)
-                    if Platform::pkg_realpath(candidate, &candidate_real) is resolved_candidate:
-                        if Platform::pkg_access(resolved_candidate, 1) == 0:
-                            tool_paths.push(candidate)
-                            executable_paths.push(candidate)
-                            clang_tool <- candidate
-            compiler_identity: mutable darray[u8] = []
-            stage1_identity: mutable darray[u8] = []
-            runtime_identity: mutable darray[u8] = []
-            clang_identity: mutable darray[u8] = []
-            compiler_identity_ok: bool = tool_file_identity(compiler, true, true, &compiler_identity)
-            stage1_identity_ok: bool = tool_file_identity(stage1_bin, false, true, &stage1_identity)
-            runtime_identity_ok: bool = tool_file_identity(runtime_obj, false, false, &runtime_identity)
-            clang_identity_ok: bool = tool_file_identity(clang_tool, false, true, &clang_identity)
-            toolchain_identity_ok: bool = compiler_identity_ok and stage1_identity_ok and runtime_identity_ok and clang_identity_ok
-            receipt: mutable darray[u8] = []
-            bytes_push_view(&receipt, "elisapkg-build-receipt:10\nentry:")
-            bytes_push_array(&receipt, target_entry)
-            bytes_push_view(&receipt, "\ntarget-kind:")
-            bytes_push_array(&receipt, target_kind)
-            bytes_push_view(&receipt, "\nartifact:")
-            bytes_push_cstr(&receipt, artifact_leaf)
-            bytes_push_view(&receipt, "\nprofile:")
-            bytes_push_cstr(&receipt, options.profile)
-            bytes_push_view(&receipt, "\ncompiler-flags:")
-            if cstr_equal(options.profile, "release"):
-                bytes_push_view(&receipt, "-O2")
-            else:
-                bytes_push_view(&receipt, "-O0,-g")
-            bytes_push_view(&receipt, "\nsource-tree-digest:sha256:")
-            bytes_push_array(&receipt, source_tree_digest)
-            bytes_push_view(&receipt, "\nsource-digest:sha256:")
-            bytes_push_array(&receipt, source_digest)
-            bytes_push_view(&receipt, "\nmanifest-digest:sha256:")
-            bytes_push_array(&receipt, manifest_digest)
-            bytes_push_view(&receipt, "\nlock-digest:sha256:")
-            bytes_push_array(&receipt, lock_digest)
-            bytes_push_view(&receipt, "\ncompiler:")
-            bytes_push_cstr(&receipt, compiler)
-            bytes_push_view(&receipt, "\ncompiler-executable:")
-            bytes_push_cstr(&receipt, compiler_executable)
-            bytes_push_view(&receipt, "\nstage1-bin:")
-            bytes_push_cstr(&receipt, stage1_bin)
-            bytes_push_view(&receipt, "\nruntime-object:")
-            bytes_push_cstr(&receipt, runtime_obj)
-            bytes_push_view(&receipt, "\ncompiler-identity:")
-            bytes_push_array(&receipt, compiler_identity)
-            bytes_push_view(&receipt, "\nstage1-identity:")
-            bytes_push_array(&receipt, stage1_identity)
-            bytes_push_view(&receipt, "\nruntime-identity:")
-            bytes_push_array(&receipt, runtime_identity)
-            bytes_push_view(&receipt, "\nclang-tool:")
-            bytes_push_cstr(&receipt, clang_tool)
-            bytes_push_view(&receipt, "\nclang-identity:")
-            bytes_push_array(&receipt, clang_identity)
-            bytes_push_view(&receipt, "\nallow-stale:")
-            bytes_push_cstr(&receipt, allow_stale)
-            bytes_push_view(&receipt, "\nsemantic-gate:1\nsandbox-policy:macos-seatbelt-v2")
-            artifact_c: mutable darray[u8] = []
-            receipt_c: mutable darray[u8] = []
-            path_with_nul_into(&artifact, &artifact_c)
-            path_with_nul_into(&receipt_path, &receipt_c)
-            artifact_name: cstr = (&artifact_c[0]).cast[cstr] can Unsafe.PointerCast
-            receipt_name: cstr = (&receipt_c[0]).cast[cstr] can Unsafe.PointerCast
-            if toolchain_identity_ok and cstr_file_exists(artifact_name) and cstr_file_exists(receipt_name) and Platform::pkg_access(artifact_name, artifact_access_mode) == 0:
-                cached_artifact: mutable darray[u8] = []
-                cached_receipt: mutable darray[u8] = []
-                cached_receipt.resize(4096)
-                if read_package_file_into(&artifact, &cached_artifact) and read_cstr_into(receipt_name, &cached_receipt):
-                    cached_digest_bytes: mutable darray[u8] = []
-                    cached_digest: mutable darray[u8] = []
-                    if Integrity::sha256(cached_artifact, &cached_digest_bytes) == Integrity::DigestCode.Ok and Integrity::hex_digest(cached_digest_bytes, &cached_digest):
-                        expected_receipt: mutable darray[u8] = []
-                        bytes_push_array(&expected_receipt, receipt)
-                        bytes_push_view(&expected_receipt, "\nartifact-digest:sha256:")
-                        bytes_push_array(&expected_receipt, cached_digest)
-                        bytes_push_view(&expected_receipt, "\n")
-                        if bytes_equal(cached_receipt, expected_receipt):
-                            write_ok("built .elisapkg/build/")
-                            write_bytes(1, &artifact_label)
-                            write_ok(" (cached)\n")
-                            _ = options
-                            return EXIT_OK
-            # The lock digest includes every resolved local dependency identity and
-            # source digest. Recompile whenever that graph changes instead of reusing a
-            # root-only artifact.
-            # Each compiler gets a distinct private scratch directory for HOME,
-            # TMPDIR, and caches. It is the only writable subtree; the final
-            # artifact and its receipt stay outside the child's writable set.
-            sandbox_template: mutable darray[u8] = []
-            bytes_push_array(&sandbox_template, build_dir)
-            if sandbox_template.count == 0.usize() or sandbox_template[sandbox_template.count - 1.usize()] != 47:
-                sandbox_template.push(47)
-            bytes_push_view(&sandbox_template, ".sandbox-XXXXXX")
-            sandbox_template.push(0)
-            if Platform::pkg_mkdtemp(&sandbox_template) != 0:
-                write_error("error: unable to create the private compiler scratch directory\n")
-                return EXIT_BUILD
-            sandbox_work_length: usize = Platform::pkg_strlen((&sandbox_template[0]).cast[cstr] can Unsafe.PointerCast)
-            sandbox_work_dir: mutable darray[u8] = []
-            for index in 0..<sandbox_work_length |sandbox_work_dir, sandbox_template|:
-                sandbox_work_dir.push(sandbox_template[index])
-            sandbox_work_c: mutable darray[u8] = []
-            path_with_nul_into(sandbox_work_dir, &sandbox_work_c)
-            sandbox_work_name: cstr = (&sandbox_work_c[0]).cast[cstr] can Unsafe.PointerCast
-            canonical_sandbox_work: mutable darray[u8] = []
-            canonical_sandbox_work.resize(4096)
-            canonical_sandbox_work_name: mutable cstr = ""
-            if Platform::pkg_realpath(sandbox_work_name, &canonical_sandbox_work) is resolved_sandbox_work:
-                canonical_sandbox_work_name <- resolved_sandbox_work
-            else:
-                _ = Platform::pkg_rmdir(sandbox_work_name)
-                write_error("error: unable to resolve the private compiler scratch directory\n")
-                return EXIT_BUILD
-            # Keep every compiler-created output, including stage1's adjacent
-            # object file, inside the private scratch subtree. The parent copies
-            # only the validated final bytes into the public cache after teardown.
-            temp_template: mutable darray[u8] = []
-            for index in 0..<sandbox_work_dir.count |temp_template, sandbox_work_dir|:
-                temp_template.push(sandbox_work_dir[index])
-            if temp_template.count == 0.usize() or temp_template[temp_template.count - 1.usize()] != 47:
-                temp_template.push(47)
-            bytes_push_cstr(&temp_template, artifact_leaf)
-            bytes_push_view(&temp_template, ".tmp.XXXXXX")
-            temp_template.push(0)
-            temp_fd: i64 = Platform::pkg_mkstemp(&temp_template)
-            if temp_fd < 0:
-                _ = Platform::pkg_rmdir(sandbox_work_name)
-                write_error("error: unable to create the exclusive compiler output file\n")
-                return EXIT_BUILD
-            temp_name: cstr = (&temp_template[0]).cast[cstr] can Unsafe.PointerCast
-            if Platform::pkg_close(temp_fd) != 0:
-                _ = Platform::pkg_unlink(temp_name)
-                _ = Platform::pkg_rmdir(sandbox_work_name)
-                write_error("error: unable to close the exclusive compiler output file\n")
-                return EXIT_BUILD
-            sandbox_profile: mutable darray[u8] = Sandbox::darwin_build_profile(home_name, start, sandbox_work_dir, dependency_roots, tool_paths, executable_paths, temp_name)
-            if sandbox_profile.count == 0.usize():
-                _ = Platform::pkg_unlink(temp_name)
-                _ = Platform::pkg_rmdir(sandbox_work_name)
-                write_error("error: could not construct the mandatory compiler sandbox profile\n")
-                return EXIT_BUILD
-            sandbox_profile.push(0)
-            sandbox_profile_name: cstr = (&sandbox_profile[0]).cast[cstr] can Unsafe.PointerCast
-            callback_parameter: mutable darray[u8] = []
-            bytes_push_view(&callback_parameter, "CALLBACK_PATH=/private/tmp/elisa-stage1-callback-")
-            callback_digits_offset: usize = callback_parameter.count
-            for _digit in 0..<20 |callback_parameter|:
-                callback_parameter.push(48)
-            bytes_push_view(&callback_parameter, ".c")
-            callback_parameter.push(0)
-            # An explicit compiler is required for reproducible builds. PATH lookup is
-            # delegated to execvp only after the user has selected the executable.
-            stage1_env: mutable darray[u8] = []
-            runtime_env: mutable darray[u8] = []
-            stale_env: mutable darray[u8] = []
-            clang_env: mutable darray[u8] = []
-            temporary_env: mutable darray[u8] = []
-            args: mutable darray[cstr] = []
-            args.push("/usr/bin/sandbox-exec")
-            args.push("-D")
-            args.push((&callback_parameter[0]).cast[cstr] can Unsafe.PointerCast)
-            args.push("-p")
-            args.push(sandbox_profile_name)
-            args.push("/usr/bin/env")
-            args.push("-i")
-            args.push("PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin")
-            bytes_push_view(&temporary_env, "TMPDIR=")
-            bytes_push_cstr(&temporary_env, canonical_sandbox_work_name)
-            temporary_env.push(0)
-            args.push((&temporary_env[0]).cast[cstr] can Unsafe.PointerCast)
-            sandbox_home_env: mutable darray[u8] = []
-            bytes_push_view(&sandbox_home_env, "HOME=")
-            bytes_push_cstr(&sandbox_home_env, canonical_sandbox_work_name)
-            sandbox_home_env.push(0)
-            args.push((&sandbox_home_env[0]).cast[cstr] can Unsafe.PointerCast)
-            fixed_home_env: mutable darray[u8] = []
-            bytes_push_view(&fixed_home_env, "CFFIXED_USER_HOME=")
-            bytes_push_cstr(&fixed_home_env, canonical_sandbox_work_name)
-            fixed_home_env.push(0)
-            args.push((&fixed_home_env[0]).cast[cstr] can Unsafe.PointerCast)
-            cache_home_env: mutable darray[u8] = []
-            bytes_push_view(&cache_home_env, "XDG_CACHE_HOME=")
-            bytes_push_cstr(&cache_home_env, canonical_sandbox_work_name)
-            cache_home_env.push(0)
-            args.push((&cache_home_env[0]).cast[cstr] can Unsafe.PointerCast)
-            args.push("ELISA_STAGE1_SEMANTIC_GATE=1")
-            if not cstr_equal(stage1_bin, ""):
-                bytes_push_view(&stage1_env, "ELISA_STAGE1_BIN=")
-                bytes_push_cstr(&stage1_env, stage1_bin)
-                stage1_env.push(0)
-                args.push((&stage1_env[0]).cast[cstr] can Unsafe.PointerCast)
-            if not cstr_equal(runtime_obj, ""):
-                bytes_push_view(&runtime_env, "ELISA_RUNTIME_OBJ=")
-                bytes_push_cstr(&runtime_env, runtime_obj)
-                runtime_env.push(0)
-                args.push((&runtime_env[0]).cast[cstr] can Unsafe.PointerCast)
-            if not cstr_equal(allow_stale, ""):
-                bytes_push_view(&stale_env, "ELISA_ALLOW_STALE_STAGE1=")
-                bytes_push_cstr(&stale_env, allow_stale)
-                stale_env.push(0)
-                args.push((&stale_env[0]).cast[cstr] can Unsafe.PointerCast)
-            if clang_tool[0].u8() != 0:
-                bytes_push_view(&clang_env, "ELISA_CLANG=")
-                bytes_push_cstr(&clang_env, clang_tool)
-                clang_env.push(0)
-                args.push((&clang_env[0]).cast[cstr] can Unsafe.PointerCast)
-            if compiler_is_stage1_wrapper:
-                # The host stage1 wrapper invokes /bin/ps for its RSS polling;
-                # macOS marks ps setuid and refuses it inside Seatbelt. The
-                # wrapper/binary paths have been checked to share the expected
-                # compiler root. Execute stage1 directly; the package parent
-                # applies the process group, resource caps, and deadline.
-                compiler_executable <- stage1_bin
-            args.push(compiler_executable)
-            if cstr_equal(options.profile, "release"):
-                args.push("-O2")
-            else:
-                args.push("-O0")
-                args.push("-g")
-            args.push("-emit")
-            args.push(emit_kind)
-            args.push("-o")
-            args.push(temp_name)
-            args.push(target_entry_name)
-            args.push(null)
-            stdout_template: mutable darray[u8] = []
-            bytes_push_array(&stdout_template, sandbox_work_dir)
-            if stdout_template.count == 0.usize() or stdout_template[stdout_template.count - 1.usize()] != 47:
-                stdout_template.push(47)
-            bytes_push_view(&stdout_template, "compiler.stdout.XXXXXX")
-            stdout_template.push(0)
-            compiler_stdout_fd: mutable i64 = Platform::pkg_mkstemp(&stdout_template)
-            if compiler_stdout_fd < 0:
-                _ = Platform::pkg_unlink(temp_name)
-                _ = Platform::pkg_rmdir(sandbox_work_name)
-                write_error("error: unable to create the private compiler stdout capture\n")
-                return EXIT_BUILD
-            if compiler_stdout_fd < 3:
-                raised_stdout_fd: i64 = Platform::pkg_dup_fd_min(compiler_stdout_fd, 3)
-                if raised_stdout_fd < 0:
-                    _ = Platform::pkg_close(compiler_stdout_fd)
-                    _ = Platform::pkg_unlink((&stdout_template[0]).cast[cstr] can Unsafe.PointerCast)
-                    _ = Platform::pkg_unlink(temp_name)
-                    _ = Platform::pkg_rmdir(sandbox_work_name)
-                    write_error("error: unable to secure the compiler stdout capture descriptor\n")
+            dependency_aggregate: mutable darray[u8] = []
+            dependency_aggregate_digest: mutable darray[u8] = []
+            has_local_build_dependencies: mutable bool = false
+            region build_state(67108864):
+                # Retain package records and their nested buffers after the planner
+                # returns by tying allocations to the caller's output region.
+                dependency_packages: mutable darray[LocalBuildPackage] @build_state = []
+                dependency_order: mutable darray[usize] @build_state = []
+                if not build_local_dependency_aggregate(lock_raw, start, target_entry_name, &dependency_aggregate, &has_local_build_dependencies, dependency_packages, dependency_order):
+                    write_error("error: local dependency lock or library target is invalid; refusing to compile an incomplete graph\n")
                     return EXIT_BUILD
-                _ = Platform::pkg_close(compiler_stdout_fd)
-                compiler_stdout_fd <- raised_stdout_fd
-            compiler_stdout_name: cstr = (&stdout_template[0]).cast[cstr] can Unsafe.PointerCast
-            stderr_template: mutable darray[u8] = []
-            bytes_push_array(&stderr_template, sandbox_work_dir)
-            if stderr_template.count == 0.usize() or stderr_template[stderr_template.count - 1.usize()] != 47:
-                stderr_template.push(47)
-            bytes_push_view(&stderr_template, "compiler.stderr.XXXXXX")
-            stderr_template.push(0)
-            compiler_stderr_fd: mutable i64 = Platform::pkg_mkstemp(&stderr_template)
-            if compiler_stderr_fd < 0:
-                _ = Platform::pkg_close(compiler_stdout_fd)
-                _ = Platform::pkg_unlink(compiler_stdout_name)
-                _ = Platform::pkg_unlink(temp_name)
-                _ = Platform::pkg_rmdir(sandbox_work_name)
-                write_error("error: unable to create the private compiler stderr capture\n")
-                return EXIT_BUILD
-            if compiler_stderr_fd < 3:
-                raised_stderr_fd: i64 = Platform::pkg_dup_fd_min(compiler_stderr_fd, 3)
-                if raised_stderr_fd < 0:
-                    _ = Platform::pkg_close(compiler_stderr_fd)
+                if has_local_build_dependencies:
+                    dependency_aggregate_digest_bytes: mutable darray[u8] = []
+                    if Integrity::sha256(dependency_aggregate, &dependency_aggregate_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(dependency_aggregate_digest_bytes, &dependency_aggregate_digest):
+                        write_error("error: unable to fingerprint the verified dependency aggregate\n")
+                        return EXIT_BUILD
+                if publish_path_forbidden(target_entry):
+                    write_error("error: selected target entry is not a safe package source path\n")
+                    return EXIT_BUILD
+                target_source: mutable darray[u8] = []
+                target_source_size: i64 = Platform::pkg_package_file_size(target_entry_raw)
+                return EXIT_BUILD if target_source_size < 0 or target_source_size > 67108864
+                target_source.resize(target_source_size.usize() + 1.usize())
+                target_source_raw: mutable u8& = (&target_source[0]).cast[mutable u8&] can Unsafe.PointerCast
+                target_source_read: i64 = Platform::pkg_read_package_file(target_entry_raw, target_source_raw, target_source.count)
+                return EXIT_BUILD if target_source_read < 0 or target_source_read != target_source_size
+                target_source.resize(target_source_read.usize())
+                source_digest_bytes: mutable darray[u8] = []
+                source_digest: mutable darray[u8] = []
+                return EXIT_BUILD if Integrity::sha256(target_source, &source_digest_bytes) != Integrity::DigestCode.Ok
+                return EXIT_BUILD if not Integrity::hex_digest(source_digest_bytes, &source_digest)
+                build_dir: mutable darray[u8] = []
+                artifact: mutable darray[u8] = []
+                receipt_path: mutable darray[u8] = []
+                base_build_dir: mutable darray[u8] = []
+                path_join_into(start, ".elisapkg/build", &base_build_dir)
+                if cstr_equal(options.profile, "release"):
+                    path_join_into(base_build_dir, "release", &build_dir)
+                else:
+                    for index in 0..<base_build_dir.count |build_dir, base_build_dir|:
+                        build_dir.push(base_build_dir[index])
+                artifact_leaf_storage: mutable darray[u8] = []
+                for index in 0..<target_name.count |artifact_leaf_storage, target_name|:
+                    artifact_leaf_storage.push(target_name[index])
+                artifact_leaf_storage.push(0)
+                artifact_leaf: mutable cstr = (&artifact_leaf_storage[0]).cast[cstr] can Unsafe.PointerCast
+                emit_kind: mutable cstr = "exe"
+                artifact_access_mode: mutable i64 = 1
+                if is_library:
+                    artifact_leaf_storage.resize(artifact_leaf_storage.count - 1.usize())
+                    artifact_leaf_storage.push(46)
+                    artifact_leaf_storage.push(111)
+                    artifact_leaf_storage.push(0)
+                    artifact_leaf <- (&artifact_leaf_storage[0]).cast[cstr] can Unsafe.PointerCast
+                    emit_kind <- "obj"
+                    artifact_access_mode <- 0
+                artifact_label: mutable darray[u8] = []
+                bytes_push_cstr(&artifact_label, artifact_leaf)
+                path_join_into(build_dir, artifact_leaf, &artifact)
+                receipt_leaf_storage: mutable darray[u8] = []
+                for index in 0..<target_name.count |receipt_leaf_storage, target_name|:
+                    receipt_leaf_storage.push(target_name[index])
+                bytes_push_view(&receipt_leaf_storage, ".receipt")
+                receipt_leaf_storage.push(0)
+                receipt_leaf: cstr = (&receipt_leaf_storage[0]).cast[cstr] can Unsafe.PointerCast
+                path_join_into(build_dir, receipt_leaf, &receipt_path)
+                return EXIT_BUILD if not make_directory(&build_dir)
+                compiler: mutable cstr = "elisac-stage1"
+                if Platform::pkg_getenv("ELISAPKG_COMPILER") is configured:
+                    compiler <- configured.cast[cstr]
+                return EXIT_BUILD if not valid_compiler_argument(compiler)
+                # Capture only the compiler settings needed by the wrapper. The child is
+                # started with a scrubbed environment so registry credentials and unrelated
+                # user variables cannot reach compile-time execution.
+                stage1_bin: mutable cstr = ""
+                runtime_obj: mutable cstr = ""
+                allow_stale: mutable cstr = ""
+                clang_tool: mutable cstr = ""
+                if Platform::pkg_getenv("ELISA_STAGE1_BIN") is configured_stage1:
+                    stage1_bin <- configured_stage1.cast[cstr]
+                if Platform::pkg_getenv("ELISA_RUNTIME_OBJ") is configured_runtime:
+                    runtime_obj <- configured_runtime.cast[cstr]
+                if Platform::pkg_getenv("ELISA_ALLOW_STALE_STAGE1") is configured_stale:
+                    allow_stale <- configured_stale.cast[cstr]
+                if Platform::pkg_getenv("ELISA_CLANG") is configured_clang:
+                    clang_tool <- configured_clang.cast[cstr]
+                return EXIT_BUILD if not valid_toolchain_value(stage1_bin, 4096.usize()) or not valid_toolchain_value(runtime_obj, 4096.usize()) or not valid_toolchain_value(allow_stale, 64.usize()) or not valid_toolchain_value(clang_tool, 4096.usize())
+                compiler_executable: mutable cstr = compiler
+                compiler_is_stage1_wrapper: bool = stage1_wrapper_pair_matches(compiler, stage1_bin)
+                if compiler_is_stage1_wrapper and stage1_bin[0].u8() != 0:
+                    compiler_executable <- stage1_bin
+                home_name: mutable cstr = ""
+                if Platform::pkg_getenv("HOME") is configured_home:
+                    home_name <- configured_home.cast[cstr]
+                else:
+                    write_error("error: HOME must name an existing directory to construct the build sandbox\n")
+                    return EXIT_BUILD
+                dependency_roots: mutable darray[u8] = []
+                return EXIT_BUILD if not sandbox_dependency_roots(lock_raw, start, &dependency_roots)
+                tool_paths: mutable darray[cstr] = []
+                if not compiler_is_stage1_wrapper:
+                    tool_paths.push(compiler)
+                tool_paths.push(stage1_bin)
+                tool_paths.push(runtime_obj)
+                executable_paths: mutable darray[cstr] = []
+                if not compiler_is_stage1_wrapper:
+                    executable_paths.push(compiler)
+                executable_paths.push(stage1_bin)
+                if clang_tool[0].u8() != 0:
+                    tool_paths.push(clang_tool)
+                    executable_paths.push(clang_tool)
+                for candidate_index in 0..<3 |tool_paths, executable_paths|:
+                    if clang_tool[0].u8() == 0:
+                        candidate: mutable cstr = "/opt/homebrew/opt/llvm/bin/clang"
+                        if candidate_index == 1:
+                            candidate <- "/usr/local/opt/llvm/bin/clang"
+                        elif candidate_index == 2:
+                            candidate <- "/usr/bin/clang"
+                        candidate_real: mutable darray[u8] = []
+                        candidate_real.resize(4096)
+                        if Platform::pkg_realpath(candidate, &candidate_real) is resolved_candidate:
+                            if Platform::pkg_access(resolved_candidate, 1) == 0:
+                                tool_paths.push(candidate)
+                                executable_paths.push(candidate)
+                                clang_tool <- candidate
+                compiler_identity: mutable darray[u8] = []
+                stage1_identity: mutable darray[u8] = []
+                runtime_identity: mutable darray[u8] = []
+                clang_identity: mutable darray[u8] = []
+                compiler_identity_ok: bool = tool_file_identity(compiler, true, true, &compiler_identity)
+                stage1_identity_ok: bool = tool_file_identity(stage1_bin, false, true, &stage1_identity)
+                runtime_identity_ok: bool = tool_file_identity(runtime_obj, false, false, &runtime_identity)
+                clang_identity_ok: bool = tool_file_identity(clang_tool, false, true, &clang_identity)
+                toolchain_identity_ok: bool = compiler_identity_ok and stage1_identity_ok and runtime_identity_ok and clang_identity_ok
+
+                # Take one private, bounded snapshot after validating the lock and
+                # toolchain. Its digest must match the bytes hashed above; all
+                # compiler inputs below come from this copied tree, never from a
+                # mutable checkout path.
+                snapshot_template: mutable darray[u8] = []
+                bytes_push_array(&snapshot_template, build_dir)
+                if snapshot_template.count == 0.usize() or snapshot_template[snapshot_template.count - 1.usize()] != 47:
+                    snapshot_template.push(47)
+                bytes_push_view(&snapshot_template, ".source-snapshots-XXXXXX")
+                snapshot_template.push(0)
+                if Platform::pkg_mkdtemp(&snapshot_template) != 0:
+                    write_error("error: unable to create the private build source snapshot directory\n")
+                    return EXIT_BUILD
+                snapshot_container_length: usize = Platform::pkg_strlen((&snapshot_template[0]).cast[cstr] can Unsafe.PointerCast)
+                for index in 0..<snapshot_container_length |source_snapshot_container_storage, snapshot_template|:
+                    source_snapshot_container_storage.push(snapshot_template[index])
+                source_snapshot_container_storage.push(0)
+                source_snapshot_container_name <- (&source_snapshot_container_storage[0]).cast[cstr] can Unsafe.PointerCast
+                snapshot_container_path: mutable darray[u8] = []
+                for index in 0..<snapshot_container_length |snapshot_container_path, source_snapshot_container_storage|:
+                    snapshot_container_path.push(source_snapshot_container_storage[index])
+                if not canonical_existing_path(snapshot_container_path, &source_snapshot_root):
+                    _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
+                    write_error("error: unable to resolve the private build source snapshot directory\n")
+                    return EXIT_BUILD
+                root_source_root: mutable darray[u8] = []
+                project_snapshot_status: mutable i64 = -1
+                if canonical_existing_path(start, &root_source_root):
+                    project_snapshot_status <- create_verified_build_snapshot(source_snapshot_root, root_source_root, "root", source_tree_digest, target_entry, &source_snapshot_roots, &snapshot_total_bytes, &root_snapshot_root, &root_snapshot_entry)
+                if project_snapshot_status != 0:
+                    _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
+                    if project_snapshot_status == -87:
+                        write_error("error: project source changed while creating the verified build snapshot\n")
+                    elif project_snapshot_status == -75:
+                        write_error("error: project source exceeds the configured build snapshot limit\n")
+                    elif project_snapshot_status == -22:
+                        write_error("error: source snapshot path is invalid or overlaps package source data\n")
+                    elif project_snapshot_status == -13:
+                        write_error("error: source snapshot was rejected by package path or ownership policy\n")
+                    elif project_snapshot_status == -86:
+                        write_error("error: unable to fingerprint the copied project source snapshot\n")
+                    elif project_snapshot_status == -88:
+                        write_error("error: selected target is missing from the copied project source snapshot\n")
+                    elif project_snapshot_status == -84:
+                        write_error("error: selected target path is unsafe for a package source snapshot\n")
+                    else:
+                        snapshot_error: mutable darray[u8] = []
+                        bytes_push_view(&snapshot_error, "error: project source could not be copied into the verified build snapshot (status ")
+                        bytes_push_i64(&snapshot_error, project_snapshot_status)
+                        bytes_push_view(&snapshot_error, ")\n")
+                        snapshot_error.push(0)
+                        write_error((&snapshot_error[0]).cast[cstr] can Unsafe.PointerCast)
+                    return EXIT_BUILD
+                dependency_snapshots_ok: mutable bool = true
+                for order_index in 0..<dependency_order.count |dependency_order, dependency_packages, source_snapshot_root, source_snapshot_roots, snapshot_total_bytes, dependency_snapshots_ok|:
+                    package_index: usize = dependency_order[order_index]
+                    snapshot_package_root: mutable darray[u8] = []
+                    if package_index >= dependency_packages.count:
+                        dependency_snapshots_ok <- false
+                        break
+                    dependency_packages[package_index].snapshot_entry.resize(0)
+                    snapshot_status: i64 = create_verified_build_snapshot(source_snapshot_root, dependency_packages[package_index].root, "dependency", dependency_packages[package_index].source_digest, dependency_packages[package_index].relative_entry, &source_snapshot_roots, &snapshot_total_bytes, &snapshot_package_root, &dependency_packages[package_index].snapshot_entry)
+                    if snapshot_status != 0:
+                        dependency_snapshots_ok <- false
+                        break
+                if not dependency_snapshots_ok:
+                    _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
+                    write_error("error: local dependency changed or could not be copied into the verified build snapshot\n")
+                    return EXIT_BUILD
+                snapshot_target_source: mutable darray[u8] = []
+                if not read_package_file_into(root_snapshot_entry, &snapshot_target_source):
+                    _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
+                    write_error("error: selected target is missing from the verified source snapshot\n")
+                    return EXIT_BUILD
+                snapshot_source_digest_bytes: mutable darray[u8] = []
+                snapshot_source_digest: mutable darray[u8] = []
+                if Integrity::sha256(snapshot_target_source, &snapshot_source_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(snapshot_source_digest_bytes, &snapshot_source_digest) or not bytes_equal(snapshot_source_digest, source_digest):
+                    _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
+                    write_error("error: selected target changed while creating the verified source snapshot\n")
+                    return EXIT_BUILD
+                source_digest <- snapshot_source_digest
+                if has_local_build_dependencies:
+                    dependency_aggregate_ok: mutable bool = true
+                    for order_index in 0..<dependency_order.count |dependency_order, dependency_packages, compiler_dependency_aggregate|:
+                        package_index: usize = dependency_order[order_index]
+                        if package_index >= dependency_packages.count or not Build::append_include_path(dependency_packages[package_index].snapshot_entry, &compiler_dependency_aggregate):
+                            dependency_aggregate_ok <- false
+                            break
+                    if not dependency_aggregate_ok or not Build::append_include_path(root_snapshot_entry, &compiler_dependency_aggregate) or compiler_dependency_aggregate.count > MAX_BUILD_AGGREGATE_BYTES:
+                        _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
+                        write_error("error: verified dependency aggregate exceeds the configured build limit\n")
+                        return EXIT_BUILD
+                receipt: mutable darray[u8] = []
+                bytes_push_view(&receipt, "elisapkg-build-receipt:11\nentry:")
+                bytes_push_array(&receipt, target_entry)
+                bytes_push_view(&receipt, "\ntarget-kind:")
+                bytes_push_array(&receipt, target_kind)
+                bytes_push_view(&receipt, "\nartifact:")
+                bytes_push_cstr(&receipt, artifact_leaf)
+                bytes_push_view(&receipt, "\nprofile:")
+                bytes_push_cstr(&receipt, options.profile)
+                bytes_push_view(&receipt, "\ncompiler-flags:")
+                if cstr_equal(options.profile, "release"):
+                    bytes_push_view(&receipt, "-O2")
+                else:
+                    bytes_push_view(&receipt, "-O0,-g")
+                bytes_push_view(&receipt, "\nsource-tree-digest:sha256:")
+                bytes_push_array(&receipt, source_tree_digest)
+                bytes_push_view(&receipt, "\nsource-digest:sha256:")
+                bytes_push_array(&receipt, source_digest)
+                bytes_push_view(&receipt, "\nmanifest-digest:sha256:")
+                bytes_push_array(&receipt, manifest_digest)
+                bytes_push_view(&receipt, "\nlock-digest:sha256:")
+                bytes_push_array(&receipt, lock_digest)
+                if has_local_build_dependencies:
+                    bytes_push_view(&receipt, "\ndependency-aggregate-digest:sha256:")
+                    bytes_push_array(&receipt, dependency_aggregate_digest)
+                else:
+                    bytes_push_view(&receipt, "\ndependency-aggregate-digest:none")
+                bytes_push_view(&receipt, "\ncompiler:")
+                bytes_push_cstr(&receipt, compiler)
+                bytes_push_view(&receipt, "\ncompiler-executable:")
+                bytes_push_cstr(&receipt, compiler_executable)
+                bytes_push_view(&receipt, "\nstage1-bin:")
+                bytes_push_cstr(&receipt, stage1_bin)
+                bytes_push_view(&receipt, "\nruntime-object:")
+                bytes_push_cstr(&receipt, runtime_obj)
+                bytes_push_view(&receipt, "\ncompiler-identity:")
+                bytes_push_array(&receipt, compiler_identity)
+                bytes_push_view(&receipt, "\nstage1-identity:")
+                bytes_push_array(&receipt, stage1_identity)
+                bytes_push_view(&receipt, "\nruntime-identity:")
+                bytes_push_array(&receipt, runtime_identity)
+                bytes_push_view(&receipt, "\nclang-tool:")
+                bytes_push_cstr(&receipt, clang_tool)
+                bytes_push_view(&receipt, "\nclang-identity:")
+                bytes_push_array(&receipt, clang_identity)
+                bytes_push_view(&receipt, "\nallow-stale:")
+                bytes_push_cstr(&receipt, allow_stale)
+                bytes_push_view(&receipt, "\nsemantic-gate:1\nsandbox-policy:macos-seatbelt-v2")
+                artifact_c: mutable darray[u8] = []
+                receipt_c: mutable darray[u8] = []
+                path_with_nul_into(&artifact, &artifact_c)
+                path_with_nul_into(&receipt_path, &receipt_c)
+                artifact_name: cstr = (&artifact_c[0]).cast[cstr] can Unsafe.PointerCast
+                receipt_name: cstr = (&receipt_c[0]).cast[cstr] can Unsafe.PointerCast
+                if toolchain_identity_ok and cstr_file_exists(artifact_name) and cstr_file_exists(receipt_name) and Platform::pkg_access(artifact_name, artifact_access_mode) == 0:
+                    cached_artifact: mutable darray[u8] = []
+                    cached_receipt: mutable darray[u8] = []
+                    cached_receipt.resize(4096)
+                    if read_package_file_into(&artifact, &cached_artifact) and read_cstr_into(receipt_name, &cached_receipt):
+                        cached_digest_bytes: mutable darray[u8] = []
+                        cached_digest: mutable darray[u8] = []
+                        if Integrity::sha256(cached_artifact, &cached_digest_bytes) == Integrity::DigestCode.Ok and Integrity::hex_digest(cached_digest_bytes, &cached_digest):
+                            expected_receipt: mutable darray[u8] = []
+                            bytes_push_array(&expected_receipt, receipt)
+                            bytes_push_view(&expected_receipt, "\nartifact-digest:sha256:")
+                            bytes_push_array(&expected_receipt, cached_digest)
+                            bytes_push_view(&expected_receipt, "\n")
+                            if bytes_equal(cached_receipt, expected_receipt):
+                                if not remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots):
+                                    write_error("error: unable to remove the verified build source snapshots\n")
+                                    return EXIT_BUILD
+                                write_ok("built .elisapkg/build/")
+                                write_bytes(1, &artifact_label)
+                                write_ok(" (cached)\n")
+                                _ = options
+                                return EXIT_OK
+                # The lock digest includes every resolved local dependency identity and
+                # source digest. Recompile whenever that graph changes instead of reusing a
+                # root-only artifact.
+                # Each compiler gets a distinct private scratch directory for HOME,
+                # TMPDIR, and caches. It is the only writable subtree; the final
+                # artifact and its receipt stay outside the child's writable set.
+                sandbox_template: mutable darray[u8] = []
+                bytes_push_array(&sandbox_template, build_dir)
+                if sandbox_template.count == 0.usize() or sandbox_template[sandbox_template.count - 1.usize()] != 47:
+                    sandbox_template.push(47)
+                bytes_push_view(&sandbox_template, ".sandbox-XXXXXX")
+                sandbox_template.push(0)
+                if Platform::pkg_mkdtemp(&sandbox_template) != 0:
+                    _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
+                    write_error("error: unable to create the private compiler scratch directory\n")
+                    return EXIT_BUILD
+                sandbox_work_length: usize = Platform::pkg_strlen((&sandbox_template[0]).cast[cstr] can Unsafe.PointerCast)
+                sandbox_work_dir: mutable darray[u8] = []
+                for index in 0..<sandbox_work_length |sandbox_work_dir, sandbox_template|:
+                    sandbox_work_dir.push(sandbox_template[index])
+                sandbox_work_c: mutable darray[u8] = []
+                path_with_nul_into(sandbox_work_dir, &sandbox_work_c)
+                sandbox_work_name: cstr = (&sandbox_work_c[0]).cast[cstr] can Unsafe.PointerCast
+                canonical_sandbox_work: mutable darray[u8] = []
+                canonical_sandbox_work.resize(4096)
+                canonical_sandbox_work_name: mutable cstr = ""
+                if Platform::pkg_realpath(sandbox_work_name, &canonical_sandbox_work) is resolved_sandbox_work:
+                    canonical_sandbox_work_name <- resolved_sandbox_work
+                else:
+                    _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
+                    _ = remove_optional_build_aggregate(aggregate_source_name)
+                    _ = Platform::pkg_rmdir(sandbox_work_name)
+                    write_error("error: unable to resolve the private compiler scratch directory\n")
+                    return EXIT_BUILD
+                compiler_source_c: mutable darray[u8] = []
+                path_with_nul_into(root_snapshot_entry, &compiler_source_c)
+                compiler_source_name: mutable cstr = (&compiler_source_c[0]).cast[cstr] can Unsafe.PointerCast
+                aggregate_source_path: mutable darray[u8] = []
+                aggregate_source_template: mutable darray[u8] = []
+                aggregate_source_path_c: mutable darray[u8] = []
+                aggregate_compile_source_c: mutable darray[u8] = []
+                if has_local_build_dependencies:
+                    bytes_push_array(&aggregate_source_template, sandbox_work_dir)
+                    if aggregate_source_template.count == 0.usize() or aggregate_source_template[aggregate_source_template.count - 1.usize()] != 47:
+                        aggregate_source_template.push(47)
+                    bytes_push_view(&aggregate_source_template, "dependency-aggregate.XXXXXX")
+                    aggregate_source_template.push(0)
+                    aggregate_fd: i64 = Platform::pkg_mkstemp(&aggregate_source_template)
+                    if aggregate_fd < 0:
+                        _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
+                        _ = remove_optional_build_aggregate(aggregate_source_name)
+                        _ = Platform::pkg_rmdir(sandbox_work_name)
+                        write_error("error: unable to create the private dependency aggregate source\n")
+                        return EXIT_BUILD
+                    aggregate_source_name <- (&aggregate_source_template[0]).cast[cstr] can Unsafe.PointerCast
+                    aggregate_path_length: usize = Platform::pkg_strlen(aggregate_source_name)
+                    for index in 0..<aggregate_path_length |aggregate_source_path, aggregate_source_template|:
+                        aggregate_source_path.push(aggregate_source_template[index])
+                    if not write_fd_all(aggregate_fd, compiler_dependency_aggregate):
+                        _ = Platform::pkg_close(aggregate_fd)
+                        _ = Platform::pkg_unlink(aggregate_source_name)
+                        aggregate_source_name <- ""
+                        _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
+                        _ = remove_optional_build_aggregate(aggregate_source_name)
+                        _ = Platform::pkg_rmdir(sandbox_work_name)
+                        write_error("error: unable to write the private dependency aggregate source\n")
+                        return EXIT_BUILD
+                    aggregate_flush_status: i64 = Platform::pkg_fsync(aggregate_fd)
+                    aggregate_close_status: i64 = Platform::pkg_close(aggregate_fd)
+                    if aggregate_flush_status != 0 or aggregate_close_status != 0:
+                        _ = Platform::pkg_unlink(aggregate_source_name)
+                        aggregate_source_name <- ""
+                        _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
+                        _ = remove_optional_build_aggregate(aggregate_source_name)
+                        _ = Platform::pkg_rmdir(sandbox_work_name)
+                        write_error("error: unable to flush the private dependency aggregate source\n")
+                        return EXIT_BUILD
+                    canonical_aggregate_source: mutable darray[u8] = []
+                    if not canonical_existing_path(aggregate_source_path, &canonical_aggregate_source):
+                        _ = Platform::pkg_unlink(aggregate_source_name)
+                        aggregate_source_name <- ""
+                        _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
+                        _ = remove_optional_build_aggregate(aggregate_source_name)
+                        _ = Platform::pkg_rmdir(sandbox_work_name)
+                        write_error("error: unable to resolve the private dependency aggregate source\n")
+                        return EXIT_BUILD
+                    path_with_nul_into(canonical_aggregate_source, &aggregate_compile_source_c)
+                    compiler_source_name <- (&aggregate_compile_source_c[0]).cast[cstr] can Unsafe.PointerCast
+                # Keep every compiler-created output, including stage1's adjacent
+                # object file, inside the private scratch subtree. The parent copies
+                # only the validated final bytes into the public cache after teardown.
+                temp_template: mutable darray[u8] = []
+                for index in 0..<sandbox_work_dir.count |temp_template, sandbox_work_dir|:
+                    temp_template.push(sandbox_work_dir[index])
+                if temp_template.count == 0.usize() or temp_template[temp_template.count - 1.usize()] != 47:
+                    temp_template.push(47)
+                bytes_push_cstr(&temp_template, artifact_leaf)
+                bytes_push_view(&temp_template, ".tmp.XXXXXX")
+                temp_template.push(0)
+                temp_fd: i64 = Platform::pkg_mkstemp(&temp_template)
+                if temp_fd < 0:
+                    _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
+                    _ = remove_optional_build_aggregate(aggregate_source_name)
+                    _ = Platform::pkg_rmdir(sandbox_work_name)
+                    write_error("error: unable to create the exclusive compiler output file\n")
+                    return EXIT_BUILD
+                temp_name: cstr = (&temp_template[0]).cast[cstr] can Unsafe.PointerCast
+                if Platform::pkg_close(temp_fd) != 0:
+                    _ = Platform::pkg_unlink(temp_name)
+                    _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
+                    _ = remove_optional_build_aggregate(aggregate_source_name)
+                    _ = Platform::pkg_rmdir(sandbox_work_name)
+                    write_error("error: unable to close the exclusive compiler output file\n")
+                    return EXIT_BUILD
+                sandbox_profile: mutable darray[u8] = Sandbox::darwin_build_profile(home_name, start, sandbox_work_dir, source_snapshot_root, dependency_roots, tool_paths, executable_paths, temp_name)
+                if sandbox_profile.count == 0.usize():
+                    _ = Platform::pkg_unlink(temp_name)
+                    _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
+                    _ = remove_optional_build_aggregate(aggregate_source_name)
+                    _ = Platform::pkg_rmdir(sandbox_work_name)
+                    write_error("error: could not construct the mandatory compiler sandbox profile\n")
+                    return EXIT_BUILD
+                sandbox_profile.push(0)
+                sandbox_profile_name: cstr = (&sandbox_profile[0]).cast[cstr] can Unsafe.PointerCast
+                callback_parameter: mutable darray[u8] = []
+                bytes_push_view(&callback_parameter, "CALLBACK_PATH=/private/tmp/elisa-stage1-callback-")
+                callback_digits_offset: usize = callback_parameter.count
+                for _digit in 0..<20 |callback_parameter|:
+                    callback_parameter.push(48)
+                bytes_push_view(&callback_parameter, ".c")
+                callback_parameter.push(0)
+                # An explicit compiler is required for reproducible builds. PATH lookup is
+                # delegated to execvp only after the user has selected the executable.
+                stage1_env: mutable darray[u8] = []
+                runtime_env: mutable darray[u8] = []
+                stale_env: mutable darray[u8] = []
+                clang_env: mutable darray[u8] = []
+                temporary_env: mutable darray[u8] = []
+                args: mutable darray[cstr] = []
+                args.push("/usr/bin/sandbox-exec")
+                args.push("-D")
+                args.push((&callback_parameter[0]).cast[cstr] can Unsafe.PointerCast)
+                args.push("-p")
+                args.push(sandbox_profile_name)
+                args.push("/usr/bin/env")
+                args.push("-i")
+                args.push("PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin")
+                bytes_push_view(&temporary_env, "TMPDIR=")
+                bytes_push_cstr(&temporary_env, canonical_sandbox_work_name)
+                temporary_env.push(0)
+                args.push((&temporary_env[0]).cast[cstr] can Unsafe.PointerCast)
+                sandbox_home_env: mutable darray[u8] = []
+                bytes_push_view(&sandbox_home_env, "HOME=")
+                bytes_push_cstr(&sandbox_home_env, canonical_sandbox_work_name)
+                sandbox_home_env.push(0)
+                args.push((&sandbox_home_env[0]).cast[cstr] can Unsafe.PointerCast)
+                fixed_home_env: mutable darray[u8] = []
+                bytes_push_view(&fixed_home_env, "CFFIXED_USER_HOME=")
+                bytes_push_cstr(&fixed_home_env, canonical_sandbox_work_name)
+                fixed_home_env.push(0)
+                args.push((&fixed_home_env[0]).cast[cstr] can Unsafe.PointerCast)
+                cache_home_env: mutable darray[u8] = []
+                bytes_push_view(&cache_home_env, "XDG_CACHE_HOME=")
+                bytes_push_cstr(&cache_home_env, canonical_sandbox_work_name)
+                cache_home_env.push(0)
+                args.push((&cache_home_env[0]).cast[cstr] can Unsafe.PointerCast)
+                args.push("ELISA_STAGE1_SEMANTIC_GATE=1")
+                if not cstr_equal(stage1_bin, ""):
+                    bytes_push_view(&stage1_env, "ELISA_STAGE1_BIN=")
+                    bytes_push_cstr(&stage1_env, stage1_bin)
+                    stage1_env.push(0)
+                    args.push((&stage1_env[0]).cast[cstr] can Unsafe.PointerCast)
+                if not cstr_equal(runtime_obj, ""):
+                    bytes_push_view(&runtime_env, "ELISA_RUNTIME_OBJ=")
+                    bytes_push_cstr(&runtime_env, runtime_obj)
+                    runtime_env.push(0)
+                    args.push((&runtime_env[0]).cast[cstr] can Unsafe.PointerCast)
+                if not cstr_equal(allow_stale, ""):
+                    bytes_push_view(&stale_env, "ELISA_ALLOW_STALE_STAGE1=")
+                    bytes_push_cstr(&stale_env, allow_stale)
+                    stale_env.push(0)
+                    args.push((&stale_env[0]).cast[cstr] can Unsafe.PointerCast)
+                if clang_tool[0].u8() != 0:
+                    bytes_push_view(&clang_env, "ELISA_CLANG=")
+                    bytes_push_cstr(&clang_env, clang_tool)
+                    clang_env.push(0)
+                    args.push((&clang_env[0]).cast[cstr] can Unsafe.PointerCast)
+                if compiler_is_stage1_wrapper:
+                    # The host stage1 wrapper invokes /bin/ps for its RSS polling;
+                    # macOS marks ps setuid and refuses it inside Seatbelt. The
+                    # wrapper/binary paths have been checked to share the expected
+                    # compiler root. Execute stage1 directly; the package parent
+                    # applies the process group, resource caps, and deadline.
+                    compiler_executable <- stage1_bin
+                args.push(compiler_executable)
+                if cstr_equal(options.profile, "release"):
+                    args.push("-O2")
+                else:
+                    args.push("-O0")
+                    args.push("-g")
+                args.push("-emit")
+                args.push(emit_kind)
+                args.push("-o")
+                args.push(temp_name)
+                args.push(compiler_source_name)
+                args.push(null)
+                stdout_template: mutable darray[u8] = []
+                bytes_push_array(&stdout_template, sandbox_work_dir)
+                if stdout_template.count == 0.usize() or stdout_template[stdout_template.count - 1.usize()] != 47:
+                    stdout_template.push(47)
+                bytes_push_view(&stdout_template, "compiler.stdout.XXXXXX")
+                stdout_template.push(0)
+                compiler_stdout_fd: mutable i64 = Platform::pkg_mkstemp(&stdout_template)
+                if compiler_stdout_fd < 0:
+                    _ = Platform::pkg_unlink(temp_name)
+                    _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
+                    _ = remove_optional_build_aggregate(aggregate_source_name)
+                    _ = Platform::pkg_rmdir(sandbox_work_name)
+                    write_error("error: unable to create the private compiler stdout capture\n")
+                    return EXIT_BUILD
+                if compiler_stdout_fd < 3:
+                    raised_stdout_fd: i64 = Platform::pkg_dup_fd_min(compiler_stdout_fd, 3)
+                    if raised_stdout_fd < 0:
+                        _ = Platform::pkg_close(compiler_stdout_fd)
+                        _ = Platform::pkg_unlink((&stdout_template[0]).cast[cstr] can Unsafe.PointerCast)
+                        _ = Platform::pkg_unlink(temp_name)
+                        _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
+                        _ = remove_optional_build_aggregate(aggregate_source_name)
+                        _ = Platform::pkg_rmdir(sandbox_work_name)
+                        write_error("error: unable to secure the compiler stdout capture descriptor\n")
+                        return EXIT_BUILD
                     _ = Platform::pkg_close(compiler_stdout_fd)
-                    _ = Platform::pkg_unlink((&stderr_template[0]).cast[cstr] can Unsafe.PointerCast)
+                    compiler_stdout_fd <- raised_stdout_fd
+                compiler_stdout_name: cstr = (&stdout_template[0]).cast[cstr] can Unsafe.PointerCast
+                stderr_template: mutable darray[u8] = []
+                bytes_push_array(&stderr_template, sandbox_work_dir)
+                if stderr_template.count == 0.usize() or stderr_template[stderr_template.count - 1.usize()] != 47:
+                    stderr_template.push(47)
+                bytes_push_view(&stderr_template, "compiler.stderr.XXXXXX")
+                stderr_template.push(0)
+                compiler_stderr_fd: mutable i64 = Platform::pkg_mkstemp(&stderr_template)
+                if compiler_stderr_fd < 0:
+                    _ = Platform::pkg_close(compiler_stdout_fd)
                     _ = Platform::pkg_unlink(compiler_stdout_name)
                     _ = Platform::pkg_unlink(temp_name)
+                    _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
+                    _ = remove_optional_build_aggregate(aggregate_source_name)
                     _ = Platform::pkg_rmdir(sandbox_work_name)
-                    write_error("error: unable to secure the compiler stderr capture descriptor\n")
+                    write_error("error: unable to create the private compiler stderr capture\n")
                     return EXIT_BUILD
-                _ = Platform::pkg_close(compiler_stderr_fd)
-                compiler_stderr_fd <- raised_stderr_fd
-            compiler_stderr_name: cstr = (&stderr_template[0]).cast[cstr] can Unsafe.PointerCast
-            child_argv: mutable cstr&& = (&args[0]).cast[mutable cstr&&] can Unsafe.PointerCast
-            pid: i64 = Platform::pkg_fork()
-            if pid == 0:
-                process_id: i64 = Platform::pkg_process_id()
-                if not set_callback_path_pid(&callback_parameter, callback_digits_offset, process_id):
-                    Platform::pkg_process_exit(126)
+                if compiler_stderr_fd < 3:
+                    raised_stderr_fd: i64 = Platform::pkg_dup_fd_min(compiler_stderr_fd, 3)
+                    if raised_stderr_fd < 0:
+                        _ = Platform::pkg_close(compiler_stderr_fd)
+                        _ = Platform::pkg_close(compiler_stdout_fd)
+                        _ = Platform::pkg_unlink((&stderr_template[0]).cast[cstr] can Unsafe.PointerCast)
+                        _ = Platform::pkg_unlink(compiler_stdout_name)
+                        _ = Platform::pkg_unlink(temp_name)
+                        _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
+                        _ = remove_optional_build_aggregate(aggregate_source_name)
+                        _ = Platform::pkg_rmdir(sandbox_work_name)
+                        write_error("error: unable to secure the compiler stderr capture descriptor\n")
+                        return EXIT_BUILD
+                    _ = Platform::pkg_close(compiler_stderr_fd)
+                    compiler_stderr_fd <- raised_stderr_fd
+                compiler_stderr_name: cstr = (&stderr_template[0]).cast[cstr] can Unsafe.PointerCast
+                child_argv: mutable cstr&& = (&args[0]).cast[mutable cstr&&] can Unsafe.PointerCast
+                pid: i64 = Platform::pkg_fork()
+                if pid == 0:
+                    process_id: i64 = Platform::pkg_process_id()
+                    if not set_callback_path_pid(&callback_parameter, callback_digits_offset, process_id):
+                        Platform::pkg_process_exit(126)
+                    callback_file_name: cstr = (&callback_parameter[14]).cast[cstr] can Unsafe.PointerCast
+                    if Platform::pkg_create_exclusive_file(callback_file_name) != 0:
+                        Platform::pkg_process_exit(126)
+                    if Platform::pkg_set_process_group() != 0:
+                        Platform::pkg_process_exit(126)
+                    if Platform::pkg_set_process_limits(1) != 0:
+                        Platform::pkg_process_exit(126)
+                    null_fd: i64 = Platform::pkg_open_null()
+                    if null_fd < 0 or Platform::pkg_dup2(null_fd, 0) != 0 or Platform::pkg_dup2(compiler_stdout_fd, 1) != 1 or Platform::pkg_dup2(compiler_stderr_fd, 2) != 2:
+                        Platform::pkg_process_exit(126)
+                    if null_fd > 2:
+                        _ = Platform::pkg_close(null_fd)
+                    if Platform::pkg_close_inherited_fds() != 0:
+                        Platform::pkg_process_exit(126)
+                    _ = Platform::pkg_execvp("/usr/bin/sandbox-exec", child_argv)
+                    Platform::pkg_process_exit(127)
+                if pid < 0:
+                    _ = Platform::pkg_close(compiler_stdout_fd)
+                    _ = Platform::pkg_close(compiler_stderr_fd)
+                    _ = Platform::pkg_unlink(compiler_stdout_name)
+                    _ = Platform::pkg_unlink(compiler_stderr_name)
+                    _ = Platform::pkg_unlink(temp_name)
+                    _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
+                    _ = remove_optional_build_aggregate(aggregate_source_name)
+                    _ = Platform::pkg_rmdir(sandbox_work_name)
+                    write_error("error: unable to start the sandboxed compiler process\n")
+                    return EXIT_BUILD
+                if not set_callback_path_pid(&callback_parameter, callback_digits_offset, pid):
+                    _ = Platform::pkg_terminate_process_group(pid)
+                    _ = Platform::pkg_close(compiler_stdout_fd)
+                    _ = Platform::pkg_close(compiler_stderr_fd)
+                    _ = Platform::pkg_unlink(compiler_stdout_name)
+                    _ = Platform::pkg_unlink(compiler_stderr_name)
+                    _ = Platform::pkg_unlink(temp_name)
+                    _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
+                    _ = remove_optional_build_aggregate(aggregate_source_name)
+                    _ = Platform::pkg_rmdir(sandbox_work_name)
+                    write_error("error: unable to name the stage1 callback file safely\n")
+                    return EXIT_BUILD
                 callback_file_name: cstr = (&callback_parameter[14]).cast[cstr] can Unsafe.PointerCast
-                if Platform::pkg_create_exclusive_file(callback_file_name) != 0:
-                    Platform::pkg_process_exit(126)
-                if Platform::pkg_set_process_group() != 0:
-                    Platform::pkg_process_exit(126)
-                if Platform::pkg_set_process_limits(1) != 0:
-                    Platform::pkg_process_exit(126)
-                null_fd: i64 = Platform::pkg_open_null()
-                if null_fd < 0 or Platform::pkg_dup2(null_fd, 0) != 0 or Platform::pkg_dup2(compiler_stdout_fd, 1) != 1 or Platform::pkg_dup2(compiler_stderr_fd, 2) != 2:
-                    Platform::pkg_process_exit(126)
-                if null_fd > 2:
-                    _ = Platform::pkg_close(null_fd)
-                if Platform::pkg_close_inherited_fds() != 0:
-                    Platform::pkg_process_exit(126)
-                _ = Platform::pkg_execvp("/usr/bin/sandbox-exec", child_argv)
-                Platform::pkg_process_exit(127)
-            if pid < 0:
-                _ = Platform::pkg_close(compiler_stdout_fd)
-                _ = Platform::pkg_close(compiler_stderr_fd)
-                _ = Platform::pkg_unlink(compiler_stdout_name)
-                _ = Platform::pkg_unlink(compiler_stderr_name)
-                _ = Platform::pkg_unlink(temp_name)
-                _ = Platform::pkg_rmdir(sandbox_work_name)
-                write_error("error: unable to start the sandboxed compiler process\n")
-                return EXIT_BUILD
-            if not set_callback_path_pid(&callback_parameter, callback_digits_offset, pid):
-                _ = Platform::pkg_terminate_process_group(pid)
-                _ = Platform::pkg_close(compiler_stdout_fd)
-                _ = Platform::pkg_close(compiler_stderr_fd)
-                _ = Platform::pkg_unlink(compiler_stdout_name)
-                _ = Platform::pkg_unlink(compiler_stderr_name)
-                _ = Platform::pkg_unlink(temp_name)
-                _ = Platform::pkg_rmdir(sandbox_work_name)
-                write_error("error: unable to name the stage1 callback file safely\n")
-                return EXIT_BUILD
-            callback_file_name: cstr = (&callback_parameter[14]).cast[cstr] can Unsafe.PointerCast
-            status: mutable i32 = 0
-            waited: i64 = Platform::pkg_waitpid_timeout(pid, &status, BUILD_TIMEOUT_MS)
-            group_cleanup: i64 = Platform::pkg_terminate_process_group(pid)
-            callback_remove_status: i64 = Platform::pkg_unlink(callback_file_name)
-            if group_cleanup != 0 or (callback_remove_status != 0 and callback_remove_status != -2):
-                _ = Platform::pkg_close(compiler_stdout_fd)
-                _ = Platform::pkg_close(compiler_stderr_fd)
-                _ = Platform::pkg_unlink(compiler_stdout_name)
-                _ = Platform::pkg_unlink(compiler_stderr_name)
-                _ = Platform::pkg_unlink(temp_name)
-                _ = Platform::pkg_rmdir(sandbox_work_name)
-                write_error("error: unable to stop the compiler process group before output validation\n")
-                return EXIT_BUILD
-            replay_stdout_ok: bool = forward_fd_output(compiler_stdout_fd, 1)
-            replay_stderr_ok: bool = forward_fd_output(compiler_stderr_fd, 2)
-            stdout_close_status: i64 = Platform::pkg_close(compiler_stdout_fd)
-            stderr_close_status: i64 = Platform::pkg_close(compiler_stderr_fd)
-            stdout_remove_status: i64 = Platform::pkg_unlink(compiler_stdout_name)
-            stderr_remove_status: i64 = Platform::pkg_unlink(compiler_stderr_name)
-            if not replay_stdout_ok or not replay_stderr_ok or stdout_close_status != 0 or stderr_close_status != 0 or stdout_remove_status != 0 or stderr_remove_status != 0:
-                _ = Platform::pkg_unlink(temp_name)
-                _ = Platform::pkg_rmdir(sandbox_work_name)
-                write_error("error: unable to safely collect compiler output\n")
-                return EXIT_BUILD
-            if waited == Platform::pkg_timeout_error():
-                _ = Platform::pkg_unlink(temp_name)
-                _ = Platform::pkg_rmdir(sandbox_work_name)
-                write_error("error: compiler exceeded the 10-minute execution limit\n")
-                return EXIT_CANCEL
-            if waited < 0 or status != 0:
-                _ = Platform::pkg_unlink(temp_name)
-                _ = Platform::pkg_rmdir(sandbox_work_name)
-                write_error("error: sandboxed compiler process failed or could not be reaped\n")
-                return EXIT_BUILD
-            temporary_size: i64 = Platform::pkg_package_file_size(temp_name)
-            if temporary_size <= 0:
-                _ = Platform::pkg_unlink(temp_name)
-                _ = Platform::pkg_rmdir(sandbox_work_name)
-                return EXIT_BUILD
-            temporary_path: mutable darray[u8] = []
-            bytes_push_cstr(&temporary_path, temp_name)
-            artifact_content: mutable darray[u8] = []
-            artifact_digest_bytes: mutable darray[u8] = []
-            artifact_digest: mutable darray[u8] = []
-            if not read_package_file_into(&temporary_path, &artifact_content):
-                _ = Platform::pkg_unlink(temp_name)
-                _ = Platform::pkg_rmdir(sandbox_work_name)
-                return EXIT_BUILD
-            if Integrity::sha256(artifact_content, &artifact_digest_bytes) != Integrity::DigestCode.Ok:
-                _ = Platform::pkg_unlink(temp_name)
-                _ = Platform::pkg_rmdir(sandbox_work_name)
-                return EXIT_BUILD
-            if not Integrity::hex_digest(artifact_digest_bytes, &artifact_digest):
-                _ = Platform::pkg_unlink(temp_name)
-                _ = Platform::pkg_rmdir(sandbox_work_name)
-                return EXIT_BUILD
-            # Detach the compiler-owned output inode before validating the source
-            # tree or publishing. A session-escaping child may retain an fd, but
-            # it cannot change the bytes already copied into artifact_content.
-            if Platform::pkg_unlink(temp_name) != 0:
-                _ = Platform::pkg_rmdir(sandbox_work_name)
-                write_error("error: unable to detach compiler-owned output before validation\n")
-                return EXIT_BUILD
-            # Do not publish an artifact whose compiler input tree changed while
-            # the child was running. The receipt records the pre-build digest;
-            # rechecking immediately before publication keeps that identity bound
-            # to the inputs that were presented to the compiler. Revalidate the
-            # exact manifest and lock too: local lock validation recomputes every
-            # transitive dependency source digest, including paths outside the root.
-            manifest_after_build: mutable darray[u8] = []
-            manifest_after_build.resize(1048577)
-            lock_after_build: mutable darray[u8] = []
-            lock_after_build.resize(1048577)
-            if not read_cstr_into("elisapkg.json", &manifest_after_build) or not read_cstr_into("elisapkg.lock", &lock_after_build):
-                _ = Platform::pkg_unlink(temp_name)
-                _ = Platform::pkg_rmdir(sandbox_work_name)
-                return EXIT_BUILD
-            if not bytes_equal(manifest_after_build, manifest_raw) or not bytes_equal(lock_after_build, lock_raw) or not lock_matches_manifest(manifest_raw, lock_raw, root_name, root_version, start):
-                _ = Platform::pkg_unlink(temp_name)
-                _ = Platform::pkg_rmdir(sandbox_work_name)
-                return EXIT_BUILD
-            post_source_tree_digest: mutable darray[u8] = []
-            if not source_tree_digest_into(&post_source_tree_digest) or not bytes_equal(post_source_tree_digest, source_tree_digest):
-                _ = Platform::pkg_unlink(temp_name)
-                _ = Platform::pkg_rmdir(sandbox_work_name)
-                return EXIT_BUILD
-            toolchain_unchanged: mutable bool = true
-            post_tool_identity: mutable darray[u8] = []
-            if compiler_identity_ok:
-                toolchain_unchanged <- tool_file_identity(compiler, true, true, &post_tool_identity) and bytes_equal(post_tool_identity, compiler_identity)
-            if toolchain_unchanged and stage1_identity_ok:
-                toolchain_unchanged <- tool_file_identity(stage1_bin, false, true, &post_tool_identity) and bytes_equal(post_tool_identity, stage1_identity)
-            if toolchain_unchanged and runtime_identity_ok:
-                toolchain_unchanged <- tool_file_identity(runtime_obj, false, false, &post_tool_identity) and bytes_equal(post_tool_identity, runtime_identity)
-            if toolchain_unchanged and clang_identity_ok:
-                toolchain_unchanged <- tool_file_identity(clang_tool, false, true, &post_tool_identity) and bytes_equal(post_tool_identity, clang_identity)
-            if not toolchain_unchanged:
-                _ = Platform::pkg_rmdir(sandbox_work_name)
-                write_error("error: compiler toolchain changed during the build; refusing to publish the artifact\n")
-                return EXIT_BUILD
-            if Platform::pkg_rmdir(sandbox_work_name) != 0:
-                _ = Platform::pkg_unlink(temp_name)
-                write_error("error: compiler left files in its private scratch directory; refusing to publish the build result\n")
-                return EXIT_BUILD
-            # Never publish the compiler-owned inode directly. A descendant can
-            # leave its process group and retain an already-open descriptor even
-            # after the main compiler exits. Copy the bytes we hashed into a new
-            # parent-owned inode that was not present in the sandbox during build.
-            publish_template: mutable darray[u8] = []
-            bytes_push_array(&publish_template, build_dir)
-            if publish_template.count == 0.usize() or publish_template[publish_template.count - 1.usize()] != 47:
-                publish_template.push(47)
-            bytes_push_cstr(&publish_template, artifact_leaf)
-            bytes_push_view(&publish_template, ".publish.XXXXXX")
-            publish_template.push(0)
-            publish_fd: i64 = Platform::pkg_mkstemp(&publish_template)
-            if publish_fd < 0:
-                _ = Platform::pkg_unlink(temp_name)
-                return EXIT_BUILD
-            publish_name: cstr = (&publish_template[0]).cast[cstr] can Unsafe.PointerCast
-            output_mode: u16 = 493.u16() if cstr_equal(emit_kind, "exe") else 420.u16()
-            publish_ok: mutable bool = write_fd_all(publish_fd, artifact_content)
-            publish_ok <- false if Platform::pkg_chmod(publish_name, output_mode) != 0
-            publish_ok <- false if Platform::pkg_access(publish_name, artifact_access_mode) != 0
-            publish_ok <- false if Platform::pkg_fsync(publish_fd) != 0
-            publish_close_status: i64 = Platform::pkg_close(publish_fd)
-            if not publish_ok or publish_close_status != 0:
-                _ = Platform::pkg_unlink(publish_name)
-                _ = Platform::pkg_unlink(temp_name)
-                write_error("error: unable to create a normalized parent-owned build artifact\n")
-                return EXIT_BUILD
-            if Platform::pkg_rename(publish_name, artifact_name) != 0:
-                _ = Platform::pkg_unlink(publish_name)
-                _ = Platform::pkg_unlink(temp_name)
-                return EXIT_BUILD
-            bytes_push_view(&receipt, "\nartifact-digest:sha256:")
-            bytes_push_array(&receipt, artifact_digest)
-            bytes_push_view(&receipt, "\n")
-            if not write_cstr_file(receipt_name, &receipt):
-                # The artifact has already been atomically published. Do not unlink
-                # this pathname after a receipt failure: an older artifact may have
-                # been replaced by the rename, and removing it would destroy package
-                # output whose ownership is no longer distinguishable at this point.
-                # The missing or stale receipt makes the next build reject the cache
-                # and re-establish the pair before reuse.
-                return EXIT_BUILD
-            write_ok("built .elisapkg/build/")
-            write_bytes(1, &artifact_label)
-            write_ok("\n")
-            _ = options
-            return EXIT_OK
+                status: mutable i32 = 0
+                waited: i64 = Platform::pkg_waitpid_timeout(pid, &status, BUILD_TIMEOUT_MS)
+                group_cleanup: i64 = Platform::pkg_terminate_process_group(pid)
+                callback_remove_status: i64 = Platform::pkg_unlink(callback_file_name)
+                if group_cleanup != 0 or (callback_remove_status != 0 and callback_remove_status != -2):
+                    _ = Platform::pkg_close(compiler_stdout_fd)
+                    _ = Platform::pkg_close(compiler_stderr_fd)
+                    _ = Platform::pkg_unlink(compiler_stdout_name)
+                    _ = Platform::pkg_unlink(compiler_stderr_name)
+                    _ = Platform::pkg_unlink(temp_name)
+                    _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
+                    _ = remove_optional_build_aggregate(aggregate_source_name)
+                    _ = Platform::pkg_rmdir(sandbox_work_name)
+                    write_error("error: unable to stop the compiler process group before output validation\n")
+                    return EXIT_BUILD
+                replay_stdout_ok: bool = forward_fd_output(compiler_stdout_fd, 1)
+                replay_stderr_ok: bool = forward_fd_output(compiler_stderr_fd, 2)
+                stdout_close_status: i64 = Platform::pkg_close(compiler_stdout_fd)
+                stderr_close_status: i64 = Platform::pkg_close(compiler_stderr_fd)
+                stdout_remove_status: i64 = Platform::pkg_unlink(compiler_stdout_name)
+                stderr_remove_status: i64 = Platform::pkg_unlink(compiler_stderr_name)
+                if not replay_stdout_ok or not replay_stderr_ok or stdout_close_status != 0 or stderr_close_status != 0 or stdout_remove_status != 0 or stderr_remove_status != 0:
+                    _ = Platform::pkg_unlink(temp_name)
+                    _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
+                    _ = remove_optional_build_aggregate(aggregate_source_name)
+                    _ = Platform::pkg_rmdir(sandbox_work_name)
+                    write_error("error: unable to safely collect compiler output\n")
+                    return EXIT_BUILD
+                if waited == Platform::pkg_timeout_error():
+                    _ = Platform::pkg_unlink(temp_name)
+                    _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
+                    _ = remove_optional_build_aggregate(aggregate_source_name)
+                    _ = Platform::pkg_rmdir(sandbox_work_name)
+                    write_error("error: compiler exceeded the 10-minute execution limit\n")
+                    return EXIT_CANCEL
+                if waited < 0 or status != 0:
+                    _ = Platform::pkg_unlink(temp_name)
+                    _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
+                    _ = remove_optional_build_aggregate(aggregate_source_name)
+                    _ = Platform::pkg_rmdir(sandbox_work_name)
+                    write_error("error: sandboxed compiler process failed or could not be reaped\n")
+                    return EXIT_BUILD
+                temporary_size: i64 = Platform::pkg_package_file_size(temp_name)
+                if temporary_size <= 0:
+                    _ = Platform::pkg_unlink(temp_name)
+                    _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
+                    _ = remove_optional_build_aggregate(aggregate_source_name)
+                    _ = Platform::pkg_rmdir(sandbox_work_name)
+                    return EXIT_BUILD
+                temporary_path: mutable darray[u8] = []
+                bytes_push_cstr(&temporary_path, temp_name)
+                artifact_content: mutable darray[u8] = []
+                artifact_digest_bytes: mutable darray[u8] = []
+                artifact_digest: mutable darray[u8] = []
+                if not read_package_file_into(&temporary_path, &artifact_content):
+                    _ = Platform::pkg_unlink(temp_name)
+                    _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
+                    _ = remove_optional_build_aggregate(aggregate_source_name)
+                    _ = Platform::pkg_rmdir(sandbox_work_name)
+                    return EXIT_BUILD
+                if Integrity::sha256(artifact_content, &artifact_digest_bytes) != Integrity::DigestCode.Ok:
+                    _ = Platform::pkg_unlink(temp_name)
+                    _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
+                    _ = remove_optional_build_aggregate(aggregate_source_name)
+                    _ = Platform::pkg_rmdir(sandbox_work_name)
+                    return EXIT_BUILD
+                if not Integrity::hex_digest(artifact_digest_bytes, &artifact_digest):
+                    _ = Platform::pkg_unlink(temp_name)
+                    _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
+                    _ = remove_optional_build_aggregate(aggregate_source_name)
+                    _ = Platform::pkg_rmdir(sandbox_work_name)
+                    return EXIT_BUILD
+                # Detach the compiler-owned output inode before validating the source
+                # tree or publishing. A session-escaping child may retain an fd, but
+                # it cannot change the bytes already copied into artifact_content.
+                if Platform::pkg_unlink(temp_name) != 0:
+                    _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
+                    _ = remove_optional_build_aggregate(aggregate_source_name)
+                    _ = Platform::pkg_rmdir(sandbox_work_name)
+                    write_error("error: unable to detach compiler-owned output before validation\n")
+                    return EXIT_BUILD
+                # Do not publish an artifact whose compiler input tree changed while
+                # the child was running. The receipt records the pre-build digest;
+                # rechecking immediately before publication keeps that identity bound
+                # to the inputs that were presented to the compiler. Revalidate the
+                # exact manifest and lock too: local lock validation recomputes every
+                # transitive dependency source digest, including paths outside the root.
+                manifest_after_build: mutable darray[u8] = []
+                manifest_after_build.resize(1048577)
+                lock_after_build: mutable darray[u8] = []
+                lock_after_build.resize(1048577)
+                if not read_cstr_into("elisapkg.json", &manifest_after_build) or not read_cstr_into("elisapkg.lock", &lock_after_build):
+                    _ = Platform::pkg_unlink(temp_name)
+                    _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
+                    _ = remove_optional_build_aggregate(aggregate_source_name)
+                    _ = Platform::pkg_rmdir(sandbox_work_name)
+                    return EXIT_BUILD
+                if not bytes_equal(manifest_after_build, manifest_raw) or not bytes_equal(lock_after_build, lock_raw) or not lock_matches_manifest(manifest_raw, lock_raw, root_name, root_version, start):
+                    _ = Platform::pkg_unlink(temp_name)
+                    _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
+                    _ = remove_optional_build_aggregate(aggregate_source_name)
+                    _ = Platform::pkg_rmdir(sandbox_work_name)
+                    return EXIT_BUILD
+                post_source_tree_digest: mutable darray[u8] = []
+                if not source_tree_digest_into(&post_source_tree_digest) or not bytes_equal(post_source_tree_digest, source_tree_digest):
+                    _ = Platform::pkg_unlink(temp_name)
+                    _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
+                    _ = remove_optional_build_aggregate(aggregate_source_name)
+                    _ = Platform::pkg_rmdir(sandbox_work_name)
+                    return EXIT_BUILD
+                if has_local_build_dependencies:
+                    aggregate_after_build: mutable darray[u8] = []
+                    if not read_package_file_into(aggregate_source_path, &aggregate_after_build) or not bytes_equal(aggregate_after_build, compiler_dependency_aggregate):
+                        _ = Platform::pkg_unlink(temp_name)
+                        _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
+                        _ = remove_optional_build_aggregate(aggregate_source_name)
+                        _ = Platform::pkg_rmdir(sandbox_work_name)
+                        write_error("error: private dependency aggregate changed during compilation\n")
+                        return EXIT_BUILD
+                toolchain_unchanged: mutable bool = true
+                post_tool_identity: mutable darray[u8] = []
+                if compiler_identity_ok:
+                    toolchain_unchanged <- tool_file_identity(compiler, true, true, &post_tool_identity) and bytes_equal(post_tool_identity, compiler_identity)
+                if toolchain_unchanged and stage1_identity_ok:
+                    toolchain_unchanged <- tool_file_identity(stage1_bin, false, true, &post_tool_identity) and bytes_equal(post_tool_identity, stage1_identity)
+                if toolchain_unchanged and runtime_identity_ok:
+                    toolchain_unchanged <- tool_file_identity(runtime_obj, false, false, &post_tool_identity) and bytes_equal(post_tool_identity, runtime_identity)
+                if toolchain_unchanged and clang_identity_ok:
+                    toolchain_unchanged <- tool_file_identity(clang_tool, false, true, &post_tool_identity) and bytes_equal(post_tool_identity, clang_identity)
+                if not toolchain_unchanged:
+                    _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
+                    _ = remove_optional_build_aggregate(aggregate_source_name)
+                    _ = Platform::pkg_rmdir(sandbox_work_name)
+                    write_error("error: compiler toolchain changed during the build; refusing to publish the artifact\n")
+                    return EXIT_BUILD
+                if not remove_optional_build_aggregate(aggregate_source_name):
+                    _ = Platform::pkg_unlink(temp_name)
+                    _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
+                    write_error("error: unable to remove the private dependency aggregate source\n")
+                    return EXIT_BUILD
+                if Platform::pkg_rmdir(sandbox_work_name) != 0:
+                    _ = Platform::pkg_unlink(temp_name)
+                    _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
+                    write_error("error: compiler left files in its private scratch directory; refusing to publish the build result\n")
+                    return EXIT_BUILD
+                if not remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots):
+                    _ = Platform::pkg_unlink(temp_name)
+                    write_error("error: unable to remove the verified build source snapshots\n")
+                    return EXIT_BUILD
+                # Never publish the compiler-owned inode directly. A descendant can
+                # leave its process group and retain an already-open descriptor even
+                # after the main compiler exits. Copy the bytes we hashed into a new
+                # parent-owned inode that was not present in the sandbox during build.
+                publish_template: mutable darray[u8] = []
+                bytes_push_array(&publish_template, build_dir)
+                if publish_template.count == 0.usize() or publish_template[publish_template.count - 1.usize()] != 47:
+                    publish_template.push(47)
+                bytes_push_cstr(&publish_template, artifact_leaf)
+                bytes_push_view(&publish_template, ".publish.XXXXXX")
+                publish_template.push(0)
+                publish_fd: i64 = Platform::pkg_mkstemp(&publish_template)
+                if publish_fd < 0:
+                    _ = Platform::pkg_unlink(temp_name)
+                    return EXIT_BUILD
+                publish_name: cstr = (&publish_template[0]).cast[cstr] can Unsafe.PointerCast
+                output_mode: u16 = 493.u16() if cstr_equal(emit_kind, "exe") else 420.u16()
+                publish_ok: mutable bool = write_fd_all(publish_fd, artifact_content)
+                publish_ok <- false if Platform::pkg_chmod(publish_name, output_mode) != 0
+                publish_ok <- false if Platform::pkg_access(publish_name, artifact_access_mode) != 0
+                publish_ok <- false if Platform::pkg_fsync(publish_fd) != 0
+                publish_close_status: i64 = Platform::pkg_close(publish_fd)
+                if not publish_ok or publish_close_status != 0:
+                    _ = Platform::pkg_unlink(publish_name)
+                    _ = Platform::pkg_unlink(temp_name)
+                    write_error("error: unable to create a normalized parent-owned build artifact\n")
+                    return EXIT_BUILD
+                if Platform::pkg_rename(publish_name, artifact_name) != 0:
+                    _ = Platform::pkg_unlink(publish_name)
+                    _ = Platform::pkg_unlink(temp_name)
+                    return EXIT_BUILD
+                bytes_push_view(&receipt, "\nartifact-digest:sha256:")
+                bytes_push_array(&receipt, artifact_digest)
+                bytes_push_view(&receipt, "\n")
+                if not write_cstr_file(receipt_name, &receipt):
+                    # The artifact has already been atomically published. Do not unlink
+                    # this pathname after a receipt failure: an older artifact may have
+                    # been replaced by the rename, and removing it would destroy package
+                    # output whose ownership is no longer distinguishable at this point.
+                    # The missing or stale receipt makes the next build reject the cache
+                    # and re-establish the pair before reuse.
+                    return EXIT_BUILD
+                write_ok("built .elisapkg/build/")
+                write_bytes(1, &artifact_label)
+                write_ok("\n")
+                _ = options
+                return EXIT_OK
 
         def set_callback_path_pid(value: mutable darray[u8]&, digits_offset: usize, process_id: i64) -> bool:
             return false if process_id <= 0 or digits_offset + 22.usize() >= value.count

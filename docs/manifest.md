@@ -34,6 +34,18 @@ Package names are 1–64 bytes, start with a lowercase ASCII letter, and contain
 
 Dependency objects select exactly one source. A local dependency uses `{"path":"../sibling"}` and is checked as a bounded relative path resolved from the declaring manifest. Reachable local packages are traversed transitively; lexical `.`/`..` segments are normalized for the lockfile, and the canonical real path is checked before a target is accepted. The configured `primary` registry source uses `{"registry":"primary","version":"^1.2.0"}` and is accepted only when the signed local registry provider can authenticate the complete graph. Registry-only graphs produce lockfile version 3 records with exact archive identities; mixed local/registry graphs and Git sources remain rejected until their source identity rules are implemented. The `SemVer` module accepts stable exact, caret, tilde, single-comparator, and paired lower/upper ranges and rejects malformed, overflowed, or leading-zero numeric identifiers. Duplicate aliases, mixed local/remote source fields, non-string values, and unsupported Git fields are rejected before resolution. The `dev-dependencies` object is reserved for root test/example graph activation and must currently be empty; non-empty declarations are rejected instead of being silently ignored. Network transport remains disabled; configuring a URL never bypasses signature checks.
 
+Builds currently compile only a fully validated version 2 local-path graph.
+Every transitive dependency must declare exactly one `lib` target; that target
+is included before its dependents in a deterministic dependency-first aggregate
+source. The build receipt binds the ordered logical dependency target paths
+along with the lock and source digests. The compiler receives a separate
+aggregate of validated absolute includes into the verified snapshots, created
+in private compiler scratch and checked unchanged before publication. Local dependency
+manifests, target entries, and source-tree digests are revalidated from the
+canonical lock identities. Registry-only builds fail closed until authenticated
+package acquisition and dependency compilation are integrated; mixed graphs
+remain unsupported. Fixture: `scripts/local_dependency_build_regression.py`.
+
 The current Elisa decoder validates value grammar with a bounded iterative stack (64 containers), including separators, literals, number syntax, and every JSON string escape form. It requires valid UTF-8, tokenizes quoted keys (so text inside descriptions cannot spoof fields), rejects duplicate keys in every JSON object, checks root/package object ownership, permits arbitrary names only as direct dependency keys, and rejects unknown execution fields. Required manifest field lookup remains byte-exact, so those fields must use their documented spelling rather than escaped key equivalents. It does not yet provide a decoded value tree or location diagnostics; a future parser layer can add those usability features without weakening this bounded validation pass.
 
 Prerelease package versions may use dotted identifiers. Dependency requirements containing prereleases are rejected until the requirement model preserves their complete identity; stable ranges exclude prerelease candidates.

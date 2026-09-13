@@ -10,20 +10,27 @@ module Sandbox:
             return false
 
         def darwin_build_profile(home: cstr, project_root: darray[u8]&, build_root: darray[u8]&,
-                                 dependency_roots: darray[u8]&, tool_paths: darray[cstr]&,
+                                 source_snapshot_root: darray[u8]&, dependency_roots: darray[u8]&, tool_paths: darray[cstr]&,
                                  executable_paths: darray[cstr]&, output_temp: cstr) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             static if not ELISA_TARGET_OS_MACOS:
                 return []
             home_real: mutable darray[u8] = []
             project_real: mutable darray[u8] = []
             build_real: mutable darray[u8] = []
+            snapshot_real: mutable darray[u8] = []
             if not canonical_path(home, &home_real):
                 return []
             if not canonical_path_array(project_root, &project_real):
                 return []
             if not canonical_path_array(build_root, &build_real):
                 return []
-            return [] if not absolute_path(home_real) or not absolute_path(project_real) or not absolute_path(build_real)
+            if not canonical_path_array(source_snapshot_root, &snapshot_real):
+                return []
+            return [] if not absolute_path(home_real) or not absolute_path(project_real) or not absolute_path(build_real) or not absolute_path(snapshot_real)
+            # Source snapshots are a distinct read-only input boundary. If one
+            # aliases writable compiler scratch, the later scratch exception
+            # would silently turn verified inputs into mutable compiler state.
+            return [] if path_is_same_or_ancestor(build_real, snapshot_real) or path_is_same_or_ancestor(snapshot_real, build_real)
             return [] if Platform::pkg_strlen(output_temp) == 0.usize()
 
             tool_roots: mutable darray[u8] = []
@@ -129,6 +136,20 @@ module Sandbox:
             for index in 0..<tool_paths.count |tool_paths, profile|:
                 return [] if not append_toolchain_library_root(&profile, tool_paths[index], home_real)
 
+            # The compiler consumes only copied, verified package sources. The
+            # live project and dependency trees stay unreadable for the child,
+            # closing edit/restore races and absolute-include escapes back to
+            # mutable checkout paths. Tool roots were allowed above; these
+            # later denials still apply when a tool lives inside a source tree.
+            # This keeps a selected tool exception from reopening package data.
+            return [] if not append_subpath_rule(&profile, "deny", "file-read*", "subpath", project_real)
+            root_cursor <- 0.usize()
+            while root_cursor < dependency_roots.count |dependency_roots, root_cursor, profile|:
+                dependency_path: mutable darray[u8] = []
+                return [] if not next_root(dependency_roots, &root_cursor, &dependency_path)
+                dependency_real: mutable darray[u8] = []
+                return [] if not canonical_path_array(dependency_path, &dependency_real)
+                return [] if not append_subpath_rule(&profile, "deny", "file-read*", "subpath", dependency_real)
             # The compiler's controlled linker path uses these exact host
             # utilities. Allow their exact paths so it cannot execute
             # unrelated programs simply because they share /usr/bin.
@@ -156,8 +177,16 @@ module Sandbox:
                 return [] if not canonical_path_array(dependency_path, &dependency_real)
                 return [] if not append_source_state_denials(&profile, dependency_real)
 
+            # The snapshot root is intentionally beneath reserved build state,
+            # so grant its exact read boundary after those denials. Keep this
+            # exception before the credential matcher; credential-like names
+            # inside a malformed snapshot remain denied.
+            return [] if not append_read_root(&profile, snapshot_real)
+            return [] if not append_source_state_denials(&profile, snapshot_real)
+            return [] if not append_subpath_rule(&profile, "deny", "file-write*", "subpath", snapshot_real)
+
             # Common credentials and private build state are not source inputs.
-            # Project and toolchain roots are reallowed narrowly above; retain
+            # Tool and scratch exceptions stay narrow; retain
             # these denials after those exceptions to keep obvious secret files
             # outside the compiler's view.
             bytes_push_view(&profile, "(deny file-read* (regex #\"^.*/(\\.[eE][nN][vV][^/]*|[^/]*\\.[eE][nN][vV]|\\.[nN][eE][tT][rR][cC]|\\.[sS][sS][hH]|\\.[aA][wW][sS]|\\.[gG][nN][uU][pP][gG]|\\.[kK][uU][bB][eE]|\\.[dD][oO][cC][kK][eE][rR]|\\.[aA][zZ][uU][rR][eE]|\\.[tT][eE][rR][rR][aA][fF][oO][rR][mM](\\.[dD])?|\\.[cC][oO][nN][fF][iI][gG]/([gG][cC][lL][oO][uU][dD]|[gG][hH]|[rR][cC][lL][oO][nN][eE])|\\.[nN][pP][mM][rR][cC]|\\.[pP][yY][pP][iI][rR][cC]|\\.[gG][iI][tT]|\\.[hH][gG]|\\.[sS][vV][nN]|[iI][mM][pP][lL][eE][mM][eE][nN][tT][aA][tT][iI][oO][nN]_[pP][lL][aA][nN]\\.[mM][dD]|\\.[gG][iI][tT]-[cC][rR][eE][dD][eE][nN][tT][iI][aA][lL][sS]|[iI][dD]_([rR][sS][aA]|[eE][dD]25519|[eE][cC][dD][sS][aA]|[dD][sS][aA])|[cC][rR][eE][dD][eE][nN][tT][iI][aA][lL][sS][^/]*|[^/]*\\.[pP][eE][mM][^/]*|[^/]*\\.[kK][eE][yY][^/]*|[^/]*\\.[pP]12|[^/]*\\.[pP][fF][xX]|[^/]*\\.[pP]8|[^/]*\\.[jJ][kK][sS]|[^/]*\\.[kK][eE][yY][sS][tT][oO][rR][eE])($|/.*)$\"))\n")
