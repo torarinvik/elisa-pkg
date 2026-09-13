@@ -83,15 +83,15 @@ def special(
     return name.encode("ascii"), b"", typeflag, linkname, False
 
 
-def source_for(cases: list[tuple[str, Path, Path, bool]]) -> str:
+def source_for(cases: list[tuple[str, Path, Path, bool, bytes]]) -> str:
     lines = [
         f'include "{ROOT / "src/platform.elisa"}"',
         "",
         "def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:",
     ]
-    for index, (label, destination, archive_path, should_succeed) in enumerate(cases, 1):
+    for index, (label, destination, archive_path, should_succeed, destination_bytes) in enumerate(cases, 1):
         archive_path_values = ", ".join(str(byte) for byte in os.fsencode(archive_path) + b"\0")
-        destination_values = ", ".join(str(byte) for byte in os.fsencode(destination))
+        destination_values = ", ".join(str(byte) for byte in destination_bytes)
         lines.extend(
             [
                 f"    archive_path_{index}: mutable darray[u8] = [{archive_path_values}]",
@@ -189,11 +189,16 @@ def main() -> int:
                 [regular("safe.txt", b"cleanup me"), (b"bad-checksum", b"x", b"0", b"", True)],
                 False,
             ),
+            (
+                "embedded-nul-destination",
+                [regular(name, payload) for name, payload in valid_payloads.items()],
+                False,
+            ),
         ]
 
         fixtures = work / "fixtures"
         fixtures.mkdir(mode=0o700)
-        cases: list[tuple[str, Path, Path, bool]] = []
+        cases: list[tuple[str, Path, Path, bool, bytes]] = []
         outside_sentinel = work / "traversal" / "escape"
         for label, entries, should_succeed in case_specs:
             case_root = work / label
@@ -206,7 +211,10 @@ def main() -> int:
             archive_path = fixtures / f"{label}.tar"
             archive_path.write_bytes(make_archive(entries))
             archive_path.chmod(0o600)
-            cases.append((label, stage, archive_path, should_succeed))
+            destination_bytes = os.fsencode(stage)
+            if label == "embedded-nul-destination":
+                destination_bytes += b"\0/truncated-path-must-not-be-used"
+            cases.append((label, stage, archive_path, should_succeed, destination_bytes))
 
         outside_sentinel.write_bytes(b"must remain outside extraction\n")
         source = work / "archive_extract_probe.elisa"
@@ -229,7 +237,7 @@ def main() -> int:
         if run_result.returncode != 0:
             raise SystemExit(f"error: archive extractor probe returned {run_result.returncode}")
 
-        for label, stage, _, should_succeed in cases:
+        for label, stage, _, should_succeed, _ in cases:
             if should_succeed:
                 for relative, expected in valid_payloads.items():
                     actual_path = stage / relative
