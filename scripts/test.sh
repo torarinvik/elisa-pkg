@@ -1765,7 +1765,11 @@ EOF
   else
     test "$?" -eq 6
   fi
-  grep -F 'builds with registry dependencies are not supported' "$registry_build_log" >/dev/null
+  if ! grep -F -e 'builds with registry dependencies are not supported' \
+    -e 'compiler builds require the macOS Seatbelt sandbox' "$registry_build_log" >/dev/null; then
+    echo "registry build did not fail for the dependency or sandbox policy reason" >&2
+    exit 1
+  fi
   if [[ -e "$registry_compiler_marker" ]]; then
     echo "compiler was invoked for a registry dependency graph" >&2
     exit 1

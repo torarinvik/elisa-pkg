@@ -258,11 +258,15 @@ def main() -> int:
         "uninstall.targets.synced",
         "transaction.journal.unlinked",
     )
-    with tempfile.TemporaryDirectory(prefix="elisapkg-install-killpoints-", dir=BUILD_ROOT) as raw:
+    # Install prefixes require every ancestor to be trusted and euid-owned.
+    # The checkout may be on a shared mount, so keep both prefixes and their
+    # package fixture under the current user's private home directory.
+    with tempfile.TemporaryDirectory(prefix="elisapkg-install-killpoints-", dir=Path.home()) as raw:
         work = Path(raw)
         test_binary = compile_fault_binary(work)
         package = work / "package"
-        (package / "src").mkdir(parents=True)
+        package.mkdir(mode=0o700)
+        (package / "src").mkdir(mode=0o700)
         (package / "src" / "main.elisa").write_text(
             "def main() -> i64:\n    return 0\n", encoding="utf-8"
         )
@@ -275,7 +279,8 @@ def main() -> int:
         # A known fixture binary lets these tests exercise install publication
         # even on hosts where the external toolchain cannot link package code.
         prebuilt = package / ".elisapkg" / "build" / "app"
-        prebuilt.parent.mkdir(parents=True)
+        (package / ".elisapkg").mkdir(mode=0o700)
+        prebuilt.parent.mkdir(mode=0o700)
         prebuilt.write_bytes(b"#!/bin/sh\nexit 0\n")
 
         # The copied test module explicitly selects this prebuilt fixture;
@@ -300,8 +305,11 @@ def main() -> int:
 
         for point in uninstall_points:
             prefix = work / point
-            (prefix / "bin").mkdir(parents=True, mode=0o755)
-            (prefix / "share" / "elisapkg" / "receipts").mkdir(parents=True, mode=0o755)
+            prefix.mkdir(mode=0o755)
+            (prefix / "bin").mkdir(mode=0o755)
+            (prefix / "share").mkdir(mode=0o755)
+            (prefix / "share" / "elisapkg").mkdir(mode=0o755)
+            (prefix / "share" / "elisapkg" / "receipts").mkdir(mode=0o755)
             binary_path, receipt_path, journal_path = write_install(prefix)
             kill_at_boundary(test_binary, prefix, point)
 

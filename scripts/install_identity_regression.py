@@ -34,7 +34,9 @@ def main() -> int:
     env["ELISA_RUNTIME_OBJ"] = env.get("ELISA_RUNTIME_OBJ", str(COMPILER_ROOT / "build/runtime/elisacore_runtime.o"))
     env["ELISA_ALLOW_STALE_STAGE1"] = env.get("ELISA_ALLOW_STALE_STAGE1", "0")
 
-    with tempfile.TemporaryDirectory(prefix="elisapkg-install-identity-", dir=ROOT / "build") as temporary:
+    # The identity-safe unlink requires an euid-owned trusted parent chain.
+    # Keep the probe out of potentially shared checkout mounts.
+    with tempfile.TemporaryDirectory(prefix="elisapkg-install-identity-", dir=Path.home()) as temporary:
         directory = Path(temporary)
         directory.chmod(0o700)
         target = directory / "target"

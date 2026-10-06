@@ -122,7 +122,10 @@ def expect_rejected_without_blocking(binary: Path, prefix: Path, label: str) -> 
 
 def main() -> int:
     (ROOT / "build").mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="elisapkg-install-lock-", dir=ROOT / "build") as directory:
+    # The platform lock accepts only a trusted, euid-owned path. The checkout
+    # may live on a shared or otherwise untrusted mount, so keep the fixture in
+    # the current user's private home directory instead of inheriting that path.
+    with tempfile.TemporaryDirectory(prefix="elisapkg-install-lock-", dir=Path.home()) as directory:
         work = Path(directory)
         binary = build_probe(work)
         prefix = work / "prefix"

@@ -43,12 +43,12 @@ def main() -> int:
         file_names = [f"source-{index:04d}.elisa" for index in range(256)]
         for name in reversed(file_names):
             (ordered_root / name).write_text("package input\n", encoding="ascii")
-        (ordered_root / "empty-directory").mkdir()
+        (ordered_root / "empty-directory").mkdir(mode=0o700)
 
         stress_root = work / "stress"
         stress_root.mkdir(mode=0o700)
         for index in range(8192):
-            (stress_root / f"directory-{index:04d}").mkdir()
+            (stress_root / f"directory-{index:04d}").mkdir(mode=0o700)
             (stress_root / f"credentials-{index:04d}").write_bytes(b"excluded by path policy")
 
         expected = b"".join(os.fsencode(ordered_root / name) + b"\0" for name in file_names)

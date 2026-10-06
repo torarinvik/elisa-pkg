@@ -26,6 +26,16 @@ def write_manifest(path: Path, name: str, targets: list[dict], dependencies: dic
     }) + "\n", encoding="utf-8")
 
 
+def make_private_directory(path: Path, root: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    current = path
+    while current != root.parent:
+        os.chmod(current, 0o700)
+        if current == root:
+            break
+        current = current.parent
+
+
 def cli(root: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [str(BIN), *arguments], cwd=root, text=True,
@@ -53,9 +63,9 @@ def main() -> int:
         root = Path(raw)
         bridge = root / "deps" / "bridge lib"
         leaf = root / "deps" / "leaf lib"
-        (root / "src").mkdir(parents=True)
-        (bridge / "src").mkdir(parents=True)
-        (leaf / "src").mkdir(parents=True)
+        make_private_directory(root / "src", root)
+        make_private_directory(bridge / "src", root)
+        make_private_directory(leaf / "src", root)
 
         write_manifest(
             root / "elisapkg.json", "root-app",
@@ -211,7 +221,7 @@ def main() -> int:
             "pkg-d": root / "deps" / "pkg-d",
         }
         for package_root in cross_edge_packages.values():
-            (package_root / "src").mkdir(parents=True, exist_ok=True)
+            make_private_directory(package_root / "src", root)
             package_name = package_root.name
             write_manifest(
                 package_root / "elisapkg.json", package_name,

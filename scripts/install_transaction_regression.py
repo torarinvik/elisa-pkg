@@ -149,10 +149,20 @@ def main() -> int:
         raise SystemExit(f"error: built elisapkg binary is missing: {BIN}")
     check_install_recovery_sync_order()
 
-    with tempfile.TemporaryDirectory(prefix="elisapkg-install-transaction-", dir=ROOT / "build") as temporary:
+    # The install boundary verifies every parent directory's owner and write
+    # bits. The checkout can sit on a shared mount, so run recovery fixtures
+    # below the current user's private home directory.
+    with tempfile.TemporaryDirectory(prefix="elisapkg-install-transaction-", dir=Path.home()) as temporary:
         prefix = Path(temporary) / "prefix"
-        (prefix / "bin").mkdir(parents=True, mode=0o755)
-        (prefix / "share/elisapkg/receipts").mkdir(parents=True, mode=0o755)
+        for directory in (
+            prefix,
+            prefix / "bin",
+            prefix / "share",
+            prefix / "share/elisapkg",
+            prefix / "share/elisapkg/receipts",
+        ):
+            directory.mkdir(mode=0o755)
+            directory.chmod(0o755)
         binary = prefix / "bin/app"
         receipt = prefix / "share/elisapkg/receipts/app"
         journal = prefix / ".elisapkg-install-transaction"
