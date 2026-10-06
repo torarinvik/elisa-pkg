@@ -188,6 +188,49 @@ def recover(prefix: Path, expected: int, label: str) -> None:
         )
 
 
+def retry_install(binary: Path, prefix: Path, cwd: Path, artifact: bytes, label: str) -> None:
+    environment = dict(os.environ)
+    environment["ELISAPKG_INSTALL_PREFIX"] = str(prefix)
+    environment.pop("ELISAPKG_TEST_CRASH_POINT", None)
+    result = subprocess.run(
+        [str(binary), "install", "--local", "--quiet"],
+        cwd=cwd,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise SystemExit(
+            f"error: {label} returned {result.returncode}: "
+            f"{result.stdout.decode(errors='replace')}{result.stderr.decode(errors='replace')}"
+        )
+
+    binary_path = prefix / "bin" / "app"
+    receipt_path = prefix / "share" / "elisapkg" / "receipts" / "app"
+    journal_path = prefix / ".elisapkg-install-transaction"
+    digest = hashlib.sha256(artifact).hexdigest().encode("ascii")
+    expected_receipt = (
+        b"elisapkg-install-receipt:1\nname:app\nversion:1.2.3\npath:"
+        + str(binary_path).encode("utf-8")
+        + b"\nartifact-digest:sha256:"
+        + digest
+        + b"\n"
+    )
+    if (
+        not binary_path.is_file()
+        or binary_path.is_symlink()
+        or binary_path.read_bytes() != artifact
+        or binary_path.stat().st_mode & 0o777 != 0o755
+        or not receipt_path.is_file()
+        or receipt_path.is_symlink()
+        or receipt_path.read_bytes() != expected_receipt
+        or journal_path.exists()
+    ):
+        raise SystemExit(f"error: {label} did not leave the exact installed artifact, receipt, and retired journal")
+
+
 def main() -> int:
     if not PRODUCTION_BIN.is_file():
         raise SystemExit(f"error: production binary is missing: {PRODUCTION_BIN}")
@@ -247,8 +290,8 @@ def main() -> int:
                 args=("install", "--local", "--quiet"),
                 cwd=package,
             )
-            expected_recovery = 7 if point == "install.journal.durable" else 0
-            recover(prefix, expected_recovery, f"recovery after {point}")
+            retry_install(test_binary, prefix, package, prebuilt.read_bytes(), f"install retry after {point}")
+            recover(prefix, 0, f"cleanup after retrying {point}")
             binary_path = prefix / "bin" / "app"
             receipt_path = prefix / "share" / "elisapkg" / "receipts" / "app"
             journal_path = prefix / ".elisapkg-install-transaction"

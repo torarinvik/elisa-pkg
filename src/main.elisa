@@ -4485,9 +4485,12 @@ module Cli:
             # above can report a failed fsync after the hard link became visible.
             return Platform::pkg_fsync_parent(path_name) == 0
 
-        def recover_local_install_transaction(prefix: darray[u8]&, out_operation: mutable darray[u8]&, out_name: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+        def recover_local_install_transaction(prefix: darray[u8]&, out_operation: mutable darray[u8]&, out_name: mutable darray[u8]&, out_version: mutable darray[u8]&, out_digest: mutable darray[u8]&, out_install_published: mutable bool&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             out_operation.resize(0)
             out_name.resize(0)
+            out_version.resize(0)
+            out_digest.resize(0)
+            out_install_published <- false
             transaction_path: mutable darray[u8] = []
             local_install_transaction_path(prefix, &transaction_path)
             transaction_c: mutable darray[u8] = []
@@ -4552,6 +4555,7 @@ module Cli:
                     # durable before retiring the only recovery record.
                     return false if not sync_local_install_entry_parents(destination_name, receipt_name)
                     return false if not retire_local_install_transaction(transaction_path)
+                    out_install_published <- true
             else:
                 # Removal intent is durable before the first unlink. The only
                 # reachable partial state is a verified binary with receipt, or
@@ -4581,6 +4585,10 @@ module Cli:
                 out_operation.push(operation[index])
             for index in 0..<name.count |out_name, name|:
                 out_name.push(name[index])
+            for index in 0..<version.count |out_version, version|:
+                out_version.push(version[index])
+            for index in 0..<expected_digest.count |out_digest, expected_digest|:
+                out_digest.push(expected_digest[index])
             return true
 
         def finish_local_install_error(lock_fd: i64, message: cstr) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -4661,10 +4669,21 @@ module Cli:
                 return 7
             recovered_operation: mutable darray[u8] = []
             recovered_name: mutable darray[u8] = []
-            if not recover_local_install_transaction(prefix, &recovered_operation, &recovered_name):
+            recovered_version: mutable darray[u8] = []
+            recovered_digest: mutable darray[u8] = []
+            recovered_install_published: mutable bool = false
+            if not recover_local_install_transaction(prefix, &recovered_operation, &recovered_name, &recovered_version, &recovered_digest, &recovered_install_published):
                 return finish_local_install_error(lock_fd, "error: an interrupted local installation could not be safely recovered; preserve the journal and files for review\n")
             destination.resize(0)
             bytes_push_array(&destination, destination_snapshot)
+            if recovered_install_published and bytes_equal_view(recovered_operation, "install") and bytes_equal(recovered_name, name) and bytes_equal(recovered_version, version) and bytes_equal(recovered_digest, digest):
+                return finish_local_install_error(lock_fd, "error: could not close the recovered local installation lock descriptor\n") if not release_install_lock(lock_fd)
+                write_ok("already installed ")
+                write_bytes(1, &name)
+                write_ok(" to ")
+                write_bytes(1, &destination)
+                write_ok("\n")
+                return EXIT_OK
             if file_exists(&destination):
                 return finish_local_install_error(lock_fd, "error: install destination or receipt already exists; refusing to overwrite\n")
             receipt_path.resize(0)
@@ -4775,7 +4794,10 @@ module Cli:
                 return 7
             recovered_operation: mutable darray[u8] = []
             recovered_name: mutable darray[u8] = []
-            if not recover_local_install_transaction(prefix, &recovered_operation, &recovered_name):
+            recovered_version: mutable darray[u8] = []
+            recovered_digest: mutable darray[u8] = []
+            recovered_install_published: mutable bool = false
+            if not recover_local_install_transaction(prefix, &recovered_operation, &recovered_name, &recovered_version, &recovered_digest, &recovered_install_published):
                 return finish_local_install_error(lock_fd, "error: an interrupted local installation could not be safely recovered; preserve the journal and files for review\n")
             if bytes_equal_view(recovered_operation, "uninstall") and bytes_equal(recovered_name, name):
                 return finish_local_install_error(lock_fd, "error: could not close the recovered local installation lock\n") if not release_install_lock(lock_fd)
