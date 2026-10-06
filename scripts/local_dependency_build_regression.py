@@ -121,6 +121,10 @@ def main() -> int:
             executed = subprocess.run([str(artifact)], timeout=20, check=False)
             require(executed, 0, "run binary using transitive libraries")
 
+        if build_skipped:
+            print("local dependency build assertions skipped: host cannot run the sandboxed compiler")
+            return 0
+
         lock_path = root / "elisapkg.lock"
         valid_lock = lock_path.read_bytes()
         lock_path.write_text("{}\n", encoding="utf-8")

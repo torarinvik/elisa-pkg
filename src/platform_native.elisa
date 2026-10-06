@@ -105,7 +105,9 @@ extern native_closedir(directory: heap void&) -> i32
 @link_name("fork")
 extern native_fork() -> i32
 @link_name("execvp")
-extern native_execvp(path: cstr, argv: mutable cstr&&) -> i32
+# C receives `char **` as one pointer-sized argument. Keep its pointer depth
+# typed in the Elisa wrapper and erase it only at this private native boundary.
+extern native_execvp(path: cstr, argv: void&) -> i32
 @link_name("_exit")
 extern native_exit(code: i64)
 @link_name("setpgid")
@@ -851,8 +853,9 @@ module PlatformNative:
         def fork() -> i64:
             return native_fork()
 
-        def execvp(path: cstr, argv: mutable cstr&&) -> i64:
-            return native_execvp(path, argv)
+        def execvp(path: cstr, argv: mutable cstr&&) -> i64 can[Unsafe.PointerCast]:
+            raw_argv: void& = argv.cast[void&] can Unsafe.PointerCast
+            return native_execvp(path, raw_argv)
 
         def process_exit(code: i64):
             native_exit(code)
@@ -930,7 +933,7 @@ module PlatformNative:
                     native_exit(126)
                 if close_inherited_fds() != 0:
                     native_exit(126)
-                _ = native_execvp("/usr/bin/env", child_argv)
+                _ = execvp("/usr/bin/env", child_argv)
                 native_exit(127)
             elif pid > 0:
                 status: mutable i32 = 0
@@ -1560,63 +1563,6 @@ module PlatformNative:
         def flags_file_read() -> i64:
             return flag_read_only + flag_no_follow + flag_close_on_exec + flag_nonblock
 
-        # Pin a candidate without invoking a device driver's open operation.
-        # Linux uses OPENAT2_REGULAR where available and an O_PATH + procfs
-        # reopen fallback on older kernels. macOS has no O_PATH equivalent,
-        # so its protected-parent policy combines pre-stat, O_NOFOLLOW, and a
-        # post-open inode comparison.
-        def open_regular_file_at(directory: i64, leaf_name: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            before: mutable darray[u8] = []
-            before.resize(144)
-            before_raw: mutable void& = (&before[0]).cast[mutable void&] can Unsafe.PointerCast
-            if native_fstatat(directory, leaf_name, before_raw, at_no_follow) != 0:
-                return negative_errno()
-            before_mode: u64 = read_u16(before, stat_mode_offset) & 61440.u64()
-            return package_nonregular_file_error(before_mode) if before_mode != regular_mode
-            return open_regular_file_after_check(directory, leaf_name, before)
-
-        static if ELISA_TARGET_OS_LINUX:
-            def open_regular_file_after_check(directory: i64, leaf_name: cstr, before: darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-                how: mutable darray[u8] = []
-                how.resize(24)
-                for index in 0..<how.count |how|:
-                    how[index] <- 0
-                how_flags: u64 = linux_openat2_regular + flags_file_read().u64()
-                write_u64_le(&how, 0.usize(), how_flags)
-                how_raw: mutable void& = (&how[0]).cast[mutable void&] can Unsafe.PointerCast
-                opened: i64 = native_syscall(linux_openat2_syscall, directory, leaf_name, how_raw, 24)
-                if opened >= 0:
-                    after: mutable darray[u8] = []
-                    after.resize(144)
-                    after_raw: mutable void& = (&after[0]).cast[mutable void&] can Unsafe.PointerCast
-                    if native_fstat(opened, after_raw) != 0:
-                        errno_value: i64 = negative_errno()
-                        return close_error(opened, errno_value)
-                    if (read_u16(after, stat_mode_offset) & 61440.u64()) != regular_mode or read_stat_device(before) != read_stat_device(after) or read_u64(before, 8.usize()) != read_u64(after, 8.usize()):
-                        return close_error(opened, -13)
-                    return opened
-                open_errno: i64 = current_errno()
-                if open_errno != 38 and open_errno != 22:
-                    return negative_value(open_errno)
-                return open_regular_file_at_pinned(directory, leaf_name, before)
-
-        static else:
-            def open_regular_file_after_check(directory: i64, leaf_name: cstr, before: darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-                opened: i64 = native_openat(directory, leaf_name, flags_file_read())
-                return negative_errno() if opened < 0
-                after: mutable darray[u8] = []
-                after.resize(144)
-                after_raw: mutable void& = (&after[0]).cast[mutable void&] can Unsafe.PointerCast
-                if native_fstat(opened, after_raw) != 0:
-                    errno_value: i64 = negative_errno()
-                    return close_error(opened, errno_value)
-                after_mode: u64 = read_u16(after, stat_mode_offset) & 61440.u64()
-                if after_mode != regular_mode:
-                    return close_error(opened, package_nonregular_file_error(after_mode))
-                if read_stat_device(before) != read_stat_device(after) or read_u64(before, 8.usize()) != read_u64(after, 8.usize()):
-                    return close_error(opened, -13)
-                return opened
-
         static if ELISA_TARGET_OS_LINUX:
             def open_regular_file_at_pinned(directory: i64, leaf_name: cstr, before: darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
                 pin_flags: i64 = linux_open_path + flag_no_follow + flag_close_on_exec
@@ -1666,6 +1612,63 @@ module PlatformNative:
                     _ = native_close(reopened)
                     return -5 if close_status != 0 else -13
                 return reopened
+
+        static if ELISA_TARGET_OS_LINUX:
+            def open_regular_file_after_check(directory: i64, leaf_name: cstr, before: darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+                how: mutable darray[u8] = []
+                how.resize(24)
+                for index in 0..<how.count |how|:
+                    how[index] <- 0
+                how_flags: u64 = linux_openat2_regular + flags_file_read().u64()
+                write_u64_le(&how, 0.usize(), how_flags)
+                how_raw: mutable void& = (&how[0]).cast[mutable void&] can Unsafe.PointerCast
+                opened: i64 = native_syscall(linux_openat2_syscall, directory, leaf_name, how_raw, 24)
+                if opened >= 0:
+                    after: mutable darray[u8] = []
+                    after.resize(144)
+                    after_raw: mutable void& = (&after[0]).cast[mutable void&] can Unsafe.PointerCast
+                    if native_fstat(opened, after_raw) != 0:
+                        errno_value: i64 = negative_errno()
+                        return close_error(opened, errno_value)
+                    if (read_u16(after, stat_mode_offset) & 61440.u64()) != regular_mode or read_stat_device(before) != read_stat_device(after) or read_u64(before, 8.usize()) != read_u64(after, 8.usize()):
+                        return close_error(opened, -13)
+                    return opened
+                open_errno: i64 = current_errno()
+                if open_errno != 38 and open_errno != 22:
+                    return negative_value(open_errno)
+                return open_regular_file_at_pinned(directory, leaf_name, before)
+
+        static else:
+            def open_regular_file_after_check(directory: i64, leaf_name: cstr, before: darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+                opened: i64 = native_openat(directory, leaf_name, flags_file_read())
+                return negative_errno() if opened < 0
+                after: mutable darray[u8] = []
+                after.resize(144)
+                after_raw: mutable void& = (&after[0]).cast[mutable void&] can Unsafe.PointerCast
+                if native_fstat(opened, after_raw) != 0:
+                    errno_value: i64 = negative_errno()
+                    return close_error(opened, errno_value)
+                after_mode: u64 = read_u16(after, stat_mode_offset) & 61440.u64()
+                if after_mode != regular_mode:
+                    return close_error(opened, package_nonregular_file_error(after_mode))
+                if read_stat_device(before) != read_stat_device(after) or read_u64(before, 8.usize()) != read_u64(after, 8.usize()):
+                    return close_error(opened, -13)
+                return opened
+
+        # Pin a candidate without invoking a device driver's open operation.
+        # Linux uses OPENAT2_REGULAR where available and an O_PATH + procfs
+        # reopen fallback on older kernels. macOS has no O_PATH equivalent,
+        # so its protected-parent policy combines pre-stat, O_NOFOLLOW, and a
+        # post-open inode comparison.
+        def open_regular_file_at(directory: i64, leaf_name: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            before: mutable darray[u8] = []
+            before.resize(144)
+            before_raw: mutable void& = (&before[0]).cast[mutable void&] can Unsafe.PointerCast
+            if native_fstatat(directory, leaf_name, before_raw, at_no_follow) != 0:
+                return negative_errno()
+            before_mode: u64 = read_u16(before, stat_mode_offset) & 61440.u64()
+            return package_nonregular_file_error(before_mode) if before_mode != regular_mode
+            return open_regular_file_after_check(directory, leaf_name, before)
 
         def package_source_directory_fd(fd: i64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             stat: mutable darray[u8] = []
