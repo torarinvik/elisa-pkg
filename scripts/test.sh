@@ -2543,8 +2543,34 @@ PY
   fi
   "$BIN" publish --dry-run | grep -F 'publish dry-run: manifest, lockfile, source tree, and package file selection are valid' >/dev/null
   cp .elisapkg/package.tar .elisapkg/package.tar.before-publish-dry-run
-  "$BIN" publish --json --dry-run | grep -E '^\{"schema-version":1,"command":"publish","dry-run":true,"valid":true,"source-tree-digest":"sha256:[0-9a-f]{64}","archive-size":[0-9]+,"archive-digest":"sha256:[0-9a-f]{64}"\}$' >/dev/null
-  "$BIN" publish --dry-run --json | grep -E '^\{"schema-version":1,"command":"publish","dry-run":true,"valid":true,"source-tree-digest":"sha256:[0-9a-f]{64}","archive-size":[0-9]+,"archive-digest":"sha256:[0-9a-f]{64}"\}$' >/dev/null
+  publish_json_output="$TEST_TMP/publish-json-$$.out"
+  publish_json_reordered_output="$TEST_TMP/publish-json-reordered-$$.out"
+  "$BIN" publish --json --dry-run >"$publish_json_output"
+  "$BIN" publish --dry-run --json >"$publish_json_reordered_output"
+  cmp "$publish_json_output" "$publish_json_reordered_output" >/dev/null
+  python3 - "$publish_json_output" "$publish_json_reordered_output" <<'PY'
+import json
+from pathlib import Path
+import re
+import sys
+
+expected = re.compile(
+    r'^\{"schema-version":1,"command":"publish","dry-run":true,"valid":true,'
+    r'"source-tree-digest":"sha256:[0-9a-f]{64}","archive-size":[0-9]+,'
+    r'"archive-digest":"sha256:[0-9a-f]{64}"\}$'
+)
+for filename in sys.argv[1:]:
+    raw = Path(filename).read_bytes()
+    if not raw.endswith(b"\n") or raw.count(b"\n") != 1:
+        raise SystemExit("publish --json --dry-run emitted extra stdout lines")
+    try:
+        line = raw[:-1].decode("ascii")
+        json.loads(line)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise SystemExit(f"publish --json --dry-run emitted invalid JSON: {error}")
+    if expected.fullmatch(line) is None:
+        raise SystemExit("publish --json --dry-run emitted an unexpected JSON result")
+PY
   cmp .elisapkg/package.tar.before-publish-dry-run .elisapkg/package.tar >/dev/null
   if "$BIN" install app >/dev/null 2>&1; then
     echo "remote install unexpectedly succeeded" >&2
