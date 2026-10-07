@@ -38,6 +38,14 @@ registry support is implemented or ready to enable.
   additional signature or digest algorithm requires a reviewed profile change,
   a trusted metadata migration, and compatibility fixtures.
 
+The initial resource limits are: 1 MiB per metadata file; 64 authorized keys
+per role; 64 signatures per metadata file; 4,096 package-scoped delegated
+roles; one delegation hop from top-level Targets to a package role; 4,096
+targets per package role; 1,024 sequential root updates per refresh; and 64
+JSON container levels. Exceeding a limit rejects the refresh before state is
+changed. These limits are part of the profile and require a reviewed change if
+they prove too small for a real registry.
+
 ## Repository identity and root trust
 
 - Each configured registry has a stable local registry identity and its own
@@ -72,7 +80,9 @@ registry support is implemented or ready to enable.
   list targets under `packages/`; each package target must be reached through
   its package-scoped delegation. Each such delegation is terminating and
   package path scopes are disjoint, so a later role cannot provide a fallback
-  target for the same namespace. Only signatures from keys authorized for the
+  target for the same namespace. Delegation depth is limited to one hop: a
+  package-scoped role may list its release targets but may not delegate
+  further. Only signatures from keys authorized for the
   active role count toward its threshold. Unknown or unauthorized signatures
   never count; insufficient valid signatures, unsupported trusted algorithms,
   revoked keys, or a namespace mismatch are hard failures.
@@ -153,7 +163,8 @@ Before network support is enabled, fixtures must cover:
 - valid signatures from unauthorized keys and valid delegated signatures
   outside the package namespace are rejected when the authorized role
   threshold is not met; an otherwise valid threshold is unaffected by an
-  extra unknown signature, and duplicate signatures from one key count once;
+  extra unknown signature, while duplicate key IDs in a metadata signature
+  array are rejected as malformed;
 - wrong repository, package, version, dependency, compiler, target path, size,
   and digest bindings;
 - an expired intermediate root accepted only within a valid sequential

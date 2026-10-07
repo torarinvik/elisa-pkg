@@ -1,0 +1,88 @@
+# Bounded policy primitives for the selected TUF v1.0.36 profile.
+#
+# This is not a TUF client: callers must still parse metadata, canonicalize the
+# signed object, verify each signature, validate roles/delegations, and commit
+# trusted state atomically before exposing targets.
+
+module Tuf:
+    public:
+        const enum ValidationCode of u8:
+            WellFormed
+            UnsupportedSpecVersion
+            MalformedKeyId
+            DuplicateKeyId
+            InvalidThreshold
+            ThresholdInsufficient
+            ResourceLimit
+
+        # These limits bound a single repository refresh under the current
+        # package-scoped delegation model. Changing them requires independent
+        # metadata-size and worst-case-work review.
+        const max_metadata_file_bytes: usize = 1048576.usize()
+        const max_authorized_keys_per_role: usize = 64.usize()
+        const max_signatures_per_metadata: usize = 64.usize()
+        const max_delegated_roles: usize = 4096.usize()
+        const max_delegation_depth: usize = 1.usize()
+        const max_targets_per_package_role: usize = 4096.usize()
+        const max_root_updates_per_refresh: usize = 1024.usize()
+        const max_json_container_depth: usize = 64.usize()
+
+        # The selected profile accepts stable 1.0.P versions through the pinned
+        # v1.0.36 patch, inclusive. This checks only the protocol version text;
+        # it does not validate or authenticate a metadata document.
+        def precheck_spec_version(value: darray[u8]&) -> ValidationCode:
+            return ValidationCode.UnsupportedSpecVersion if value.count < 5.usize() or value.count > 6.usize()
+            return ValidationCode.UnsupportedSpecVersion if value[0] != 49 or value[1] != 46 or value[2] != 48 or value[3] != 46
+            patch_start: usize = 4.usize()
+            return ValidationCode.UnsupportedSpecVersion if value[patch_start] < 48 or value[patch_start] > 57
+            return ValidationCode.UnsupportedSpecVersion if value.count == 6.usize() and (value[patch_start] == 48 or value[5] < 48 or value[5] > 57)
+            patch: mutable u64 = (value[patch_start] - 48).u64()
+            patch <- patch * 10.u64() + (value[5] - 48).u64() if value.count == 6.usize()
+            return ValidationCode.UnsupportedSpecVersion if patch > 36.u64()
+            return ValidationCode.WellFormed
+
+        # Validate the shape of the authorized and supplied signature key-id
+        # lists. Each input is a flat sequence of 64-byte lowercase SHA-256
+        # hex IDs. Unknown supplied IDs are permitted but cannot satisfy the
+        # role threshold. The matching count is only a pre-verification upper
+        # bound: it does not prove that any signature is cryptographically
+        # valid or authorized by the exact role metadata.
+        def precheck_signature_key_ids(authorized_ids: darray[u8]&, supplied_ids: darray[u8]&, threshold: u64) -> ValidationCode:
+            return ValidationCode.ResourceLimit if authorized_ids.count > max_authorized_keys_per_role * 64.usize() or supplied_ids.count > max_signatures_per_metadata * 64.usize()
+            return ValidationCode.MalformedKeyId if authorized_ids.count % 64.usize() != 0.usize() or supplied_ids.count % 64.usize() != 0.usize()
+            authorized_count: usize = authorized_ids.count / 64.usize()
+            supplied_count: usize = supplied_ids.count / 64.usize()
+            return ValidationCode.InvalidThreshold if threshold == 0.u64() or threshold > authorized_count.u64()
+            authorized_status: ValidationCode = validate_key_id_list(authorized_ids)
+            return authorized_status if authorized_status != ValidationCode.WellFormed
+            supplied_status: ValidationCode = validate_key_id_list(supplied_ids)
+            return supplied_status if supplied_status != ValidationCode.WellFormed
+            authorized_signatures: mutable usize = 0.usize()
+            for supplied_index in 0..<supplied_count |authorized_ids, supplied_ids, supplied_index, authorized_signatures|:
+                supplied_offset: usize = supplied_index * 64.usize()
+                for authorized_index in 0..<authorized_count |authorized_ids, supplied_ids, supplied_offset, authorized_index, authorized_signatures|:
+                    authorized_offset: usize = authorized_index * 64.usize()
+                    if key_id_equal(authorized_ids, authorized_offset, supplied_ids, supplied_offset):
+                        authorized_signatures <- authorized_signatures + 1.usize()
+                        break
+            return ValidationCode.ThresholdInsufficient if authorized_signatures.u64() < threshold
+            return ValidationCode.WellFormed
+
+    private:
+        const key_id_size: usize = 64.usize()
+
+        def validate_key_id_list(ids: darray[u8]&) -> ValidationCode:
+            count: usize = ids.count / key_id_size
+            for index in 0..<count |ids, count|:
+                offset: usize = index * key_id_size
+                for byte_index in 0..<key_id_size |ids, offset|:
+                    byte: u8 = ids[offset + byte_index]
+                    return ValidationCode.MalformedKeyId if not ((byte >= 48 and byte <= 57) or (byte >= 97 and byte <= 102))
+                for previous in 0..<index |ids, offset|:
+                    return ValidationCode.DuplicateKeyId if key_id_equal(ids, previous * key_id_size, ids, offset)
+            return ValidationCode.WellFormed
+
+        def key_id_equal(left: darray[u8]&, left_offset: usize, right: darray[u8]&, right_offset: usize) -> bool:
+            for byte_index in 0..<key_id_size |left, right, left_offset, right_offset|:
+                return false if left[left_offset + byte_index] != right[right_offset + byte_index]
+            return true
