@@ -227,6 +227,21 @@ to TUF's rule allowing an expired intermediate root during a valid sequential
 rotation. Signatures by unknown or unauthorized keys never count toward a
 role's threshold.
 
+The initial engine review evaluated
+[`sigstore-rust` commit `79d8597006987309930ed3b286f58668adee43cd`](https://github.com/sigstore/sigstore-rust/tree/79d8597006987309930ed3b286f58668adee43cd),
+whose `sigstore-tuf` crate is version 0.14.0. On Rust 1.99, its library and
+integration targets passed 34 tests with default features disabled and Cargo
+offline. The unqualified no-default-features test command failed to compile an
+example that imports the feature-gated `HttpRepository`. This baseline is not a
+conformance approval: the reviewed parser accepted duplicate JSON members,
+accepted `spec_version` values outside this profile's stable `1.0.P` range,
+and accepted SHA-512 target digests. The reviewed update paths also log and
+swallow metadata-store write failures, while the default file store does not
+fsync the metadata file and parent directory. Its Rust API has no stable C ABI
+for the Elisa FFI boundary. Each of these gaps must be resolved and verified
+against the exact pinned build before this candidate can be approved; remote
+registry operations remain disabled in the meantime.
+
 The fixture in D-011 remains a local implementation test only. Its custom
 single-key index and signed metadata are not a compatible TUF implementation
 or a network protocol. TUF authenticates release authorization and exact
