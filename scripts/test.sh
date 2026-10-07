@@ -24,6 +24,7 @@ export ELISA_ALLOW_STALE_STAGE1="${ELISA_ALLOW_STALE_STAGE1:-0}"
 "$BIN" --version | grep -F 'elisapkg 0.1.0' >/dev/null
 "$BIN" doctor | grep -F 'fixed trusted local OpenSSL candidate' >/dev/null
 python3 "$ROOT/scripts/ffi_boundary_test.py"
+python3 "$ROOT/scripts/linux_acl_regression.py"
 python3 "$ROOT/scripts/macos_toolchain_path_regression.py"
 python3 "$ROOT/scripts/collect_files_budget_regression.py"
 python3 "$ROOT/scripts/build_include_regression.py"

@@ -139,9 +139,11 @@ or removal, the prefix and its existing directory
 chain must contain only real directories owned by root or the effective user,
 with no group or other write bits; shared writable locations such as `/tmp` are
 refused. On macOS, the check permits deny-only extended ACLs but rejects allow
-ACEs and unknown ACL entries even when mode bits look safe. Linux ACL grants
-are not inspected, and no platform check prevents pathname races by another
-process running as the same user. Remote `install NAME` remains trust-gated
+ACEs and unknown ACL entries even when mode bits look safe. Linux checks POSIX
+ACLs on opened descriptors and rejects named user/group access entries,
+malformed or unreadable ACLs, and default ACLs on trusted directories. No
+platform check prevents pathname races by another process running as the same
+user. Remote `install NAME` remains trust-gated
 with the other network operations.
 
 ## Security posture

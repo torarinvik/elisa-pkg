@@ -66,8 +66,10 @@ paths exist, by canonical identity as well. Reads use one no-follow descriptor,
 so the bytes verified are the bytes from the checked file. Persisted trust-state
 and clock files follow the same ownership, permission, and descriptor rules.
 On macOS, trusted directory and regular-file descriptors also reject extended
-ACL allow entries and unknown ACL tags while permitting deny-only entries;
-Linux ACL grants are not inspected. Both `metadata.sig` and `index.sig` are
+ACL allow entries and unknown ACL tags while permitting deny-only entries.
+Linux checks parse access ACLs on opened descriptors, reject named user/group
+entries and malformed or unreadable ACLs, and reject default ACLs on trusted
+directories. Both `metadata.sig` and `index.sig` are
 exactly 64 raw Ed25519 signature bytes. The `index` payload is signed
 byte-for-byte and uses this bounded line format:
 

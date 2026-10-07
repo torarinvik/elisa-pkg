@@ -40,6 +40,7 @@ C_INT_RETURN_SYMBOLS = {
     "native_nanosleep",
     "native_setrlimit",
 }
+C_SSIZE_T_RETURN_SYMBOLS = {"native_fgetxattr"}
 
 
 def source_files():
@@ -69,6 +70,15 @@ def main() -> int:
         print("error: POSIX C int returns must use i32 at the FFI boundary", flush=True)
         for name in bad_c_int_returns:
             print(f"  {name}: expected i32, got {extern_returns.get(name, 'missing')}", flush=True)
+        return 1
+
+    bad_ssize_t_returns = sorted(
+        name for name in C_SSIZE_T_RETURN_SYMBOLS if extern_returns.get(name) != "i64"
+    )
+    if bad_ssize_t_returns:
+        print("error: 64-bit POSIX ssize_t returns must use i64 at the FFI boundary", flush=True)
+        for name in bad_ssize_t_returns:
+            print(f"  {name}: expected i64, got {extern_returns.get(name, 'missing')}", flush=True)
         return 1
 
     native_files = [

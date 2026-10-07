@@ -169,8 +169,10 @@ requires both existing chains to pass the same check before it reads or removes
 files. Every checked directory must be owned by root or the effective user and
 must not have group or other write bits; symlinks are rejected by the
 descriptor-relative walker. On macOS it rejects extended ACL allow entries and
-unknown tags while accepting deny-only entries; Linux ACL grants remain
-unchecked. A durable per-prefix journal records install or uninstall intent
+unknown tags while accepting deny-only entries. Linux checks parse access ACLs
+on opened descriptors, reject named user/group entries and malformed or
+unreadable ACLs, and reject default ACLs on trusted directories. A durable
+per-prefix journal records install or uninstall intent
 before changing the executable or receipt, and the next operation validates
 the journaled identity while holding the persistent prefix lock. Mismatched or
 malformed states fail closed and preserve their evidence. Uninstall reads each

@@ -51,8 +51,11 @@ then rechecks the completed `bin` and receipt directory chains; uninstall checks
 both existing chains before opening its transaction lock or reading files. This
 reduces cross-user replacement risk. On macOS, every opened directory is also
 checked for extended ACLs: deny-only entries are accepted, while allow entries
-and unknown tags fail closed. Linux ACL grants are not inspected. Neither mode
-nor ACL checks prevent pathname races by another process with the same user ID;
+and unknown tags fail closed. Linux descriptor checks parse POSIX ACL xattrs,
+reject named user/group entries and malformed or unreadable ACLs, and reject
+every default ACL on trusted directories. Filesystems without POSIX ACL xattr
+support are accepted. Neither mode nor ACL checks prevent pathname races by
+another process with the same user ID;
 handle-relative identity-checked removal remains required before hostile shared
 prefixes can be supported. A durable per-prefix transaction journal records
 install or uninstall intent before the executable or receipt changes. The next
@@ -86,7 +89,10 @@ those paths and each file must be owned by root or the effective user and must
 not be group- or world-writable. Symlinks and shared writable directories such
 as `/tmp` are rejected. On macOS, directory and regular-file checks also
 reject extended ACL allow entries and unknown ACL tags; deny-only entries are
-accepted. Linux ACL grants are not inspected.
+accepted. Linux checks parse access ACLs on opened descriptors, rejecting
+named user/group entries and malformed or unreadable ACLs, and reject any
+default ACL on trusted directories. Filesystems without POSIX ACL xattr support
+are accepted.
 
 `Trust::precheck_threshold`, `precheck_revocation`, and
 `precheck_publisher_attestation` validate caller-supplied policy facts; they do
@@ -300,8 +306,8 @@ synthesizes recovery states; `scripts/install_killpoint_regression.py` adds
 process kills after each transaction-level install/uninstall operation and
 validates recovery with the production binary. Fault controls exist only in a
 temporary copied source tree. The tests do not interrupt inside FFI filesystem
-helpers or simulate power loss. Same-UID pathname races and Linux ACL grants
-also remain outside the current protection.
+helpers or simulate power loss. Same-UID pathname races remain outside the
+current protection.
 
 The local package writer emits only regular files in sorted ustar order with
 zero timestamps and normalized ownership, with a maximum of 512 selected files
@@ -372,6 +378,7 @@ installation enforces root/effective-user ownership and no-group/other-write
 permissions on its directory chain. Uninstall reads each receipt-owned file
 through one trusted descriptor and compares its device/inode through that same
 parent directory immediately before `unlinkat`. macOS also rejects extended
-ACL allow entries and unknown tags, while Linux ACLs and a same-UID race between
-the final identity comparison and `unlinkat` remain. This narrows the pathname
+ACL allow entries and unknown tags. Linux rejects named user/group access ACL
+entries and all default ACLs on trusted directories. A same-UID race between
+the final identity comparison and `unlinkat` remains. This narrows the pathname
 window but does not make concurrent hostile same-UID mutation safe.
