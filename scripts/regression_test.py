@@ -260,6 +260,19 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
         '    solver_preferred_result: Solver::SolveCode = Solver::solve_with_preferences(solver_candidates, solver_roots, solver_preference, &solver_preferred_selected)',
     ])
     check('solver_preferred_result == Solver::SolveCode.Solved and solver_preferred_selected.count == 1.usize() and solver_preferred_selected[0] == 0.usize()')
+    lines.extend([
+        '    solver_yanked_candidates: mutable darray[Solver::Candidate] = []',
+        '    solver_yanked_candidates.push(Solver::Candidate{package: solver_name, version: Model::Version{major: 1, minor: 0, patch: 0, prerelease: false}, dependencies: solver_dependencies, yanked: true})',
+        '    solver_yanked_candidates.push(Solver::Candidate{package: solver_name, version: Model::Version{major: 1, minor: 1, patch: 0, prerelease: false}, dependencies: solver_dependencies, yanked: false})',
+        '    solver_yanked_preferred_selected: mutable darray[usize] = []',
+        '    solver_yanked_preferred_result: Solver::SolveCode = Solver::solve_with_preferences(solver_yanked_candidates, solver_roots, solver_preference, &solver_yanked_preferred_selected)',
+    ])
+    check('solver_yanked_preferred_result == Solver::SolveCode.Solved and solver_yanked_preferred_selected.count == 1.usize() and solver_yanked_preferred_selected[0] == 0.usize()')
+    lines.extend([
+        '    solver_yanked_unpreferred_selected: mutable darray[usize] = []',
+        '    solver_yanked_unpreferred_result: Solver::SolveCode = Solver::solve(solver_yanked_candidates, solver_roots, &solver_yanked_unpreferred_selected)',
+    ])
+    check('solver_yanked_unpreferred_result == Solver::SolveCode.Solved and solver_yanked_unpreferred_selected.count == 1.usize() and solver_yanked_unpreferred_selected[0] == 1.usize()')
     # These individually bounded inputs create millions of candidate/range
     # comparisons in the solver. The aggregate deterministic work cap must
     # stop the operation with ResourceLimit instead of spending unbounded CPU.

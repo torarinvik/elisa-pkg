@@ -67,7 +67,7 @@ module Solver:
             return result if result != SolveCode.Unsatisfiable
             for first in 0..<failure_constraints.count |failure_constraints, candidates, conflict|:
                 return SolveCode.ResourceLimit if not solver_charge_work(&work, 1)
-                has_candidate: bool = solver_requirement_has_candidate(candidates, failure_constraints[first], &work)
+                has_candidate: bool = solver_requirement_has_candidate(candidates, failure_constraints[first], preferences, &work)
                 return SolveCode.ResourceLimit if solver_work_exhausted(work)
                 if not has_candidate:
                     return SolveCode.ResourceLimit if not solver_charge_work(&work, failure_constraints[first].package.count)
@@ -91,7 +91,7 @@ module Solver:
                     continue if not same_package
                     comparisons <- comparisons + 1.usize()
                     continue if comparisons > 128.usize()
-                    pair_has_candidate: bool = solver_requirement_pair_has_candidate(candidates, failure_constraints[first], failure_constraints[second], &work)
+                    pair_has_candidate: bool = solver_requirement_pair_has_candidate(candidates, failure_constraints[first], failure_constraints[second], preferences, &work)
                     return SolveCode.ResourceLimit if solver_work_exhausted(work)
                     if not pair_has_candidate:
                         return SolveCode.ResourceLimit if not solver_charge_work(&work, failure_constraints[first].package.count)
@@ -251,7 +251,10 @@ module Solver:
                     return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
                     candidate_slot: usize = solver_slot_for(candidates[candidate_index].package, package_slots, candidates, work)
                     return SolveCode.ResourceLimit if solver_work_exhausted(work)
-                    continue if candidate_slot != slot or candidates[candidate_index].yanked
+                    continue if candidate_slot != slot
+                    available: bool = solver_candidate_available(candidates[candidate_index], preferences, work)
+                    return SolveCode.ResourceLimit if solver_work_exhausted(work)
+                    continue if not available
                     satisfies: bool = solver_candidate_satisfies(candidates[candidate_index], package_slots[slot], constraints, package_slots, candidates, work)
                     return SolveCode.ResourceLimit if solver_work_exhausted(work)
                     possible <- possible + 1.usize() if satisfies
@@ -273,7 +276,10 @@ module Solver:
                 return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
                 candidate_slot: usize = solver_slot_for(candidates[candidate_index].package, package_slots, candidates, work)
                 return SolveCode.ResourceLimit if solver_work_exhausted(work)
-                continue if candidate_slot != best_slot or candidates[candidate_index].yanked
+                continue if candidate_slot != best_slot
+                available: bool = solver_candidate_available(candidates[candidate_index], preferences, work)
+                return SolveCode.ResourceLimit if solver_work_exhausted(work)
+                continue if not available
                 satisfies: bool = solver_candidate_satisfies(candidates[candidate_index], package_slots[best_slot], constraints, package_slots, candidates, work)
                 return SolveCode.ResourceLimit if solver_work_exhausted(work)
                 order.push(candidate_index) if satisfies
@@ -308,33 +314,47 @@ module Solver:
                     failure_constraints.push(constraints[index])
             return SolveCode.Unsatisfiable
 
-        def solver_requirement_has_candidate(candidates: darray[Candidate]&, constraint: Constraint, work: mutable WorkBudget&) -> bool:
-            for candidate_index in 0..<candidates.count |candidates, constraint|:
+        def solver_requirement_has_candidate(candidates: darray[Candidate]&, constraint: Constraint, preferences: darray[Preference]&, work: mutable WorkBudget&) -> bool:
+            for candidate_index in 0..<candidates.count |candidates, constraint, preferences|:
                 return false if not solver_charge_work(work, 1)
                 candidate: Candidate = candidates[candidate_index]
-                continue if candidate.yanked
                 same_package: bool = solver_equal(candidate.package, constraint.package, work)
                 return false if solver_work_exhausted(work)
                 continue if not same_package
+                available: bool = solver_candidate_available(candidate, preferences, work)
+                return false if solver_work_exhausted(work)
+                continue if not available
                 return false if not solver_charge_work(work, constraint.requirement.count)
                 parsed: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
                 return true if SemVer::parse_requirement(constraint.requirement, &parsed) and SemVer::matches(parsed, candidate.version)
             return false
 
-        def solver_requirement_pair_has_candidate(candidates: darray[Candidate]&, first: Constraint, second: Constraint, work: mutable WorkBudget&) -> bool:
-            for candidate_index in 0..<candidates.count |candidates, first, second|:
+        def solver_requirement_pair_has_candidate(candidates: darray[Candidate]&, first: Constraint, second: Constraint, preferences: darray[Preference]&, work: mutable WorkBudget&) -> bool:
+            for candidate_index in 0..<candidates.count |candidates, first, second, preferences|:
                 return false if not solver_charge_work(work, 1)
                 candidate: Candidate = candidates[candidate_index]
-                continue if candidate.yanked
                 same_package: bool = solver_equal(candidate.package, first.package, work)
                 return false if solver_work_exhausted(work)
                 continue if not same_package
+                available: bool = solver_candidate_available(candidate, preferences, work)
+                return false if solver_work_exhausted(work)
+                continue if not available
                 return false if not solver_charge_work(work, first.requirement.count)
                 return false if not solver_charge_work(work, second.requirement.count)
                 first_parsed: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
                 second_parsed: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
                 return true if SemVer::parse_requirement(first.requirement, &first_parsed) and SemVer::parse_requirement(second.requirement, &second_parsed) and SemVer::matches(first_parsed, candidate.version) and SemVer::matches(second_parsed, candidate.version)
             return false
+
+        # A yanked candidate is eligible only when it is the exact version
+        # selected by the previous lock. The caller supplies preferences from
+        # that validated lock; this preserves existing graphs without allowing
+        # a fresh resolution to introduce a yanked release.
+        def solver_candidate_available(candidate: Candidate, preferences: darray[Preference]&, work: mutable WorkBudget&) -> bool:
+            return true if not candidate.yanked
+            preference_index: usize = solver_preference_index(preferences, candidate.package, work)
+            return false if solver_work_exhausted(work) or preference_index >= preferences.count
+            return SemVer::compare(candidate.version, preferences[preference_index].version) == 0
 
         def solver_candidate_satisfies(candidate: Candidate, slot_candidate: usize, constraints: darray[Constraint]&, package_slots: darray[usize]&, candidates: darray[Candidate]&, work: mutable WorkBudget&) -> bool:
             for index in 0..<constraints.count |candidate, slot_candidate, constraints, package_slots, candidates|:
