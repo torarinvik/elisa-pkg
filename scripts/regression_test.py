@@ -155,6 +155,11 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
         check(f'not SemVer::parse_requirement({data(value)}, &req)')
     left, right = data('1.0.0-alpha.1'), data('1.0.0-alpha.2')
     check(f'SemVer::compare_text({left}, {right}) == -1')
+    hyphenated_prerelease = data('1.2.3-alpha-beta')
+    parsed_hyphenated_prerelease = 'parsed_hyphenated_prerelease'
+    lines.append(f'    {parsed_hyphenated_prerelease}: mutable Model::Version = Model::Version{{major: 0, minor: 0, patch: 0, prerelease: false}}')
+    check(f'SemVer::parse({hyphenated_prerelease}, &{parsed_hyphenated_prerelease})')
+    check(f'{parsed_hyphenated_prerelease}.major == 1 and {parsed_hyphenated_prerelease}.minor == 2 and {parsed_hyphenated_prerelease}.patch == 3 and {parsed_hyphenated_prerelease}.prerelease')
     lines.extend([
         '    exact_requirement: mutable darray[u8] = []',
         '    Registry::exact_requirement(Model::Version{major: 1, minor: 2, patch: 3, prerelease: false}, &exact_requirement)',
