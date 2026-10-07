@@ -80,14 +80,24 @@ expires:1780000000
 versions:
 1.0.0
 1.2.0
+yanked:
+1.0.0
 ```
 
 The registry and package fields must match the configured registry and
 requested package. Generation and expiry are canonical unsigned decimal
 integers; generation must be positive. Versions must be unique, ascending,
 stable SemVer values without build metadata, with at most 4096 entries. The
-resolver picks the highest version satisfying the requested exact, caret,
-tilde, or comparison
+optional `yanked:` section follows the version list and contains unique,
+ascending stable versions that must also appear in that list. Omitting the
+section means no listed version is yanked. A new resolution excludes yanked
+versions; a previously locked exact version may remain selected with a warning,
+and `elisapkg update PACKAGE` releases that preference. This soft yank policy
+is not a security revocation mechanism: emergency security blocks must be
+authenticated and enforced separately, including for locked versions. The
+current signed file-backed index is a local test fixture only; it does not
+implement the production TUF revocation profile. The resolver picks the highest
+eligible version satisfying the requested exact, caret, tilde, or comparison
 requirement. The snapshot expires within 30 days, and its generation is stored
 in rollback-protected trust state under an identity bound to the registry and
 package. A lower generation is rejected; reusing a generation with different

@@ -2206,11 +2206,6 @@ module Cli:
                 return true if bytes_equal(candidates[index].package, package) and SemVer::compare(candidates[index].version, version) == 0
             return false
 
-        def registry_constraint_present(constraints: darray[Solver::Constraint]&, package: darray[u8]&) -> bool:
-            for index in 0..<constraints.count |constraints, package|:
-                return true if bytes_equal(constraints[index].package, package)
-            return false
-
         # Candidate enumeration drives graph solving before the selected
         # metadata is read a second time. Require the final signed dependency
         # set to match that exact graph input so a concurrent metadata change
@@ -2235,9 +2230,13 @@ module Cli:
                 return true if bytes_equal(preferences[index].package, package)
             return false
 
-        def append_registry_lock_preferences(lock: darray[u8]&, unlock: darray[u8]&, candidates: darray[Solver::Candidate]&, constraints: darray[Solver::Constraint]&, preferences: mutable darray[Solver::Preference]&) -> void can[Memory.Allocate, Abort.Panic]:
+        # A prior lock entry is an ordering hint and permits retention of only
+        # that exact soft-yanked release. It is never a constraint: the solver
+        # checks every active requirement and backtracks when another version
+        # is required by the manifest or a selected dependency.
+        def append_registry_lock_preferences(lock: darray[u8]&, unlock: darray[u8]&, candidates: darray[Solver::Candidate]&, preferences: mutable darray[Solver::Preference]&) -> void can[Memory.Allocate, Abort.Panic]:
             return if lock.count == 0.usize() or not Json::valid_document(lock) or not Json::unique_object_keys(lock) or not lock_version_is(lock, 3)
-            for index in 0..<lock.count |lock, unlock, candidates, constraints, preferences|:
+            for index in 0..<lock.count |lock, unlock, candidates, preferences|:
                 continue if lock[index] != 123
                 object_end: usize = json_object_end(lock, index)
                 continue if object_end <= index
@@ -2247,7 +2246,7 @@ module Cli:
                 continue if unlock.count > 0.usize() and bytes_equal(package, unlock)
                 parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
                 continue if not SemVer::parse(version_text, &parsed) or parsed.prerelease
-                continue if not registry_candidate_matches(candidates, package, parsed) or registry_constraint_present(constraints, package) or registry_preference_present(preferences, package)
+                continue if not registry_candidate_matches(candidates, package, parsed) or registry_preference_present(preferences, package)
                 preferences.push(Solver::Preference{package: package, version: parsed})
 
         def canonical_registry_lock(name: darray[u8]&, version: darray[u8]&, raw: darray[u8]&, root: darray[u8]&, roots: darray[Solver::Constraint]&, preferred_lock: darray[u8]&, unlock: darray[u8]&, persist_trust: bool) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
@@ -2273,15 +2272,17 @@ module Cli:
                 package: mutable darray[u8] = []
                 return [] if not registry_queue_field_at(package_queue, processed, &package)
                 index_data: mutable darray[u8] = []
+                yanked_flags: mutable darray[u8] = []
                 index_generation: mutable u64 = 0
                 index_digest: mutable darray[u8] = []
                 index_identity: mutable darray[u8] = []
-                index_status: Registry::ResultCode = Registry::read_index(package, &index_data, &index_generation, &index_digest, &index_identity)
+                index_status: Registry::ResultCode = Registry::read_index_with_yanked(package, &index_data, &yanked_flags, &index_generation, &index_digest, &index_identity)
                 if index_status != Registry::ResultCode.Ok and persist_trust and registry_security_status(index_status):
                     out.push(index_status.u8() + 1.u8())
                     return out
                 return [] if index_status != Registry::ResultCode.Ok
                 cursor: mutable usize = 0
+                version_ordinal: mutable usize = 0
                 while cursor < index_data.count:
                     finish: mutable usize = cursor
                     while finish < index_data.count and index_data[finish] != 10 |index_data, finish|:
@@ -2294,6 +2295,9 @@ module Cli:
                         version_text.push(index_data[item])
                     parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
                     return [] if not SemVer::parse(version_text, &parsed)
+                    return [] if version_ordinal >= yanked_flags.count or yanked_flags[version_ordinal] > 1
+                    candidate_yanked: bool = yanked_flags[version_ordinal] == 1
+                    version_ordinal <- version_ordinal + 1.usize()
                     selected_text: mutable darray[u8] = []
                     archive: mutable darray[u8] = []
                     digest: mutable darray[u8] = []
@@ -2321,13 +2325,14 @@ module Cli:
                             return [] if package_total >= MAX_DEPENDENCIES
                             registry_queue_append(&package_queue, dependencies[dependency_index].package)
                             package_total <- package_total + 1
-                    candidate: Solver::Candidate = Solver::Candidate{package: candidate_package, version: parsed, dependencies: dependencies, yanked: false}
+                    candidate: Solver::Candidate = Solver::Candidate{package: candidate_package, version: parsed, dependencies: dependencies, yanked: candidate_yanked}
                     candidates.push(candidate)
                     candidate_index_generations.push(index_generation)
                     registry_queue_append(&candidate_index_digests, index_digest)
                     registry_queue_append(&candidate_index_identities, index_identity)
                     return [] if candidates.count > 4096
                     cursor <- finish + 1
+                return [] if version_ordinal != yanked_flags.count
                 processed <- processed + 1
                 return [] if processed > 4096
 
@@ -2336,7 +2341,7 @@ module Cli:
             for index in 0..<roots.count |roots, solve_constraints|:
                 solve_constraints.push(roots[index])
             lock_preferences: mutable darray[Solver::Preference] = []
-            append_registry_lock_preferences(preferred_lock, unlock, candidates, solve_constraints, &lock_preferences)
+            append_registry_lock_preferences(preferred_lock, unlock, candidates, &lock_preferences)
             solve_status: mutable Solver::SolveCode = Solver::SolveCode.Malformed
             conflict: mutable Solver::Conflict = Solver::Conflict{package: [], first_requirement: [], second_requirement: []}
             if persist_trust:
@@ -2389,6 +2394,18 @@ module Cli:
                 return [] if not found
                 candidate_index: usize = selected_indexes[selected_slot]
                 candidate: Solver::Candidate = candidates[candidate_index]
+                if candidate.yanked and persist_trust:
+                    warning: mutable darray[u8] = []
+                    version_label: mutable darray[u8] = []
+                    bytes_push_view(&warning, "warning: retaining locked yanked release ")
+                    bytes_push_array(&warning, candidate.package)
+                    warning.push(64)
+                    Registry::exact_requirement(candidate.version, &version_label)
+                    bytes_push_array(&warning, version_label)
+                    bytes_push_view(&warning, "; run 'elisapkg update ")
+                    bytes_push_array(&warning, candidate.package)
+                    bytes_push_view(&warning, "' to select a non-yanked release\n")
+                    write_bytes(2, warning)
                 selected_index_generation: u64 = candidate_index_generations[candidate_index]
                 selected_index_digest: mutable darray[u8] = []
                 selected_index_identity: mutable darray[u8] = []
@@ -2403,7 +2420,7 @@ module Cli:
                 verified_index_generation: mutable u64 = 0
                 verified_index_digest: mutable darray[u8] = []
                 verified_index_identity: mutable darray[u8] = []
-                final_status: Registry::ResultCode = Registry::resolve_with_index_evidence(candidate.package, exact, Model::Version{major:0,minor:0,patch:0,prerelease:false}, &selected_text, &archive, &digest, &archive_size, &metadata, &verified_index_generation, &verified_index_digest, &verified_index_identity)
+                final_status: Registry::ResultCode = Registry::resolve_selected_with_index_evidence(candidate.package, exact, &selected_text, &archive, &digest, &archive_size, &metadata, &verified_index_generation, &verified_index_digest, &verified_index_identity)
                 if final_status != Registry::ResultCode.Ok and persist_trust and registry_security_status(final_status):
                     out.push(final_status.u8() + 1.u8())
                     return out

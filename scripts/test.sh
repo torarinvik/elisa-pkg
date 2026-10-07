@@ -438,7 +438,8 @@ PY
 write_registry_index() {
   local expiry_kind="${4:-}"
   local identity_mode="${5:-}"
-  python3 - "$REGISTRY_EXPIRY_ROOT" "$REGISTRY_EXPIRY_PRIVATE" "$OPENSSL_BIN" "$1" "$2" "$3" "$expiry_kind" "$identity_mode" <<'PY'
+  local yanked_versions="${6:-}"
+  python3 - "$REGISTRY_EXPIRY_ROOT" "$REGISTRY_EXPIRY_PRIVATE" "$OPENSSL_BIN" "$1" "$2" "$3" "$expiry_kind" "$identity_mode" "$yanked_versions" <<'PY'
 from pathlib import Path
 import subprocess, sys, time
 
@@ -452,6 +453,7 @@ if versions == ["4097-versions"]:
     versions = [f"0.0.{number}" for number in range(1, 4098)]
 expiry_kind = sys.argv[7]
 identity_mode = sys.argv[8]
+yanked_versions = sys.argv[9].split(",") if sys.argv[9] else []
 expires = int(time.time()) + 86400
 if expiry_kind == "expired":
     expires = 1
@@ -469,6 +471,7 @@ payload = (
     f"expires:{expires}\n"
     "versions:\n"
     + "".join(f"{version}\n" for version in versions)
+    + ("yanked:\n" + "".join(f"{version}\n" for version in yanked_versions) if yanked_versions else "")
 ).encode("ascii")
 package_dir = root / package
 package_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -639,7 +642,7 @@ resolve_registry_app
 cp "$REGISTRY_EXPIRY_APP/elisapkg.lock" "$REGISTRY_EXPIRY_CASE/lock-before-index-policy-failures"
 cp "$REGISTRY_EXPIRY_STATE" "$REGISTRY_EXPIRY_CASE/state-before-index-policy-failures"
 cp "$REGISTRY_EXPIRY_STATE.clock" "$REGISTRY_EXPIRY_CASE/clock-before-index-policy-failures"
-for invalid_index_case in "wrong-registry" "wrong-package" "expired" "long" "unsorted" "duplicate" "prerelease" "overflow-generation" "too-many-versions" "missing-signature" "short-signature"; do
+for invalid_index_case in "wrong-registry" "wrong-package" "expired" "long" "unsorted" "duplicate" "prerelease" "yanked-unlisted" "yanked-unsorted" "yanked-duplicate" "overflow-generation" "too-many-versions" "missing-signature" "short-signature"; do
   case "$invalid_index_case" in
     wrong-registry) write_registry_index foo 4 1.0.0,1.1.0 "" wrong-registry ;;
     wrong-package) write_registry_index foo 4 1.0.0,1.1.0 "" wrong-package ;;
@@ -648,6 +651,9 @@ for invalid_index_case in "wrong-registry" "wrong-package" "expired" "long" "uns
     unsorted) write_registry_index foo 4 1.1.0,1.0.0 ;;
     duplicate) write_registry_index foo 4 1.0.0,1.0.0 ;;
     prerelease) write_registry_index foo 4 1.0.0-alpha ;;
+    yanked-unlisted) write_registry_index foo 4 1.0.0 "" "" 2.0.0 ;;
+    yanked-unsorted) write_registry_index foo 4 1.0.0,1.1.0 "" "" 1.1.0,1.0.0 ;;
+    yanked-duplicate) write_registry_index foo 4 1.0.0,1.1.0 "" "" 1.0.0,1.0.0 ;;
     overflow-generation) write_registry_index foo 18446744073709551616 1.0.0,1.1.0 ;;
     too-many-versions) write_registry_index foo 4 4097-versions ;;
     missing-signature) write_registry_index foo 4 1.0.0,1.1.0; rm "$REGISTRY_EXPIRY_ROOT/foo/index.sig" ;;
@@ -913,6 +919,7 @@ def write_signed(path, data):
 for package, version, dependencies in (
         ("foo", "1.0.0", {"bar": {"registry": "primary", "version": "^1.0.0"}}),
         ("foo", "2.0.0", {}),
+        ("foo", "2.1.0", {}),
         ("bar", "1.0.0", {})):
     version_dir = root / package / version
     version_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1002,7 +1009,95 @@ selected = {record["name"]: record["version"] for record in lock["packages"]}
 if selected != {"foo": "2.0.0"}:
     raise SystemExit(f"stale lock preference added unreachable packages: {selected!r}")
 PY
-echo "registry lock preference regression passed"
+python3 - "$REGISTRY_GRAPH_ROOT" "$REGISTRY_GRAPH_PRIVATE" "$OPENSSL_BIN" <<'PY'
+from pathlib import Path
+import subprocess, sys, time
+
+root = Path(sys.argv[1])
+private_key = sys.argv[2]
+openssl = sys.argv[3]
+expires = int(time.time()) + 3600
+payload = (
+    "elisapkg-index:1\n"
+    f"registry:{root}\n"
+    "package:foo\n"
+    "generation:2\n"
+    f"expires:{expires}\n"
+    "versions:\n"
+    "1.0.0\n"
+    "2.0.0\n"
+    "2.1.0\n"
+    "yanked:\n"
+    "2.0.0\n"
+).encode("ascii")
+index = root / "foo" / "index"
+index.write_bytes(payload)
+index.chmod(0o600)
+signature = index.with_name("index.sig")
+subprocess.run([openssl, "pkeyutl", "-sign", "-rawin", "-inkey", private_key,
+                "-in", str(index), "-out", str(signature)], check=True)
+signature.chmod(0o600)
+PY
+(
+  cd "$REGISTRY_GRAPH_APP"
+  ELISAPKG_REGISTRY_DIR="$REGISTRY_GRAPH_ROOT" \
+  ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_GRAPH_KEY" \
+  ELISAPKG_TRUST_STATE="$REGISTRY_GRAPH_STATE" \
+    "$BIN" resolve >/dev/null 2>"$TEST_TMP/locked-yanked-warning.err"
+)
+grep -F "warning: retaining locked yanked release foo@2.0.0" "$TEST_TMP/locked-yanked-warning.err" >/dev/null
+python3 - "$REGISTRY_GRAPH_APP/elisapkg.lock" <<'PY'
+from pathlib import Path
+import json, sys
+
+lock = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+selected = {record["name"]: record["version"] for record in lock["packages"]}
+if selected != {"foo": "2.0.0"}:
+    raise SystemExit(f"normal resolution did not retain the exact locked yank: {selected!r}")
+PY
+(
+  cd "$REGISTRY_GRAPH_APP"
+  ELISAPKG_REGISTRY_DIR="$REGISTRY_GRAPH_ROOT" \
+  ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_GRAPH_KEY" \
+  ELISAPKG_TRUST_STATE="$REGISTRY_GRAPH_STATE" \
+    "$BIN" update foo >/dev/null
+)
+python3 - "$REGISTRY_GRAPH_APP/elisapkg.lock" <<'PY'
+from pathlib import Path
+import json, sys
+
+lock = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+selected = {record["name"]: record["version"] for record in lock["packages"]}
+if selected != {"foo": "2.1.0"}:
+    raise SystemExit(f"explicit update did not move to an unyanked release: {selected!r}")
+PY
+REGISTRY_YANKED_APP="$REGISTRY_GRAPH_CASE/fresh-exact-yanked"
+"$BIN" init "$REGISTRY_YANKED_APP" >/dev/null
+python3 - "$REGISTRY_YANKED_APP/elisapkg.json" <<'PY'
+from pathlib import Path
+import json, sys
+
+path = Path(sys.argv[1])
+manifest = json.loads(path.read_text(encoding="utf-8"))
+manifest["dependencies"] = {"foo": {"version": "2.0.0", "registry": "primary"}}
+path.write_text(json.dumps(manifest, separators=(",", ":")) + "\n", encoding="utf-8")
+PY
+if (
+  cd "$REGISTRY_YANKED_APP"
+  ELISAPKG_REGISTRY_DIR="$REGISTRY_GRAPH_ROOT" \
+  ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_GRAPH_KEY" \
+  ELISAPKG_TRUST_STATE="$REGISTRY_GRAPH_CASE/fresh-trust-state" \
+    "$BIN" resolve >/dev/null 2>&1
+); then
+  echo "fresh resolution selected an exact yanked release" >&2
+  exit 1
+else
+  # A soft yank removes the candidate from this graph; it is not a security
+  # revocation, so the resolver reports an unsatisfiable dependency graph.
+  test "$?" -eq 3
+fi
+test ! -e "$REGISTRY_YANKED_APP/elisapkg.lock"
+echo "registry lock and signed yank regressions passed"
 
 # A writable package directory must be rejected as a security failure before
 # it can replace a signed snapshot or its detached signature.

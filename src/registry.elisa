@@ -63,12 +63,21 @@ module Registry:
         # generation is recorded in the same rollback-protected user state as
         # selected release identities.
         def read_index(package: darray[u8]&, out: mutable darray[u8]&, generation_out: mutable u64&, snapshot_digest_out: mutable darray[u8]&, identity_out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            yanked_flags: mutable darray[u8] = []
+            return read_index_with_yanked(package, out, &yanked_flags, generation_out, snapshot_digest_out, identity_out)
+
+        # Return the exact signed yanked set beside the authenticated version
+        # list. Yank state is index policy and cannot be inferred from release
+        # metadata; security revocation requires a separate authenticated rule.
+        # The output is a 0/1 byte bitmap aligned with newline-delimited versions.
+        def read_index_with_yanked(package: darray[u8]&, out: mutable darray[u8]&, yanked_flags_out: mutable darray[u8]&, generation_out: mutable u64&, snapshot_digest_out: mutable darray[u8]&, identity_out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             key_fingerprint: mutable darray[u8] = []
-            return read_index_with_key_fingerprint(package, out, generation_out, snapshot_digest_out, identity_out, &key_fingerprint)
+            return read_index_with_key_fingerprint(package, out, yanked_flags_out, generation_out, snapshot_digest_out, identity_out, &key_fingerprint)
 
     private:
-        def read_index_with_key_fingerprint(package: darray[u8]&, out: mutable darray[u8]&, generation_out: mutable u64&, snapshot_digest_out: mutable darray[u8]&, identity_out: mutable darray[u8]&, key_fingerprint_out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+        def read_index_with_key_fingerprint(package: darray[u8]&, out: mutable darray[u8]&, yanked_flags_out: mutable darray[u8]&, generation_out: mutable u64&, snapshot_digest_out: mutable darray[u8]&, identity_out: mutable darray[u8]&, key_fingerprint_out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out.resize(0)
+            yanked_flags_out.resize(0)
             generation_out <- 0
             snapshot_digest_out.resize(0)
             identity_out.resize(0)
@@ -80,7 +89,7 @@ module Registry:
             key_path: mutable darray[u8] = []
             trust_root_status: ResultCode = configured_trust_root(root, &key_path)
             return trust_root_status if trust_root_status != ResultCode.Ok
-            return read_verified_index(root, package, key_path, out, generation_out, snapshot_digest_out, identity_out, key_fingerprint_out)
+            return read_verified_index(root, package, key_path, out, yanked_flags_out, generation_out, snapshot_digest_out, identity_out, key_fingerprint_out)
 
     public:
 
@@ -119,11 +128,12 @@ module Registry:
             expiry_status: ResultCode = metadata_expiry_status(expires, now.u64())
             return expiry_status if expiry_status != ResultCode.Ok
             versions: mutable darray[u8] = []
+            yanked_flags: mutable darray[u8] = []
             generation: mutable u64 = 0
             index_digest: mutable darray[u8] = []
             index_identity: mutable darray[u8] = []
             key_fingerprint: mutable darray[u8] = []
-            index_status: ResultCode = read_index_with_key_fingerprint(package, &versions, &generation, &index_digest, &index_identity, &key_fingerprint)
+            index_status: ResultCode = read_index_with_key_fingerprint(package, &versions, &yanked_flags, &generation, &index_digest, &index_identity, &key_fingerprint)
             return index_status if index_status != ResultCode.Ok
             return ResultCode.NoMatchingVersion if not registry_index_contains_version(versions, version)
             return trust_state_record_at_index(package, version, digest, metadata_digest, expires, generation, index_digest, index_identity, key_fingerprint)
@@ -141,11 +151,12 @@ module Registry:
             expiry_status: ResultCode = metadata_expiry_status(expires, now.u64())
             return expiry_status if expiry_status != ResultCode.Ok
             versions: mutable darray[u8] = []
+            yanked_flags: mutable darray[u8] = []
             current_generation: mutable u64 = 0
             current_digest: mutable darray[u8] = []
             current_identity: mutable darray[u8] = []
             key_fingerprint: mutable darray[u8] = []
-            index_status: ResultCode = read_index_with_key_fingerprint(package, &versions, &current_generation, &current_digest, &current_identity, &key_fingerprint)
+            index_status: ResultCode = read_index_with_key_fingerprint(package, &versions, &yanked_flags, &current_generation, &current_digest, &current_identity, &key_fingerprint)
             return index_status if index_status != ResultCode.Ok
             return ResultCode.RollbackDetected if current_generation != generation or not bytes_equal(current_digest, index_digest) or not bytes_equal(current_identity, index_identity)
             return ResultCode.NoMatchingVersion if not registry_index_contains_version(versions, version)
@@ -172,6 +183,35 @@ module Registry:
         # list was used to select the result.
         def resolve_with_index_evidence(package: darray[u8]&, requirement: darray[u8]&, previous_version: Model::Version, version_out: mutable darray[u8]&, archive_out: mutable darray[u8]&, digest_out: mutable darray[u8]&, archive_size_out: mutable u64&, metadata_out: mutable darray[u8]&, generation_out: mutable u64&, snapshot_digest_out: mutable darray[u8]&, identity_out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return resolve_internal(package, requirement, previous_version, version_out, archive_out, digest_out, archive_size_out, metadata_out, true, generation_out, snapshot_digest_out, identity_out)
+
+        # Verify one exact version already selected by the authenticated graph
+        # solver. This entry permits the solver's exact locked-yank exception;
+        # it does not choose a version and must not replace solver policy.
+        def resolve_selected_with_index_evidence(package: darray[u8]&, version: darray[u8]&, version_out: mutable darray[u8]&, archive_out: mutable darray[u8]&, digest_out: mutable darray[u8]&, archive_size_out: mutable u64&, metadata_out: mutable darray[u8]&, generation_out: mutable u64&, snapshot_digest_out: mutable darray[u8]&, identity_out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            version_out.resize(0)
+            archive_out.resize(0)
+            digest_out.resize(0)
+            metadata_out.resize(0)
+            archive_size_out <- 0
+            generation_out <- 0
+            snapshot_digest_out.resize(0)
+            identity_out.resize(0)
+            return ResultCode.InvalidConfiguration if not valid_package_path(package) or not Archive::is_safe_entry(version)
+            parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
+            return ResultCode.InvalidConfiguration if not SemVer::parse(version, &parsed) or parsed.prerelease
+            root: mutable darray[u8] = []
+            return ResultCode.NotConfigured if not configured_root(&root)
+            return ResultCode.InvalidConfiguration if not valid_registry_root(root)
+            key_path: mutable darray[u8] = []
+            trust_root_status: ResultCode = configured_trust_root(root, &key_path)
+            return trust_root_status if trust_root_status != ResultCode.Ok
+            index: mutable darray[u8] = []
+            yanked_flags: mutable darray[u8] = []
+            key_fingerprint: mutable darray[u8] = []
+            index_status: ResultCode = read_verified_index(root, package, key_path, &index, &yanked_flags, generation_out, snapshot_digest_out, identity_out, &key_fingerprint)
+            return index_status if index_status != ResultCode.Ok
+            return ResultCode.NoMatchingVersion if not registry_index_contains_version(index, version)
+            return resolve_selected_internal(root, key_path, package, version, Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, version_out, archive_out, digest_out, archive_size_out, metadata_out, true)
 
         # Candidate enumeration authenticates metadata without reading every
         # archive. This keeps a large signed index from forcing unbounded
@@ -278,11 +318,33 @@ module Registry:
             return trust_root_status if trust_root_status != ResultCode.Ok
             index: mutable darray[u8] = []
             index_key_fingerprint: mutable darray[u8] = []
-            index_status: ResultCode = read_verified_index(root, package, key_path, &index, generation_out, snapshot_digest_out, identity_out, &index_key_fingerprint)
+            index_yanked_flags: mutable darray[u8] = []
+            index_status: ResultCode = read_verified_index(root, package, key_path, &index, &index_yanked_flags, generation_out, snapshot_digest_out, identity_out, &index_key_fingerprint)
             return index_status if index_status != ResultCode.Ok
+            eligible_index: mutable darray[u8] = []
+            return ResultCode.MalformedMetadata if not filter_yanked_versions(index, index_yanked_flags, &eligible_index)
             selected: mutable darray[u8] = []
-            return ResultCode.NoMatchingVersion if not Resolve::select_highest_version(index, requirement, &selected)
+            return ResultCode.NoMatchingVersion if not Resolve::select_highest_version(eligible_index, requirement, &selected)
             return resolve_selected_internal(root, key_path, package, selected, previous_version, version_out, archive_out, digest_out, archive_size_out, metadata_out, verify_archive)
+
+        # The signed index parser returns one byte per version line. Keep the
+        # direct resolver fail-closed if those authenticated views ever stop
+        # matching, and never offer a yanked release as a new unpinned choice.
+        def filter_yanked_versions(index: darray[u8]&, yanked_flags: darray[u8]&, eligible_out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            eligible_out.resize(0)
+            cursor: mutable usize = 0.usize()
+            ordinal: mutable usize = 0.usize()
+            while cursor < index.count:
+                finish: mutable usize = cursor
+                while finish < index.count and index[finish] != 10 |index, finish|:
+                    finish <- finish + 1.usize()
+                return false if finish == index.count or finish == cursor or ordinal >= yanked_flags.count or yanked_flags[ordinal] > 1
+                if yanked_flags[ordinal] == 0:
+                    for item in cursor..<(finish + 1.usize()) |eligible_out, index|:
+                        eligible_out.push(index[item])
+                ordinal <- ordinal + 1.usize()
+                cursor <- finish + 1.usize()
+            return ordinal == yanked_flags.count
 
         def resolve_selected_internal(root: darray[u8]&, key_path: darray[u8]&, package: darray[u8]&, selected: darray[u8]&, previous_version: Model::Version, version_out: mutable darray[u8]&, archive_out: mutable darray[u8]&, digest_out: mutable darray[u8]&, archive_size_out: mutable u64&, metadata_out: mutable darray[u8]&, verify_archive: bool) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             version_out.resize(0)
@@ -947,8 +1009,9 @@ module Registry:
             out.resize(loaded.usize())
             return loaded
 
-        def read_verified_index(root: darray[u8]&, package: darray[u8]&, key_path: darray[u8]&, out: mutable darray[u8]&, generation_out: mutable u64&, snapshot_digest_out: mutable darray[u8]&, identity_out: mutable darray[u8]&, key_fingerprint_out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+        def read_verified_index(root: darray[u8]&, package: darray[u8]&, key_path: darray[u8]&, out: mutable darray[u8]&, yanked_flags_out: mutable darray[u8]&, generation_out: mutable u64&, snapshot_digest_out: mutable darray[u8]&, identity_out: mutable darray[u8]&, key_fingerprint_out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             out.resize(0)
+            yanked_flags_out.resize(0)
             generation_out <- 0
             snapshot_digest_out.resize(0)
             identity_out.resize(0)
@@ -980,11 +1043,12 @@ module Registry:
             return ResultCode.InvalidSignature if trust_status != Trust::VerificationCode.Valid
 
             versions: mutable darray[u8] = []
+            yanked_flags: mutable darray[u8] = []
             snapshot_root: mutable darray[u8] = []
             snapshot_package: mutable darray[u8] = []
             generation: mutable u64 = 0
             expires: mutable u64 = 0
-            return ResultCode.MalformedMetadata if not parse_index_snapshot(snapshot, &snapshot_root, &snapshot_package, &generation, &expires, &versions)
+            return ResultCode.MalformedMetadata if not parse_index_snapshot(snapshot, &snapshot_root, &snapshot_package, &generation, &expires, &versions, &yanked_flags)
             return ResultCode.InvalidSignature if not bytes_equal(snapshot_root, root) or not bytes_equal(snapshot_package, package)
             now: i64 = Platform::pkg_wall_clock_seconds()
             return ResultCode.ClockUnavailable if now < 0
@@ -1000,6 +1064,8 @@ module Registry:
             return state_status if state_status != ResultCode.Ok
             for index in 0..<versions.count |out, versions|:
                 out.push(versions[index])
+            for index in 0..<yanked_flags.count |yanked_flags_out, yanked_flags|:
+                yanked_flags_out.push(yanked_flags[index])
             generation_out <- generation
             for index in 0..<snapshot_digest.count |snapshot_digest_out, snapshot_digest|:
                 snapshot_digest_out.push(snapshot_digest[index])
@@ -1007,10 +1073,11 @@ module Registry:
                 identity_out.push(index_identity[index])
             return ResultCode.Ok
 
-        def parse_index_snapshot(raw: darray[u8]&, registry_out: mutable darray[u8]&, package_out: mutable darray[u8]&, generation_out: mutable u64&, expires_out: mutable u64&, versions_out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+        def parse_index_snapshot(raw: darray[u8]&, registry_out: mutable darray[u8]&, package_out: mutable darray[u8]&, generation_out: mutable u64&, expires_out: mutable u64&, versions_out: mutable darray[u8]&, yanked_flags_out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
             registry_out.resize(0)
             package_out.resize(0)
             versions_out.resize(0)
+            yanked_flags_out.resize(0)
             return false if raw.count == 0 or raw.count > 1048576 or raw[raw.count - 1.usize()] != 10
             cursor: mutable usize = 0
             header: cstr = "elisapkg-index:1\n"
@@ -1095,7 +1162,11 @@ module Registry:
             return false if not valid_registry_root(registry_out) or not valid_package_path(package_out)
             previous: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
             seen: mutable darray[u8] = []
+            yanked_versions: mutable darray[u8] = []
+            previous_yanked: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
             candidates: mutable usize = 0
+            yanked_count: mutable usize = 0
+            reading_yanked: mutable bool = false
             while cursor < raw.count:
                 start: usize = cursor
                 finish: mutable usize = start
@@ -1106,21 +1177,67 @@ module Registry:
                 for index in start..<finish |version, raw|:
                     return false if raw[index] < 33 or raw[index] == 127 or raw[index] == 92
                     version.push(raw[index])
+                if not reading_yanked and candidates > 0.usize() and bytes_equal_text(version, "yanked:"):
+                    reading_yanked <- true
+                    cursor <- finish + 1.usize()
+                    continue
                 parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
                 return false if not SemVer::parse(version, &parsed) or parsed.prerelease
-                return false if registry_version_seen(seen, version)
-                return false if candidates > 0 and SemVer::compare(parsed, previous) <= 0
-                for index in 0..<version.count |seen, version|:
-                    seen.push(version[index])
-                seen.push(0)
-                previous <- parsed
-                for index in 0..<version.count |versions_out, version|:
-                    versions_out.push(version[index])
-                versions_out.push(10)
-                candidates <- candidates + 1
-                return false if candidates > 4096
+                if reading_yanked:
+                    return false if yanked_count > 0.usize() and SemVer::compare(parsed, previous_yanked) <= 0
+                    for index in 0..<version.count |yanked_versions, version|:
+                        yanked_versions.push(version[index])
+                    yanked_versions.push(10)
+                    previous_yanked <- parsed
+                    yanked_count <- yanked_count + 1.usize()
+                    return false if yanked_count > candidates
+                else:
+                    return false if registry_version_seen(seen, version)
+                    return false if candidates > 0 and SemVer::compare(parsed, previous) <= 0
+                    for index in 0..<version.count |seen, version|:
+                        seen.push(version[index])
+                    seen.push(0)
+                    previous <- parsed
+                    for index in 0..<version.count |versions_out, version|:
+                        versions_out.push(version[index])
+                    versions_out.push(10)
+                    candidates <- candidates + 1.usize()
+                    return false if candidates > 4096.usize()
                 cursor <- finish + 1
-            return candidates > 0
+            return false if candidates == 0.usize()
+
+            version_cursor: mutable usize = 0.usize()
+            yanked_cursor: mutable usize = 0.usize()
+            while version_cursor < versions_out.count:
+                version_finish: mutable usize = version_cursor
+                while version_finish < versions_out.count and versions_out[version_finish] != 10 |versions_out, version_finish|:
+                    version_finish <- version_finish + 1.usize()
+                return false if version_finish == versions_out.count
+                current_version: mutable darray[u8] = []
+                for index in version_cursor..<version_finish |current_version, versions_out|:
+                    current_version.push(versions_out[index])
+                current_parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
+                return false if not SemVer::parse(current_version, &current_parsed)
+                is_yanked: mutable bool = false
+                if yanked_cursor < yanked_versions.count:
+                    yanked_finish: mutable usize = yanked_cursor
+                    while yanked_finish < yanked_versions.count and yanked_versions[yanked_finish] != 10 |yanked_versions, yanked_finish|:
+                        yanked_finish <- yanked_finish + 1.usize()
+                    return false if yanked_finish == yanked_versions.count
+                    yanked_version: mutable darray[u8] = []
+                    for index in yanked_cursor..<yanked_finish |yanked_version, yanked_versions|:
+                        yanked_version.push(yanked_versions[index])
+                    yanked_parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
+                    return false if not SemVer::parse(yanked_version, &yanked_parsed)
+                    comparison: i64 = SemVer::compare(yanked_parsed, current_parsed)
+                    return false if comparison < 0
+                    if comparison == 0:
+                        return false if not registry_slice_equal(versions_out, version_cursor, version_finish, yanked_version)
+                        is_yanked <- true
+                        yanked_cursor <- yanked_finish + 1.usize()
+                yanked_flags_out.push(1 if is_yanked else 0)
+                version_cursor <- version_finish + 1.usize()
+            return yanked_cursor == yanked_versions.count
 
         def make_index_identity(root: darray[u8]&, package: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             root_digest_bytes: mutable darray[u8] = []
