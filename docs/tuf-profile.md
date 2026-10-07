@@ -42,9 +42,11 @@ The initial resource limits are: 1 MiB per metadata file; 64 authorized keys
 per role; 64 signatures per metadata file; 4,096 package-scoped delegated
 roles; one delegation hop from top-level Targets to a package role; 4,096
 targets per package role; 1,024 sequential root updates per refresh; and 64
-JSON container levels. Exceeding a limit rejects the refresh before state is
-changed. These limits are part of the profile and require a reviewed change if
-they prove too small for a real registry.
+JSON container levels. The duplicate-key validator additionally bounds each
+file to 65,536 total object keys, 8,500,000 candidate comparisons, and 65,536
+bytes of key-equality comparisons; exceeding any of these limits rejects the
+metadata before trust state is changed. These limits are part of the profile
+and require a reviewed change if they prove too small for a real registry.
 
 ## Repository identity and root trust
 

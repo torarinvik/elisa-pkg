@@ -5,10 +5,21 @@
 
 module Json:
     public:
+        const max_document_bytes: usize = 1048576.usize()
+        const max_container_depth: usize = 64.usize()
+        # TUF package-target metadata may contain several fields per target.
+        # Keep a document-wide key ceiling above the target-count bound while
+        # separately limiting collision work and compared bytes below.
+        const max_object_keys: usize = 65536.usize()
+        # Covers 4096 target keys' pairwise scans plus a bounded allowance for
+        # members inside each target record; hash-collision work also fails closed.
+        const max_duplicate_key_candidates: usize = 8500000.usize()
+        const max_duplicate_key_comparison_bytes: usize = 65536.usize()
+
         # Iterative grammar validation; stack states distinguish object keys,
         # values and separators, with a fixed maximum nesting depth.
         def valid_document(raw: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            return false if raw.count == 0.usize() or raw.count > 1048576.usize() or not valid_utf8(raw)
+            return false if raw.count == 0.usize() or raw.count > max_document_bytes or not valid_utf8(raw)
             # The root frame has kind 0. Object frames use kind 1 and array
             # frames use kind 2. A frame state is one of:
             #   root: 0=value, 1=done
@@ -89,7 +100,7 @@ module Json:
                     return false if not closed
                     states[top] <- 4 if object_key else (5 if kinds[top] == 1 else (7 if kinds[top] == 2 else 1))
                 elif byte == 123 or byte == 91:
-                    return false if not expects_value or states.count >= 65.usize()
+                    return false if not expects_value or states.count > max_container_depth
                     states[top] <- 8 if kinds[top] == 1 else (9 if kinds[top] == 2 else 10)
                     states.push(2 if byte == 123 else 6)
                     kinds.push(1 if byte == 123 else 2)
@@ -133,6 +144,7 @@ module Json:
             return true
 
         def unique_object_keys(raw: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            return false if raw.count == 0.usize() or raw.count > max_document_bytes
             # Keep each object's keys in a linked chain. Nested objects may
             # interleave their keys with a parent's keys in the input, so a
             # flat scan needlessly compares every key against unrelated
@@ -163,7 +175,7 @@ module Json:
                         if after < raw.count and raw[after] == 58 and object_last_keys.count > 0.usize():
                             object_index: usize = object_last_keys.count - 1.usize()
                             return false if duplicate_key(raw, string_start, index, object_last_keys[object_index], object_has_keys[object_index], seen_hashes, seen_starts, seen_ends, seen_previous_keys, seen_has_previous_keys, &candidate_checks, &comparison_bytes)
-                            return false if seen_hashes.count >= 4096.usize()
+                            return false if seen_hashes.count >= max_object_keys
                             key_index: usize = seen_hashes.count
                             seen_previous_keys.push(object_last_keys[object_index])
                             seen_has_previous_keys.push(object_has_keys[object_index])
@@ -178,7 +190,7 @@ module Json:
                     in_string <- true
                     string_start <- index + 1.usize()
                 elif byte == 123:
-                    return false if object_last_keys.count >= 4096.usize()
+                    return false if object_last_keys.count >= max_container_depth
                     object_last_keys.push(0.usize())
                     object_has_keys.push(false)
                 elif byte == 125:
@@ -189,11 +201,8 @@ module Json:
             return true
 
     private:
-        # This is exactly the maximum number of prior-key candidates for the
-        # existing 4096-key document limit, leaving that public limit intact.
-        const max_duplicate_key_candidates: usize = 8386560.usize()
-        const max_duplicate_key_comparison_bytes: usize = 65536.usize()
-
+        # A 4096-target role can require over eight million candidate comparisons.
+        # Keep that work ceiling explicit and shared with callers.
         def json_scalar(raw: darray[u8]&, start: usize, end: usize) -> bool:
             return false if start == end
             if end - start == 4.usize():

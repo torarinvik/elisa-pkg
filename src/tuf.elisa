@@ -4,6 +4,8 @@
 # signed object, verify each signature, validate roles/delegations, and commit
 # trusted state atomically before exposing targets.
 
+include "./json.elisa"
+
 module Tuf:
     public:
         const enum ValidationCode of u8:
@@ -14,18 +16,35 @@ module Tuf:
             InvalidThreshold
             ThresholdInsufficient
             ResourceLimit
+            MalformedJson
+            InvalidJsonKeys
+            NoncanonicalNumber
 
         # These limits bound a single repository refresh under the current
         # package-scoped delegation model. Changing them requires independent
         # metadata-size and worst-case-work review.
-        const max_metadata_file_bytes: usize = 1048576.usize()
+        const max_metadata_file_bytes: usize = Json::max_document_bytes
         const max_authorized_keys_per_role: usize = 64.usize()
         const max_signatures_per_metadata: usize = 64.usize()
         const max_delegated_roles: usize = 4096.usize()
         const max_delegation_depth: usize = 1.usize()
         const max_targets_per_package_role: usize = 4096.usize()
         const max_root_updates_per_refresh: usize = 1024.usize()
-        const max_json_container_depth: usize = 64.usize()
+        const max_json_container_depth: usize = Json::max_container_depth
+        const max_json_object_keys: usize = Json::max_object_keys
+        const max_duplicate_key_candidates: usize = Json::max_duplicate_key_candidates
+        const max_duplicate_key_comparison_bytes: usize = Json::max_duplicate_key_comparison_bytes
+
+        # Bounded syntax precheck for the pinned metadata profile. This does
+        # not decode role schemas, canonicalize signed bytes, verify signatures,
+        # or authorize targets.
+        def precheck_metadata_json(raw: darray[u8]&) -> ValidationCode can[Memory.Allocate, Abort.Panic]:
+            return ValidationCode.MalformedJson if raw.count == 0.usize()
+            return ValidationCode.ResourceLimit if raw.count > max_metadata_file_bytes
+            return ValidationCode.MalformedJson if not Json::valid_document(raw)
+            return ValidationCode.InvalidJsonKeys if not Json::unique_object_keys(raw)
+            return ValidationCode.NoncanonicalNumber if not tuf_integer_numbers_only(raw)
+            return ValidationCode.WellFormed
 
         # The selected profile accepts stable 1.0.P versions through the pinned
         # v1.0.36 patch, inclusive. This checks only the protocol version text;
@@ -70,6 +89,39 @@ module Tuf:
 
     private:
         const key_id_size: usize = 64.usize()
+
+        # TUF's canonical JSON subdialect contains integers only and forbids
+        # negative zero. Json::valid_document has already established token
+        # boundaries and ordinary JSON number grammar before this scan runs.
+        def tuf_integer_numbers_only(raw: darray[u8]&) -> bool:
+            in_string: mutable bool = false
+            escaped: mutable bool = false
+            cursor: mutable usize = 0.usize()
+            while cursor < raw.count |raw, in_string, escaped, cursor|:
+                byte: u8 = raw[cursor]
+                if in_string:
+                    if escaped:
+                        escaped <- false
+                    elif byte == 92:
+                        escaped <- true
+                    elif byte == 34:
+                        in_string <- false
+                    cursor <- cursor + 1.usize()
+                    continue
+                if byte == 34:
+                    in_string <- true
+                    cursor <- cursor + 1.usize()
+                    continue
+                if byte == 45 or (byte >= 48 and byte <= 57):
+                    start: usize = cursor
+                    cursor <- cursor + 1.usize()
+                    while cursor < raw.count and ((raw[cursor] >= 48 and raw[cursor] <= 57) or raw[cursor] == 46 or raw[cursor] == 69 or raw[cursor] == 101 or raw[cursor] == 43 or raw[cursor] == 45) |raw, cursor|:
+                        return false if raw[cursor] == 46 or raw[cursor] == 69 or raw[cursor] == 101
+                        cursor <- cursor + 1.usize()
+                    return false if cursor - start == 2.usize() and raw[start] == 45 and raw[start + 1.usize()] == 48
+                    continue
+                cursor <- cursor + 1.usize()
+            return not in_string and not escaped
 
         def validate_key_id_list(ids: darray[u8]&) -> ValidationCode:
             count: usize = ids.count / key_id_size

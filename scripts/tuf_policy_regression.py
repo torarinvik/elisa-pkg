@@ -32,6 +32,17 @@ def main() -> int:
     valid_latest = elisa_bytes(b"1.0.36")
     invalid_versions = [b"1.0.37", b"1.1.0", b"2.0.0", b"1.0.00", b"1.0.1-alpha", b"1.0.1+build"]
     invalid_version_literals = [elisa_bytes(value) for value in invalid_versions]
+    json_cases = {
+        "valid_metadata": b'{"signed":{"version":1,"text":"value 1.5 and -0"},"signatures":[]}',
+        "duplicate_metadata": b'{"signed":{"version":1,"version":2},"signatures":[]}',
+        "float_metadata": b'{"signed":{"version":1.0},"signatures":[]}',
+        "exponent_metadata": b'{"signed":{"version":1e2},"signatures":[]}',
+        "negative_zero_metadata": b'{"signed":{"version":-0},"signatures":[]}',
+        "negative_integer_metadata": b'{"signed":{"version":-1},"signatures":[]}',
+        "malformed_metadata": b'{"signed":, "signatures":[]}',
+        "empty_metadata": b"",
+    }
+    json_literals = {name: elisa_bytes(value) for name, value in json_cases.items()}
 
     with tempfile.TemporaryDirectory(prefix="elisapkg-tuf-policy-", dir=ROOT) as raw:
         work = Path(raw)
@@ -46,6 +57,23 @@ def main() -> int:
         source.write_text(
             f'''include "{ROOT / "src/tuf.elisa"}"
 
+def append_ascii(out: mutable darray[u8]&, text: cstr) -> void can[Memory.Allocate, Abort.Panic]:
+    cursor: mutable usize = 0.usize()
+    while text[cursor].u8() != 0 |out, text, cursor|:
+        out.push(text[cursor].u8())
+        cursor <- cursor + 1.usize()
+
+def append_decimal(out: mutable darray[u8]&, value: u64) -> void can[Memory.Allocate, Abort.Panic]:
+    digits: mutable darray[u8] = []
+    remaining: mutable u64 = value
+    if remaining == 0.u64():
+        digits.push(48)
+    while remaining > 0.u64() |digits, remaining|:
+        digits.push(48 + (remaining % 10.u64()).u8())
+        remaining <- remaining / 10.u64()
+    for digit_index in 0..<digits.count |out, digits|:
+        out.push(digits[digits.count - 1.usize() - digit_index])
+
 def main() -> i64 can[Memory.Allocate, Abort.Panic]:
     early: mutable darray[u8] = [{valid_early}]
     middle: mutable darray[u8] = [{valid_middle}]
@@ -54,6 +82,44 @@ def main() -> i64 can[Memory.Allocate, Abort.Panic]:
     return 2 if Tuf::precheck_spec_version(middle) != Tuf::ValidationCode.WellFormed
     return 3 if Tuf::precheck_spec_version(latest) != Tuf::ValidationCode.WellFormed
 {invalid_version_checks}
+    valid_metadata: mutable darray[u8] = [{json_literals['valid_metadata']}]
+    duplicate_metadata: mutable darray[u8] = [{json_literals['duplicate_metadata']}]
+    float_metadata: mutable darray[u8] = [{json_literals['float_metadata']}]
+    exponent_metadata: mutable darray[u8] = [{json_literals['exponent_metadata']}]
+    negative_zero_metadata: mutable darray[u8] = [{json_literals['negative_zero_metadata']}]
+    negative_integer_metadata: mutable darray[u8] = [{json_literals['negative_integer_metadata']}]
+    malformed_metadata: mutable darray[u8] = [{json_literals['malformed_metadata']}]
+    empty_metadata: mutable darray[u8] = []
+    return 34 if Tuf::precheck_metadata_json(valid_metadata) != Tuf::ValidationCode.WellFormed
+    return 35 if Tuf::precheck_metadata_json(duplicate_metadata) != Tuf::ValidationCode.InvalidJsonKeys
+    return 36 if Tuf::precheck_metadata_json(float_metadata) != Tuf::ValidationCode.NoncanonicalNumber
+    return 37 if Tuf::precheck_metadata_json(exponent_metadata) != Tuf::ValidationCode.NoncanonicalNumber
+    return 38 if Tuf::precheck_metadata_json(negative_zero_metadata) != Tuf::ValidationCode.NoncanonicalNumber
+    return 39 if Tuf::precheck_metadata_json(negative_integer_metadata) != Tuf::ValidationCode.WellFormed
+    return 40 if Tuf::precheck_metadata_json(malformed_metadata) != Tuf::ValidationCode.MalformedJson
+    return 44 if Tuf::precheck_metadata_json(empty_metadata) != Tuf::ValidationCode.MalformedJson
+    small_metadata: mutable darray[u8] = []
+    append_ascii(&small_metadata, "{{\\\"signed\\\":{{\\\"targets\\\":{{}}}},\\\"signatures\\\":[]}}")
+    return 49 if Tuf::precheck_metadata_json(small_metadata) != Tuf::ValidationCode.WellFormed
+    large_metadata: mutable darray[u8] = []
+    append_ascii(&large_metadata, "{{\\\"signed\\\":{{\\\"targets\\\":{{")
+    for target_index in 0..<4096 |large_metadata, target_index|:
+        if target_index > 0:
+            append_ascii(&large_metadata, ",")
+        append_ascii(&large_metadata, "\\\"pkg/")
+        append_decimal(&large_metadata, target_index.u64())
+        append_ascii(&large_metadata, "\\\":{{\\\"length\\\":1,\\\"hashes\\\":{{\\\"sha256\\\":\\\"")
+        for digest_byte in 0..<64 |large_metadata|:
+            large_metadata.push(48)
+        append_ascii(&large_metadata, "\\\"}},\\\"custom\\\":{{\\\"schema-version\\\":1}}}}")
+    append_ascii(&large_metadata, "}}}},\\\"signatures\\\":[]}}")
+    return 41 if large_metadata.count > Tuf::max_metadata_file_bytes
+    large_status: Tuf::ValidationCode = Tuf::precheck_metadata_json(large_metadata)
+    return 42 if large_status == Tuf::ValidationCode.MalformedJson
+    return 45 if large_status == Tuf::ValidationCode.ResourceLimit
+    return 46 if large_status == Tuf::ValidationCode.InvalidJsonKeys
+    return 47 if large_status == Tuf::ValidationCode.NoncanonicalNumber
+    return 48 if large_status != Tuf::ValidationCode.WellFormed
     authorized: mutable darray[u8] = []
     known_and_unknown: mutable darray[u8] = []
     unknown_only: mutable darray[u8] = []
@@ -97,6 +163,7 @@ def main() -> i64 can[Memory.Allocate, Abort.Panic]:
     return 31 if Tuf::max_signatures_per_metadata != 64.usize() or Tuf::max_delegation_depth != 1.usize()
     return 32 if Tuf::max_delegated_roles != 4096.usize() or Tuf::max_targets_per_package_role != 4096.usize()
     return 33 if Tuf::max_root_updates_per_refresh != 1024.usize() or Tuf::max_json_container_depth != 64.usize()
+    return 43 if Tuf::max_json_object_keys != 65536.usize() or Tuf::max_duplicate_key_candidates != 8500000.usize() or Tuf::max_duplicate_key_comparison_bytes != 65536.usize()
     return 0
 ''',
             encoding="utf-8",
