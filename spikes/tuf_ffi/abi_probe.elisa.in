@@ -1,0 +1,75 @@
+# FFI smoke and policy-boundary probe for the test-only Rust adapter.
+# The foreign declarations stay at compilation-unit scope because the current
+# Elisa compiler requires that placement; callers use the qualified module API.
+
+include "../../src/tuf.elisa"
+
+@link_name("elisapkg_tuf_engine_abi_version_v1")
+extern native_tuf_engine_abi_version_v1() -> u32
+@link_name("elisapkg_tuf_engine_verify_root_v1")
+extern native_tuf_engine_verify_root_v1(metadata: void&, metadata_len: usize, out_version: mutable u64&, out_key_count: mutable u32&, out_root_threshold: mutable u32&) -> i32
+
+module TufEngine:
+    public:
+        const enum Status of i32:
+            Ok
+            InvalidArgument
+            InvalidRoot
+            UnsupportedSpec
+            InternalPanic
+            InvalidMetadata
+
+        def abi_version() -> u32:
+            return native_tuf_engine_abi_version_v1()
+
+        def verify_root(metadata: darray[u8]&, version: mutable u64&, key_count: mutable u32&, root_threshold: mutable u32&) -> Status can[Unsafe.PointerCast]:
+            return Status.InvalidArgument if metadata.count == 0.usize() or metadata.count > max_root_bytes
+            return Status.InvalidMetadata if Tuf::precheck_metadata_json(metadata) != Tuf::ValidationCode.WellFormed
+            bytes_ptr: void& = (&metadata[0]).cast[void&] can Unsafe.PointerCast
+            result: i32 = native_tuf_engine_verify_root_v1(bytes_ptr, metadata.count, version, key_count, root_threshold)
+            return Status.Ok if result == 0
+            return Status.InvalidArgument if result == 1
+            return Status.InvalidRoot if result == 2
+            return Status.UnsupportedSpec if result == 3
+            return Status.InternalPanic
+
+    private:
+        const max_root_bytes: usize = 1048576.usize()
+
+module TufEngineProbe:
+    public:
+        @link_name("elisapkg_tuf_probe_run_v1")
+        def run() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return 1 if TufEngine::abi_version() != expected_abi_version
+
+            malformed_root: mutable darray[u8] = [123, 34, 115, 105, 103, 110, 101, 100, 34, 58, 123, 125, 44, 34, 115, 105, 103, 110, 97, 116, 117, 114, 101, 115, 34, 58, 91, 93, 125]
+            version: mutable u64 = 77.u64()
+            key_count: mutable u32 = 77.u32()
+            threshold: mutable u32 = 77.u32()
+            return 2 if TufEngine::verify_root(malformed_root, &version, &key_count, &threshold) != TufEngine::Status.InvalidRoot
+            return 3 if version != 77.u64() or key_count != 77.u32() or threshold != 77.u32()
+
+            duplicate_keys: mutable darray[u8] = [123, 34, 115, 105, 103, 110, 101, 100, 34, 58, 123, 34, 118, 101, 114, 115, 105, 111, 110, 34, 58, 49, 44, 34, 118, 101, 114, 115, 105, 111, 110, 34, 58, 50, 125, 44, 34, 115, 105, 103, 110, 97, 116, 117, 114, 101, 115, 34, 58, 91, 93, 125]
+            return 4 if TufEngine::verify_root(duplicate_keys, &version, &key_count, &threshold) != TufEngine::Status.InvalidMetadata
+            return 5 if version != 77.u64() or key_count != 77.u32() or threshold != 77.u32()
+
+            valid_root: mutable darray[u8] = [@@ROOT_BYTES@@]
+            return 6 if TufEngine::verify_root(valid_root, &version, &key_count, &threshold) != TufEngine::Status.Ok
+            return 70 if version != @@ROOT_VERSION@@.u64()
+            return 71 if key_count != @@ROOT_KEY_COUNT@@.u32()
+            return 72 if threshold != @@ROOT_THRESHOLD@@.u32()
+
+            tampered_root: mutable darray[u8] = [@@TAMPERED_ROOT_BYTES@@]
+            version <- 77.u64()
+            key_count <- 77.u32()
+            threshold <- 77.u32()
+            return 8 if TufEngine::verify_root(tampered_root, &version, &key_count, &threshold) != TufEngine::Status.InvalidRoot
+            return 9 if version != 77.u64() or key_count != 77.u32() or threshold != 77.u32()
+
+            unsupported_spec_root: mutable darray[u8] = [@@UNSUPPORTED_SPEC_ROOT_BYTES@@]
+            return 10 if TufEngine::verify_root(unsupported_spec_root, &version, &key_count, &threshold) != TufEngine::Status.UnsupportedSpec
+            return 11 if version != 77.u64() or key_count != 77.u32() or threshold != 77.u32()
+            return 0
+
+    private:
+        const expected_abi_version: u32 = 1.u32()

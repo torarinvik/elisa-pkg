@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+SPIKE="$ROOT/spikes/tuf_ffi"
+COMPILER_ROOT="${ELISA_COMPILER_ROOT:-}"
+if [[ -z "$COMPILER_ROOT" ]]; then
+  echo "error: set ELISA_COMPILER_ROOT to an Elisa compiler checkout" >&2
+  exit 2
+fi
+COMPILER_ROOT="$(cd -- "$COMPILER_ROOT" && pwd)"
+STAGE1="${ELISA_STAGE1_BIN:-$COMPILER_ROOT/bin/elisac-stage1}"
+WRAPPER="${ELISA_COMPILER_WRAPPER:-$COMPILER_ROOT/scripts/elisac_stage1.sh}"
+RUNTIME="${ELISA_RUNTIME_OBJ:-$COMPILER_ROOT/build/runtime/elisacore_runtime.o}"
+CARGO_BIN="${CARGO:-cargo}"
+
+for path in "$STAGE1" "$WRAPPER" "$RUNTIME"; do
+  if [[ ! -e "$path" ]]; then
+    echo "error: required toolchain input is missing: $path" >&2
+    exit 2
+  fi
+done
+if [[ ! -x "$STAGE1" || ! -x "$WRAPPER" ]]; then
+  echo "error: Elisa compiler and wrapper must be executable" >&2
+  exit 2
+fi
+
+mkdir -p "$ROOT/build"
+export CARGO_TARGET_DIR="$ROOT/build/tuf-ffi-cargo"
+mkdir -p "$CARGO_TARGET_DIR"
+WORK="$(mktemp -d "$ROOT/build/tuf-ffi.XXXXXXXX")"
+chmod 700 "$WORK"
+trap 'rm -rf -- "$WORK"' EXIT
+mkdir -m 700 "$WORK/package-root" "$WORK/package-root/src"
+
+"$CARGO_BIN" test --locked --manifest-path "$SPIKE/Cargo.toml"
+"$CARGO_BIN" build --locked --release --manifest-path "$SPIKE/Cargo.toml"
+
+python3 - "$SPIKE/abi_probe.elisa.in" "$SPIKE/testdata/github-root.json" "$WORK/abi_probe.elisa" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+template_path, root_path, output_path = map(Path, sys.argv[1:])
+raw = root_path.read_bytes()
+document = json.loads(raw)
+signed = document["signed"]
+tampered = raw.replace(b'"consistent_snapshot": true', b'"consistent_snapshot": false', 1)
+unsupported = raw.replace(b'"spec_version": "1.0.31"', b'"spec_version": "1.0.37"', 1)
+if tampered == raw or unsupported == raw:
+    raise SystemExit("pinned root fixture no longer matches expected test transformations")
+
+replacements = {
+    "@@ROOT_BYTES@@": ", ".join(map(str, raw)),
+    "@@ROOT_VERSION@@": str(signed["version"]),
+    "@@ROOT_KEY_COUNT@@": str(len(signed["keys"])),
+    "@@ROOT_THRESHOLD@@": str(signed["roles"]["root"]["threshold"]),
+    "@@TAMPERED_ROOT_BYTES@@": ", ".join(map(str, tampered)),
+    "@@UNSUPPORTED_SPEC_ROOT_BYTES@@": ", ".join(map(str, unsupported)),
+}
+source = template_path.read_text()
+for marker, value in replacements.items():
+    source = source.replace(marker, value)
+if "@@" in source:
+    raise SystemExit("unexpanded Elisa probe template marker")
+output_path.write_text(source)
+PY
+
+STATIC_LIB="$CARGO_TARGET_DIR/release/libelisapkg_tuf_ffi_spike.a"
+if [[ ! -f "$STATIC_LIB" ]]; then
+  echo "error: Rust static library was not produced: $STATIC_LIB" >&2
+  exit 2
+fi
+
+(cd "$WORK/package-root" && \
+  ELISA_STAGE1_BIN="$STAGE1" \
+  ELISA_RUNTIME_OBJ="$RUNTIME" \
+    "$WRAPPER" -emit obj -o "$WORK/tuf-ffi-probe.o" "$WORK/abi_probe.elisa")
+
+"${RUSTC:-rustc}" --edition=2021 "$SPIKE/ffi_runner.rs" \
+  -L "native=$CARGO_TARGET_DIR/release" \
+  -l static=elisapkg_tuf_ffi_spike \
+  -C relocation-model=static \
+  -C "link-arg=$WORK/tuf-ffi-probe.o" \
+  -C "link-arg=$RUNTIME" \
+  -o "$WORK/tuf-ffi-probe"
+
+(cd "$WORK/package-root" && "$WORK/tuf-ffi-probe")
+echo "TUF ABI v1 Rust/Elisa probe passed"
