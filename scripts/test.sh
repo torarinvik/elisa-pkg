@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Fixtures that the application consumes must have a predictable, non-shared
+# writable mode even on hosts whose default umask is group-friendly (for
+# example 0002). The package path policy intentionally rejects group-writable
+# source roots.
+umask 022
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 "$ROOT/scripts/build.sh"

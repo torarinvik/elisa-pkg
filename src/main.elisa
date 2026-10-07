@@ -6072,7 +6072,50 @@ module Cli:
                 stage1_identity_ok: bool = tool_file_identity(stage1_bin, false, true, &stage1_identity)
                 runtime_identity_ok: bool = tool_file_identity(runtime_obj, false, false, &runtime_identity)
                 clang_identity_ok: bool = tool_file_identity(clang_tool, false, true, &clang_identity)
-                toolchain_identity_ok: bool = compiler_identity_ok and stage1_identity_ok and runtime_identity_ok and clang_identity_ok
+                sdk_root: mutable darray[u8] = []
+                developer_dir: mutable darray[u8] = []
+                if not Platform::pkg_macos_toolchain_paths(&sdk_root, &developer_dir):
+                    write_error("error: could not locate a supported macOS SDK and developer directory for the compiler sandbox\n")
+                    return EXIT_BUILD
+                sdk_settings_path: mutable darray[u8] = []
+                sdk_settings_path_c: mutable darray[u8] = []
+                sdk_settings_name: mutable cstr = ""
+                if sdk_root.count > 0.usize():
+                    bytes_push_array(&sdk_settings_path, sdk_root)
+                    bytes_push_view(&sdk_settings_path, "/SDKSettings.json")
+                    path_with_nul_into(sdk_settings_path, &sdk_settings_path_c)
+                    sdk_settings_name <- (&sdk_settings_path_c[0]).cast[cstr] can Unsafe.PointerCast
+                sdk_identity: mutable darray[u8] = []
+                sdk_identity_ok: bool = tool_file_identity(sdk_settings_name, sdk_root.count == 0.usize(), false, &sdk_identity)
+                developer_linker_path: mutable darray[u8] = []
+                developer_linker_path_c: mutable darray[u8] = []
+                developer_linker_name: mutable cstr = ""
+                developer_assembler_path: mutable darray[u8] = []
+                developer_assembler_path_c: mutable darray[u8] = []
+                developer_assembler_name: mutable cstr = ""
+                if developer_dir.count > 0.usize():
+                    bytes_push_array(&developer_linker_path, developer_dir)
+                    bytes_push_array(&developer_assembler_path, developer_dir)
+                    if bytes_equal_view(developer_dir, "/Library/Developer/CommandLineTools"):
+                        bytes_push_view(&developer_linker_path, "/usr/bin/ld")
+                        bytes_push_view(&developer_assembler_path, "/usr/bin/as")
+                    elif bytes_equal_view(developer_dir, "/Applications/Xcode.app/Contents/Developer"):
+                        bytes_push_view(&developer_linker_path, "/Toolchains/XcodeDefault.xctoolchain/usr/bin/ld")
+                        bytes_push_view(&developer_assembler_path, "/Toolchains/XcodeDefault.xctoolchain/usr/bin/as")
+                    else:
+                        write_error("error: unsupported macOS developer toolchain directory\n")
+                        return EXIT_BUILD
+                    path_with_nul_into(developer_linker_path, &developer_linker_path_c)
+                    developer_linker_name <- (&developer_linker_path_c[0]).cast[cstr] can Unsafe.PointerCast
+                    path_with_nul_into(developer_assembler_path, &developer_assembler_path_c)
+                    developer_assembler_name <- (&developer_assembler_path_c[0]).cast[cstr] can Unsafe.PointerCast
+                    executable_paths.push(developer_linker_name)
+                    executable_paths.push(developer_assembler_name)
+                developer_linker_identity: mutable darray[u8] = []
+                developer_assembler_identity: mutable darray[u8] = []
+                developer_linker_identity_ok: bool = tool_file_identity(developer_linker_name, sdk_root.count == 0.usize(), true, &developer_linker_identity)
+                developer_assembler_identity_ok: bool = tool_file_identity(developer_assembler_name, sdk_root.count == 0.usize(), true, &developer_assembler_identity)
+                toolchain_identity_ok: bool = compiler_identity_ok and stage1_identity_ok and runtime_identity_ok and clang_identity_ok and sdk_identity_ok and developer_linker_identity_ok and developer_assembler_identity_ok
 
                 # Take one private, bounded snapshot after validating the lock and
                 # toolchain. Its digest must match the bytes hashed above; all
@@ -6167,7 +6210,7 @@ module Cli:
                         write_error("error: verified dependency aggregate exceeds the configured build limit\n")
                         return EXIT_BUILD
                 receipt: mutable darray[u8] = []
-                bytes_push_view(&receipt, "elisapkg-build-receipt:11\nentry:")
+                bytes_push_view(&receipt, "elisapkg-build-receipt:12\nentry:")
                 bytes_push_array(&receipt, target_entry)
                 bytes_push_view(&receipt, "\ntarget-kind:")
                 bytes_push_array(&receipt, target_kind)
@@ -6211,9 +6254,19 @@ module Cli:
                 bytes_push_cstr(&receipt, clang_tool)
                 bytes_push_view(&receipt, "\nclang-identity:")
                 bytes_push_array(&receipt, clang_identity)
+                bytes_push_view(&receipt, "\nmacos-sdk-root:")
+                bytes_push_array(&receipt, sdk_root)
+                bytes_push_view(&receipt, "\nmacos-developer-dir:")
+                bytes_push_array(&receipt, developer_dir)
+                bytes_push_view(&receipt, "\nmacos-linker-identity:")
+                bytes_push_array(&receipt, developer_linker_identity)
+                bytes_push_view(&receipt, "\nmacos-assembler-identity:")
+                bytes_push_array(&receipt, developer_assembler_identity)
+                bytes_push_view(&receipt, "\nmacos-sdk-identity:")
+                bytes_push_array(&receipt, sdk_identity)
                 bytes_push_view(&receipt, "\nallow-stale:")
                 bytes_push_cstr(&receipt, allow_stale)
-                bytes_push_view(&receipt, "\nsemantic-gate:1\nsandbox-policy:macos-seatbelt-v2")
+                bytes_push_view(&receipt, "\nsemantic-gate:1\nsandbox-policy:macos-seatbelt-v3")
                 artifact_c: mutable darray[u8] = []
                 receipt_c: mutable darray[u8] = []
                 path_with_nul_into(&artifact, &artifact_c)
@@ -6379,6 +6432,8 @@ module Cli:
                 runtime_env: mutable darray[u8] = []
                 stale_env: mutable darray[u8] = []
                 clang_env: mutable darray[u8] = []
+                sdkroot_env: mutable darray[u8] = []
+                developer_dir_env: mutable darray[u8] = []
                 temporary_env: mutable darray[u8] = []
                 args: mutable darray[cstr] = []
                 args.push("/usr/bin/sandbox-exec")
@@ -6429,6 +6484,15 @@ module Cli:
                     bytes_push_cstr(&clang_env, clang_tool)
                     clang_env.push(0)
                     args.push((&clang_env[0]).cast[cstr] can Unsafe.PointerCast)
+                if sdk_root.count > 0.usize():
+                    bytes_push_view(&sdkroot_env, "SDKROOT=")
+                    bytes_push_array(&sdkroot_env, sdk_root)
+                    sdkroot_env.push(0)
+                    args.push((&sdkroot_env[0]).cast[cstr] can Unsafe.PointerCast)
+                    bytes_push_view(&developer_dir_env, "DEVELOPER_DIR=")
+                    bytes_push_array(&developer_dir_env, developer_dir)
+                    developer_dir_env.push(0)
+                    args.push((&developer_dir_env[0]).cast[cstr] can Unsafe.PointerCast)
                 if compiler_is_stage1_wrapper:
                     # The host stage1 wrapper invokes /bin/ps for its RSS polling;
                     # macOS marks ps setuid and refuses it inside Seatbelt. The
@@ -6701,6 +6765,12 @@ module Cli:
                     toolchain_unchanged <- tool_file_identity(runtime_obj, false, false, &post_tool_identity) and bytes_equal(post_tool_identity, runtime_identity)
                 if toolchain_unchanged and clang_identity_ok:
                     toolchain_unchanged <- tool_file_identity(clang_tool, false, true, &post_tool_identity) and bytes_equal(post_tool_identity, clang_identity)
+                if toolchain_unchanged and sdk_identity_ok:
+                    toolchain_unchanged <- tool_file_identity(sdk_settings_name, sdk_root.count == 0.usize(), false, &post_tool_identity) and bytes_equal(post_tool_identity, sdk_identity)
+                if toolchain_unchanged and developer_linker_identity_ok:
+                    toolchain_unchanged <- tool_file_identity(developer_linker_name, sdk_root.count == 0.usize(), true, &post_tool_identity) and bytes_equal(post_tool_identity, developer_linker_identity)
+                if toolchain_unchanged and developer_assembler_identity_ok:
+                    toolchain_unchanged <- tool_file_identity(developer_assembler_name, sdk_root.count == 0.usize(), true, &post_tool_identity) and bytes_equal(post_tool_identity, developer_assembler_identity)
                 if not toolchain_unchanged:
                     _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
                     _ = remove_optional_build_aggregate(aggregate_source_name)
