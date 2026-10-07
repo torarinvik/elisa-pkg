@@ -438,7 +438,15 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
         HOME=str(empty_home),
     )
     if probe_built:
-        run([work / 'probe'], env=probe_environment)
+        # Exercise the package-file FFI inside a private source root. The
+        # platform boundary intentionally rejects group-writable roots such
+        # as some shared Vast checkouts.
+        probe_root = work / 'probe-root'
+        probe_root.mkdir(mode=0o700)
+        probe_source = probe_root / 'src'
+        probe_source.mkdir(mode=0o700)
+        (probe_source / 'main.elisa').write_text('def main() -> i64:\n    return 0\n')
+        run([work / 'probe'], cwd=probe_root, env=probe_environment)
         assert not (empty_home / '.local').exists(), 'read-only trust verification created user state directories'
 
     run([BIN, 'init', work / 'project'], stdout=subprocess.DEVNULL)
