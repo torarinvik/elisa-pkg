@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import shlex
 import struct
 import subprocess
 import tempfile
@@ -16,6 +17,7 @@ COMPILER_ROOT = Path(os.environ.get("ELISA_COMPILER_ROOT", ""))
 STAGE1 = Path(os.environ.get("ELISA_STAGE1_BIN", COMPILER_ROOT / "bin/elisac-stage1"))
 WRAPPER = Path(os.environ.get("ELISA_COMPILER_WRAPPER", COMPILER_ROOT / "scripts/elisac_stage1.sh"))
 RUNTIME = Path(os.environ.get("ELISA_RUNTIME_OBJ", COMPILER_ROOT / "build/runtime/elisacore_runtime.o"))
+EXECUTOR = shlex.split(os.environ.get("ELISAPKG_TEST_EXECUTOR", ""))
 ACL_VERSION = 2
 ACL_USER_OBJ = 1
 ACL_USER = 2
@@ -144,7 +146,7 @@ def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
         )
         if result.returncode != 0:
             raise SystemExit(f"error: could not compile Linux ACL probe:\n{result.stdout}")
-        probe = subprocess.run([str(binary)], cwd=work, env=compiler_env, timeout=10, check=False)
+        probe = subprocess.run([*EXECUTOR, str(binary)], cwd=work, env=compiler_env, timeout=10, check=False)
         if probe.returncode != 0:
             raise SystemExit(f"error: Linux ACL probe failed at case {probe.returncode}")
 

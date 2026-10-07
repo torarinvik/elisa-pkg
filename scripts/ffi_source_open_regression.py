@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import shlex
 import socket
 import stat
 import subprocess
@@ -16,6 +17,7 @@ COMPILER_ROOT = Path(os.environ.get("ELISA_COMPILER_ROOT", ""))
 STAGE1 = Path(os.environ.get("ELISA_STAGE1_BIN", COMPILER_ROOT / "bin/elisac-stage1"))
 WRAPPER = Path(os.environ.get("ELISA_COMPILER_WRAPPER", COMPILER_ROOT / "scripts/elisac_stage1.sh"))
 RUNTIME = Path(os.environ.get("ELISA_RUNTIME_OBJ", COMPILER_ROOT / "build/runtime/elisacore_runtime.o"))
+EXECUTOR = shlex.split(os.environ.get("ELISAPKG_TEST_EXECUTOR", ""))
 
 
 def elisa_string(value: str | Path) -> str:
@@ -180,7 +182,7 @@ def main() -> int:
                 raise SystemExit(f"error: could not compile source-open probe:\n{compile_result.stdout}")
 
             try:
-                result = subprocess.run([str(binary)], cwd=work, env=environment, timeout=15, check=False)
+                result = subprocess.run([*EXECUTOR, str(binary)], cwd=work, env=environment, timeout=15, check=False)
             except subprocess.TimeoutExpired as error:
                 raise SystemExit("error: source-open probe blocked while inspecting a special file") from error
             if result.returncode != 0:

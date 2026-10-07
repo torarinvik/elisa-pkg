@@ -56,3 +56,6 @@ operations use the documented native FFI target matrix above.
 The private POSIX FFI currently has explicit layouts for macOS arm64, Linux
 x86_64, and Linux arm64. Other host layouts remain unsupported and must be
 added as reviewed target-specific Elisa branches before those hosts are used.
+Run `scripts/linux_arm64_qemu_regression.sh` with an AArch64 Linux cross
+compiler, matching libc sysroot, and `qemu-user` to compile the package manager
+and execute the Linux source-open and ACL probes against the arm64 ABI.
