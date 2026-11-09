@@ -7,6 +7,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 
 
 TIMEOUT_SECONDS = 30
@@ -21,14 +22,19 @@ def main() -> int:
         return 2
 
     command = sys.argv[2:]
+    deadline = time.monotonic() + TIMEOUT_SECONDS
     try:
-        process = subprocess.Popen(command, start_new_session=True)
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
     except OSError as error:
         print(f"error: unable to start compiler rebuild: {error}", file=sys.stderr)
         return 127
 
     try:
-        return_code = process.wait(timeout=TIMEOUT_SECONDS)
+        return_code = process.wait(timeout=max(0.0, deadline - time.monotonic()))
     except subprocess.TimeoutExpired:
         try:
             # The rebuild can spawn make, Go, or compiler children. Keep them
