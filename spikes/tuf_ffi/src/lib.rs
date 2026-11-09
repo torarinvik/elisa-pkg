@@ -556,9 +556,8 @@ fn validate_signature_profile(bytes: &[u8], malformed: VerifyError) -> Result<()
             .get("sig")
             .and_then(Value::as_str)
             .ok_or(malformed)?;
-        if !signature_bytes.is_empty()
-            && (signature_bytes.len() != 128
-                || !signature_bytes.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        if signature_bytes.len() != 128
+            || !signature_bytes.bytes().all(|byte| byte.is_ascii_hexdigit())
         {
             return Err(malformed);
         }
