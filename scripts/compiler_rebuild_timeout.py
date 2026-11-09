@@ -38,6 +38,16 @@ def terminate_process_group(process_group: int) -> None:
         pass
 
 
+def is_stage1_seed_command(command: list[str]) -> bool:
+    for index in range(len(command) - 1):
+        if (
+            os.path.basename(command[index]) == "elisac_stage1.sh"
+            and command[index + 1] == "--seed"
+        ):
+            return True
+    return False
+
+
 def main() -> int:
     if len(sys.argv) < 3 or sys.argv[1] != "--":
         print(
@@ -48,9 +58,16 @@ def main() -> int:
 
     command = sys.argv[2:]
     deadline = time.monotonic() + TIMEOUT_SECONDS
+    environment = os.environ.copy()
+    if is_stage1_seed_command(command):
+        # The Stage1 wrapper normally starts its own timeout session. Here this
+        # process owns the timeout and group, so keep the seed build inside it
+        # for reliable cancellation at the same deadline.
+        environment["ELISA_STAGE1_SEED_TIMEOUT_WRAPPED"] = "1"
     try:
         process = subprocess.Popen(
             command,
+            env=environment,
             stdin=subprocess.DEVNULL,
             start_new_session=True,
         )
