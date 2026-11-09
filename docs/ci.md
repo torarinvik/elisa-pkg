@@ -75,6 +75,11 @@ using whatever compiler happens to be installed on the runner:
 | `actions/download-artifact` | `634f93cb2916e3fdff6788551b99b062d0335ce0` (v5.0.0) |
 | `actions/attest` | `1e69f48acb82d1966a394da916b4c1698aa569d6` (v4.2.2) |
 
+Each Stage0 and Stage1 rebuild runs through
+`scripts/compiler_rebuild_timeout.py`, which enforces a 30-second wall-clock
+limit and kills the rebuild's entire process group at the deadline. A timeout
+fails the workflow; profile and optimize the rebuild before retrying it.
+
 To update a pin, review the upstream source and compatibility notes, update the
 workflow and this table together, then run the clean seed/build/test sequence
 on the supported host. An LLVM formula change intentionally fails the version
