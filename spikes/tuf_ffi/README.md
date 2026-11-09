@@ -6,19 +6,21 @@ dependency is pinned to commit
 [`79d8597006987309930ed3b286f58668adee43cd`](https://github.com/sigstore/sigstore-rust/tree/79d8597006987309930ed3b286f58668adee43cd).
 The Rust crate builds a static library; it adds no C source files.
 
-The ABI accepts at most 1 MiB of root metadata, catches Rust unwinding panics,
-returns stable integer status codes, and writes a verified root summary only
-after parsing and threshold verification succeed. It also checks one root
-rotation link per call; the Elisa caller must persist that candidate before
-passing it as the trusted root for the next link. A separate operation checks
-root expiry against the caller's fixed refresh time at nanosecond precision;
-keeping it separate lets a valid chain pass an expired intermediate root while
-requiring the caller to check its final root. The ABI still does not write
-trust state. Elisa's bounded TUF JSON precheck runs before the foreign call, so
-duplicate JSON keys and noncanonical numbers never reach the upstream parser.
-The adapter owns no persistent trust state, production filesystem I/O, network
-transport, or package policy; the test-only fixture generator writes ephemeral
-signed roots under the probe's private build dir.
+The ABI accepts at most 1 MiB per metadata file, catches Rust unwinding panics,
+and returns stable integer status codes. Root verification writes its summary
+only after threshold verification succeeds. Timestamp verification checks the
+timestamp role against a trusted root and returns the authenticated snapshot
+version, length, and SHA-256 pin. It also checks one root-rotation link per
+call; Elisa must persist that candidate before passing it as the trusted root
+for the next link. Root and timestamp expiry checks use the caller's fixed
+refresh time at nanosecond precision, so expired intermediate roots can pass
+only through sequential rotation while final roots and active timestamps must
+be current. The ABI still does not own rollback floors or write trust state.
+Elisa's bounded TUF JSON prechecks run before the foreign calls, so duplicate
+JSON keys and noncanonical numbers never reach the upstream parser. The adapter
+owns no persistent trust state, production filesystem I/O, network transport,
+or package policy; the test-only fixture generator writes ephemeral signed
+metadata under the probe's private build dir.
 The probe's signed GitHub root fixture is copied from the pinned upstream
 `crates/sigstore-tuf/tests/../../sigstore-trust-root/repository/tuf_github_root.json`
 path (SHA-256 `eb303461e0109458144b6ebcbfd62aaa6f6d7481e9ca77504b85f17761661462`);
@@ -51,8 +53,10 @@ of C sources. The probe exercises valid-root summary output, tampered signature
 rejection, duplicate-key rejection in Elisa, and spec-version rejection. It
 also generates three ephemeral roots, makes the intermediate root expired,
 verifies two consecutive rotations through the Elisa ABI, and checks final-root
-expiry separately, including a root expiring exactly at the fixed refresh time.
-It rejects a skipped version, invalid signature, and expired final root.
-Signature-threshold edge cases, role/delegation policy,
+expiry separately, including equality and subsecond boundaries. It verifies a
+timestamp signature and authenticated snapshot pin, rejects an expired or
+exact-boundary timestamp, and rejects a skipped root version, invalid
+signature, and expired final root. Snapshot/targets verification,
+signature-threshold edge cases, role/delegation policy,
 profile-specific hash rules, durable root checkpointing, and injected
 write-failure tests remain required before any integration is considered.

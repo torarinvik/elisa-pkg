@@ -11,6 +11,7 @@ use sigstore_tuf::{canonical_json, Key};
 const FAR_FUTURE: &str = "2999-01-01T00:00:00Z";
 const EXPIRED: &str = "2000-01-01T00:00:00Z";
 const EXPIRY_BOUNDARY: &str = "2023-11-14T22:13:20Z";
+const SNAPSHOT_SHA256: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 fn key_entry(key_pair: &KeyPair) -> (String, Value) {
     let public_key = key_pair.public_key_der().expect("public key").to_pem();
@@ -48,6 +49,22 @@ fn root_signed_with_expiry(version: u64, key_id: &str, key: Value, expires: &str
             "snapshot": role,
             "targets": role,
         },
+    })
+}
+
+fn timestamp_signed(version: u64, expires: &str) -> Value {
+    json!({
+        "_type": "timestamp",
+        "spec_version": "1.0.0",
+        "version": version,
+        "expires": expires,
+        "meta": {
+            "snapshot.json": {
+                "version": 1,
+                "length": 2,
+                "hashes": { "sha256": SNAPSHOT_SHA256 }
+            }
+        }
     })
 }
 
@@ -108,10 +125,29 @@ fn main() {
         boundary_root_signed.clone(),
         vec![signature(&boundary_root_signed, &id3, &key3)],
     );
+    let timestamp = timestamp_signed(1, FAR_FUTURE);
+    let timestamp = envelope(timestamp.clone(), vec![signature(&timestamp, &id3, &key3)]);
+    let expired_timestamp = timestamp_signed(2, EXPIRED);
+    let expired_timestamp = envelope(
+        expired_timestamp.clone(),
+        vec![signature(&expired_timestamp, &id3, &key3)],
+    );
+    let boundary_timestamp = timestamp_signed(3, EXPIRY_BOUNDARY);
+    let boundary_timestamp = envelope(
+        boundary_timestamp.clone(),
+        vec![signature(&boundary_timestamp, &id3, &key3)],
+    );
 
     write_fixture(&directory, "root1.json", &root1);
     write_fixture(&directory, "root2.json", &root2);
     write_fixture(&directory, "root3.json", &root3);
     write_fixture(&directory, "root-expired.json", &expired_root);
     write_fixture(&directory, "root-expiry-boundary.json", &boundary_root);
+    write_fixture(&directory, "timestamp.json", &timestamp);
+    write_fixture(&directory, "timestamp-expired.json", &expired_timestamp);
+    write_fixture(
+        &directory,
+        "timestamp-expiry-boundary.json",
+        &boundary_timestamp,
+    );
 }

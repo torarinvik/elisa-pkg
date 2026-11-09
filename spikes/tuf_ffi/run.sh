@@ -60,6 +60,12 @@ expired_root_path = fixture_dir / "root-expired.json"
 expired_root_document = json.loads(expired_root_path.read_bytes())
 boundary_root_path = fixture_dir / "root-expiry-boundary.json"
 boundary_root_document = json.loads(boundary_root_path.read_bytes())
+timestamp_path = fixture_dir / "timestamp.json"
+timestamp_document = json.loads(timestamp_path.read_bytes())
+expired_timestamp_path = fixture_dir / "timestamp-expired.json"
+expired_timestamp_document = json.loads(expired_timestamp_path.read_bytes())
+boundary_timestamp_path = fixture_dir / "timestamp-expiry-boundary.json"
+boundary_timestamp_document = json.loads(boundary_timestamp_path.read_bytes())
 if rotation_documents[1]["signed"]["expires"] >= "2023-11-14T22:13:20Z":
     raise SystemExit("root 2 must be expired at the fixed probe time")
 if rotation_documents[2]["signed"]["expires"] <= "2023-11-14T22:13:20Z":
@@ -68,6 +74,12 @@ if expired_root_document["signed"]["expires"] >= "2023-11-14T22:13:20Z":
     raise SystemExit("expired root fixture must be expired at the fixed probe time")
 if boundary_root_document["signed"]["expires"] != "2023-11-14T22:13:20Z":
     raise SystemExit("boundary root fixture must expire exactly at the fixed probe time")
+if timestamp_document["signed"]["_type"] != "timestamp":
+    raise SystemExit("timestamp fixture has the wrong role type")
+if expired_timestamp_document["signed"]["expires"] >= "2023-11-14T22:13:20Z":
+    raise SystemExit("expired timestamp fixture must be expired at the fixed probe time")
+if boundary_timestamp_document["signed"]["expires"] != "2023-11-14T22:13:20Z":
+    raise SystemExit("boundary timestamp fixture must expire exactly at the fixed probe time")
 root2 = rotation_roots[1].read_bytes()
 duplicate_root2 = root2.replace(b'"version":2', b'"version":2,"version":2', 1)
 tampered_root2 = root2.replace(b'"consistent_snapshot":false', b'"consistent_snapshot":true', 1)
@@ -87,6 +99,9 @@ replacements = {
     "@@ROOT3_BYTES@@": ", ".join(map(str, rotation_roots[2].read_bytes())),
     "@@EXPIRED_ROOT_BYTES@@": ", ".join(map(str, expired_root_path.read_bytes())),
     "@@BOUNDARY_ROOT_BYTES@@": ", ".join(map(str, boundary_root_path.read_bytes())),
+    "@@TIMESTAMP_BYTES@@": ", ".join(map(str, timestamp_path.read_bytes())),
+    "@@EXPIRED_TIMESTAMP_BYTES@@": ", ".join(map(str, expired_timestamp_path.read_bytes())),
+    "@@BOUNDARY_TIMESTAMP_BYTES@@": ", ".join(map(str, boundary_timestamp_path.read_bytes())),
     "@@DUPLICATE_ROOT2_BYTES@@": ", ".join(map(str, duplicate_root2)),
     "@@TAMPERED_ROOT2_BYTES@@": ", ".join(map(str, tampered_root2)),
     "@@UNSUPPORTED_ROOT2_BYTES@@": ", ".join(map(str, unsupported_root2)),

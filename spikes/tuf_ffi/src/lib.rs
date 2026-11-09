@@ -8,10 +8,10 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::slice;
 
 use serde_json::Value;
-use sigstore_tuf::{Root, TrustedMetadataSet};
+use sigstore_tuf::{Error as TufError, Role, Root, TrustedMetadataSet};
 
 const ABI_VERSION: u32 = 1;
-const MAX_ROOT_BYTES: usize = 1_048_576;
+const MAX_METADATA_BYTES: usize = 1_048_576;
 
 const STATUS_OK: i32 = 0;
 const STATUS_INVALID_ARGUMENT: i32 = 1;
@@ -19,6 +19,8 @@ const STATUS_INVALID_ROOT: i32 = 2;
 const STATUS_UNSUPPORTED_SPEC: i32 = 3;
 const STATUS_INTERNAL_PANIC: i32 = 4;
 const STATUS_EXPIRED_ROOT: i32 = 5;
+const STATUS_INVALID_METADATA: i32 = 6;
+const STATUS_EXPIRED_METADATA: i32 = 7;
 
 #[derive(Debug, Clone, Copy)]
 struct VerifiedRootSummary {
@@ -30,8 +32,18 @@ struct VerifiedRootSummary {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VerifyError {
     InvalidRoot,
+    InvalidMetadata,
     UnsupportedSpec,
     ExpiredRoot,
+    ExpiredMetadata,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct VerifiedTimestampSummary {
+    version: u64,
+    snapshot_version: u64,
+    snapshot_length: u64,
+    snapshot_sha256: [u8; 32],
 }
 
 /// Return the ABI version expected by the private Elisa adapter.
@@ -50,7 +62,8 @@ pub extern "C" fn elisapkg_tuf_engine_abi_version_v1() -> u32 {
 ///
 /// ABI v1 status values are stable: 0 success, 1 invalid argument, 2 malformed
 /// or cryptographically invalid root, 3 unsupported profile version,
-/// 4 contained Rust panic, and 5 expired root for the expiry-check operation.
+/// 4 contained Rust panic, 5 expired root, 6 invalid metadata, and
+/// 7 expired active metadata.
 ///
 /// # Safety
 ///
@@ -69,7 +82,7 @@ pub unsafe extern "C" fn elisapkg_tuf_engine_verify_root_v1(
 ) -> i32 {
     if metadata.is_null()
         || metadata_len == 0
-        || metadata_len > MAX_ROOT_BYTES
+        || metadata_len > MAX_METADATA_BYTES
         || out_version.is_null()
         || out_key_count.is_null()
         || out_root_threshold.is_null()
@@ -86,9 +99,7 @@ pub unsafe extern "C" fn elisapkg_tuf_engine_verify_root_v1(
 
     let summary = match verification {
         Ok(Ok(summary)) => summary,
-        Ok(Err(VerifyError::UnsupportedSpec)) => return STATUS_UNSUPPORTED_SPEC,
-        Ok(Err(VerifyError::InvalidRoot)) => return STATUS_INVALID_ROOT,
-        Ok(Err(VerifyError::ExpiredRoot)) => return STATUS_EXPIRED_ROOT,
+        Ok(Err(error)) => return status_for_verify_error(error),
         Err(_) => return STATUS_INTERNAL_PANIC,
     };
 
@@ -130,10 +141,10 @@ pub unsafe extern "C" fn elisapkg_tuf_engine_verify_root_update_v1(
 ) -> i32 {
     if trusted_root.is_null()
         || trusted_root_len == 0
-        || trusted_root_len > MAX_ROOT_BYTES
+        || trusted_root_len > MAX_METADATA_BYTES
         || candidate_root.is_null()
         || candidate_root_len == 0
-        || candidate_root_len > MAX_ROOT_BYTES
+        || candidate_root_len > MAX_METADATA_BYTES
         || out_version.is_null()
         || out_key_count.is_null()
         || out_root_threshold.is_null()
@@ -151,9 +162,7 @@ pub unsafe extern "C" fn elisapkg_tuf_engine_verify_root_update_v1(
 
     let summary = match verification {
         Ok(Ok(summary)) => summary,
-        Ok(Err(VerifyError::UnsupportedSpec)) => return STATUS_UNSUPPORTED_SPEC,
-        Ok(Err(VerifyError::InvalidRoot)) => return STATUS_INVALID_ROOT,
-        Ok(Err(VerifyError::ExpiredRoot)) => return STATUS_EXPIRED_ROOT,
+        Ok(Err(error)) => return status_for_verify_error(error),
         Err(_) => return STATUS_INTERNAL_PANIC,
     };
 
@@ -173,7 +182,9 @@ pub unsafe extern "C" fn elisapkg_tuf_engine_verify_root_update_v1(
 /// expired intermediate roots within a valid sequential rotation, but the
 /// final trusted root must be current before refreshing active roles.
 ///
-/// Status values match the root verification ABI, with 5 for an expired root.
+/// Status values are 0 success, 1 invalid arguments, 2 invalid root,
+/// 3 unsupported spec, 4 contained panic, 5 expired root, 6 invalid metadata,
+/// and 7 expired metadata.
 ///
 /// # Safety
 ///
@@ -187,7 +198,7 @@ pub unsafe extern "C" fn elisapkg_tuf_engine_check_root_expiry_v1(
     now_unix_seconds: i64,
     now_nanoseconds: u32,
 ) -> i32 {
-    if metadata.is_null() || metadata_len == 0 || metadata_len > MAX_ROOT_BYTES {
+    if metadata.is_null() || metadata_len == 0 || metadata_len > MAX_METADATA_BYTES {
         return STATUS_INVALID_ARGUMENT;
     }
     if now_nanoseconds >= 1_000_000_000 {
@@ -207,11 +218,83 @@ pub unsafe extern "C" fn elisapkg_tuf_engine_check_root_expiry_v1(
 
     match verification {
         Ok(Ok(())) => STATUS_OK,
-        Ok(Err(VerifyError::UnsupportedSpec)) => STATUS_UNSUPPORTED_SPEC,
-        Ok(Err(VerifyError::ExpiredRoot)) => STATUS_EXPIRED_ROOT,
-        Ok(Err(VerifyError::InvalidRoot)) => STATUS_INVALID_ROOT,
+        Ok(Err(error)) => status_for_verify_error(error),
         Err(_) => STATUS_INTERNAL_PANIC,
     }
+}
+
+/// Verify a timestamp against a self-authenticating trusted root.
+///
+/// This operation authenticates the timestamp role and returns its snapshot
+/// pin. Elisa remains responsible for durable rollback floors and persistence.
+/// The caller supplies the fixed refresh-start time at nanosecond precision.
+///
+/// # Safety
+///
+/// The two inputs must point to readable buffers that passed Elisa's bounded
+/// JSON, duplicate-key, canonical-number, and SHA-256 profile prechecks. The
+/// output pointers must be aligned and writable; their output ranges must not
+/// overlap each other or either input range. `out_snapshot_sha256` addresses
+/// exactly 32 writable bytes. `now_nanoseconds` must be less than one billion.
+#[no_mangle]
+pub unsafe extern "C" fn elisapkg_tuf_engine_verify_timestamp_v1(
+    trusted_root: *const u8,
+    trusted_root_len: usize,
+    timestamp: *const u8,
+    timestamp_len: usize,
+    now_unix_seconds: i64,
+    now_nanoseconds: u32,
+    out_timestamp_version: *mut u64,
+    out_snapshot_version: *mut u64,
+    out_snapshot_length: *mut u64,
+    out_snapshot_sha256: *mut u8,
+) -> i32 {
+    if trusted_root.is_null()
+        || trusted_root_len == 0
+        || trusted_root_len > MAX_METADATA_BYTES
+        || timestamp.is_null()
+        || timestamp_len == 0
+        || timestamp_len > MAX_METADATA_BYTES
+        || now_nanoseconds >= 1_000_000_000
+        || out_timestamp_version.is_null()
+        || out_snapshot_version.is_null()
+        || out_snapshot_length.is_null()
+        || out_snapshot_sha256.is_null()
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    let now = match jiff::Timestamp::new(now_unix_seconds, now_nanoseconds as i32) {
+        Ok(now) => now,
+        Err(_) => return STATUS_INVALID_ARGUMENT,
+    };
+
+    let verification = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: null and length bounds are checked above. The caller contract
+        // requires each input pointer to address its declared readable range.
+        let root_bytes = unsafe { slice::from_raw_parts(trusted_root, trusted_root_len) };
+        let timestamp_bytes = unsafe { slice::from_raw_parts(timestamp, timestamp_len) };
+        verify_timestamp_bytes(root_bytes, timestamp_bytes, now)
+    }));
+
+    let summary = match verification {
+        Ok(Ok(summary)) => summary,
+        Ok(Err(error)) => return status_for_verify_error(error),
+        Err(_) => return STATUS_INTERNAL_PANIC,
+    };
+
+    // SAFETY: output pointer validity, extents, exclusive access, and
+    // non-overlap are caller obligations documented above.
+    unsafe {
+        *out_timestamp_version = summary.version;
+        *out_snapshot_version = summary.snapshot_version;
+        *out_snapshot_length = summary.snapshot_length;
+        std::ptr::copy_nonoverlapping(
+            summary.snapshot_sha256.as_ptr(),
+            out_snapshot_sha256,
+            summary.snapshot_sha256.len(),
+        );
+    }
+    STATUS_OK
 }
 
 fn verify_root_bytes(bytes: &[u8]) -> Result<VerifiedRootSummary, VerifyError> {
@@ -242,32 +325,108 @@ fn check_root_expiry_bytes(bytes: &[u8], now: jiff::Timestamp) -> Result<(), Ver
     let trusted = TrustedMetadataSet::from_root(bytes).map_err(|_| VerifyError::InvalidRoot)?;
     // TUF requires expiry to be later than the fixed refresh start time. The
     // pinned helper uses `< now`, which would incorrectly accept equality.
-    let expires_at = trusted
-        .root()
-        .expires
-        .parse::<jiff::Timestamp>()
-        .map_err(|_| VerifyError::InvalidRoot)?;
-    if expires_at <= now {
+    if expiration_is_at_or_before(trusted.root(), now).map_err(|_| VerifyError::InvalidRoot)? {
         Err(VerifyError::ExpiredRoot)
     } else {
         Ok(())
     }
 }
 
-fn validate_root_spec_version(bytes: &[u8]) -> Result<(), VerifyError> {
+fn verify_timestamp_bytes(
+    root_bytes: &[u8],
+    timestamp_bytes: &[u8],
+    now: jiff::Timestamp,
+) -> Result<VerifiedTimestampSummary, VerifyError> {
+    validate_spec_version(root_bytes, VerifyError::InvalidRoot)?;
+    validate_spec_version(timestamp_bytes, VerifyError::InvalidMetadata)?;
+
+    let mut trusted =
+        TrustedMetadataSet::from_root(root_bytes).map_err(|_| VerifyError::InvalidRoot)?;
+    if expiration_is_at_or_before(trusted.root(), now).map_err(|_| VerifyError::InvalidRoot)? {
+        return Err(VerifyError::ExpiredRoot);
+    }
+
+    trusted
+        .update_timestamp(timestamp_bytes, now)
+        .map_err(|error| match error {
+            TufError::Expired { .. } => VerifyError::ExpiredMetadata,
+            _ => VerifyError::InvalidMetadata,
+        })?;
+    let timestamp = trusted.timestamp().ok_or(VerifyError::InvalidMetadata)?;
+    if expiration_is_at_or_before(timestamp, now).map_err(|_| VerifyError::InvalidMetadata)? {
+        return Err(VerifyError::ExpiredMetadata);
+    }
+
+    // The package profile permits timestamp.json to pin only snapshot.json,
+    // with both a bounded length and the required SHA-256 digest.
+    if timestamp.meta.len() != 1 {
+        return Err(VerifyError::InvalidMetadata);
+    }
+    let pin = timestamp
+        .snapshot_meta()
+        .ok_or(VerifyError::InvalidMetadata)?;
+    let snapshot_length = pin
+        .length
+        .filter(|length| *length > 0 && *length <= MAX_METADATA_BYTES as u64)
+        .ok_or(VerifyError::InvalidMetadata)?;
+    let hashes = pin.hashes.as_ref().ok_or(VerifyError::InvalidMetadata)?;
+    if hashes.len() != 1 {
+        return Err(VerifyError::InvalidMetadata);
+    }
+    let digest = hashes.get("sha256").ok_or(VerifyError::InvalidMetadata)?;
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(VerifyError::InvalidMetadata);
+    }
+    let mut snapshot_sha256 = [0_u8; 32];
+    hex::decode_to_slice(digest, &mut snapshot_sha256).map_err(|_| VerifyError::InvalidMetadata)?;
+
+    Ok(VerifiedTimestampSummary {
+        version: timestamp.version,
+        snapshot_version: pin.version,
+        snapshot_length,
+        snapshot_sha256,
+    })
+}
+
+fn expiration_is_at_or_before<T: Role>(role: &T, now: jiff::Timestamp) -> Result<bool, ()> {
+    role.expires()
+        .parse::<jiff::Timestamp>()
+        .map(|expires_at| expires_at <= now)
+        .map_err(|_| ())
+}
+
+fn validate_spec_version(bytes: &[u8], malformed: VerifyError) -> Result<(), VerifyError> {
     // Elisa's bounded precheck is authoritative for duplicate-key rejection
-    // and canonical integer syntax. Parsing here extracts only the profile
-    // field before delegating signature and schema validation to sigstore-tuf.
-    let value: Value = serde_json::from_slice(bytes).map_err(|_| VerifyError::InvalidRoot)?;
+    // and canonical integer syntax. Parse the version here to enforce this
+    // package's stricter compatibility range before the upstream parser runs.
+    let value: Value = serde_json::from_slice(bytes).map_err(|_| malformed)?;
     let spec_version = value
         .get("signed")
         .and_then(|signed| signed.get("spec_version"))
         .and_then(Value::as_str)
-        .ok_or(VerifyError::InvalidRoot)?;
+        .ok_or(malformed)?;
     if !supported_spec_version(spec_version) {
         return Err(VerifyError::UnsupportedSpec);
     }
     Ok(())
+}
+
+fn status_for_verify_error(error: VerifyError) -> i32 {
+    match error {
+        VerifyError::InvalidRoot => STATUS_INVALID_ROOT,
+        VerifyError::InvalidMetadata => STATUS_INVALID_METADATA,
+        VerifyError::UnsupportedSpec => STATUS_UNSUPPORTED_SPEC,
+        VerifyError::ExpiredRoot => STATUS_EXPIRED_ROOT,
+        VerifyError::ExpiredMetadata => STATUS_EXPIRED_METADATA,
+    }
+}
+
+fn validate_root_spec_version(bytes: &[u8]) -> Result<(), VerifyError> {
+    validate_spec_version(bytes, VerifyError::InvalidRoot)
 }
 
 fn summarize_root(root: &Root) -> Result<VerifiedRootSummary, VerifyError> {
@@ -343,7 +502,7 @@ mod tests {
         let result = unsafe {
             elisapkg_tuf_engine_verify_root_v1(
                 byte.as_ptr(),
-                MAX_ROOT_BYTES + 1,
+                MAX_METADATA_BYTES + 1,
                 &mut version,
                 &mut key_count,
                 &mut threshold,
@@ -393,7 +552,7 @@ mod tests {
                 bytes.as_ptr(),
                 bytes.len(),
                 bytes.as_ptr(),
-                MAX_ROOT_BYTES + 1,
+                MAX_METADATA_BYTES + 1,
                 &mut version,
                 &mut key_count,
                 &mut threshold,

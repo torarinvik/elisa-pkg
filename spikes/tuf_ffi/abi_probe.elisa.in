@@ -12,6 +12,8 @@ extern native_tuf_engine_verify_root_v1(metadata: void&, metadata_len: usize, ou
 extern native_tuf_engine_verify_root_update_v1(trusted_root: void&, trusted_root_len: usize, candidate_root: void&, candidate_root_len: usize, out_version: mutable u64&, out_key_count: mutable u32&, out_root_threshold: mutable u32&) -> i32
 @link_name("elisapkg_tuf_engine_check_root_expiry_v1")
 extern native_tuf_engine_check_root_expiry_v1(metadata: void&, metadata_len: usize, now_unix_seconds: i64, now_nanoseconds: u32) -> i32
+@link_name("elisapkg_tuf_engine_verify_timestamp_v1")
+extern native_tuf_engine_verify_timestamp_v1(trusted_root: void&, trusted_root_len: usize, timestamp: void&, timestamp_len: usize, now_unix_seconds: i64, now_nanoseconds: u32, out_timestamp_version: mutable u64&, out_snapshot_version: mutable u64&, out_snapshot_length: mutable u64&, out_snapshot_sha256: mutable void&) -> i32
 
 module TufEngine:
     public:
@@ -23,19 +25,20 @@ module TufEngine:
             InternalPanic
             ExpiredRoot
             InvalidMetadata
+            ExpiredMetadata
 
         def abi_version() -> u32:
             return native_tuf_engine_abi_version_v1()
 
         def verify_root(metadata: darray[u8]&, version: mutable u64&, key_count: mutable u32&, root_threshold: mutable u32&) -> Status can[Unsafe.PointerCast]:
-            return Status.InvalidArgument if metadata.count == 0.usize() or metadata.count > max_root_bytes
+            return Status.InvalidArgument if metadata.count == 0.usize() or metadata.count > max_metadata_bytes
             return Status.InvalidMetadata if Tuf::precheck_metadata_json(metadata) != Tuf::ValidationCode.WellFormed
             bytes_ptr: void& = (&metadata[0]).cast[void&] can Unsafe.PointerCast
             result: i32 = native_tuf_engine_verify_root_v1(bytes_ptr, metadata.count, version, key_count, root_threshold)
             return status_from_native(result)
 
         def verify_root_update(trusted_root: darray[u8]&, candidate_root: darray[u8]&, version: mutable u64&, key_count: mutable u32&, root_threshold: mutable u32&) -> Status can[Unsafe.PointerCast]:
-            return Status.InvalidArgument if trusted_root.count == 0.usize() or trusted_root.count > max_root_bytes or candidate_root.count == 0.usize() or candidate_root.count > max_root_bytes
+            return Status.InvalidArgument if trusted_root.count == 0.usize() or trusted_root.count > max_metadata_bytes or candidate_root.count == 0.usize() or candidate_root.count > max_metadata_bytes
             return Status.InvalidMetadata if Tuf::precheck_metadata_json(trusted_root) != Tuf::ValidationCode.WellFormed
             return Status.InvalidMetadata if Tuf::precheck_metadata_json(candidate_root) != Tuf::ValidationCode.WellFormed
             trusted_bytes_ptr: void& = (&trusted_root[0]).cast[void&] can Unsafe.PointerCast
@@ -44,14 +47,28 @@ module TufEngine:
             return status_from_native(result)
 
         def check_root_expiry(root: darray[u8]&, now_unix_seconds: i64, now_nanoseconds: u32) -> Status can[Unsafe.PointerCast]:
-            return Status.InvalidArgument if root.count == 0.usize() or root.count > max_root_bytes
+            return Status.InvalidArgument if root.count == 0.usize() or root.count > max_metadata_bytes
             return Status.InvalidMetadata if Tuf::precheck_metadata_json(root) != Tuf::ValidationCode.WellFormed
             root_bytes_ptr: void& = (&root[0]).cast[void&] can Unsafe.PointerCast
             result: i32 = native_tuf_engine_check_root_expiry_v1(root_bytes_ptr, root.count, now_unix_seconds, now_nanoseconds)
             return status_from_native(result)
 
+        def verify_timestamp(trusted_root: darray[u8]&, timestamp: darray[u8]&, now_unix_seconds: i64, now_nanoseconds: u32, timestamp_version: mutable u64&, snapshot_version: mutable u64&, snapshot_length: mutable u64&, snapshot_sha256: mutable darray[u8]&) -> Status can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return Status.InvalidArgument if trusted_root.count == 0.usize() or trusted_root.count > max_metadata_bytes or timestamp.count == 0.usize() or timestamp.count > max_metadata_bytes
+            return Status.InvalidMetadata if Tuf::precheck_metadata_json(trusted_root) != Tuf::ValidationCode.WellFormed
+            return Status.InvalidMetadata if Tuf::precheck_sha256_hashes(timestamp) != Tuf::ValidationCode.WellFormed
+            snapshot_sha256.resize(32.usize())
+            root_bytes_ptr: void& = (&trusted_root[0]).cast[void&] can Unsafe.PointerCast
+            timestamp_bytes_ptr: void& = (&timestamp[0]).cast[void&] can Unsafe.PointerCast
+            digest_bytes_ptr: void& = (&snapshot_sha256[0]).cast[void&] can Unsafe.PointerCast
+            result: i32 = native_tuf_engine_verify_timestamp_v1(root_bytes_ptr, trusted_root.count, timestamp_bytes_ptr, timestamp.count, now_unix_seconds, now_nanoseconds, timestamp_version, snapshot_version, snapshot_length, digest_bytes_ptr)
+            if result != 0:
+                snapshot_sha256.resize(0.usize())
+                return status_from_native(result)
+            return Status.Ok
+
     private:
-        const max_root_bytes: usize = 1048576.usize()
+        const max_metadata_bytes: usize = 1048576.usize()
 
         def status_from_native(result: i32) -> Status:
             return Status.Ok if result == 0
@@ -59,6 +76,8 @@ module TufEngine:
             return Status.InvalidRoot if result == 2
             return Status.UnsupportedSpec if result == 3
             return Status.ExpiredRoot if result == 5
+            return Status.InvalidMetadata if result == 6
+            return Status.ExpiredMetadata if result == 7
             return Status.InternalPanic
 
 module TufEngineProbe:
@@ -100,6 +119,9 @@ module TufEngineProbe:
             root3: mutable darray[u8] = [@@ROOT3_BYTES@@]
             expired_root: mutable darray[u8] = [@@EXPIRED_ROOT_BYTES@@]
             boundary_root: mutable darray[u8] = [@@BOUNDARY_ROOT_BYTES@@]
+            timestamp: mutable darray[u8] = [@@TIMESTAMP_BYTES@@]
+            expired_timestamp: mutable darray[u8] = [@@EXPIRED_TIMESTAMP_BYTES@@]
+            boundary_timestamp: mutable darray[u8] = [@@BOUNDARY_TIMESTAMP_BYTES@@]
             return 12 if TufEngine::verify_root(root1, &version, &key_count, &threshold) != TufEngine::Status.Ok
             return 13 if version != 1.u64() or key_count != 1.u32() or threshold != 1.u32()
             return 14 if TufEngine::verify_root_update(root1, root2, &version, &key_count, &threshold) != TufEngine::Status.Ok
@@ -111,6 +133,24 @@ module TufEngineProbe:
             return 28 if TufEngine::check_root_expiry(expired_root, 1700000000.i64(), 0.u32()) != TufEngine::Status.ExpiredRoot
             return 29 if TufEngine::check_root_expiry(boundary_root, 1700000000.i64(), 0.u32()) != TufEngine::Status.ExpiredRoot
             return 30 if TufEngine::check_root_expiry(boundary_root, 1700000000.i64(), 1.u32()) != TufEngine::Status.ExpiredRoot
+
+            timestamp_version: mutable u64 = 77.u64()
+            snapshot_version: mutable u64 = 77.u64()
+            snapshot_length: mutable u64 = 77.u64()
+            snapshot_sha256: mutable darray[u8] = []
+            return 31 if TufEngine::verify_timestamp(root3, timestamp, 1700000000.i64(), 0.u32(), &timestamp_version, &snapshot_version, &snapshot_length, &snapshot_sha256) != TufEngine::Status.Ok
+            return 32 if timestamp_version != 1.u64() or snapshot_version != 1.u64() or snapshot_length != 2.u64() or snapshot_sha256.count != 32.usize()
+            for digest_index in 0..<32 |snapshot_sha256, digest_index|:
+                return 33 if snapshot_sha256[digest_index] != 0
+
+            timestamp_version <- 77.u64()
+            snapshot_version <- 77.u64()
+            snapshot_length <- 77.u64()
+            return 34 if TufEngine::verify_timestamp(root3, expired_timestamp, 1700000000.i64(), 0.u32(), &timestamp_version, &snapshot_version, &snapshot_length, &snapshot_sha256) != TufEngine::Status.ExpiredMetadata
+            return 35 if timestamp_version != 77.u64() or snapshot_version != 77.u64() or snapshot_length != 77.u64() or snapshot_sha256.count != 0.usize()
+            return 36 if TufEngine::verify_timestamp(root3, boundary_timestamp, 1699999999.i64(), 999999999.u32(), &timestamp_version, &snapshot_version, &snapshot_length, &snapshot_sha256) != TufEngine::Status.Ok
+            return 37 if TufEngine::verify_timestamp(root3, boundary_timestamp, 1700000000.i64(), 0.u32(), &timestamp_version, &snapshot_version, &snapshot_length, &snapshot_sha256) != TufEngine::Status.ExpiredMetadata
+            return 38 if TufEngine::verify_timestamp(root3, boundary_timestamp, 1700000000.i64(), 1.u32(), &timestamp_version, &snapshot_version, &snapshot_length, &snapshot_sha256) != TufEngine::Status.ExpiredMetadata
 
             version <- 77.u64()
             key_count <- 77.u32()

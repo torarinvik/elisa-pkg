@@ -272,14 +272,15 @@ duplicate keys in Elisa before FFI, and left output fields untouched on
 failures. This establishes only the v1 ABI layout and bounded root-verification
 operations on one target. The Rust entry point depends on the Elisa precheck to
 reject duplicate keys and noncanonical numbers; the prototype has no durable
-root checkpoint implementation, role refresh, delegation, target hash policy,
-cache writes, transport, or supported-platform CI coverage. A separate ABI
-operation can check final-root expiry at a caller-supplied time, including the
-TUF-required equality boundary where expiry must be later than refresh start;
-the ABI accepts seconds and nanoseconds to avoid truncating the fixed time.
-The prototype does not own the complete refresh workflow or guarantee that
-this check follows a full root chain. It is not approval to ship the engine or
-enable remote operations.
+root checkpoint implementation, complete role refresh, delegation, cache
+writes, transport, or supported-platform CI coverage. Separate ABI operations
+can check final-root expiry and verify a timestamp against a root, returning
+its snapshot pin. They enforce the TUF-required strict expiry boundary at a
+caller-supplied fixed time with seconds and nanoseconds. The Elisa probe cases
+for timestamp verification have not yet run on Vast because the instance
+refuses the SSH connection. The prototype does not own rollback floors or the
+complete refresh workflow. It is not approval to ship the engine or enable
+remote operations.
 
 The fixture in D-011 remains a local implementation test only. Its custom
 single-key index and signed metadata are not a compatible TUF implementation
