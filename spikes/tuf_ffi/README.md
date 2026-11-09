@@ -12,15 +12,18 @@ only after threshold verification succeeds. It rejects mismatched TUF root key
 IDs, non-Ed25519 root keys, roots with more than 64 key IDs in any role, over
 320 root keys, metadata with more than 64 signatures, duplicate signature key
 IDs, and malformed Ed25519 signature encodings before the upstream verifier
-processes them. Timestamp
-verification checks the timestamp role against a trusted root and returns the
-authenticated snapshot version, length, and SHA-256 pin. It also checks one
+processes them. Timestamp verification checks the timestamp role against a
+trusted root and returns the authenticated snapshot version, length, and
+SHA-256 pin. Snapshot verification rechecks that chain, validates each
+snapshot metadata entry's bounded length and SHA-256 pin, verifies the snapshot
+threshold, and returns its version and entry count. The caller can parse those
+pins from the exact snapshot bytes that were verified. The ABI also checks one
 root-rotation link per call; Elisa must persist that candidate before passing
-it as the trusted root for the next link. Root and timestamp expiry checks use
-the caller's fixed refresh time at nanosecond precision. Expired intermediate
-roots can pass only through sequential rotation; final roots and active
-timestamps must be current. The ABI still does not own rollback floors or
-write trust state.
+it as the trusted root for the next link. Root, timestamp, and snapshot
+expiry checks use the caller's fixed refresh time at nanosecond precision.
+Expired intermediate roots can pass only through sequential rotation; final
+roots and active metadata must be current. The ABI still does not own rollback
+floors or write trust state.
 Elisa's bounded TUF JSON prechecks run before the foreign calls, so duplicate
 JSON keys and noncanonical numbers never reach the upstream parser. The adapter
 owns no persistent trust state, production filesystem I/O, network transport,
@@ -60,7 +63,9 @@ verifies two consecutive rotations through the Elisa ABI, and checks final-root
 expiry separately, including equality and subsecond boundaries. It verifies a
 timestamp signature and authenticated snapshot pin, rejects an expired or
 exact-boundary timestamp, and rejects a skipped root version, invalid
-signature, and expired final root. Snapshot/targets verification,
-signature-threshold edge cases, role/delegation policy,
-profile-specific hash rules, durable root checkpointing, and injected
-write-failure tests remain required before any integration is considered.
+signature, and expired final root. The Rust ABI now has a snapshot-chain
+verification entry point; the probe does not yet exercise it. Targets
+verification, signature-threshold edge cases, role/delegation policy,
+profile-specific package metadata rules, durable root checkpointing, and
+injected write-failure tests remain required before any integration is
+considered.
