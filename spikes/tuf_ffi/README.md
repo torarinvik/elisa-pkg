@@ -67,11 +67,14 @@ expiry separately, including equality and subsecond boundaries. It verifies a
 timestamp signature and authenticated snapshot pin, rejects an expired or
 exact-boundary timestamp, and rejects a skipped root version, invalid
 signature, and expired final root. The Rust ABI now has snapshot-chain,
-authenticated pin lookup, and top-level Targets verification entry points;
-the probe does not yet exercise them. Top-level Targets verification bounds
-target records, rejects direct package targets, and checks package delegation
-names, paths, key IDs, and thresholds. Delegated Targets verification, target
-selection, package target-record policy, signature-threshold edge cases,
-profile-specific package metadata rules, durable root checkpointing, and
-injected write-failure tests remain required before any integration is
-considered.
+authenticated pin lookup, top-level Targets verification, and package-target
+verification entry points; the probe does not yet exercise them. Top-level
+Targets verification bounds target records, rejects direct package targets,
+and checks package delegation names, paths, key IDs, and thresholds.
+Package-target verification checks one caller-specified path under the
+`package-<name>` delegated role against its snapshot pin and delegated
+signature threshold, requires one archive per exact version, and returns the
+authenticated length and digest. Resolver candidate enumeration,
+profile-specific `custom.elisapkg` validation, broader target-record policy,
+signature-threshold edge cases, durable root checkpointing, and injected
+write-failure tests remain required before any integration is considered.

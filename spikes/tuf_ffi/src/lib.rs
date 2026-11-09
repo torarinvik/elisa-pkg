@@ -70,6 +70,13 @@ struct VerifiedTargetsSummary {
     delegation_count: u32,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct VerifiedPackageTargetSummary {
+    delegated_targets_version: u64,
+    target_length: u64,
+    target_sha256: [u8; 32],
+}
+
 /// Return the ABI version expected by the private Elisa adapter.
 #[no_mangle]
 pub extern "C" fn elisapkg_tuf_engine_abi_version_v1() -> u32 {
@@ -560,6 +567,122 @@ pub unsafe extern "C" fn elisapkg_tuf_engine_verify_targets_v1(
     STATUS_OK
 }
 
+/// Verify one package-scoped delegated Targets role and select an authenticated
+/// package target from it.
+///
+/// The package role name is `package-<package_name>`. The full root → timestamp
+/// → snapshot → top-level Targets chain and the delegated role are re-verified
+/// for every call. The selected target must use the profile path
+/// `packages/<package>/<stable-version>/<sha256>.tar`, and its filename digest
+/// must equal its signed SHA-256 target hash.
+///
+/// # Safety
+///
+/// The five metadata inputs must point to readable buffers that passed
+/// Elisa's bounded JSON, duplicate-key, canonical-number, and SHA-256 profile
+/// prechecks. The package name and target path must point to readable UTF-8
+/// buffers with the declared lengths. Output pointers must be aligned and
+/// writable; their ranges must not overlap each other or any input range. The
+/// SHA-256 output must address 32 writable bytes. `now_nanoseconds` must be
+/// less than one billion.
+#[no_mangle]
+pub unsafe extern "C" fn elisapkg_tuf_engine_verify_package_target_v1(
+    trusted_root: *const u8,
+    trusted_root_len: usize,
+    timestamp: *const u8,
+    timestamp_len: usize,
+    snapshot: *const u8,
+    snapshot_len: usize,
+    targets: *const u8,
+    targets_len: usize,
+    delegated_targets: *const u8,
+    delegated_targets_len: usize,
+    package_name: *const u8,
+    package_name_len: usize,
+    target_path: *const u8,
+    target_path_len: usize,
+    now_unix_seconds: i64,
+    now_nanoseconds: u32,
+    out_delegated_targets_version: *mut u64,
+    out_target_length: *mut u64,
+    out_target_sha256: *mut u8,
+) -> i32 {
+    if trusted_root.is_null()
+        || trusted_root_len == 0
+        || trusted_root_len > MAX_METADATA_BYTES
+        || timestamp.is_null()
+        || timestamp_len == 0
+        || timestamp_len > MAX_METADATA_BYTES
+        || snapshot.is_null()
+        || snapshot_len == 0
+        || snapshot_len > MAX_METADATA_BYTES
+        || targets.is_null()
+        || targets_len == 0
+        || targets_len > MAX_METADATA_BYTES
+        || delegated_targets.is_null()
+        || delegated_targets_len == 0
+        || delegated_targets_len > MAX_METADATA_BYTES
+        || package_name.is_null()
+        || package_name_len == 0
+        || package_name_len > 64
+        || target_path.is_null()
+        || target_path_len == 0
+        || target_path_len > MAX_TARGET_PATH_BYTES
+        || now_nanoseconds >= 1_000_000_000
+        || out_delegated_targets_version.is_null()
+        || out_target_length.is_null()
+        || out_target_sha256.is_null()
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    let now = match jiff::Timestamp::new(now_unix_seconds, now_nanoseconds as i32) {
+        Ok(now) => now,
+        Err(_) => return STATUS_INVALID_ARGUMENT,
+    };
+
+    let verification = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: null and length bounds are checked above. The caller contract
+        // requires every pointer to address its declared readable range.
+        let root_bytes = unsafe { slice::from_raw_parts(trusted_root, trusted_root_len) };
+        let timestamp_bytes = unsafe { slice::from_raw_parts(timestamp, timestamp_len) };
+        let snapshot_bytes = unsafe { slice::from_raw_parts(snapshot, snapshot_len) };
+        let targets_bytes = unsafe { slice::from_raw_parts(targets, targets_len) };
+        let delegated_targets_bytes =
+            unsafe { slice::from_raw_parts(delegated_targets, delegated_targets_len) };
+        let package_name_bytes = unsafe { slice::from_raw_parts(package_name, package_name_len) };
+        let target_path_bytes = unsafe { slice::from_raw_parts(target_path, target_path_len) };
+        let package_name =
+            std::str::from_utf8(package_name_bytes).map_err(|_| VerifyError::InvalidMetadata)?;
+        let target_path =
+            std::str::from_utf8(target_path_bytes).map_err(|_| VerifyError::InvalidMetadata)?;
+        verify_package_target_bytes(
+            root_bytes,
+            timestamp_bytes,
+            snapshot_bytes,
+            targets_bytes,
+            delegated_targets_bytes,
+            package_name,
+            target_path,
+            now,
+        )
+    }));
+
+    let summary = match verification {
+        Ok(Ok(summary)) => summary,
+        Ok(Err(error)) => return status_for_verify_error(error),
+        Err(_) => return STATUS_INTERNAL_PANIC,
+    };
+
+    // SAFETY: non-null output locations were checked above. Their writable,
+    // non-overlapping extents are part of the caller contract.
+    unsafe {
+        *out_delegated_targets_version = summary.delegated_targets_version;
+        *out_target_length = summary.target_length;
+        std::ptr::copy_nonoverlapping(summary.target_sha256.as_ptr(), out_target_sha256, 32);
+    }
+    STATUS_OK
+}
+
 fn verify_root_bytes(bytes: &[u8]) -> Result<VerifiedRootSummary, VerifyError> {
     validate_root_spec_version(bytes)?;
 
@@ -667,6 +790,82 @@ fn verify_top_level_targets_bytes(
     })
 }
 
+fn verify_package_target_bytes(
+    root_bytes: &[u8],
+    timestamp_bytes: &[u8],
+    snapshot_bytes: &[u8],
+    targets_bytes: &[u8],
+    delegated_targets_bytes: &[u8],
+    package_name: &str,
+    target_path: &str,
+    now: jiff::Timestamp,
+) -> Result<VerifiedPackageTargetSummary, VerifyError> {
+    if !valid_profile_package_name(package_name)
+        || package_target_path_digest(target_path, package_name).is_none()
+    {
+        return Err(VerifyError::InvalidMetadata);
+    }
+
+    let mut trusted = load_verified_snapshot(root_bytes, timestamp_bytes, snapshot_bytes, now)?;
+    validate_spec_version(targets_bytes, VerifyError::InvalidMetadata)?;
+    validate_signature_profile(targets_bytes, VerifyError::InvalidMetadata)?;
+    validate_top_level_targets_profile(targets_bytes)?;
+    {
+        let top_level_targets = trusted
+            .update_targets(targets_bytes, now)
+            .map_err(|error| match error {
+                TufError::Expired { .. } => VerifyError::ExpiredMetadata,
+                _ => VerifyError::InvalidMetadata,
+            })?;
+        if expiration_is_at_or_before(top_level_targets, now)
+            .map_err(|_| VerifyError::InvalidMetadata)?
+        {
+            return Err(VerifyError::ExpiredMetadata);
+        }
+    }
+
+    validate_spec_version(delegated_targets_bytes, VerifyError::InvalidMetadata)?;
+    validate_signature_profile(delegated_targets_bytes, VerifyError::InvalidMetadata)?;
+    validate_package_targets_profile(delegated_targets_bytes, package_name)?;
+    let role_name = format!("package-{package_name}");
+    let delegated = trusted
+        .update_delegated_targets(delegated_targets_bytes, &role_name, "targets", now)
+        .map_err(|error| match error {
+            TufError::Expired { .. } => VerifyError::ExpiredMetadata,
+            _ => VerifyError::InvalidMetadata,
+        })?;
+    if expiration_is_at_or_before(delegated, now).map_err(|_| VerifyError::InvalidMetadata)? {
+        return Err(VerifyError::ExpiredMetadata);
+    }
+
+    let target = delegated
+        .target(target_path)
+        .ok_or(VerifyError::InvalidMetadata)?;
+    let target_length = target.length;
+    if target_length == 0 || target_length > MAX_TARGET_BYTES {
+        return Err(VerifyError::InvalidMetadata);
+    }
+    let target_digest = target
+        .hashes
+        .get("sha256")
+        .filter(|digest| is_lower_hex(digest, 64))
+        .ok_or(VerifyError::InvalidMetadata)?;
+    if target.hashes.len() != 1
+        || package_target_path_digest(target_path, package_name) != Some(target_digest.as_str())
+    {
+        return Err(VerifyError::InvalidMetadata);
+    }
+    let mut target_sha256 = [0_u8; 32];
+    hex::decode_to_slice(target_digest, &mut target_sha256)
+        .map_err(|_| VerifyError::InvalidMetadata)?;
+
+    Ok(VerifiedPackageTargetSummary {
+        delegated_targets_version: delegated.version,
+        target_length,
+        target_sha256,
+    })
+}
+
 fn validate_top_level_targets_profile(bytes: &[u8]) -> Result<(u32, u32), VerifyError> {
     let value: Value = serde_json::from_slice(bytes).map_err(|_| VerifyError::InvalidMetadata)?;
     let signed = value
@@ -755,7 +954,7 @@ fn validate_package_delegations(delegations: &Value) -> Result<u32, VerifyError>
         let pattern = paths[0].as_str().ok_or(VerifyError::InvalidMetadata)?;
         let package =
             package_from_delegation_pattern(pattern).ok_or(VerifyError::InvalidMetadata)?;
-        if name != package || !package_scopes.insert(package) {
+        if name.strip_prefix("package-") != Some(package) || !package_scopes.insert(package) {
             return Err(VerifyError::InvalidMetadata);
         }
 
@@ -783,6 +982,43 @@ fn validate_package_delegations(delegations: &Value) -> Result<u32, VerifyError>
     u32::try_from(roles.len()).map_err(|_| VerifyError::InvalidMetadata)
 }
 
+fn validate_package_targets_profile(bytes: &[u8], package_name: &str) -> Result<u32, VerifyError> {
+    let value: Value = serde_json::from_slice(bytes).map_err(|_| VerifyError::InvalidMetadata)?;
+    let signed = value
+        .get("signed")
+        .and_then(Value::as_object)
+        .ok_or(VerifyError::InvalidMetadata)?;
+    if signed.contains_key("delegations") {
+        return Err(VerifyError::InvalidMetadata);
+    }
+    let targets = signed
+        .get("targets")
+        .and_then(Value::as_object)
+        .filter(|targets| targets.len() <= MAX_TARGETS_PER_ROLE)
+        .ok_or(VerifyError::InvalidMetadata)?;
+
+    let mut package_versions = BTreeSet::new();
+    for (path, target) in targets {
+        let path_digest =
+            package_target_path_digest(path, package_name).ok_or(VerifyError::InvalidMetadata)?;
+        let package_version = path.split('/').nth(2).ok_or(VerifyError::InvalidMetadata)?;
+        if !package_versions.insert(package_version) {
+            return Err(VerifyError::InvalidMetadata);
+        }
+        validate_target_record(target)?;
+        let metadata_digest = target
+            .get("hashes")
+            .and_then(|hashes| hashes.get("sha256"))
+            .and_then(Value::as_str)
+            .ok_or(VerifyError::InvalidMetadata)?;
+        if metadata_digest != path_digest {
+            return Err(VerifyError::InvalidMetadata);
+        }
+    }
+
+    u32::try_from(targets.len()).map_err(|_| VerifyError::InvalidMetadata)
+}
+
 fn package_from_delegation_pattern(pattern: &str) -> Option<&str> {
     let package_and_glob = pattern.strip_prefix("packages/")?;
     let (package, glob) = package_and_glob.split_once('/')?;
@@ -790,6 +1026,43 @@ fn package_from_delegation_pattern(pattern: &str) -> Option<&str> {
         return None;
     }
     Some(package)
+}
+
+fn package_target_path_digest<'a>(path: &'a str, expected_package: &str) -> Option<&'a str> {
+    if !valid_profile_target_path(path) {
+        return None;
+    }
+    let mut segments = path.split('/');
+    if segments.next()? != "packages" || segments.next()? != expected_package {
+        return None;
+    }
+    if !valid_stable_profile_version(segments.next()?) {
+        return None;
+    }
+    let filename = segments.next()?;
+    if segments.next().is_some() {
+        return None;
+    }
+    let digest = filename.strip_suffix(".tar")?;
+    is_lower_hex(digest, 64).then_some(digest)
+}
+
+fn valid_stable_profile_version(value: &str) -> bool {
+    let mut components = value.split('.');
+    let (Some(major), Some(minor), Some(patch), None) = (
+        components.next(),
+        components.next(),
+        components.next(),
+        components.next(),
+    ) else {
+        return false;
+    };
+    [major, minor, patch].into_iter().all(|component| {
+        !component.is_empty()
+            && !(component.len() > 1 && component.starts_with('0'))
+            && component.bytes().all(|byte| byte.is_ascii_digit())
+            && component.parse::<u64>().is_ok()
+    })
 }
 
 fn valid_profile_package_name(value: &str) -> bool {

@@ -91,8 +91,9 @@ change if they prove too small for a real registry.
   Require signed expiry, monotonic metadata versions, snapshot references, and
   hashes/lengths so stale, mixed, or rollback metadata cannot be accepted.
 - Package release authority is a delegated Targets role scoped to the
-  normalized package namespace; its role name is that normalized package name.
-  Its path is exactly `packages/<name>/*/*.tar`. Top-level Targets metadata
+  normalized package namespace; its role name is `package-<name>` so valid
+  package names cannot collide with TUF's top-level role names. Its path is
+  exactly `packages/<name>/*/*.tar`. Top-level Targets metadata
   must not directly list targets under `packages/`; each package target must
   be reached through its package-scoped delegation. Each such delegation is
   terminating and uses exactly `packages/<name>/*/*.tar` in its `paths` field,
@@ -105,7 +106,8 @@ change if they prove too small for a real registry.
   algorithms, revoked keys, or a namespace mismatch are hard failures.
 - The logical target path is
   `packages/<normalized-name>/<exact-version>/<sha256>.tar`. The repository
-  sets TUF consistent snapshots to true. The target's TUF length and SHA-256
+  sets TUF consistent snapshots to true. A package role has at most one
+  archive for each exact stable version. The target's TUF length and SHA-256
   digest describe the exact deterministic ustar archive bytes; the client
   rechecks both before parsing or extracting the archive.
 - Each target has an authenticated `custom.elisapkg` object with an explicit
