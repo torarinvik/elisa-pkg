@@ -61,7 +61,7 @@ fn root_signed_with_expiry(version: u64, key_id: &str, key: Value, expires: &str
         "spec_version": "1.0.0",
         "version": version,
         "expires": expires,
-        "consistent_snapshot": false,
+        "consistent_snapshot": true,
         "keys": { key_id: key },
         "roles": {
             "root": role,

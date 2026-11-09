@@ -489,6 +489,9 @@ fn validate_root_roles_profile(bytes: &[u8]) -> Result<(), VerifyError> {
         .get("signed")
         .and_then(|signed| signed.as_object())
         .ok_or(VerifyError::InvalidRoot)?;
+    if root.get("consistent_snapshot").and_then(Value::as_bool) != Some(true) {
+        return Err(VerifyError::InvalidRoot);
+    }
     let keys = root
         .get("keys")
         .and_then(Value::as_object)

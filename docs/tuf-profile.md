@@ -77,6 +77,9 @@ and require a reviewed change if they prove too small for a real registry.
   `snapshot`, and `targets`), with the optional `mirrors` role allowed. Reject
   unknown roles, more than 64 key IDs in any role, and more than 320 keys in
   the root key map.
+- Require `consistent_snapshot: true` in every trusted root. Reject missing or
+  false values so the client uses versioned metadata and hash-prefixed target
+  names as required by this profile.
 
 ## Roles, package authority, and target identity
 
