@@ -34,24 +34,25 @@ registry support is implemented or ready to enable.
   threshold to be a positive integer and reject thresholds larger than the
   number of distinct authorized key IDs.
 - Initially accept only TUF `ed25519` signing keys and signatures. Verify each
-  declared root key ID against the TUF SHA-256 key ID calculated from that
-  key's canonical public fields. Each signature must encode exactly 64 bytes as
-  hexadecimal. Accept SHA-256 target digests encoded as exactly 64 lowercase
-  hexadecimal characters. Do
-  not negotiate algorithms from server input. Supporting an additional
+  declared key ID in root and delegation key maps against the TUF SHA-256 key
+  ID calculated from that key's canonical public fields. Each signature must
+  encode exactly 64 bytes as hexadecimal. Accept SHA-256 target digests encoded
+  as exactly 64 lowercase hexadecimal characters. Do not negotiate algorithms
+  from server input. Supporting an additional
   signature or digest algorithm requires a reviewed profile change, a trusted
   metadata migration, and compatibility fixtures.
 
 The initial resource limits are: 1 MiB per metadata file; 64 authorized keys
-per role and 320 keys total in root metadata; 64 signatures per metadata file;
-4,096 package-scoped delegated roles; one delegation hop from top-level
-Targets to a package role; 4,096
-targets per package role; 1,024 sequential root updates per refresh; and 64
-JSON container levels. The duplicate-key validator additionally bounds each
-file to 65,536 total object keys, 8,500,000 candidate comparisons, and 65,536
-bytes of key-equality comparisons; exceeding any of these limits rejects the
-metadata before trust state is changed. These limits are part of the profile
-and require a reviewed change if they prove too small for a real registry.
+per role; 320 keys total in root metadata; 65,536 delegation keys total;
+64 signatures per metadata file; 4,096 package-scoped delegated roles; one
+delegation hop from top-level Targets to a package role; 4,096 targets in each
+Targets role; 4,096-byte target paths; 64 MiB per target artifact; 1,024
+sequential root updates per refresh; and 64 JSON container levels. The
+duplicate-key validator additionally bounds each file to 65,536 total object
+keys, 8,500,000 candidate comparisons, and 65,536 bytes of key-equality
+comparisons; exceeding any of these limits rejects the metadata before trust
+state is changed. These limits are part of the profile and require a reviewed
+change if they prove too small for a real registry.
 
 ## Repository identity and root trust
 
@@ -90,16 +91,18 @@ and require a reviewed change if they prove too small for a real registry.
   Require signed expiry, monotonic metadata versions, snapshot references, and
   hashes/lengths so stale, mixed, or rollback metadata cannot be accepted.
 - Package release authority is a delegated Targets role scoped to the
-  normalized package namespace. Top-level Targets metadata must not directly
-  list targets under `packages/`; each package target must be reached through
-  its package-scoped delegation. Each such delegation is terminating and
-  package path scopes are disjoint, so a later role cannot provide a fallback
-  target for the same namespace. Delegation depth is limited to one hop: a
-  package-scoped role may list its release targets but may not delegate
-  further. Only signatures from keys authorized for the
-  active role count toward its threshold. Unknown or unauthorized signatures
-  never count; insufficient valid signatures, unsupported trusted algorithms,
-  revoked keys, or a namespace mismatch are hard failures.
+  normalized package namespace; its role name is that normalized package name.
+  Its path is exactly `packages/<name>/*/*.tar`. Top-level Targets metadata
+  must not directly list targets under `packages/`; each package target must
+  be reached through its package-scoped delegation. Each such delegation is
+  terminating and uses exactly `packages/<name>/*/*.tar` in its `paths` field,
+  with no `path_hash_prefixes`; package path scopes are disjoint, so a later
+  role cannot provide a fallback target for the same namespace. Delegation
+  depth is limited to one hop: a package-scoped role may list its release
+  targets but may not delegate further. Only signatures from keys authorized
+  for the active role count toward its threshold. Unknown or unauthorized
+  signatures never count; insufficient valid signatures, unsupported trusted
+  algorithms, revoked keys, or a namespace mismatch are hard failures.
 - The logical target path is
   `packages/<normalized-name>/<exact-version>/<sha256>.tar`. The repository
   sets TUF consistent snapshots to true. The target's TUF length and SHA-256

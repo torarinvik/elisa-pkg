@@ -16,6 +16,11 @@ const MAX_METADATA_BYTES: usize = 1_048_576;
 const MAX_KEYS_PER_ROLE: usize = 64;
 const MAX_SIGNATURES_PER_METADATA: usize = 64;
 const MAX_ROOT_KEYS: usize = MAX_KEYS_PER_ROLE * 5;
+const MAX_DELEGATED_ROLES: usize = 4_096;
+const MAX_DELEGATED_KEYS: usize = 65_536;
+const MAX_TARGETS_PER_ROLE: usize = 4_096;
+const MAX_TARGET_PATH_BYTES: usize = 4_096;
+const MAX_TARGET_BYTES: u64 = 67_108_864;
 
 const STATUS_OK: i32 = 0;
 const STATUS_INVALID_ARGUMENT: i32 = 1;
@@ -56,6 +61,13 @@ struct VerifiedTimestampSummary {
 struct VerifiedSnapshotSummary {
     version: u64,
     metadata_count: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct VerifiedTargetsSummary {
+    version: u64,
+    target_count: u32,
+    delegation_count: u32,
 }
 
 /// Return the ABI version expected by the private Elisa adapter.
@@ -461,6 +473,93 @@ pub unsafe extern "C" fn elisapkg_tuf_engine_get_snapshot_pin_v1(
     STATUS_OK
 }
 
+/// Verify top-level Targets metadata against the trusted root and snapshot.
+///
+/// The root→timestamp→snapshot chain is re-verified in this call. The top-level
+/// Targets threshold is checked against the root, all direct target records are
+/// bounded and SHA-256-only, and package target paths are reserved for package
+/// delegations. Delegation keys and package-scope declarations are validated,
+/// but delegated Targets files and target selection are separate operations.
+///
+/// # Safety
+///
+/// The four metadata inputs must point to readable buffers that passed
+/// Elisa's bounded JSON, duplicate-key, canonical-number, and SHA-256 profile
+/// prechecks. Output pointers must be aligned and writable; their ranges must
+/// not overlap each other or any input range. `now_nanoseconds` must be less
+/// than one billion.
+#[no_mangle]
+pub unsafe extern "C" fn elisapkg_tuf_engine_verify_targets_v1(
+    trusted_root: *const u8,
+    trusted_root_len: usize,
+    timestamp: *const u8,
+    timestamp_len: usize,
+    snapshot: *const u8,
+    snapshot_len: usize,
+    targets: *const u8,
+    targets_len: usize,
+    now_unix_seconds: i64,
+    now_nanoseconds: u32,
+    out_targets_version: *mut u64,
+    out_target_count: *mut u32,
+    out_delegation_count: *mut u32,
+) -> i32 {
+    if trusted_root.is_null()
+        || trusted_root_len == 0
+        || trusted_root_len > MAX_METADATA_BYTES
+        || timestamp.is_null()
+        || timestamp_len == 0
+        || timestamp_len > MAX_METADATA_BYTES
+        || snapshot.is_null()
+        || snapshot_len == 0
+        || snapshot_len > MAX_METADATA_BYTES
+        || targets.is_null()
+        || targets_len == 0
+        || targets_len > MAX_METADATA_BYTES
+        || now_nanoseconds >= 1_000_000_000
+        || out_targets_version.is_null()
+        || out_target_count.is_null()
+        || out_delegation_count.is_null()
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    let now = match jiff::Timestamp::new(now_unix_seconds, now_nanoseconds as i32) {
+        Ok(now) => now,
+        Err(_) => return STATUS_INVALID_ARGUMENT,
+    };
+
+    let verification = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: null and length bounds are checked above. The caller contract
+        // requires each input pointer to address its declared readable range.
+        let root_bytes = unsafe { slice::from_raw_parts(trusted_root, trusted_root_len) };
+        let timestamp_bytes = unsafe { slice::from_raw_parts(timestamp, timestamp_len) };
+        let snapshot_bytes = unsafe { slice::from_raw_parts(snapshot, snapshot_len) };
+        let targets_bytes = unsafe { slice::from_raw_parts(targets, targets_len) };
+        verify_top_level_targets_bytes(
+            root_bytes,
+            timestamp_bytes,
+            snapshot_bytes,
+            targets_bytes,
+            now,
+        )
+    }));
+
+    let summary = match verification {
+        Ok(Ok(summary)) => summary,
+        Ok(Err(error)) => return status_for_verify_error(error),
+        Err(_) => return STATUS_INTERNAL_PANIC,
+    };
+
+    // SAFETY: non-null output locations were checked above. Their writable,
+    // non-overlapping extents are part of the caller contract.
+    unsafe {
+        *out_targets_version = summary.version;
+        *out_target_count = summary.target_count;
+        *out_delegation_count = summary.delegation_count;
+    }
+    STATUS_OK
+}
+
 fn verify_root_bytes(bytes: &[u8]) -> Result<VerifiedRootSummary, VerifyError> {
     validate_root_spec_version(bytes)?;
 
@@ -537,6 +636,195 @@ fn verify_timestamp_bytes(
         snapshot_length: snapshot_pin.length,
         snapshot_sha256: snapshot_pin.sha256,
     })
+}
+
+fn verify_top_level_targets_bytes(
+    root_bytes: &[u8],
+    timestamp_bytes: &[u8],
+    snapshot_bytes: &[u8],
+    targets_bytes: &[u8],
+    now: jiff::Timestamp,
+) -> Result<VerifiedTargetsSummary, VerifyError> {
+    let mut trusted = load_verified_snapshot(root_bytes, timestamp_bytes, snapshot_bytes, now)?;
+    validate_spec_version(targets_bytes, VerifyError::InvalidMetadata)?;
+    validate_signature_profile(targets_bytes, VerifyError::InvalidMetadata)?;
+    let (target_count, delegation_count) = validate_top_level_targets_profile(targets_bytes)?;
+
+    let targets = trusted
+        .update_targets(targets_bytes, now)
+        .map_err(|error| match error {
+            TufError::Expired { .. } => VerifyError::ExpiredMetadata,
+            _ => VerifyError::InvalidMetadata,
+        })?;
+    if expiration_is_at_or_before(targets, now).map_err(|_| VerifyError::InvalidMetadata)? {
+        return Err(VerifyError::ExpiredMetadata);
+    }
+
+    Ok(VerifiedTargetsSummary {
+        version: targets.version,
+        target_count,
+        delegation_count,
+    })
+}
+
+fn validate_top_level_targets_profile(bytes: &[u8]) -> Result<(u32, u32), VerifyError> {
+    let value: Value = serde_json::from_slice(bytes).map_err(|_| VerifyError::InvalidMetadata)?;
+    let signed = value
+        .get("signed")
+        .and_then(Value::as_object)
+        .ok_or(VerifyError::InvalidMetadata)?;
+    let targets = signed
+        .get("targets")
+        .and_then(Value::as_object)
+        .filter(|targets| targets.len() <= MAX_TARGETS_PER_ROLE)
+        .ok_or(VerifyError::InvalidMetadata)?;
+
+    for (path, target) in targets {
+        if !valid_profile_target_path(path) || path.starts_with("packages/") {
+            return Err(VerifyError::InvalidMetadata);
+        }
+        validate_target_record(target)?;
+    }
+
+    let delegation_count = match signed.get("delegations") {
+        None => 0,
+        Some(delegations) => validate_package_delegations(delegations)?,
+    };
+    Ok((
+        u32::try_from(targets.len()).map_err(|_| VerifyError::InvalidMetadata)?,
+        delegation_count,
+    ))
+}
+
+fn validate_target_record(target: &Value) -> Result<(), VerifyError> {
+    target
+        .get("length")
+        .and_then(Value::as_u64)
+        .filter(|length| *length > 0 && *length <= MAX_TARGET_BYTES)
+        .ok_or(VerifyError::InvalidMetadata)?;
+    let hashes = target
+        .get("hashes")
+        .and_then(Value::as_object)
+        .filter(|hashes| hashes.len() == 1)
+        .ok_or(VerifyError::InvalidMetadata)?;
+    hashes
+        .get("sha256")
+        .and_then(Value::as_str)
+        .filter(|digest| is_lower_hex(digest, 64))
+        .ok_or(VerifyError::InvalidMetadata)?;
+    Ok(())
+}
+
+fn validate_package_delegations(delegations: &Value) -> Result<u32, VerifyError> {
+    let delegations = delegations
+        .as_object()
+        .ok_or(VerifyError::InvalidMetadata)?;
+    let keys = delegations
+        .get("keys")
+        .and_then(Value::as_object)
+        .ok_or(VerifyError::InvalidMetadata)?;
+    let roles = delegations
+        .get("roles")
+        .and_then(Value::as_array)
+        .filter(|roles| roles.len() <= MAX_DELEGATED_ROLES)
+        .ok_or(VerifyError::InvalidMetadata)?;
+    validate_key_map(keys, MAX_DELEGATED_KEYS, true, VerifyError::InvalidMetadata)?;
+
+    let mut role_names = BTreeSet::new();
+    let mut package_scopes = BTreeSet::new();
+    for role in roles {
+        let name = role
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty() && name.len() <= 256)
+            .ok_or(VerifyError::InvalidMetadata)?;
+        if matches!(name, "root" | "timestamp" | "snapshot" | "targets") || !role_names.insert(name)
+        {
+            return Err(VerifyError::InvalidMetadata);
+        }
+        if role.get("terminating").and_then(Value::as_bool) != Some(true)
+            || role.get("path_hash_prefixes").is_some()
+        {
+            return Err(VerifyError::InvalidMetadata);
+        }
+        let paths = role
+            .get("paths")
+            .and_then(Value::as_array)
+            .filter(|paths| paths.len() == 1)
+            .ok_or(VerifyError::InvalidMetadata)?;
+        let pattern = paths[0].as_str().ok_or(VerifyError::InvalidMetadata)?;
+        let package =
+            package_from_delegation_pattern(pattern).ok_or(VerifyError::InvalidMetadata)?;
+        if name != package || !package_scopes.insert(package) {
+            return Err(VerifyError::InvalidMetadata);
+        }
+
+        let key_ids = role
+            .get("keyids")
+            .and_then(Value::as_array)
+            .filter(|key_ids| !key_ids.is_empty() && key_ids.len() <= MAX_KEYS_PER_ROLE)
+            .ok_or(VerifyError::InvalidMetadata)?;
+        role.get("threshold")
+            .and_then(Value::as_u64)
+            .filter(|threshold| *threshold > 0 && *threshold <= key_ids.len() as u64)
+            .ok_or(VerifyError::InvalidMetadata)?;
+        let mut seen_key_ids = BTreeSet::new();
+        for key_id in key_ids {
+            let key_id = key_id.as_str().ok_or(VerifyError::InvalidMetadata)?;
+            if !is_lower_hex(key_id, 64)
+                || !keys.contains_key(key_id)
+                || !seen_key_ids.insert(key_id)
+            {
+                return Err(VerifyError::InvalidMetadata);
+            }
+        }
+    }
+
+    u32::try_from(roles.len()).map_err(|_| VerifyError::InvalidMetadata)
+}
+
+fn package_from_delegation_pattern(pattern: &str) -> Option<&str> {
+    let package_and_glob = pattern.strip_prefix("packages/")?;
+    let (package, glob) = package_and_glob.split_once('/')?;
+    if glob != "*/*.tar" || !valid_profile_package_name(package) {
+        return None;
+    }
+    Some(package)
+}
+
+fn valid_profile_package_name(value: &str) -> bool {
+    if value.is_empty() || value.len() > 64 {
+        return false;
+    }
+    let bytes = value.as_bytes();
+    if !bytes[0].is_ascii_lowercase() {
+        return false;
+    }
+    let mut previous_hyphen = false;
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        let valid = byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-';
+        if !valid || (byte == b'-' && (index == 0 || index + 1 == bytes.len() || previous_hyphen)) {
+            return false;
+        }
+        previous_hyphen = byte == b'-';
+    }
+    true
+}
+
+fn valid_profile_target_path(path: &str) -> bool {
+    if path.is_empty() || path.len() > MAX_TARGET_PATH_BYTES || !path.is_ascii() {
+        return false;
+    }
+    if path.starts_with('/')
+        || path.ends_with('/')
+        || path.contains('\\')
+        || path.contains(':')
+        || path.bytes().any(|byte| !(0x21..=0x7e).contains(&byte))
+    {
+        return false;
+    }
+    path.split('/')
+        .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
 }
 
 fn verify_snapshot_bytes(
@@ -781,30 +1069,33 @@ fn validate_root_key_profile(bytes: &[u8]) -> Result<(), VerifyError> {
         .get("signed")
         .and_then(|signed| signed.get("keys"))
         .and_then(Value::as_object)
-        .filter(|keys| !keys.is_empty())
         .ok_or(VerifyError::InvalidRoot)?;
-    if keys.len() > MAX_ROOT_KEYS {
-        return Err(VerifyError::InvalidRoot);
-    }
+    validate_key_map(keys, MAX_ROOT_KEYS, false, VerifyError::InvalidRoot)
+}
 
+fn validate_key_map(
+    keys: &serde_json::Map<String, Value>,
+    max_keys: usize,
+    allow_empty: bool,
+    malformed: VerifyError,
+) -> Result<(), VerifyError> {
+    if (!allow_empty && keys.is_empty()) || keys.len() > max_keys {
+        return Err(malformed);
+    }
     for (key_id, key) in keys {
         if !is_lower_hex(key_id, 64) {
-            return Err(VerifyError::InvalidRoot);
+            return Err(malformed);
         }
-        let parsed_key: Key =
-            serde_json::from_value(key.clone()).map_err(|_| VerifyError::InvalidRoot)?;
-        let calculated_key_id = parsed_key.key_id().map_err(|_| VerifyError::InvalidRoot)?;
+        let parsed_key: Key = serde_json::from_value(key.clone()).map_err(|_| malformed)?;
+        let calculated_key_id = parsed_key.key_id().map_err(|_| malformed)?;
         if calculated_key_id.as_str() != key_id.as_str() {
-            return Err(VerifyError::InvalidRoot);
+            return Err(malformed);
         }
         let keytype = key
             .get("keytype")
             .and_then(Value::as_str)
-            .ok_or(VerifyError::InvalidRoot)?;
-        let scheme = key
-            .get("scheme")
-            .and_then(Value::as_str)
-            .ok_or(VerifyError::InvalidRoot)?;
+            .ok_or(malformed)?;
+        let scheme = key.get("scheme").and_then(Value::as_str).ok_or(malformed)?;
         if keytype != "ed25519" || scheme != "ed25519" {
             return Err(VerifyError::UnsupportedAlgorithm);
         }
@@ -812,13 +1103,13 @@ fn validate_root_key_profile(bytes: &[u8]) -> Result<(), VerifyError> {
             .get("keyval")
             .and_then(|keyval| keyval.get("public"))
             .and_then(Value::as_str)
-            .ok_or(VerifyError::InvalidRoot)?;
+            .ok_or(malformed)?;
         if public.len() != 64
             || !public
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         {
-            return Err(VerifyError::InvalidRoot);
+            return Err(malformed);
         }
     }
     Ok(())
