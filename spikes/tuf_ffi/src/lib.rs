@@ -381,6 +381,86 @@ pub unsafe extern "C" fn elisapkg_tuf_engine_verify_snapshot_v1(
     STATUS_OK
 }
 
+/// Return one authenticated metadata pin from a snapshot.
+///
+/// This operation re-verifies the root, timestamp, and snapshot chain on every
+/// call, then returns the requested snapshot entry's version, length, and
+/// SHA-256 digest. It never exposes an unverified pin or mutates trust state.
+///
+/// # Safety
+///
+/// The three metadata inputs must point to readable buffers that passed
+/// Elisa's bounded JSON, duplicate-key, canonical-number, and SHA-256 profile
+/// prechecks. `metadata_name` must point to `metadata_name_len` readable bytes.
+/// Output pointers must be aligned and writable; output ranges must not overlap
+/// one another or any input range. `out_sha256` addresses 32 writable bytes.
+/// `now_nanoseconds` must be less than one billion.
+#[no_mangle]
+pub unsafe extern "C" fn elisapkg_tuf_engine_get_snapshot_pin_v1(
+    trusted_root: *const u8,
+    trusted_root_len: usize,
+    timestamp: *const u8,
+    timestamp_len: usize,
+    snapshot: *const u8,
+    snapshot_len: usize,
+    metadata_name: *const u8,
+    metadata_name_len: usize,
+    now_unix_seconds: i64,
+    now_nanoseconds: u32,
+    out_version: *mut u64,
+    out_length: *mut u64,
+    out_sha256: *mut u8,
+) -> i32 {
+    if trusted_root.is_null()
+        || trusted_root_len == 0
+        || trusted_root_len > MAX_METADATA_BYTES
+        || timestamp.is_null()
+        || timestamp_len == 0
+        || timestamp_len > MAX_METADATA_BYTES
+        || snapshot.is_null()
+        || snapshot_len == 0
+        || snapshot_len > MAX_METADATA_BYTES
+        || metadata_name.is_null()
+        || metadata_name_len == 0
+        || metadata_name_len > 256
+        || now_nanoseconds >= 1_000_000_000
+        || out_version.is_null()
+        || out_length.is_null()
+        || out_sha256.is_null()
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    let now = match jiff::Timestamp::new(now_unix_seconds, now_nanoseconds as i32) {
+        Ok(now) => now,
+        Err(_) => return STATUS_INVALID_ARGUMENT,
+    };
+
+    let verification = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: null and length bounds are checked above. The caller contract
+        // requires every input pointer to address its declared readable range.
+        let root_bytes = unsafe { slice::from_raw_parts(trusted_root, trusted_root_len) };
+        let timestamp_bytes = unsafe { slice::from_raw_parts(timestamp, timestamp_len) };
+        let snapshot_bytes = unsafe { slice::from_raw_parts(snapshot, snapshot_len) };
+        let name_bytes = unsafe { slice::from_raw_parts(metadata_name, metadata_name_len) };
+        verify_snapshot_pin_bytes(root_bytes, timestamp_bytes, snapshot_bytes, name_bytes, now)
+    }));
+
+    let pin = match verification {
+        Ok(Ok(pin)) => pin,
+        Ok(Err(error)) => return status_for_verify_error(error),
+        Err(_) => return STATUS_INTERNAL_PANIC,
+    };
+
+    // SAFETY: non-null output locations were checked above. Their writable,
+    // non-overlapping extents are part of the caller contract.
+    unsafe {
+        *out_version = pin.version;
+        *out_length = pin.length;
+        std::ptr::copy_nonoverlapping(pin.sha256.as_ptr(), out_sha256, pin.sha256.len());
+    }
+    STATUS_OK
+}
+
 fn verify_root_bytes(bytes: &[u8]) -> Result<VerifiedRootSummary, VerifyError> {
     validate_root_spec_version(bytes)?;
 
@@ -465,13 +545,73 @@ fn verify_snapshot_bytes(
     snapshot_bytes: &[u8],
     now: jiff::Timestamp,
 ) -> Result<VerifiedSnapshotSummary, VerifyError> {
+    let trusted = load_verified_snapshot(root_bytes, timestamp_bytes, snapshot_bytes, now)?;
+    let snapshot = trusted.snapshot().ok_or(VerifyError::InvalidMetadata)?;
+
+    Ok(VerifiedSnapshotSummary {
+        version: snapshot.version,
+        metadata_count: u32::try_from(snapshot.meta.len())
+            .map_err(|_| VerifyError::InvalidMetadata)?,
+    })
+}
+
+fn verify_snapshot_pin_bytes(
+    root_bytes: &[u8],
+    timestamp_bytes: &[u8],
+    snapshot_bytes: &[u8],
+    metadata_name: &[u8],
+    now: jiff::Timestamp,
+) -> Result<VerifiedMetadataPin, VerifyError> {
+    if metadata_name.contains(&0) {
+        return Err(VerifyError::InvalidMetadata);
+    }
+    let metadata_name =
+        std::str::from_utf8(metadata_name).map_err(|_| VerifyError::InvalidMetadata)?;
+    let trusted = load_verified_snapshot(root_bytes, timestamp_bytes, snapshot_bytes, now)?;
+    let snapshot = trusted.snapshot().ok_or(VerifyError::InvalidMetadata)?;
+    let pin = snapshot
+        .meta
+        .get(metadata_name)
+        .ok_or(VerifyError::InvalidMetadata)?;
+    let version = pin.version;
+    if version == 0 {
+        return Err(VerifyError::InvalidMetadata);
+    }
+    let length = pin
+        .length
+        .filter(|length| *length > 0 && *length <= MAX_METADATA_BYTES as u64)
+        .ok_or(VerifyError::InvalidMetadata)?;
+    let hashes = pin.hashes.as_ref().ok_or(VerifyError::InvalidMetadata)?;
+    if hashes.len() != 1 {
+        return Err(VerifyError::InvalidMetadata);
+    }
+    let digest = hashes
+        .get("sha256")
+        .filter(|digest| is_lower_hex(digest, 64))
+        .ok_or(VerifyError::InvalidMetadata)?;
+    let mut sha256 = [0_u8; 32];
+    hex::decode_to_slice(digest, &mut sha256).map_err(|_| VerifyError::InvalidMetadata)?;
+
+    Ok(VerifiedMetadataPin {
+        version,
+        length,
+        sha256,
+    })
+}
+
+fn load_verified_snapshot(
+    root_bytes: &[u8],
+    timestamp_bytes: &[u8],
+    snapshot_bytes: &[u8],
+    now: jiff::Timestamp,
+) -> Result<TrustedMetadataSet, VerifyError> {
     validate_root_spec_version(root_bytes)?;
     validate_spec_version(timestamp_bytes, VerifyError::InvalidMetadata)?;
     validate_signature_profile(timestamp_bytes, VerifyError::InvalidMetadata)?;
     validate_timestamp_snapshot_pin(timestamp_bytes)?;
     validate_spec_version(snapshot_bytes, VerifyError::InvalidMetadata)?;
     validate_signature_profile(snapshot_bytes, VerifyError::InvalidMetadata)?;
-    let metadata_count = validate_snapshot_profile(snapshot_bytes)?;
+    validate_snapshot_profile(snapshot_bytes)?;
 
     let mut trusted =
         TrustedMetadataSet::from_root(root_bytes).map_err(|_| VerifyError::InvalidRoot)?;
@@ -498,21 +638,17 @@ fn verify_snapshot_bytes(
     if expiration_is_at_or_before(snapshot, now).map_err(|_| VerifyError::InvalidMetadata)? {
         return Err(VerifyError::ExpiredMetadata);
     }
-
-    Ok(VerifiedSnapshotSummary {
-        version: snapshot.version,
-        metadata_count,
-    })
+    Ok(trusted)
 }
 
 #[derive(Debug, Clone, Copy)]
-struct VerifiedSnapshotPin {
+struct VerifiedMetadataPin {
     version: u64,
     length: u64,
     sha256: [u8; 32],
 }
 
-fn validate_timestamp_snapshot_pin(bytes: &[u8]) -> Result<VerifiedSnapshotPin, VerifyError> {
+fn validate_timestamp_snapshot_pin(bytes: &[u8]) -> Result<VerifiedMetadataPin, VerifyError> {
     let value: Value = serde_json::from_slice(bytes).map_err(|_| VerifyError::InvalidMetadata)?;
     let timestamp = value
         .get("signed")
@@ -546,7 +682,7 @@ fn validate_timestamp_snapshot_pin(bytes: &[u8]) -> Result<VerifiedSnapshotPin, 
     let mut sha256 = [0_u8; 32];
     hex::decode_to_slice(digest, &mut sha256).map_err(|_| VerifyError::InvalidMetadata)?;
 
-    Ok(VerifiedSnapshotPin {
+    Ok(VerifiedMetadataPin {
         version,
         length,
         sha256,

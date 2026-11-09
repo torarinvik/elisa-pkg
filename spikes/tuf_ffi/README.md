@@ -16,8 +16,9 @@ processes them. Timestamp verification checks the timestamp role against a
 trusted root and returns the authenticated snapshot version, length, and
 SHA-256 pin. Snapshot verification rechecks that chain, validates each
 snapshot metadata entry's bounded length and SHA-256 pin, verifies the snapshot
-threshold, and returns its version and entry count. The caller can parse those
-pins from the exact snapshot bytes that were verified. The ABI also checks one
+threshold, and returns its version and entry count. A pin lookup operation
+re-verifies the same chain and returns one authenticated metadata version,
+length, and digest for a requested entry. The ABI also checks one
 root-rotation link per call; Elisa must persist that candidate before passing
 it as the trusted root for the next link. Root, timestamp, and snapshot
 expiry checks use the caller's fixed refresh time at nanosecond precision.
@@ -63,8 +64,8 @@ verifies two consecutive rotations through the Elisa ABI, and checks final-root
 expiry separately, including equality and subsecond boundaries. It verifies a
 timestamp signature and authenticated snapshot pin, rejects an expired or
 exact-boundary timestamp, and rejects a skipped root version, invalid
-signature, and expired final root. The Rust ABI now has a snapshot-chain
-verification entry point; the probe does not yet exercise it. Targets
+signature, and expired final root. The Rust ABI now has snapshot-chain and
+authenticated pin lookup entry points; the probe does not yet exercise them. Targets
 verification, signature-threshold edge cases, role/delegation policy,
 profile-specific package metadata rules, durable root checkpointing, and
 injected write-failure tests remain required before any integration is
