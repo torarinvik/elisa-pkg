@@ -33,9 +33,11 @@ registry support is implemented or ready to enable.
   reject unknown fields that could alter package semantics. Require every role
   threshold to be a positive integer and reject thresholds larger than the
   number of distinct authorized key IDs.
-- Initially accept only TUF `ed25519` signing keys and signatures. Each
-  signature must encode exactly 64 bytes as hexadecimal. Accept SHA-256 target
-  digests encoded as exactly 64 lowercase hexadecimal characters. Do
+- Initially accept only TUF `ed25519` signing keys and signatures. Verify each
+  declared root key ID against the TUF SHA-256 key ID calculated from that
+  key's canonical public fields. Each signature must encode exactly 64 bytes as
+  hexadecimal. Accept SHA-256 target digests encoded as exactly 64 lowercase
+  hexadecimal characters. Do
   not negotiate algorithms from server input. Supporting an additional
   signature or digest algorithm requires a reviewed profile change, a trusted
   metadata migration, and compatibility fixtures.

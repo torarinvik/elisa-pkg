@@ -8,10 +8,11 @@ The Rust crate builds a static library; it adds no C source files.
 
 The ABI accepts at most 1 MiB per metadata file, catches Rust unwinding panics,
 and returns stable integer status codes. Root verification writes its summary
-only after threshold verification succeeds. It rejects non-Ed25519 root keys,
-roots with more than 64 key IDs in any role, over 320 root keys, metadata with
-more than 64 signatures, duplicate signature key IDs, and malformed Ed25519
-signature encodings before the upstream verifier processes them. Timestamp
+only after threshold verification succeeds. It rejects mismatched TUF root key
+IDs, non-Ed25519 root keys, roots with more than 64 key IDs in any role, over
+320 root keys, metadata with more than 64 signatures, duplicate signature key
+IDs, and malformed Ed25519 signature encodings before the upstream verifier
+processes them. Timestamp
 verification checks the timestamp role against a trusted root and returns the
 authenticated snapshot version, length, and SHA-256 pin. It also checks one
 root-rotation link per call; Elisa must persist that candidate before passing

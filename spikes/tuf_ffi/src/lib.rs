@@ -9,7 +9,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::slice;
 
 use serde_json::Value;
-use sigstore_tuf::{Error as TufError, Role, Root, TrustedMetadataSet};
+use sigstore_tuf::{Error as TufError, Key, Role, Root, TrustedMetadataSet};
 
 const ABI_VERSION: u32 = 1;
 const MAX_METADATA_BYTES: usize = 1_048_576;
@@ -454,6 +454,12 @@ fn validate_root_key_profile(bytes: &[u8]) -> Result<(), VerifyError> {
 
     for (key_id, key) in keys {
         if !is_lower_hex(key_id, 64) {
+            return Err(VerifyError::InvalidRoot);
+        }
+        let parsed_key: Key =
+            serde_json::from_value(key.clone()).map_err(|_| VerifyError::InvalidRoot)?;
+        let calculated_key_id = parsed_key.key_id().map_err(|_| VerifyError::InvalidRoot)?;
+        if calculated_key_id.as_str() != key_id.as_str() {
             return Err(VerifyError::InvalidRoot);
         }
         let keytype = key
