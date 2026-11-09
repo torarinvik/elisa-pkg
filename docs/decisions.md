@@ -279,8 +279,10 @@ its snapshot pin. They enforce the TUF-required strict expiry boundary at a
 caller-supplied fixed time with seconds and nanoseconds. The Elisa probe cases
 for timestamp verification have not yet run on Vast because the instance
 refuses the SSH connection. The prototype does not own rollback floors or the
-complete refresh workflow. It is not approval to ship the engine or enable
-remote operations.
+complete refresh workflow. The ABI source also enforces the selected Ed25519
+root-key profile and includes the pinned ECDSA GitHub root as a negative case;
+that case has not yet run on Vast. It is not approval to ship the engine or
+enable remote operations.
 
 The fixture in D-011 remains a local implementation test only. Its custom
 single-key index and signed metadata are not a compatible TUF implementation

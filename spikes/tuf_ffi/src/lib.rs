@@ -21,6 +21,7 @@ const STATUS_INTERNAL_PANIC: i32 = 4;
 const STATUS_EXPIRED_ROOT: i32 = 5;
 const STATUS_INVALID_METADATA: i32 = 6;
 const STATUS_EXPIRED_METADATA: i32 = 7;
+const STATUS_UNSUPPORTED_ALGORITHM: i32 = 8;
 
 #[derive(Debug, Clone, Copy)]
 struct VerifiedRootSummary {
@@ -34,6 +35,7 @@ enum VerifyError {
     InvalidRoot,
     InvalidMetadata,
     UnsupportedSpec,
+    UnsupportedAlgorithm,
     ExpiredRoot,
     ExpiredMetadata,
 }
@@ -62,8 +64,8 @@ pub extern "C" fn elisapkg_tuf_engine_abi_version_v1() -> u32 {
 ///
 /// ABI v1 status values are stable: 0 success, 1 invalid argument, 2 malformed
 /// or cryptographically invalid root, 3 unsupported profile version,
-/// 4 contained Rust panic, 5 expired root, 6 invalid metadata, and
-/// 7 expired active metadata.
+/// 4 contained Rust panic, 5 expired root, 6 invalid metadata, 7 expired
+/// active metadata, and 8 unsupported signature algorithm.
 ///
 /// # Safety
 ///
@@ -184,7 +186,7 @@ pub unsafe extern "C" fn elisapkg_tuf_engine_verify_root_update_v1(
 ///
 /// Status values are 0 success, 1 invalid arguments, 2 invalid root,
 /// 3 unsupported spec, 4 contained panic, 5 expired root, 6 invalid metadata,
-/// and 7 expired metadata.
+/// 7 expired metadata, and 8 unsupported signature algorithm.
 ///
 /// # Safety
 ///
@@ -337,7 +339,7 @@ fn verify_timestamp_bytes(
     timestamp_bytes: &[u8],
     now: jiff::Timestamp,
 ) -> Result<VerifiedTimestampSummary, VerifyError> {
-    validate_spec_version(root_bytes, VerifyError::InvalidRoot)?;
+    validate_root_spec_version(root_bytes)?;
     validate_spec_version(timestamp_bytes, VerifyError::InvalidMetadata)?;
 
     let mut trusted =
@@ -420,13 +422,52 @@ fn status_for_verify_error(error: VerifyError) -> i32 {
         VerifyError::InvalidRoot => STATUS_INVALID_ROOT,
         VerifyError::InvalidMetadata => STATUS_INVALID_METADATA,
         VerifyError::UnsupportedSpec => STATUS_UNSUPPORTED_SPEC,
+        VerifyError::UnsupportedAlgorithm => STATUS_UNSUPPORTED_ALGORITHM,
         VerifyError::ExpiredRoot => STATUS_EXPIRED_ROOT,
         VerifyError::ExpiredMetadata => STATUS_EXPIRED_METADATA,
     }
 }
 
 fn validate_root_spec_version(bytes: &[u8]) -> Result<(), VerifyError> {
-    validate_spec_version(bytes, VerifyError::InvalidRoot)
+    validate_spec_version(bytes, VerifyError::InvalidRoot)?;
+    validate_root_key_profile(bytes)
+}
+
+fn validate_root_key_profile(bytes: &[u8]) -> Result<(), VerifyError> {
+    let value: Value = serde_json::from_slice(bytes).map_err(|_| VerifyError::InvalidRoot)?;
+    let keys = value
+        .get("signed")
+        .and_then(|signed| signed.get("keys"))
+        .and_then(Value::as_object)
+        .filter(|keys| !keys.is_empty())
+        .ok_or(VerifyError::InvalidRoot)?;
+
+    for key in keys.values() {
+        let keytype = key
+            .get("keytype")
+            .and_then(Value::as_str)
+            .ok_or(VerifyError::InvalidRoot)?;
+        let scheme = key
+            .get("scheme")
+            .and_then(Value::as_str)
+            .ok_or(VerifyError::InvalidRoot)?;
+        if keytype != "ed25519" || scheme != "ed25519" {
+            return Err(VerifyError::UnsupportedAlgorithm);
+        }
+        let public = key
+            .get("keyval")
+            .and_then(|keyval| keyval.get("public"))
+            .and_then(Value::as_str)
+            .ok_or(VerifyError::InvalidRoot)?;
+        if public.len() != 64
+            || !public
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(VerifyError::InvalidRoot);
+        }
+    }
+    Ok(())
 }
 
 fn summarize_root(root: &Root) -> Result<VerifiedRootSummary, VerifyError> {
@@ -587,22 +628,11 @@ mod tests {
     }
 
     #[test]
-    fn verifies_and_publishes_a_real_signed_root_summary() {
+    fn rejects_a_real_root_outside_the_ed25519_profile_without_publishing() {
         let bytes = include_bytes!("../testdata/github-root.json");
-        let value: Value = serde_json::from_slice(bytes).expect("fixture JSON");
-        let signed = &value["signed"];
-        let expected_version = signed["version"].as_u64().expect("root version");
-        let expected_keys = u32::try_from(signed["keys"].as_object().expect("root keys").len())
-            .expect("fixture key count fits u32");
-        let expected_threshold = u32::try_from(
-            signed["roles"]["root"]["threshold"]
-                .as_u64()
-                .expect("root threshold"),
-        )
-        .expect("fixture threshold fits u32");
-        let mut version = 0;
-        let mut key_count = 0;
-        let mut threshold = 0;
+        let mut version = 0xfeed_u64;
+        let mut key_count = 0xfeed_u32;
+        let mut threshold = 0xfeed_u32;
 
         let result = unsafe {
             elisapkg_tuf_engine_verify_root_v1(
@@ -614,9 +644,9 @@ mod tests {
             )
         };
 
-        assert_eq!(result, STATUS_OK);
-        assert_eq!(version, expected_version);
-        assert_eq!(key_count, expected_keys);
-        assert_eq!(threshold, expected_threshold);
+        assert_eq!(result, STATUS_UNSUPPORTED_ALGORITHM);
+        assert_eq!(version, 0xfeed_u64);
+        assert_eq!(key_count, 0xfeed_u32);
+        assert_eq!(threshold, 0xfeed_u32);
     }
 }

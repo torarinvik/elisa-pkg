@@ -20,12 +20,11 @@ Elisa's bounded TUF JSON prechecks run before the foreign calls, so duplicate
 JSON keys and noncanonical numbers never reach the upstream parser. The adapter
 owns no persistent trust state, production filesystem I/O, network transport,
 or package policy; the test-only fixture generator writes ephemeral signed
-metadata under the probe's private build dir.
-The probe's signed GitHub root fixture is copied from the pinned upstream
-`crates/sigstore-tuf/tests/../../sigstore-trust-root/repository/tuf_github_root.json`
-path (SHA-256 `eb303461e0109458144b6ebcbfd62aaa6f6d7481e9ca77504b85f17761661462`);
-the test alters signed fields to confirm signature failure and an out-of-profile
-version to confirm fail-closed profile handling.
+metadata under the probe's private build dir. Generated valid roots use
+Ed25519 keys, and the probe rejects the pinned GitHub ECDSA root because it is
+outside the selected package profile. The source root fixture is copied from
+the pinned upstream `crates/sigstore-tuf/tests/../../sigstore-trust-root/repository/tuf_github_root.json`
+path (SHA-256 `eb303461e0109458144b6ebcbfd62aaa6f6d7481e9ca77504b85f17761661462`).
 
 The foreign declarations in `abi_probe.elisa.in` are at compilation-unit scope
 because the current Elisa compiler requires that placement. All caller-facing

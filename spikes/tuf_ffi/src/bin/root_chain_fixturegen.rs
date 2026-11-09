@@ -4,8 +4,11 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use aws_lc_rs::{
+    rand::SystemRandom,
+    signature::{Ed25519KeyPair, KeyPair as AwsKeyPair},
+};
 use serde_json::{json, Value};
-use sigstore_crypto::KeyPair;
 use sigstore_tuf::{canonical_json, Key};
 
 const FAR_FUTURE: &str = "2999-01-01T00:00:00Z";
@@ -13,21 +16,38 @@ const EXPIRED: &str = "2000-01-01T00:00:00Z";
 const EXPIRY_BOUNDARY: &str = "2023-11-14T22:13:20Z";
 const SNAPSHOT_SHA256: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
-fn key_entry(key_pair: &KeyPair) -> (String, Value) {
-    let public_key = key_pair.public_key_der().expect("public key").to_pem();
+struct FixtureKeyPair(Ed25519KeyPair);
+
+impl FixtureKeyPair {
+    fn generate() -> Self {
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
+            .expect("generate Ed25519 fixture key");
+        Self(Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("load Ed25519 fixture key"))
+    }
+
+    fn public_key(&self) -> &[u8] {
+        self.0.public_key().as_ref()
+    }
+
+    fn sign(&self, message: &[u8]) -> Vec<u8> {
+        self.0.sign(message).as_ref().to_vec()
+    }
+}
+
+fn key_entry(key_pair: &FixtureKeyPair) -> (String, Value) {
     let value = json!({
-        "keytype": "ecdsa",
-        "scheme": "ecdsa-sha2-nistp256",
-        "keyval": { "public": public_key },
+        "keytype": "ed25519",
+        "scheme": "ed25519",
+        "keyval": { "public": hex::encode(key_pair.public_key()) },
     });
     let key: Key = serde_json::from_value(value.clone()).expect("TUF key");
     (key.key_id().expect("key id"), value)
 }
 
-fn signature(signed: &Value, key_id: &str, key_pair: &KeyPair) -> Value {
+fn signature(signed: &Value, key_id: &str, key_pair: &FixtureKeyPair) -> Value {
     let canonical = canonical_json::to_canonical_bytes(signed).expect("canonical JSON");
-    let signature = key_pair.sign(&canonical).expect("root signature");
-    json!({ "keyid": key_id, "sig": hex::encode(signature.as_bytes()) })
+    let signature = key_pair.sign(&canonical);
+    json!({ "keyid": key_id, "sig": hex::encode(signature) })
 }
 
 fn root_signed(version: u64, key_id: &str, key: Value) -> Value {
@@ -84,9 +104,9 @@ fn main() {
         .expect("fixture output directory argument");
     fs::create_dir_all(&directory).expect("create fixture directory");
 
-    let key1 = KeyPair::generate_ecdsa_p256().expect("generate root key 1");
-    let key2 = KeyPair::generate_ecdsa_p256().expect("generate root key 2");
-    let key3 = KeyPair::generate_ecdsa_p256().expect("generate root key 3");
+    let key1 = FixtureKeyPair::generate();
+    let key2 = FixtureKeyPair::generate();
+    let key3 = FixtureKeyPair::generate();
     let (id1, entry1) = key_entry(&key1);
     let (id2, entry2) = key_entry(&key2);
     let (id3, entry3) = key_entry(&key3);

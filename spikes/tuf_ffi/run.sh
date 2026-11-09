@@ -38,19 +38,20 @@ mkdir -m 700 "$WORK/fixtures"
 "$CARGO_BIN" build --locked --release --manifest-path "$SPIKE/Cargo.toml"
 "$CARGO_BIN" run --locked --release --manifest-path "$SPIKE/Cargo.toml" --bin root_chain_fixturegen -- "$WORK/fixtures"
 
-python3 - "$SPIKE/abi_probe.elisa.in" "$SPIKE/testdata/github-root.json" "$WORK/fixtures" "$WORK/abi_probe.elisa" <<'PY'
+python3 - "$SPIKE/abi_probe.elisa.in" "$WORK/fixtures/root3.json" "$SPIKE/testdata/github-root.json" "$WORK/fixtures" "$WORK/abi_probe.elisa" <<'PY'
 import json
 from pathlib import Path
 import sys
 
-template_path, root_path, fixture_dir, output_path = map(Path, sys.argv[1:])
+template_path, root_path, github_root_path, fixture_dir, output_path = map(Path, sys.argv[1:])
 raw = root_path.read_bytes()
 document = json.loads(raw)
 signed = document["signed"]
-tampered = raw.replace(b'"consistent_snapshot": true', b'"consistent_snapshot": false', 1)
-unsupported = raw.replace(b'"spec_version": "1.0.31"', b'"spec_version": "1.0.37"', 1)
+github_root = github_root_path.read_bytes()
+tampered = raw.replace(b'"consistent_snapshot":false', b'"consistent_snapshot":true', 1)
+unsupported = raw.replace(b'"spec_version":"1.0.0"', b'"spec_version":"1.0.37"', 1)
 if tampered == raw or unsupported == raw:
-    raise SystemExit("pinned root fixture no longer matches expected test transformations")
+    raise SystemExit("generated Ed25519 root no longer matches expected test transformations")
 
 rotation_roots = [fixture_dir / f"root{version}.json" for version in (1, 2, 3)]
 rotation_documents = [json.loads(path.read_bytes()) for path in rotation_roots]
@@ -94,6 +95,7 @@ replacements = {
     "@@ROOT_THRESHOLD@@": str(signed["roles"]["root"]["threshold"]),
     "@@TAMPERED_ROOT_BYTES@@": ", ".join(map(str, tampered)),
     "@@UNSUPPORTED_SPEC_ROOT_BYTES@@": ", ".join(map(str, unsupported)),
+    "@@UNSUPPORTED_KEY_ALGORITHM_BYTES@@": ", ".join(map(str, github_root)),
     "@@ROOT1_BYTES@@": ", ".join(map(str, rotation_roots[0].read_bytes())),
     "@@ROOT2_BYTES@@": ", ".join(map(str, root2)),
     "@@ROOT3_BYTES@@": ", ".join(map(str, rotation_roots[2].read_bytes())),
