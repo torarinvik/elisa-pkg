@@ -37,6 +37,8 @@ module Cli:
         const PROGRAM_TIMEOUT_MS: i64 = 120000
         const MAX_DEPENDENCIES: usize = 4096
         const MAX_TARGETS: usize = 4096
+        const MAX_ARCHIVE_GLOB_WORK: usize = 16777216.usize()
+        const MAX_ARCHIVE_GLOB_ROWS: usize = 65536.usize()
         const MAX_BUILD_GRAPH_EDGES: usize = 65536.usize()
         const MAX_BUILD_AGGREGATE_BYTES: usize = 33554432.usize()
         const MAX_BUILD_SNAPSHOT_BYTES: usize = 268435456.usize()
@@ -5193,12 +5195,25 @@ module Cli:
                 return 7
             return EXIT_USAGE
 
-        def archive_glob_matches(pattern: darray[u8]&, path: darray[u8]&) -> bool:
-            # Keep matching bounded by the manifest and path limits. Two
-            # boolean rows avoid recursive backtracking and give `**/` the
-            # conventional zero-directory behavior (`src/**/main` matches both
-            # `src/main` and `src/nested/main`).
+        def archive_glob_charge(work_remaining: mutable usize&, rows_remaining: mutable usize&, amount: usize, new_row: bool) -> bool:
+            return false if amount > work_remaining or new_row and rows_remaining == 0.usize()
+            work_remaining <- work_remaining - amount
+            rows_remaining <- rows_remaining - 1.usize() if new_row
+            return true
+
+        def archive_glob_charge_scan(work_remaining: mutable usize&, rows_remaining: mutable usize&, budget_exhausted: mutable bool&) -> bool:
+            if not archive_glob_charge(work_remaining, rows_remaining, 1.usize(), false):
+                budget_exhausted <- true
+                return false
+            return true
+
+        def archive_glob_matches(pattern: darray[u8]&, path: darray[u8]&, work_remaining: mutable usize&, rows_remaining: mutable usize&, budget_exhausted: mutable bool&) -> bool:
+            # Two boolean rows avoid recursive backtracking. Shared budgets cap
+            # both DP work and allocation count across the entire package walk.
             current: mutable darray[bool] = []
+            if not archive_glob_charge(work_remaining, rows_remaining, path.count + 1.usize(), true):
+                budget_exhausted <- true
+                return false
             current.resize(path.count + 1.usize())
             current[0] <- true
             pattern_index: mutable usize = 0.usize()
@@ -5209,6 +5224,9 @@ module Cli:
                         pattern_index <- pattern_index + 1.usize()
                     crosses_separator: bool = pattern_index - star_start > 1.usize()
                     next: mutable darray[bool] = []
+                    if not archive_glob_charge(work_remaining, rows_remaining, path.count + 1.usize(), true):
+                        budget_exhausted <- true
+                        return false
                     next.resize(path.count + 1.usize())
                     if crosses_separator and pattern_index < pattern.count and pattern[pattern_index] == 47:
                         # `**/` consumes zero or more complete components. The
@@ -5235,6 +5253,9 @@ module Cli:
                     current <- next
                     continue
                 next: mutable darray[bool] = []
+                if not archive_glob_charge(work_remaining, rows_remaining, path.count + 1.usize(), true):
+                    budget_exhausted <- true
+                    return false
                 next.resize(path.count + 1.usize())
                 for path_index in 0..<path.count |current, next, pattern, pattern_index, path|:
                     next[path_index + 1.usize()] <- current[path_index] and pattern[pattern_index] == path[path_index]
@@ -5250,16 +5271,17 @@ module Cli:
                 return false if index > 0.usize() and pattern[index - 1.usize()] == 47 and pattern[index] == 47
             return true
 
-        def pattern_array_matches_path(raw: darray[u8]&, key: cstr, path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            pattern_start: usize = json_key_value_offset(raw, key)
+        def pattern_array_matches_path(raw: darray[u8]&, pattern_start: usize, pattern_end: usize, path: darray[u8]&, work_remaining: mutable usize&, rows_remaining: mutable usize&, budget_exhausted: mutable bool&) -> bool can[Memory.Allocate, Abort.Panic]:
             return false if pattern_start >= raw.count
-            pattern_end: usize = json_array_end(raw, pattern_start)
             return false if pattern_end <= pattern_start or raw[pattern_start] != 91
             cursor: mutable usize = pattern_start + 1.usize()
+            return false if not archive_glob_charge_scan(work_remaining, rows_remaining, budget_exhausted)
             while cursor < pattern_end:
                 while cursor < pattern_end and (raw[cursor] == 32 or raw[cursor] == 9 or raw[cursor] == 10 or raw[cursor] == 13) |raw, cursor|:
+                    return false if not archive_glob_charge_scan(work_remaining, rows_remaining, budget_exhausted)
                     cursor <- cursor + 1.usize()
                 return false if cursor >= pattern_end or raw[cursor] != 34
+                return false if not archive_glob_charge_scan(work_remaining, rows_remaining, budget_exhausted)
                 cursor <- cursor + 1.usize()
                 pattern: mutable darray[u8] = []
                 while cursor < pattern_end and raw[cursor] != 34 |raw, cursor, pattern|:
@@ -5267,20 +5289,29 @@ module Cli:
                     pattern.push(raw[cursor])
                     cursor <- cursor + 1.usize()
                 return false if cursor >= pattern_end or not valid_publish_pattern(pattern)
-                return true if archive_glob_matches(pattern, path)
+                pattern_scan_work: usize = pattern.count * 2.usize() + 1.usize()
+                if not archive_glob_charge(work_remaining, rows_remaining, pattern_scan_work, false):
+                    budget_exhausted <- true
+                    return false
+                return true if archive_glob_matches(pattern, path, work_remaining, rows_remaining, budget_exhausted)
+                return false if budget_exhausted
+                return false if not archive_glob_charge_scan(work_remaining, rows_remaining, budget_exhausted)
                 cursor <- cursor + 1.usize()
                 while cursor < pattern_end and (raw[cursor] == 32 or raw[cursor] == 9 or raw[cursor] == 10 or raw[cursor] == 13) |raw, cursor|:
+                    return false if not archive_glob_charge_scan(work_remaining, rows_remaining, budget_exhausted)
                     cursor <- cursor + 1.usize()
                 return false if cursor >= pattern_end or raw[cursor] != 44
+                return false if not archive_glob_charge_scan(work_remaining, rows_remaining, budget_exhausted)
                 cursor <- cursor + 1.usize()
             return false
 
-        def include_allows_path(raw: darray[u8]&, path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            return true if json_key_value_offset(raw, "include") >= raw.count
-            return pattern_array_matches_path(raw, "include", path)
+        def include_allows_path(raw: darray[u8]&, pattern_start: usize, pattern_end: usize, path: darray[u8]&, work_remaining: mutable usize&, rows_remaining: mutable usize&, budget_exhausted: mutable bool&) -> bool can[Memory.Allocate, Abort.Panic]:
+            return true if pattern_start >= raw.count
+            return pattern_array_matches_path(raw, pattern_start, pattern_end, path, work_remaining, rows_remaining, budget_exhausted)
 
-        def exclude_allows_path(raw: darray[u8]&, path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            return pattern_array_matches_path(raw, "exclude", path)
+        def exclude_allows_path(raw: darray[u8]&, pattern_start: usize, pattern_end: usize, path: darray[u8]&, work_remaining: mutable usize&, rows_remaining: mutable usize&, budget_exhausted: mutable bool&) -> bool can[Memory.Allocate, Abort.Panic]:
+            return false if pattern_start >= raw.count
+            return pattern_array_matches_path(raw, pattern_start, pattern_end, path, work_remaining, rows_remaining, budget_exhausted)
 
         def publish_path_forbidden(path: darray[u8]&) -> bool:
             return true if path.count == 0.usize() or not Archive::is_safe_entry(path)
@@ -5364,7 +5395,7 @@ module Cli:
             root: mutable darray[u8] = [46]
             return source_tree_digest_at(root, out)
 
-        def collect_package_paths(raw: darray[u8]&, target: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+        def collect_package_paths(raw: darray[u8]&, target: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             out.resize(0)
             resolved_root: mutable darray[u8] = []
             resolved_root.resize(4096)
@@ -5385,6 +5416,13 @@ module Cli:
             cursor: mutable usize = 0.usize()
             selected: mutable usize = 0.usize()
             target_found: mutable bool = false
+            include_start: usize = json_key_value_offset(raw, "include")
+            include_end: usize = json_array_end(raw, include_start) if include_start < raw.count else raw.count
+            exclude_start: usize = json_key_value_offset(raw, "exclude")
+            exclude_end: usize = json_array_end(raw, exclude_start) if exclude_start < raw.count else raw.count
+            glob_work_remaining: mutable usize = MAX_ARCHIVE_GLOB_WORK
+            glob_rows_remaining: mutable usize = MAX_ARCHIVE_GLOB_ROWS
+            glob_budget_exhausted: mutable bool = false
             while cursor < collected.usize():
                 path: mutable darray[u8] = []
                 while cursor < collected.usize() and buffer[cursor] != 0 |buffer, cursor, path|:
@@ -5394,8 +5432,15 @@ module Cli:
                 cursor <- cursor + 1.usize()
                 return false if path.count == 0.usize() or publish_path_forbidden(path)
                 required: bool = bytes_equal_view(path, "elisapkg.json") or bytes_equal_view(path, "elisapkg.lock")
-                include_selected: mutable bool = required or include_allows_path(raw, path)
-                include_selected <- false if include_selected and not required and exclude_allows_path(raw, path)
+                include_selected: mutable bool = required or include_allows_path(raw, include_start, include_end, path, &glob_work_remaining, &glob_rows_remaining, &glob_budget_exhausted)
+                if glob_budget_exhausted:
+                    write_error("error: package include/exclude patterns exceeded the bounded matching budget\n")
+                    return false
+                if include_selected and not required and exclude_allows_path(raw, exclude_start, exclude_end, path, &glob_work_remaining, &glob_rows_remaining, &glob_budget_exhausted):
+                    include_selected <- false
+                if glob_budget_exhausted:
+                    write_error("error: package include/exclude patterns exceeded the bounded matching budget\n")
+                    return false
                 if include_selected:
                     return false if selected >= PackagePathPolicy::max_package_archive_entries
                     for index in 0..<path.count |out, path|:
