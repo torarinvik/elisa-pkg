@@ -8,7 +8,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::slice;
 
 use serde_json::Value;
-use sigstore_tuf::{Metadata, Root, TrustedMetadataSet};
+use sigstore_tuf::{Root, TrustedMetadataSet};
 
 const ABI_VERSION: u32 = 1;
 const MAX_ROOT_BYTES: usize = 1_048_576;
@@ -98,7 +98,93 @@ pub unsafe extern "C" fn elisapkg_tuf_engine_verify_root_v1(
     STATUS_OK
 }
 
+/// Verify exactly one sequential root-rotation link without persisting state.
+///
+/// The caller supplies its current trusted root and one candidate root. On
+/// success, the caller must durably persist the candidate bytes before asking
+/// this function to validate the next root. This operation intentionally does
+/// no filesystem or network I/O and does not check final-root expiry.
+///
+/// Status values match [`elisapkg_tuf_engine_verify_root_v1`].
+///
+/// # Safety
+///
+/// Both input pointers must address their respective readable byte ranges.
+/// Each output pointer must be aligned and writable for its pointee type; the
+/// outputs must not overlap each other or either input range. The trusted and
+/// candidate bytes must both have passed Elisa's bounded duplicate-key and
+/// canonical-number precheck.
+#[no_mangle]
+pub unsafe extern "C" fn elisapkg_tuf_engine_verify_root_update_v1(
+    trusted_root: *const u8,
+    trusted_root_len: usize,
+    candidate_root: *const u8,
+    candidate_root_len: usize,
+    out_version: *mut u64,
+    out_key_count: *mut u32,
+    out_root_threshold: *mut u32,
+) -> i32 {
+    if trusted_root.is_null()
+        || trusted_root_len == 0
+        || trusted_root_len > MAX_ROOT_BYTES
+        || candidate_root.is_null()
+        || candidate_root_len == 0
+        || candidate_root_len > MAX_ROOT_BYTES
+        || out_version.is_null()
+        || out_key_count.is_null()
+        || out_root_threshold.is_null()
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+
+    let verification = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: null and length bounds are checked above. The caller contract
+        // requires both pointers to address their respective readable ranges.
+        let trusted_bytes = unsafe { slice::from_raw_parts(trusted_root, trusted_root_len) };
+        let candidate_bytes = unsafe { slice::from_raw_parts(candidate_root, candidate_root_len) };
+        verify_root_update_bytes(trusted_bytes, candidate_bytes)
+    }));
+
+    let summary = match verification {
+        Ok(Ok(summary)) => summary,
+        Ok(Err(VerifyError::UnsupportedSpec)) => return STATUS_UNSUPPORTED_SPEC,
+        Ok(Err(VerifyError::InvalidRoot)) => return STATUS_INVALID_ROOT,
+        Err(_) => return STATUS_INTERNAL_PANIC,
+    };
+
+    // SAFETY: non-null output locations were checked above. Their writable,
+    // non-overlapping extent is part of the caller contract.
+    unsafe {
+        *out_version = summary.version;
+        *out_key_count = summary.key_count;
+        *out_root_threshold = summary.root_threshold;
+    }
+    STATUS_OK
+}
+
 fn verify_root_bytes(bytes: &[u8]) -> Result<VerifiedRootSummary, VerifyError> {
+    validate_root_spec_version(bytes)?;
+
+    let trusted = TrustedMetadataSet::from_root(bytes).map_err(|_| VerifyError::InvalidRoot)?;
+    summarize_root(trusted.root())
+}
+
+fn verify_root_update_bytes(
+    trusted_bytes: &[u8],
+    candidate_bytes: &[u8],
+) -> Result<VerifiedRootSummary, VerifyError> {
+    validate_root_spec_version(trusted_bytes)?;
+    validate_root_spec_version(candidate_bytes)?;
+
+    let mut trusted =
+        TrustedMetadataSet::from_root(trusted_bytes).map_err(|_| VerifyError::InvalidRoot)?;
+    trusted
+        .update_root(candidate_bytes)
+        .map_err(|_| VerifyError::InvalidRoot)?;
+    summarize_root(trusted.root())
+}
+
+fn validate_root_spec_version(bytes: &[u8]) -> Result<(), VerifyError> {
     // Elisa's bounded precheck is authoritative for duplicate-key rejection
     // and canonical integer syntax. Parsing here extracts only the profile
     // field before delegating signature and schema validation to sigstore-tuf.
@@ -111,14 +197,10 @@ fn verify_root_bytes(bytes: &[u8]) -> Result<VerifiedRootSummary, VerifyError> {
     if !supported_spec_version(spec_version) {
         return Err(VerifyError::UnsupportedSpec);
     }
+    Ok(())
+}
 
-    let parsed = Metadata::<Root>::from_slice(bytes).map_err(|_| VerifyError::InvalidRoot)?;
-    if parsed.signed().spec_version != spec_version {
-        return Err(VerifyError::InvalidRoot);
-    }
-
-    let trusted = TrustedMetadataSet::from_root(bytes).map_err(|_| VerifyError::InvalidRoot)?;
-    let root = trusted.root();
+fn summarize_root(root: &Root) -> Result<VerifiedRootSummary, VerifyError> {
     let root_role = root.role("root").ok_or(VerifyError::InvalidRoot)?;
     let key_count = u32::try_from(root.keys.len()).map_err(|_| VerifyError::InvalidRoot)?;
     let root_threshold =

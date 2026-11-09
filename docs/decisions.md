@@ -257,14 +257,15 @@ A test-only ABI proof is also recorded in
 commit. On 2026-10-07, four Rust tests passed, and the release static library
 linked to an Elisa-emitted object and ran on Vast Linux x86_64. The
 cross-language probe accepted the signed fixture root (version 9, eight keys,
-root threshold three), rejected a tampered signature and spec version
-`1.0.37`, rejected duplicate keys in Elisa before FFI, and left output fields
-untouched on failures. This establishes only the v1 ABI layout and one bounded
-root-verification operation on one target. The Rust entry point depends on the
-Elisa precheck to reject duplicate keys and noncanonical numbers; the prototype
-has no durable state, root rotation, role refresh, delegation, target hash
-policy, cache writes, transport, or supported-platform CI coverage. It is not
-approval to ship the engine or enable remote operations.
+root threshold three), verified two consecutive root rotations, rejected a
+skipped version, tampered signature, and spec version `1.0.37`, rejected
+duplicate keys in Elisa before FFI, and left output fields untouched on
+failures. This establishes only the v1 ABI layout and bounded root-verification
+operations on one target. The Rust entry point depends on the Elisa precheck to
+reject duplicate keys and noncanonical numbers; the prototype has no durable
+root checkpoint implementation, role refresh, delegation, target hash policy,
+cache writes, transport, final-root expiry check, or supported-platform CI
+coverage. It is not approval to ship the engine or enable remote operations.
 
 The fixture in D-011 remains a local implementation test only. Its custom
 single-key index and signed metadata are not a compatible TUF implementation

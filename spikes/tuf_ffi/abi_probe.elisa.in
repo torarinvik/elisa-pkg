@@ -8,6 +8,8 @@ include "../../src/tuf.elisa"
 extern native_tuf_engine_abi_version_v1() -> u32
 @link_name("elisapkg_tuf_engine_verify_root_v1")
 extern native_tuf_engine_verify_root_v1(metadata: void&, metadata_len: usize, out_version: mutable u64&, out_key_count: mutable u32&, out_root_threshold: mutable u32&) -> i32
+@link_name("elisapkg_tuf_engine_verify_root_update_v1")
+extern native_tuf_engine_verify_root_update_v1(trusted_root: void&, trusted_root_len: usize, candidate_root: void&, candidate_root_len: usize, out_version: mutable u64&, out_key_count: mutable u32&, out_root_threshold: mutable u32&) -> i32
 
 module TufEngine:
     public:
@@ -27,14 +29,26 @@ module TufEngine:
             return Status.InvalidMetadata if Tuf::precheck_metadata_json(metadata) != Tuf::ValidationCode.WellFormed
             bytes_ptr: void& = (&metadata[0]).cast[void&] can Unsafe.PointerCast
             result: i32 = native_tuf_engine_verify_root_v1(bytes_ptr, metadata.count, version, key_count, root_threshold)
+            return status_from_native(result)
+
+        def verify_root_update(trusted_root: darray[u8]&, candidate_root: darray[u8]&, version: mutable u64&, key_count: mutable u32&, root_threshold: mutable u32&) -> Status can[Unsafe.PointerCast]:
+            return Status.InvalidArgument if trusted_root.count == 0.usize() or trusted_root.count > max_root_bytes or candidate_root.count == 0.usize() or candidate_root.count > max_root_bytes
+            return Status.InvalidMetadata if Tuf::precheck_metadata_json(trusted_root) != Tuf::ValidationCode.WellFormed
+            return Status.InvalidMetadata if Tuf::precheck_metadata_json(candidate_root) != Tuf::ValidationCode.WellFormed
+            trusted_bytes_ptr: void& = (&trusted_root[0]).cast[void&] can Unsafe.PointerCast
+            candidate_bytes_ptr: void& = (&candidate_root[0]).cast[void&] can Unsafe.PointerCast
+            result: i32 = native_tuf_engine_verify_root_update_v1(trusted_bytes_ptr, trusted_root.count, candidate_bytes_ptr, candidate_root.count, version, key_count, root_threshold)
+            return status_from_native(result)
+
+    private:
+        const max_root_bytes: usize = 1048576.usize()
+
+        def status_from_native(result: i32) -> Status:
             return Status.Ok if result == 0
             return Status.InvalidArgument if result == 1
             return Status.InvalidRoot if result == 2
             return Status.UnsupportedSpec if result == 3
             return Status.InternalPanic
-
-    private:
-        const max_root_bytes: usize = 1048576.usize()
 
 module TufEngineProbe:
     public:
@@ -69,6 +83,30 @@ module TufEngineProbe:
             unsupported_spec_root: mutable darray[u8] = [@@UNSUPPORTED_SPEC_ROOT_BYTES@@]
             return 10 if TufEngine::verify_root(unsupported_spec_root, &version, &key_count, &threshold) != TufEngine::Status.UnsupportedSpec
             return 11 if version != 77.u64() or key_count != 77.u32() or threshold != 77.u32()
+
+            root1: mutable darray[u8] = [@@ROOT1_BYTES@@]
+            root2: mutable darray[u8] = [@@ROOT2_BYTES@@]
+            root3: mutable darray[u8] = [@@ROOT3_BYTES@@]
+            return 12 if TufEngine::verify_root(root1, &version, &key_count, &threshold) != TufEngine::Status.Ok
+            return 13 if version != 1.u64() or key_count != 1.u32() or threshold != 1.u32()
+            return 14 if TufEngine::verify_root_update(root1, root2, &version, &key_count, &threshold) != TufEngine::Status.Ok
+            return 15 if version != 2.u64() or key_count != 1.u32() or threshold != 1.u32()
+            return 16 if TufEngine::verify_root_update(root2, root3, &version, &key_count, &threshold) != TufEngine::Status.Ok
+            return 17 if version != 3.u64() or key_count != 1.u32() or threshold != 1.u32()
+
+            version <- 77.u64()
+            key_count <- 77.u32()
+            threshold <- 77.u32()
+            return 18 if TufEngine::verify_root_update(root1, root3, &version, &key_count, &threshold) != TufEngine::Status.InvalidRoot
+            return 19 if version != 77.u64() or key_count != 77.u32() or threshold != 77.u32()
+
+            tampered_root2: mutable darray[u8] = [@@TAMPERED_ROOT2_BYTES@@]
+            return 20 if TufEngine::verify_root_update(root1, tampered_root2, &version, &key_count, &threshold) != TufEngine::Status.InvalidRoot
+            return 21 if version != 77.u64() or key_count != 77.u32() or threshold != 77.u32()
+
+            unsupported_root2: mutable darray[u8] = [@@UNSUPPORTED_ROOT2_BYTES@@]
+            return 22 if TufEngine::verify_root_update(root1, unsupported_root2, &version, &key_count, &threshold) != TufEngine::Status.UnsupportedSpec
+            return 23 if version != 77.u64() or key_count != 77.u32() or threshold != 77.u32()
             return 0
 
     private:

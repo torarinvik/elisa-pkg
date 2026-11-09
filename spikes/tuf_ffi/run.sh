@@ -32,16 +32,18 @@ WORK="$(mktemp -d "$ROOT/build/tuf-ffi.XXXXXXXX")"
 chmod 700 "$WORK"
 trap 'rm -rf -- "$WORK"' EXIT
 mkdir -m 700 "$WORK/package-root" "$WORK/package-root/src"
+mkdir -m 700 "$WORK/fixtures"
 
 "$CARGO_BIN" test --locked --manifest-path "$SPIKE/Cargo.toml"
 "$CARGO_BIN" build --locked --release --manifest-path "$SPIKE/Cargo.toml"
+"$CARGO_BIN" run --locked --release --manifest-path "$SPIKE/Cargo.toml" --bin root_chain_fixturegen -- "$WORK/fixtures"
 
-python3 - "$SPIKE/abi_probe.elisa.in" "$SPIKE/testdata/github-root.json" "$WORK/abi_probe.elisa" <<'PY'
+python3 - "$SPIKE/abi_probe.elisa.in" "$SPIKE/testdata/github-root.json" "$WORK/fixtures" "$WORK/abi_probe.elisa" <<'PY'
 import json
 from pathlib import Path
 import sys
 
-template_path, root_path, output_path = map(Path, sys.argv[1:])
+template_path, root_path, fixture_dir, output_path = map(Path, sys.argv[1:])
 raw = root_path.read_bytes()
 document = json.loads(raw)
 signed = document["signed"]
@@ -50,6 +52,16 @@ unsupported = raw.replace(b'"spec_version": "1.0.31"', b'"spec_version": "1.0.37
 if tampered == raw or unsupported == raw:
     raise SystemExit("pinned root fixture no longer matches expected test transformations")
 
+rotation_roots = [fixture_dir / f"root{version}.json" for version in (1, 2, 3)]
+rotation_documents = [json.loads(path.read_bytes()) for path in rotation_roots]
+if [item["signed"]["version"] for item in rotation_documents] != [1, 2, 3]:
+    raise SystemExit("generated root rotation fixtures are not sequential")
+root2 = rotation_roots[1].read_bytes()
+tampered_root2 = root2.replace(b'"consistent_snapshot":false', b'"consistent_snapshot":true', 1)
+unsupported_root2 = root2.replace(b'"spec_version":"1.0.0"', b'"spec_version":"1.0.37"', 1)
+if tampered_root2 == root2 or unsupported_root2 == root2:
+    raise SystemExit("generated root 2 no longer matches expected test transformations")
+
 replacements = {
     "@@ROOT_BYTES@@": ", ".join(map(str, raw)),
     "@@ROOT_VERSION@@": str(signed["version"]),
@@ -57,6 +69,11 @@ replacements = {
     "@@ROOT_THRESHOLD@@": str(signed["roles"]["root"]["threshold"]),
     "@@TAMPERED_ROOT_BYTES@@": ", ".join(map(str, tampered)),
     "@@UNSUPPORTED_SPEC_ROOT_BYTES@@": ", ".join(map(str, unsupported)),
+    "@@ROOT1_BYTES@@": ", ".join(map(str, rotation_roots[0].read_bytes())),
+    "@@ROOT2_BYTES@@": ", ".join(map(str, root2)),
+    "@@ROOT3_BYTES@@": ", ".join(map(str, rotation_roots[2].read_bytes())),
+    "@@TAMPERED_ROOT2_BYTES@@": ", ".join(map(str, tampered_root2)),
+    "@@UNSUPPORTED_ROOT2_BYTES@@": ", ".join(map(str, unsupported_root2)),
 }
 source = template_path.read_text()
 for marker, value in replacements.items():
