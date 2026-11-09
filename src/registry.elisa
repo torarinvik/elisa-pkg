@@ -99,7 +99,7 @@ module Registry:
         # path. The bytes are checked again immediately before they are handed
         # to cache or extraction code so a mutable fixture cannot race the
         # metadata verification step unnoticed.
-        def read_archive(package: darray[u8]&, version: darray[u8]&, archive: darray[u8]&, expected_digest: darray[u8]&, expected_size: u64, out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+        def read_archive(package: darray[u8]&, version: darray[u8]&, metadata: darray[u8]&, archive: darray[u8]&, expected_digest: darray[u8]&, expected_size: u64, out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out.resize(0)
             return ResultCode.InvalidConfiguration if not valid_package_path(package) or not Archive::is_safe_entry(version) or not Archive::is_safe_entry(archive) or not valid_digest(expected_digest) or expected_size > 67108864
             root: mutable darray[u8] = []
@@ -112,11 +112,39 @@ module Registry:
                 path.push(archive[index])
             return ResultCode.ArchiveMissing if not read_file(path, 67108864.usize(), out)
             return ResultCode.DigestMismatch if out.count.u64() != expected_size
-            return ResultCode.MalformedMetadata if not Archive::verify_ustar_archive(out)
             digest_bytes: mutable darray[u8] = []
             digest: mutable darray[u8] = []
             return ResultCode.DigestMismatch if Integrity::sha256(out, &digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(digest_bytes, &digest) or not bytes_equal(digest, expected_digest)
+            return ResultCode.MalformedMetadata if not release_archive_matches_metadata(package, version, metadata, out)
             return ResultCode.Ok
+
+        # Bind the package shipped in an authenticated release archive to the
+        # same identity and dependency graph that the signed registry metadata
+        # authorized. Callers must authenticate metadata before using this
+        # check; the function itself treats both inputs as untrusted bytes.
+        def release_archive_matches_metadata(package: darray[u8]&, version: darray[u8]&, metadata: darray[u8]&, archive: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            return false if not valid_package_path(package) or not Archive::is_safe_entry(version)
+            manifest_name: mutable darray[u8] = [101, 108, 105, 115, 97, 112, 107, 103, 46, 106, 115, 111, 110]
+            manifest: mutable darray[u8] = []
+            return false if not Archive::read_ustar_entry(archive, manifest_name, &manifest)
+            return false if manifest.count == 0 or manifest.count > 1048576 or not Json::valid_utf8(manifest) or not Json::valid_document(manifest) or not Json::unique_object_keys(manifest) or not metadata_root_object(manifest)
+            for index in 0..<manifest.count |manifest|:
+                return false if manifest[index] == 0
+            schema: mutable u64 = 0
+            return false if not metadata_integer(manifest, "schema-version", &schema) or schema != 1
+            package_start: usize = metadata_value_start(manifest, "package")
+            package_end: usize = metadata_object_end(manifest, package_start)
+            return false if package_start >= manifest.count or manifest[package_start] != 123 or package_end <= package_start or package_end >= manifest.count
+            manifest_package: mutable darray[u8] = []
+            manifest_version: mutable darray[u8] = []
+            return false if not metadata_string_in_object(manifest, package_start, package_end, "name", &manifest_package) or not metadata_string_in_object(manifest, package_start, package_end, "version", &manifest_version)
+            return false if not bytes_equal(manifest_package, package) or not bytes_equal(manifest_version, version)
+            return false if not metadata_optional_object_empty(manifest, "dev-dependencies")
+            signed_dependencies: mutable darray[Solver::Constraint] = []
+            manifest_dependencies: mutable darray[Solver::Constraint] = []
+            return false if not metadata_dependencies(metadata, &signed_dependencies) or not metadata_dependencies(manifest, &manifest_dependencies)
+            return false if not registry_dependency_sets_equal(signed_dependencies, manifest_dependencies)
+            return true
 
         # Record the authenticated immutable package identity in user-owned
         # trust state. This is separate from the project lockfile so deleting
@@ -408,10 +436,10 @@ module Registry:
             return ResultCode.DigestMismatch if actual_size.u64() != archive_size_out
             archive_bytes: mutable darray[u8] = []
             return ResultCode.ArchiveMissing if not read_file(archive_path, 67108864.usize(), &archive_bytes)
-            return ResultCode.MalformedMetadata if not Archive::verify_ustar_archive(archive_bytes)
             actual_digest_bytes: mutable darray[u8] = []
             actual_digest: mutable darray[u8] = []
             return ResultCode.DigestMismatch if Integrity::sha256(archive_bytes, &actual_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(actual_digest_bytes, &actual_digest) or not bytes_equal(actual_digest, digest_out)
+            return ResultCode.MalformedMetadata if not release_archive_matches_metadata(package, selected, metadata, archive_bytes)
             for index in 0..<selected.count |version_out, selected|:
                 version_out.push(selected[index])
             for index in 0..<metadata.count |metadata_out, metadata|:
@@ -555,6 +583,25 @@ module Registry:
                     in_string <- false
             return true
 
+        def metadata_optional_object_empty(raw: darray[u8]&, wanted: cstr) -> bool:
+            start: usize = metadata_value_start(raw, wanted)
+            return true if start >= raw.count
+            return false if raw[start] != 123
+            finish: usize = metadata_object_end(raw, start)
+            return false if finish <= start or finish >= raw.count
+            for index in (start + 1)..<finish |raw|:
+                return false if not is_registry_space(raw[index])
+            return true
+
+        def registry_dependency_sets_equal(left: darray[Solver::Constraint]&, right: darray[Solver::Constraint]&) -> bool:
+            return false if left.count != right.count
+            for left_index in 0..<left.count |left, right|:
+                found: mutable bool = false
+                for right_index in 0..<right.count |left, right, left_index, found|:
+                    found <- true if bytes_equal(left[left_index].package, right[right_index].package) and bytes_equal(left[left_index].requirement, right[right_index].requirement)
+                return false if not found
+            return true
+
         def metadata_value_start(raw: darray[u8]&, wanted: cstr) -> usize:
             key_length: usize = Platform::pkg_strlen(wanted)
             in_string: mutable bool = false
@@ -627,12 +674,22 @@ module Registry:
             in_string: mutable bool = false
             escaped: mutable bool = false
             string_start: mutable usize = 0
-            for index in (object_start + 1)..<object_end |raw, in_string, escaped, string_start|:
+            braces: mutable i64 = 1
+            brackets: mutable i64 = 0
+            for index in (object_start + 1)..<object_end |raw, in_string, escaped, string_start, braces, brackets|:
                 byte: u8 = raw[index]
                 if not in_string:
                     if byte == 34:
                         in_string <- true
                         string_start <- index + 1
+                    elif byte == 123:
+                        braces <- braces + 1
+                    elif byte == 125:
+                        braces <- braces - 1
+                    elif byte == 91:
+                        brackets <- brackets + 1
+                    elif byte == 93:
+                        brackets <- brackets - 1
                 elif escaped:
                     escaped <- false
                 elif byte == 92:
@@ -641,7 +698,7 @@ module Registry:
                     after: mutable usize = index + 1
                     while after < object_end and is_registry_space(raw[after]) |raw, after|:
                         after <- after + 1
-                    if after < object_end and raw[after] == 58 and index - string_start == key_length:
+                    if braces == 1 and brackets == 0 and after < object_end and raw[after] == 58 and index - string_start == key_length:
                         matched: mutable bool = true
                         for item in 0..<key_length |raw, wanted, string_start, matched|:
                             matched <- false if raw[string_start + item] != wanted[item].u8()
