@@ -40,8 +40,9 @@ registry support is implemented or ready to enable.
   metadata migration, and compatibility fixtures.
 
 The initial resource limits are: 1 MiB per metadata file; 64 authorized keys
-per role; 64 signatures per metadata file; 4,096 package-scoped delegated
-roles; one delegation hop from top-level Targets to a package role; 4,096
+per role and 320 keys total in root metadata; 64 signatures per metadata file;
+4,096 package-scoped delegated roles; one delegation hop from top-level
+Targets to a package role; 4,096
 targets per package role; 1,024 sequential root updates per refresh; and 64
 JSON container levels. The duplicate-key validator additionally bounds each
 file to 65,536 total object keys, 8,500,000 candidate comparisons, and 65,536
@@ -71,6 +72,10 @@ and require a reviewed change if they prove too small for a real registry.
   authority. Deployment records must identify distinct key holders, role
   thresholds, offline custody, recovery operators, rotation, and emergency
   revocation procedures before production use.
+- Root metadata has exactly the four required TUF roles (`root`, `timestamp`,
+  `snapshot`, and `targets`), with the optional `mirrors` role allowed. Reject
+  unknown roles, more than 64 key IDs in any role, and more than 320 keys in
+  the root key map.
 
 ## Roles, package authority, and target identity
 

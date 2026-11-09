@@ -82,11 +82,37 @@ if expired_timestamp_document["signed"]["expires"] >= "2023-11-14T22:13:20Z":
 if boundary_timestamp_document["signed"]["expires"] != "2023-11-14T22:13:20Z":
     raise SystemExit("boundary timestamp fixture must expire exactly at the fixed probe time")
 root2 = rotation_roots[1].read_bytes()
+root2_document = json.loads(root2)
 duplicate_root2 = root2.replace(b'"version":2', b'"version":2,"version":2', 1)
 tampered_root2 = root2.replace(b'"consistent_snapshot":false', b'"consistent_snapshot":true', 1)
 unsupported_root2 = root2.replace(b'"spec_version":"1.0.0"', b'"spec_version":"1.0.37"', 1)
+duplicate_signature_root2 = json.dumps(
+    {"signed": root2_document["signed"], "signatures": [root2_document["signatures"][0]] * 2},
+    separators=(",", ":"),
+).encode()
+oversized_signatures_root2 = json.dumps(
+    {"signed": root2_document["signed"], "signatures": [root2_document["signatures"][0]] * 65},
+    separators=(",", ":"),
+).encode()
+oversized_role_root2_document = json.loads(root2)
+root_key_id = oversized_role_root2_document["signed"]["roles"]["root"]["keyids"][0]
+oversized_role_root2_document["signed"]["roles"]["root"]["keyids"] = [root_key_id] * 65
+oversized_role_root2 = json.dumps(oversized_role_root2_document, separators=(",", ":")).encode()
+oversized_root_keys_document = json.loads(root2)
+root_key = next(iter(oversized_root_keys_document["signed"]["keys"].values()))
+oversized_root_keys_document["signed"]["keys"] = {
+    f"{key_index:064x}": root_key for key_index in range(321)
+}
+oversized_root_keys = json.dumps(oversized_root_keys_document, separators=(",", ":")).encode()
 if duplicate_root2 == root2 or tampered_root2 == root2 or unsupported_root2 == root2:
     raise SystemExit("generated root 2 no longer matches expected test transformations")
+timestamp_document_with_duplicate_signature = {
+    "signed": timestamp_document["signed"],
+    "signatures": [timestamp_document["signatures"][0]] * 2,
+}
+duplicate_signature_timestamp = json.dumps(
+    timestamp_document_with_duplicate_signature, separators=(",", ":")
+).encode()
 
 replacements = {
     "@@ROOT_BYTES@@": ", ".join(map(str, raw)),
@@ -105,6 +131,11 @@ replacements = {
     "@@EXPIRED_TIMESTAMP_BYTES@@": ", ".join(map(str, expired_timestamp_path.read_bytes())),
     "@@BOUNDARY_TIMESTAMP_BYTES@@": ", ".join(map(str, boundary_timestamp_path.read_bytes())),
     "@@DUPLICATE_ROOT2_BYTES@@": ", ".join(map(str, duplicate_root2)),
+    "@@DUPLICATE_SIGNATURE_ROOT2_BYTES@@": ", ".join(map(str, duplicate_signature_root2)),
+    "@@OVERSIZED_SIGNATURES_ROOT2_BYTES@@": ", ".join(map(str, oversized_signatures_root2)),
+    "@@OVERSIZED_ROLE_ROOT2_BYTES@@": ", ".join(map(str, oversized_role_root2)),
+    "@@OVERSIZED_ROOT_KEYS_BYTES@@": ", ".join(map(str, oversized_root_keys)),
+    "@@DUPLICATE_SIGNATURE_TIMESTAMP_BYTES@@": ", ".join(map(str, duplicate_signature_timestamp)),
     "@@TAMPERED_ROOT2_BYTES@@": ", ".join(map(str, tampered_root2)),
     "@@UNSUPPORTED_ROOT2_BYTES@@": ", ".join(map(str, unsupported_root2)),
 }

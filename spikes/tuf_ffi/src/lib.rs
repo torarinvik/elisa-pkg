@@ -4,6 +4,7 @@
 //! keys before calling this interface. This crate does not own persistent
 //! trust state, filesystem paths, network transport, or package policy.
 
+use std::collections::BTreeSet;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::slice;
 
@@ -12,6 +13,9 @@ use sigstore_tuf::{Error as TufError, Role, Root, TrustedMetadataSet};
 
 const ABI_VERSION: u32 = 1;
 const MAX_METADATA_BYTES: usize = 1_048_576;
+const MAX_KEYS_PER_ROLE: usize = 64;
+const MAX_SIGNATURES_PER_METADATA: usize = 64;
+const MAX_ROOT_KEYS: usize = MAX_KEYS_PER_ROLE * 5;
 
 const STATUS_OK: i32 = 0;
 const STATUS_INVALID_ARGUMENT: i32 = 1;
@@ -341,6 +345,7 @@ fn verify_timestamp_bytes(
 ) -> Result<VerifiedTimestampSummary, VerifyError> {
     validate_root_spec_version(root_bytes)?;
     validate_spec_version(timestamp_bytes, VerifyError::InvalidMetadata)?;
+    validate_signature_profile(timestamp_bytes, VerifyError::InvalidMetadata)?;
 
     let mut trusted =
         TrustedMetadataSet::from_root(root_bytes).map_err(|_| VerifyError::InvalidRoot)?;
@@ -430,7 +435,9 @@ fn status_for_verify_error(error: VerifyError) -> i32 {
 
 fn validate_root_spec_version(bytes: &[u8]) -> Result<(), VerifyError> {
     validate_spec_version(bytes, VerifyError::InvalidRoot)?;
-    validate_root_key_profile(bytes)
+    validate_root_key_profile(bytes)?;
+    validate_root_roles_profile(bytes)?;
+    validate_signature_profile(bytes, VerifyError::InvalidRoot)
 }
 
 fn validate_root_key_profile(bytes: &[u8]) -> Result<(), VerifyError> {
@@ -441,8 +448,14 @@ fn validate_root_key_profile(bytes: &[u8]) -> Result<(), VerifyError> {
         .and_then(Value::as_object)
         .filter(|keys| !keys.is_empty())
         .ok_or(VerifyError::InvalidRoot)?;
+    if keys.len() > MAX_ROOT_KEYS {
+        return Err(VerifyError::InvalidRoot);
+    }
 
-    for key in keys.values() {
+    for (key_id, key) in keys {
+        if !is_lower_hex(key_id, 64) {
+            return Err(VerifyError::InvalidRoot);
+        }
         let keytype = key
             .get("keytype")
             .and_then(Value::as_str)
@@ -468,6 +481,96 @@ fn validate_root_key_profile(bytes: &[u8]) -> Result<(), VerifyError> {
         }
     }
     Ok(())
+}
+
+fn validate_root_roles_profile(bytes: &[u8]) -> Result<(), VerifyError> {
+    let value: Value = serde_json::from_slice(bytes).map_err(|_| VerifyError::InvalidRoot)?;
+    let root = value
+        .get("signed")
+        .and_then(|signed| signed.as_object())
+        .ok_or(VerifyError::InvalidRoot)?;
+    let keys = root
+        .get("keys")
+        .and_then(Value::as_object)
+        .ok_or(VerifyError::InvalidRoot)?;
+    let roles = root
+        .get("roles")
+        .and_then(Value::as_object)
+        .filter(|roles| (4..=5).contains(&roles.len()))
+        .ok_or(VerifyError::InvalidRoot)?;
+    for required in ["root", "timestamp", "snapshot", "targets"] {
+        if !roles.contains_key(required) {
+            return Err(VerifyError::InvalidRoot);
+        }
+    }
+
+    for (role_name, role) in roles {
+        if !matches!(
+            role_name.as_str(),
+            "root" | "timestamp" | "snapshot" | "targets" | "mirrors"
+        ) {
+            return Err(VerifyError::InvalidRoot);
+        }
+        let key_ids = role
+            .get("keyids")
+            .and_then(Value::as_array)
+            .filter(|key_ids| !key_ids.is_empty() && key_ids.len() <= MAX_KEYS_PER_ROLE)
+            .ok_or(VerifyError::InvalidRoot)?;
+        if role
+            .get("threshold")
+            .and_then(Value::as_u64)
+            .filter(|threshold| *threshold > 0 && *threshold <= key_ids.len() as u64)
+            .is_none()
+        {
+            return Err(VerifyError::InvalidRoot);
+        }
+
+        let mut seen = BTreeSet::new();
+        for key_id in key_ids {
+            let key_id = key_id.as_str().ok_or(VerifyError::InvalidRoot)?;
+            if !is_lower_hex(key_id, 64) || !keys.contains_key(key_id) || !seen.insert(key_id) {
+                return Err(VerifyError::InvalidRoot);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_signature_profile(bytes: &[u8], malformed: VerifyError) -> Result<(), VerifyError> {
+    let value: Value = serde_json::from_slice(bytes).map_err(|_| malformed)?;
+    let signatures = value
+        .get("signatures")
+        .and_then(Value::as_array)
+        .filter(|signatures| signatures.len() <= MAX_SIGNATURES_PER_METADATA)
+        .ok_or(malformed)?;
+    let mut seen = BTreeSet::new();
+    for signature in signatures {
+        let key_id = signature
+            .get("keyid")
+            .and_then(Value::as_str)
+            .ok_or(malformed)?;
+        if !is_lower_hex(key_id, 64) || !seen.insert(key_id) {
+            return Err(malformed);
+        }
+        let signature_bytes = signature
+            .get("sig")
+            .and_then(Value::as_str)
+            .ok_or(malformed)?;
+        if !signature_bytes.is_empty()
+            && (signature_bytes.len() != 128
+                || !signature_bytes.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        {
+            return Err(malformed);
+        }
+    }
+    Ok(())
+}
+
+fn is_lower_hex(value: &str, expected_len: usize) -> bool {
+    value.len() == expected_len
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn summarize_root(root: &Root) -> Result<VerifiedRootSummary, VerifyError> {

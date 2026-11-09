@@ -8,14 +8,18 @@ The Rust crate builds a static library; it adds no C source files.
 
 The ABI accepts at most 1 MiB per metadata file, catches Rust unwinding panics,
 and returns stable integer status codes. Root verification writes its summary
-only after threshold verification succeeds. Timestamp verification checks the
-timestamp role against a trusted root and returns the authenticated snapshot
-version, length, and SHA-256 pin. It also checks one root-rotation link per
-call; Elisa must persist that candidate before passing it as the trusted root
-for the next link. Root and timestamp expiry checks use the caller's fixed
-refresh time at nanosecond precision, so expired intermediate roots can pass
-only through sequential rotation while final roots and active timestamps must
-be current. The ABI still does not own rollback floors or write trust state.
+only after threshold verification succeeds. It rejects non-Ed25519 root keys,
+roots with more than 64 key IDs in any role, over 320 root keys, metadata with
+more than 64 signatures, duplicate signature key IDs, and malformed Ed25519
+signature encodings before the upstream verifier processes them. Timestamp
+verification checks the timestamp role against a trusted root and returns the
+authenticated snapshot version, length, and SHA-256 pin. It also checks one
+root-rotation link per call; Elisa must persist that candidate before passing
+it as the trusted root for the next link. Root and timestamp expiry checks use
+the caller's fixed refresh time at nanosecond precision. Expired intermediate
+roots can pass only through sequential rotation; final roots and active
+timestamps must be current. The ABI still does not own rollback floors or
+write trust state.
 Elisa's bounded TUF JSON prechecks run before the foreign calls, so duplicate
 JSON keys and noncanonical numbers never reach the upstream parser. The adapter
 owns no persistent trust state, production filesystem I/O, network transport,
