@@ -46,7 +46,7 @@ The initial resource limits are: 1 MiB per metadata file; 64 authorized keys
 per role; 320 keys total in root metadata; 65,536 delegation keys total;
 64 signatures per metadata file; 4,096 package-scoped delegated roles; one
 delegation hop from top-level Targets to a package role; 4,096 targets in each
-Targets role; 4,096-byte target paths; 64 MiB per target artifact; 1,024
+Targets role; 4,096-byte target paths; 64 MiB per target artifact; 256
 dependencies per release; 128-byte registry identity tokens; 1,024 sequential
 root updates per refresh; and 64 JSON container levels. The
 duplicate-key validator additionally bounds each file to 65,536 total object

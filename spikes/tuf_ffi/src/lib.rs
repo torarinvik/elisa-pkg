@@ -1223,7 +1223,7 @@ fn valid_profile_requirement_text(value: &str) -> bool {
     !bytes.is_empty()
         && bytes.len() <= 128
         && bytes.iter().copied().all(|byte| {
-            byte.is_ascii_digit() || matches!(byte, b'.' | b'^' | b'~' | b'<' | b'>' | b' ')
+            byte.is_ascii_digit() || matches!(byte, b'.' | b'^' | b'~' | b'<' | b'>' | b'=' | b' ')
         })
 }
 
