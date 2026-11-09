@@ -1219,15 +1219,96 @@ fn valid_profile_registry_identity(value: &str) -> bool {
 }
 
 fn valid_profile_requirement_text(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    !bytes.is_empty()
-        && bytes.len() <= 128
-        && bytes.iter().copied().all(|byte| {
-            byte.is_ascii_digit() || matches!(byte, b'.' | b'^' | b'~' | b'<' | b'>' | b'=' | b' ')
+    let raw_bytes = value.as_bytes();
+    if raw_bytes.is_empty()
+        || raw_bytes.len() > 128
+        || !raw_bytes.iter().copied().all(|byte| {
+            byte.is_ascii_digit()
+                || matches!(
+                    byte,
+                    b'.' | b'^' | b'~' | b'<' | b'>' | b'=' | b' ' | b'\t' | b'\r' | b'\n'
+                )
         })
+    {
+        return false;
+    }
+    let value = value.trim_matches(|character| matches!(character, ' ' | '\t' | '\r' | '\n'));
+    if value.is_empty() {
+        return false;
+    }
+    let bytes = value.as_bytes();
+
+    let mut cursor = 0;
+    let (first_operator, first_inclusive) =
+        parse_profile_requirement_operator(bytes, &mut cursor).unwrap_or((0, false));
+    skip_profile_requirement_space(bytes, &mut cursor);
+    let first_start = cursor;
+    while cursor < bytes.len() && !is_profile_requirement_space(bytes[cursor]) {
+        cursor += 1;
+    }
+    let Some(first_version) = parse_stable_profile_version(&value[first_start..cursor]) else {
+        return false;
+    };
+
+    if cursor == bytes.len() {
+        return match first_operator {
+            b'^' => {
+                first_version.0 != u64::MAX
+                    && (first_version.0 != 0 || first_version.1 != u64::MAX)
+                    && (first_version.0 != 0 || first_version.1 != 0 || first_version.2 != u64::MAX)
+            }
+            b'~' => first_version.1 != u64::MAX,
+            _ => true,
+        };
+    }
+
+    if first_operator != b'<' && first_operator != b'>' {
+        return false;
+    }
+    skip_profile_requirement_space(bytes, &mut cursor);
+    let Some((second_operator, second_inclusive)) =
+        parse_profile_requirement_operator(bytes, &mut cursor)
+    else {
+        return false;
+    };
+    if (second_operator != b'<' && second_operator != b'>') || second_operator == first_operator {
+        return false;
+    }
+    skip_profile_requirement_space(bytes, &mut cursor);
+    let second_start = cursor;
+    while cursor < bytes.len() && !is_profile_requirement_space(bytes[cursor]) {
+        cursor += 1;
+    }
+    if cursor != bytes.len() {
+        return false;
+    }
+    let Some(second_version) = parse_stable_profile_version(&value[second_start..cursor]) else {
+        return false;
+    };
+
+    let (lower, include_lower, upper, include_upper) = if first_operator == b'>' {
+        (
+            first_version,
+            first_inclusive,
+            second_version,
+            second_inclusive,
+        )
+    } else {
+        (
+            second_version,
+            second_inclusive,
+            first_version,
+            first_inclusive,
+        )
+    };
+    lower < upper || (lower == upper && include_lower && include_upper)
 }
 
 fn valid_stable_profile_version(value: &str) -> bool {
+    parse_stable_profile_version(value).is_some()
+}
+
+fn parse_stable_profile_version(value: &str) -> Option<(u64, u64, u64)> {
     let mut components = value.split('.');
     let (Some(major), Some(minor), Some(patch), None) = (
         components.next(),
@@ -1235,14 +1316,43 @@ fn valid_stable_profile_version(value: &str) -> bool {
         components.next(),
         components.next(),
     ) else {
-        return false;
+        return None;
     };
-    [major, minor, patch].into_iter().all(|component| {
-        !component.is_empty()
+    let parse_component = |component: &str| {
+        (!component.is_empty()
             && !(component.len() > 1 && component.starts_with('0'))
-            && component.bytes().all(|byte| byte.is_ascii_digit())
-            && component.parse::<u64>().is_ok()
-    })
+            && component.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| component.parse::<u64>().ok())
+        .flatten()
+    };
+    Some((
+        parse_component(major)?,
+        parse_component(minor)?,
+        parse_component(patch)?,
+    ))
+}
+
+fn parse_profile_requirement_operator(bytes: &[u8], cursor: &mut usize) -> Option<(u8, bool)> {
+    let operator = *bytes.get(*cursor)?;
+    if !matches!(operator, b'^' | b'~' | b'<' | b'>') {
+        return None;
+    }
+    *cursor += 1;
+    let inclusive = matches!(operator, b'<' | b'>') && bytes.get(*cursor) == Some(&b'=');
+    if inclusive {
+        *cursor += 1;
+    }
+    Some((operator, inclusive))
+}
+
+fn skip_profile_requirement_space(bytes: &[u8], cursor: &mut usize) {
+    while *cursor < bytes.len() && is_profile_requirement_space(bytes[*cursor]) {
+        *cursor += 1;
+    }
+}
+
+fn is_profile_requirement_space(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\r' | b'\n')
 }
 
 fn valid_profile_package_name(value: &str) -> bool {
