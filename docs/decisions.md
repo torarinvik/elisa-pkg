@@ -253,6 +253,14 @@ that the Elisa FFI boundary is safe. Each of these gaps must be resolved and
 verified against the exact pinned build before this candidate can be approved;
 remote registry operations remain disabled in the meantime.
 
+The pinned [`Role::is_expired`](https://github.com/sigstore/sigstore-rust/blob/79d8597006987309930ed3b286f58668adee43cd/crates/sigstore-tuf/src/metadata/mod.rs)
+helper compares `expires_at() < now`, while the [TUF workflow](https://theupdateframework.github.io/specification/v1.0.36/)
+requires every active metadata expiry to be later than the fixed refresh start
+time. Equality is therefore accepted by that helper even though the profile
+must reject it. The root-expiry ABI applies its own `<=` comparison; future
+timestamp, snapshot, and targets operations must enforce the same rule,
+including subsecond timestamps.
+
 A test-only ABI proof is also recorded in
 [`spikes/tuf_ffi`](../spikes/tuf_ffi/README.md), pinned to the same upstream
 commit. On 2026-10-07, four Rust tests passed, and the release static library
