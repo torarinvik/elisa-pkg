@@ -47,7 +47,8 @@ per role; 320 keys total in root metadata; 65,536 delegation keys total;
 64 signatures per metadata file; 4,096 package-scoped delegated roles; one
 delegation hop from top-level Targets to a package role; 4,096 targets in each
 Targets role; 4,096-byte target paths; 64 MiB per target artifact; 1,024
-sequential root updates per refresh; and 64 JSON container levels. The
+dependencies per release; 128-byte registry identity tokens; 1,024 sequential
+root updates per refresh; and 64 JSON container levels. The
 duplicate-key validator additionally bounds each file to 65,536 total object
 keys, 8,500,000 candidate comparisons, and 65,536 bytes of key-equality
 comparisons; exceeding any of these limits rejects the metadata before trust
@@ -110,14 +111,28 @@ change if they prove too small for a real registry.
   archive for each exact stable version. The target's TUF length and SHA-256
   digest describe the exact deterministic ustar archive bytes; the client
   rechecks both before parsing or extracting the archive.
-- Each target has an authenticated `custom.elisapkg` object with an explicit
-  schema version. It binds the configured registry identity, normalized
-  package name, exact stable SemVer, dependency declarations (registry,
-  package, and requirement), compiler requirements, archive format, and
-  publication/revocation state to the target. The client checks the custom
-  identity fields against the role scope and target path. It compares
-  dependency declarations with the packaged manifest before accepting the
-  package graph.
+- Each target has an authenticated `custom.elisapkg` object. Version 1 contains
+  exactly `schema-version`, `registry`, `package`, `version`, `dependencies`,
+  `elisa`, `archive-format`, and `status`. `schema-version` is integer `1`;
+  `registry` is a stable configured identity token (1–128 lowercase ASCII
+  letters, digits, `.`, `_`, `:`, or `-`, starting with a letter or digit);
+  `package` and `version` match the package role and target path;
+  `dependencies` is an array of at most 256 objects, each with exactly
+  `registry`, `package`, and `requirement`; `elisa` is a SemVer requirement;
+  and `archive-format` is `ustar-v1`. Dependency package names and registry
+  identities use the same normalized forms, and duplicate registry/package
+  pairs are rejected. Unknown fields at any custom schema level are rejected.
+- The configured registry identity is supplied by local registry configuration
+  and must match every release target's `custom.elisapkg.registry`. It is a
+  stable label bound to the independently provisioned TUF root; it is not a
+  URL, credential, or trust root. `status` is exactly `published`, `yanked`, or
+  `revoked`: fresh resolution excludes yanked versions, an existing lock may
+  retain a yanked version with a warning, and revoked versions are always
+  rejected, including for locked selections. This status is authenticated
+  package policy; metadata expiry still bounds offline revocation delay.
+- The client checks the custom identity fields against the role scope and target
+  path. It compares dependency declarations with the packaged manifest before
+  accepting the package graph.
 - Package metadata cannot supply arbitrary fetch URLs, executable hooks,
   compiler commands, alternate roots, or cryptographic policy. The client
   selects targets only through configured repository policy and TUF metadata.

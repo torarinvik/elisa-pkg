@@ -73,8 +73,12 @@ Targets verification bounds target records, rejects direct package targets,
 and checks package delegation names, paths, key IDs, and thresholds.
 Package-target verification checks one caller-specified path under the
 `package-<name>` delegated role against its snapshot pin and delegated
-signature threshold, requires one archive per exact version, and returns the
-authenticated length and digest. Resolver candidate enumeration,
-profile-specific `custom.elisapkg` validation, broader target-record policy,
-signature-threshold edge cases, durable root checkpointing, and injected
-write-failure tests remain required before any integration is considered.
+signature threshold, requires one archive per exact version, checks the
+configured registry/package/version bindings and strict `custom.elisapkg`
+schema, and returns the authenticated length, digest, and published/yanked
+status. Revoked selections fail with a distinct status. Elisa still has to
+parse and evaluate the dependency and compiler SemVer requirements, enumerate
+all candidates through the authenticated role, and compare dependencies with
+the packaged manifest. Signature-threshold edge cases, durable root
+checkpointing, and injected write-failure tests also remain required before
+any integration is considered.

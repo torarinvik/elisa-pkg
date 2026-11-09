@@ -21,6 +21,11 @@ const MAX_DELEGATED_KEYS: usize = 65_536;
 const MAX_TARGETS_PER_ROLE: usize = 4_096;
 const MAX_TARGET_PATH_BYTES: usize = 4_096;
 const MAX_TARGET_BYTES: u64 = 67_108_864;
+const MAX_REGISTRY_ID_BYTES: usize = 128;
+const MAX_TARGET_DEPENDENCIES: usize = 256;
+const RELEASE_STATUS_PUBLISHED: u8 = 0;
+const RELEASE_STATUS_YANKED: u8 = 1;
+const RELEASE_STATUS_REVOKED: u8 = 2;
 
 const STATUS_OK: i32 = 0;
 const STATUS_INVALID_ARGUMENT: i32 = 1;
@@ -31,6 +36,7 @@ const STATUS_EXPIRED_ROOT: i32 = 5;
 const STATUS_INVALID_METADATA: i32 = 6;
 const STATUS_EXPIRED_METADATA: i32 = 7;
 const STATUS_UNSUPPORTED_ALGORITHM: i32 = 8;
+const STATUS_REVOKED_TARGET: i32 = 9;
 
 #[derive(Debug, Clone, Copy)]
 struct VerifiedRootSummary {
@@ -47,6 +53,7 @@ enum VerifyError {
     UnsupportedAlgorithm,
     ExpiredRoot,
     ExpiredMetadata,
+    RevokedTarget,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -75,6 +82,7 @@ struct VerifiedPackageTargetSummary {
     delegated_targets_version: u64,
     target_length: u64,
     target_sha256: [u8; 32],
+    release_status: u8,
 }
 
 /// Return the ABI version expected by the private Elisa adapter.
@@ -94,7 +102,8 @@ pub extern "C" fn elisapkg_tuf_engine_abi_version_v1() -> u32 {
 /// ABI v1 status values are stable: 0 success, 1 invalid argument, 2 malformed
 /// or cryptographically invalid root, 3 unsupported profile version,
 /// 4 contained Rust panic, 5 expired root, 6 invalid metadata, 7 expired
-/// active metadata, and 8 unsupported signature algorithm.
+/// active metadata, 8 unsupported signature algorithm, and 9 revoked package
+/// target.
 ///
 /// # Safety
 ///
@@ -215,7 +224,8 @@ pub unsafe extern "C" fn elisapkg_tuf_engine_verify_root_update_v1(
 ///
 /// Status values are 0 success, 1 invalid arguments, 2 invalid root,
 /// 3 unsupported spec, 4 contained panic, 5 expired root, 6 invalid metadata,
-/// 7 expired metadata, and 8 unsupported signature algorithm.
+/// 7 expired metadata, 8 unsupported signature algorithm, and 9 revoked
+/// package target.
 ///
 /// # Safety
 ///
@@ -574,17 +584,20 @@ pub unsafe extern "C" fn elisapkg_tuf_engine_verify_targets_v1(
 /// → snapshot → top-level Targets chain and the delegated role are re-verified
 /// for every call. The selected target must use the profile path
 /// `packages/<package>/<stable-version>/<sha256>.tar`, and its filename digest
-/// must equal its signed SHA-256 target hash.
+/// must equal its signed SHA-256 target hash. Every package target must contain
+/// the exact version-1 `custom.elisapkg` schema and match the caller's stable
+/// registry identity. A yanked target returns a successful verification with
+/// a yanked status; a revoked target returns `STATUS_REVOKED_TARGET`.
 ///
 /// # Safety
 ///
 /// The five metadata inputs must point to readable buffers that passed
 /// Elisa's bounded JSON, duplicate-key, canonical-number, and SHA-256 profile
-/// prechecks. The package name and target path must point to readable UTF-8
-/// buffers with the declared lengths. Output pointers must be aligned and
-/// writable; their ranges must not overlap each other or any input range. The
-/// SHA-256 output must address 32 writable bytes. `now_nanoseconds` must be
-/// less than one billion.
+/// prechecks. The package name, registry identity, and target path must point
+/// to readable UTF-8 buffers with the declared lengths. Output pointers must
+/// be aligned and writable; their ranges must not overlap each other or any
+/// input range. The SHA-256 output must address 32 writable bytes.
+/// `now_nanoseconds` must be less than one billion.
 #[no_mangle]
 pub unsafe extern "C" fn elisapkg_tuf_engine_verify_package_target_v1(
     trusted_root: *const u8,
@@ -599,6 +612,8 @@ pub unsafe extern "C" fn elisapkg_tuf_engine_verify_package_target_v1(
     delegated_targets_len: usize,
     package_name: *const u8,
     package_name_len: usize,
+    registry_identity: *const u8,
+    registry_identity_len: usize,
     target_path: *const u8,
     target_path_len: usize,
     now_unix_seconds: i64,
@@ -606,6 +621,7 @@ pub unsafe extern "C" fn elisapkg_tuf_engine_verify_package_target_v1(
     out_delegated_targets_version: *mut u64,
     out_target_length: *mut u64,
     out_target_sha256: *mut u8,
+    out_release_status: *mut u8,
 ) -> i32 {
     if trusted_root.is_null()
         || trusted_root_len == 0
@@ -625,6 +641,9 @@ pub unsafe extern "C" fn elisapkg_tuf_engine_verify_package_target_v1(
         || package_name.is_null()
         || package_name_len == 0
         || package_name_len > 64
+        || registry_identity.is_null()
+        || registry_identity_len == 0
+        || registry_identity_len > MAX_REGISTRY_ID_BYTES
         || target_path.is_null()
         || target_path_len == 0
         || target_path_len > MAX_TARGET_PATH_BYTES
@@ -632,6 +651,7 @@ pub unsafe extern "C" fn elisapkg_tuf_engine_verify_package_target_v1(
         || out_delegated_targets_version.is_null()
         || out_target_length.is_null()
         || out_target_sha256.is_null()
+        || out_release_status.is_null()
     {
         return STATUS_INVALID_ARGUMENT;
     }
@@ -650,9 +670,13 @@ pub unsafe extern "C" fn elisapkg_tuf_engine_verify_package_target_v1(
         let delegated_targets_bytes =
             unsafe { slice::from_raw_parts(delegated_targets, delegated_targets_len) };
         let package_name_bytes = unsafe { slice::from_raw_parts(package_name, package_name_len) };
+        let registry_identity_bytes =
+            unsafe { slice::from_raw_parts(registry_identity, registry_identity_len) };
         let target_path_bytes = unsafe { slice::from_raw_parts(target_path, target_path_len) };
         let package_name =
             std::str::from_utf8(package_name_bytes).map_err(|_| VerifyError::InvalidMetadata)?;
+        let registry_identity = std::str::from_utf8(registry_identity_bytes)
+            .map_err(|_| VerifyError::InvalidMetadata)?;
         let target_path =
             std::str::from_utf8(target_path_bytes).map_err(|_| VerifyError::InvalidMetadata)?;
         verify_package_target_bytes(
@@ -662,6 +686,7 @@ pub unsafe extern "C" fn elisapkg_tuf_engine_verify_package_target_v1(
             targets_bytes,
             delegated_targets_bytes,
             package_name,
+            registry_identity,
             target_path,
             now,
         )
@@ -679,6 +704,7 @@ pub unsafe extern "C" fn elisapkg_tuf_engine_verify_package_target_v1(
         *out_delegated_targets_version = summary.delegated_targets_version;
         *out_target_length = summary.target_length;
         std::ptr::copy_nonoverlapping(summary.target_sha256.as_ptr(), out_target_sha256, 32);
+        *out_release_status = summary.release_status;
     }
     STATUS_OK
 }
@@ -797,11 +823,13 @@ fn verify_package_target_bytes(
     targets_bytes: &[u8],
     delegated_targets_bytes: &[u8],
     package_name: &str,
+    registry_identity: &str,
     target_path: &str,
     now: jiff::Timestamp,
 ) -> Result<VerifiedPackageTargetSummary, VerifyError> {
     if !valid_profile_package_name(package_name)
-        || package_target_path_digest(target_path, package_name).is_none()
+        || !valid_profile_registry_identity(registry_identity)
+        || package_target_path_identity(target_path, package_name).is_none()
     {
         return Err(VerifyError::InvalidMetadata);
     }
@@ -826,7 +854,12 @@ fn verify_package_target_bytes(
 
     validate_spec_version(delegated_targets_bytes, VerifyError::InvalidMetadata)?;
     validate_signature_profile(delegated_targets_bytes, VerifyError::InvalidMetadata)?;
-    validate_package_targets_profile(delegated_targets_bytes, package_name)?;
+    let (_, release_status) = validate_package_targets_profile(
+        delegated_targets_bytes,
+        package_name,
+        registry_identity,
+        target_path,
+    )?;
     let role_name = format!("package-{package_name}");
     let delegated = trusted
         .update_delegated_targets(delegated_targets_bytes, &role_name, "targets", now)
@@ -841,6 +874,9 @@ fn verify_package_target_bytes(
     let target = delegated
         .target(target_path)
         .ok_or(VerifyError::InvalidMetadata)?;
+    if release_status == RELEASE_STATUS_REVOKED {
+        return Err(VerifyError::RevokedTarget);
+    }
     let target_length = target.length;
     if target_length == 0 || target_length > MAX_TARGET_BYTES {
         return Err(VerifyError::InvalidMetadata);
@@ -863,6 +899,7 @@ fn verify_package_target_bytes(
         delegated_targets_version: delegated.version,
         target_length,
         target_sha256,
+        release_status,
     })
 }
 
@@ -982,7 +1019,12 @@ fn validate_package_delegations(delegations: &Value) -> Result<u32, VerifyError>
     u32::try_from(roles.len()).map_err(|_| VerifyError::InvalidMetadata)
 }
 
-fn validate_package_targets_profile(bytes: &[u8], package_name: &str) -> Result<u32, VerifyError> {
+fn validate_package_targets_profile(
+    bytes: &[u8],
+    package_name: &str,
+    registry_identity: &str,
+    selected_path: &str,
+) -> Result<(u32, u8), VerifyError> {
     let value: Value = serde_json::from_slice(bytes).map_err(|_| VerifyError::InvalidMetadata)?;
     let signed = value
         .get("signed")
@@ -998,14 +1040,20 @@ fn validate_package_targets_profile(bytes: &[u8], package_name: &str) -> Result<
         .ok_or(VerifyError::InvalidMetadata)?;
 
     let mut package_versions = BTreeSet::new();
+    let mut selected_status = None;
     for (path, target) in targets {
-        let path_digest =
-            package_target_path_digest(path, package_name).ok_or(VerifyError::InvalidMetadata)?;
-        let package_version = path.split('/').nth(2).ok_or(VerifyError::InvalidMetadata)?;
+        let (package_version, path_digest) =
+            package_target_path_identity(path, package_name).ok_or(VerifyError::InvalidMetadata)?;
         if !package_versions.insert(package_version) {
             return Err(VerifyError::InvalidMetadata);
         }
         validate_target_record(target)?;
+        let status = validate_package_target_custom(
+            target,
+            package_name,
+            package_version,
+            registry_identity,
+        )?;
         let metadata_digest = target
             .get("hashes")
             .and_then(|hashes| hashes.get("sha256"))
@@ -1014,9 +1062,108 @@ fn validate_package_targets_profile(bytes: &[u8], package_name: &str) -> Result<
         if metadata_digest != path_digest {
             return Err(VerifyError::InvalidMetadata);
         }
+        if path == selected_path {
+            selected_status = Some(status);
+        }
     }
 
-    u32::try_from(targets.len()).map_err(|_| VerifyError::InvalidMetadata)
+    let target_count = u32::try_from(targets.len()).map_err(|_| VerifyError::InvalidMetadata)?;
+    Ok((
+        target_count,
+        selected_status.ok_or(VerifyError::InvalidMetadata)?,
+    ))
+}
+
+fn validate_package_target_custom(
+    target: &Value,
+    package_name: &str,
+    package_version: &str,
+    registry_identity: &str,
+) -> Result<u8, VerifyError> {
+    let target_object = target
+        .as_object()
+        .filter(|target| exact_object_keys(target, &["length", "hashes", "custom"]))
+        .ok_or(VerifyError::InvalidMetadata)?;
+    let custom = target_object
+        .get("custom")
+        .and_then(Value::as_object)
+        .filter(|custom| exact_object_keys(custom, &["elisapkg"]))
+        .ok_or(VerifyError::InvalidMetadata)?;
+    let elisapkg = custom
+        .get("elisapkg")
+        .and_then(Value::as_object)
+        .filter(|metadata| {
+            exact_object_keys(
+                metadata,
+                &[
+                    "schema-version",
+                    "registry",
+                    "package",
+                    "version",
+                    "dependencies",
+                    "elisa",
+                    "archive-format",
+                    "status",
+                ],
+            )
+        })
+        .ok_or(VerifyError::InvalidMetadata)?;
+    if elisapkg.get("schema-version").and_then(Value::as_u64) != Some(1)
+        || elisapkg.get("registry").and_then(Value::as_str) != Some(registry_identity)
+        || elisapkg.get("package").and_then(Value::as_str) != Some(package_name)
+        || elisapkg.get("version").and_then(Value::as_str) != Some(package_version)
+        || elisapkg.get("archive-format").and_then(Value::as_str) != Some("ustar-v1")
+    {
+        return Err(VerifyError::InvalidMetadata);
+    }
+
+    let dependencies = elisapkg
+        .get("dependencies")
+        .and_then(Value::as_array)
+        .filter(|dependencies| dependencies.len() <= MAX_TARGET_DEPENDENCIES)
+        .ok_or(VerifyError::InvalidMetadata)?;
+    let mut seen_dependencies = BTreeSet::new();
+    for dependency in dependencies {
+        let dependency = dependency
+            .as_object()
+            .filter(|dependency| {
+                exact_object_keys(dependency, &["registry", "package", "requirement"])
+            })
+            .ok_or(VerifyError::InvalidMetadata)?;
+        let registry = dependency
+            .get("registry")
+            .and_then(Value::as_str)
+            .filter(|registry| valid_profile_registry_identity(registry))
+            .ok_or(VerifyError::InvalidMetadata)?;
+        let package = dependency
+            .get("package")
+            .and_then(Value::as_str)
+            .filter(|package| valid_profile_package_name(package))
+            .ok_or(VerifyError::InvalidMetadata)?;
+        let requirement = dependency
+            .get("requirement")
+            .and_then(Value::as_str)
+            .filter(|requirement| valid_profile_requirement_text(requirement))
+            .ok_or(VerifyError::InvalidMetadata)?;
+        if !seen_dependencies.insert((registry, package)) || requirement.is_empty() {
+            return Err(VerifyError::InvalidMetadata);
+        }
+    }
+
+    let elisa_requirement = elisapkg
+        .get("elisa")
+        .and_then(Value::as_str)
+        .filter(|requirement| valid_profile_requirement_text(requirement))
+        .ok_or(VerifyError::InvalidMetadata)?;
+    if elisa_requirement.is_empty() {
+        return Err(VerifyError::InvalidMetadata);
+    }
+    match elisapkg.get("status").and_then(Value::as_str) {
+        Some("published") => Ok(RELEASE_STATUS_PUBLISHED),
+        Some("yanked") => Ok(RELEASE_STATUS_YANKED),
+        Some("revoked") => Ok(RELEASE_STATUS_REVOKED),
+        _ => Err(VerifyError::InvalidMetadata),
+    }
 }
 
 fn package_from_delegation_pattern(pattern: &str) -> Option<&str> {
@@ -1029,6 +1176,13 @@ fn package_from_delegation_pattern(pattern: &str) -> Option<&str> {
 }
 
 fn package_target_path_digest<'a>(path: &'a str, expected_package: &str) -> Option<&'a str> {
+    package_target_path_identity(path, expected_package).map(|(_, digest)| digest)
+}
+
+fn package_target_path_identity<'a>(
+    path: &'a str,
+    expected_package: &str,
+) -> Option<(&'a str, &'a str)> {
     if !valid_profile_target_path(path) {
         return None;
     }
@@ -1036,7 +1190,8 @@ fn package_target_path_digest<'a>(path: &'a str, expected_package: &str) -> Opti
     if segments.next()? != "packages" || segments.next()? != expected_package {
         return None;
     }
-    if !valid_stable_profile_version(segments.next()?) {
+    let version = segments.next()?;
+    if !valid_stable_profile_version(version) {
         return None;
     }
     let filename = segments.next()?;
@@ -1044,7 +1199,32 @@ fn package_target_path_digest<'a>(path: &'a str, expected_package: &str) -> Opti
         return None;
     }
     let digest = filename.strip_suffix(".tar")?;
-    is_lower_hex(digest, 64).then_some(digest)
+    is_lower_hex(digest, 64).then_some((version, digest))
+}
+
+fn exact_object_keys(object: &serde_json::Map<String, Value>, expected: &[&str]) -> bool {
+    object.len() == expected.len() && expected.iter().all(|key| object.contains_key(*key))
+}
+
+fn valid_profile_registry_identity(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= MAX_REGISTRY_ID_BYTES
+        && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
+        && bytes.iter().copied().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'.' | b'_' | b':' | b'-')
+        })
+}
+
+fn valid_profile_requirement_text(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 128
+        && bytes.iter().copied().all(|byte| {
+            byte.is_ascii_digit() || matches!(byte, b'.' | b'^' | b'~' | b'<' | b'>' | b' ')
+        })
 }
 
 fn valid_stable_profile_version(value: &str) -> bool {
@@ -1326,6 +1506,7 @@ fn status_for_verify_error(error: VerifyError) -> i32 {
         VerifyError::UnsupportedAlgorithm => STATUS_UNSUPPORTED_ALGORITHM,
         VerifyError::ExpiredRoot => STATUS_EXPIRED_ROOT,
         VerifyError::ExpiredMetadata => STATUS_EXPIRED_METADATA,
+        VerifyError::RevokedTarget => STATUS_REVOKED_TARGET,
     }
 }
 

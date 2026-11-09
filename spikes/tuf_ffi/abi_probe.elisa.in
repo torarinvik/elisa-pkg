@@ -21,7 +21,7 @@ extern native_tuf_engine_get_snapshot_pin_v1(trusted_root: void&, trusted_root_l
 @link_name("elisapkg_tuf_engine_verify_targets_v1")
 extern native_tuf_engine_verify_targets_v1(trusted_root: void&, trusted_root_len: usize, timestamp: void&, timestamp_len: usize, snapshot: void&, snapshot_len: usize, targets: void&, targets_len: usize, now_unix_seconds: i64, now_nanoseconds: u32, out_targets_version: mutable u64&, out_target_count: mutable u32&, out_delegation_count: mutable u32&) -> i32
 @link_name("elisapkg_tuf_engine_verify_package_target_v1")
-extern native_tuf_engine_verify_package_target_v1(trusted_root: void&, trusted_root_len: usize, timestamp: void&, timestamp_len: usize, snapshot: void&, snapshot_len: usize, targets: void&, targets_len: usize, delegated_targets: void&, delegated_targets_len: usize, package_name: void&, package_name_len: usize, target_path: void&, target_path_len: usize, now_unix_seconds: i64, now_nanoseconds: u32, out_delegated_targets_version: mutable u64&, out_target_length: mutable u64&, out_target_sha256: mutable void&) -> i32
+extern native_tuf_engine_verify_package_target_v1(trusted_root: void&, trusted_root_len: usize, timestamp: void&, timestamp_len: usize, snapshot: void&, snapshot_len: usize, targets: void&, targets_len: usize, delegated_targets: void&, delegated_targets_len: usize, package_name: void&, package_name_len: usize, registry_identity: void&, registry_identity_len: usize, target_path: void&, target_path_len: usize, now_unix_seconds: i64, now_nanoseconds: u32, out_delegated_targets_version: mutable u64&, out_target_length: mutable u64&, out_target_sha256: mutable void&, out_release_status: mutable u8&) -> i32
 
 module TufEngine:
     public:
@@ -35,6 +35,11 @@ module TufEngine:
             InvalidMetadata
             ExpiredMetadata
             UnsupportedAlgorithm
+            RevokedTarget
+
+        const enum ReleaseStatus of u8:
+            Published
+            Yanked
 
         def abi_version() -> u32:
             return native_tuf_engine_abi_version_v1()
@@ -120,14 +125,15 @@ module TufEngine:
             result: i32 = native_tuf_engine_verify_targets_v1(root_bytes_ptr, trusted_root.count, timestamp_bytes_ptr, timestamp.count, snapshot_bytes_ptr, snapshot.count, targets_bytes_ptr, targets.count, now_unix_seconds, now_nanoseconds, targets_version, target_count, delegation_count)
             return status_from_native(result)
 
-        def verify_package_target(trusted_root: darray[u8]&, timestamp: darray[u8]&, snapshot: darray[u8]&, targets: darray[u8]&, delegated_targets: darray[u8]&, package_name: darray[u8]&, target_path: darray[u8]&, now_unix_seconds: i64, now_nanoseconds: u32, delegated_targets_version: mutable u64&, target_length: mutable u64&, target_sha256: mutable darray[u8]&) -> Status can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+        def verify_package_target(trusted_root: darray[u8]&, timestamp: darray[u8]&, snapshot: darray[u8]&, targets: darray[u8]&, delegated_targets: darray[u8]&, package_name: darray[u8]&, registry_identity: darray[u8]&, target_path: darray[u8]&, now_unix_seconds: i64, now_nanoseconds: u32, delegated_targets_version: mutable u64&, target_length: mutable u64&, target_sha256: mutable darray[u8]&, release_status: mutable ReleaseStatus&) -> Status can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             target_sha256.resize(0.usize())
-            return Status.InvalidArgument if trusted_root.count == 0.usize() or trusted_root.count > max_metadata_bytes or timestamp.count == 0.usize() or timestamp.count > max_metadata_bytes or snapshot.count == 0.usize() or snapshot.count > max_metadata_bytes or targets.count == 0.usize() or targets.count > max_metadata_bytes or delegated_targets.count == 0.usize() or delegated_targets.count > max_metadata_bytes or package_name.count == 0.usize() or package_name.count > 64.usize() or target_path.count == 0.usize() or target_path.count > max_target_path_bytes
+            return Status.InvalidArgument if trusted_root.count == 0.usize() or trusted_root.count > max_metadata_bytes or timestamp.count == 0.usize() or timestamp.count > max_metadata_bytes or snapshot.count == 0.usize() or snapshot.count > max_metadata_bytes or targets.count == 0.usize() or targets.count > max_metadata_bytes or delegated_targets.count == 0.usize() or delegated_targets.count > max_metadata_bytes or package_name.count == 0.usize() or package_name.count > 64.usize() or registry_identity.count == 0.usize() or registry_identity.count > max_registry_identity_bytes or target_path.count == 0.usize() or target_path.count > max_target_path_bytes
             return Status.InvalidMetadata if Tuf::precheck_metadata_json(trusted_root) != Tuf::ValidationCode.WellFormed
             return Status.InvalidMetadata if Tuf::precheck_sha256_hashes(timestamp) != Tuf::ValidationCode.WellFormed
             return Status.InvalidMetadata if Tuf::precheck_sha256_hashes(snapshot) != Tuf::ValidationCode.WellFormed
             return Status.InvalidMetadata if Tuf::precheck_sha256_hashes(targets) != Tuf::ValidationCode.WellFormed
             return Status.InvalidMetadata if Tuf::precheck_sha256_hashes(delegated_targets) != Tuf::ValidationCode.WellFormed
+            return Status.InvalidMetadata if not Tuf::valid_registry_identity_bytes(registry_identity)
             target_sha256.resize(32.usize())
             root_bytes_ptr: void& = (&trusted_root[0]).cast[void&] can Unsafe.PointerCast
             timestamp_bytes_ptr: void& = (&timestamp[0]).cast[void&] can Unsafe.PointerCast
@@ -135,17 +141,23 @@ module TufEngine:
             targets_bytes_ptr: void& = (&targets[0]).cast[void&] can Unsafe.PointerCast
             delegated_targets_bytes_ptr: void& = (&delegated_targets[0]).cast[void&] can Unsafe.PointerCast
             package_name_ptr: void& = (&package_name[0]).cast[void&] can Unsafe.PointerCast
+            registry_identity_ptr: void& = (&registry_identity[0]).cast[void&] can Unsafe.PointerCast
             target_path_ptr: void& = (&target_path[0]).cast[void&] can Unsafe.PointerCast
             digest_bytes_ptr: void& = (&target_sha256[0]).cast[void&] can Unsafe.PointerCast
-            result: i32 = native_tuf_engine_verify_package_target_v1(root_bytes_ptr, trusted_root.count, timestamp_bytes_ptr, timestamp.count, snapshot_bytes_ptr, snapshot.count, targets_bytes_ptr, targets.count, delegated_targets_bytes_ptr, delegated_targets.count, package_name_ptr, package_name.count, target_path_ptr, target_path.count, now_unix_seconds, now_nanoseconds, delegated_targets_version, target_length, digest_bytes_ptr)
+            native_release_status: mutable u8 = 255.u8()
+            result: i32 = native_tuf_engine_verify_package_target_v1(root_bytes_ptr, trusted_root.count, timestamp_bytes_ptr, timestamp.count, snapshot_bytes_ptr, snapshot.count, targets_bytes_ptr, targets.count, delegated_targets_bytes_ptr, delegated_targets.count, package_name_ptr, package_name.count, registry_identity_ptr, registry_identity.count, target_path_ptr, target_path.count, now_unix_seconds, now_nanoseconds, delegated_targets_version, target_length, digest_bytes_ptr, &native_release_status)
             if result != 0:
                 target_sha256.resize(0.usize())
                 return status_from_native(result)
+            return Status.InvalidMetadata if native_release_status > 1
+            release_status <- ReleaseStatus.Published if native_release_status == 0
+            release_status <- ReleaseStatus.Yanked if native_release_status == 1
             return Status.Ok
 
     private:
         const max_metadata_bytes: usize = 1048576.usize()
         const max_target_path_bytes: usize = 4096.usize()
+        const max_registry_identity_bytes: usize = 128.usize()
 
         def status_from_native(result: i32) -> Status:
             return Status.Ok if result == 0
@@ -156,6 +168,7 @@ module TufEngine:
             return Status.InvalidMetadata if result == 6
             return Status.ExpiredMetadata if result == 7
             return Status.UnsupportedAlgorithm if result == 8
+            return Status.RevokedTarget if result == 9
             return Status.InternalPanic
 
 module TufEngineProbe:
