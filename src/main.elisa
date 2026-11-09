@@ -2056,12 +2056,15 @@ module Cli:
 
         def canonical_transitive_local_lock(name: darray[u8]&, version: darray[u8]&, raw: darray[u8]&, root: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out: mutable darray[u8] = []
+            graph_source_bytes: mutable usize = 0.usize()
             root_digest_bytes: mutable darray[u8] = []
             root_digest: mutable darray[u8] = []
             return [] if Integrity::sha256(raw, &root_digest_bytes) != Integrity::DigestCode.Ok
             return [] if not Integrity::hex_digest(root_digest_bytes, &root_digest)
             root_source_digest: mutable darray[u8] = []
-            return [] if not source_tree_digest_at(root, &root_source_digest)
+            root_source_bytes: mutable usize = 0.usize()
+            return [] if not source_tree_digest_at_bounded(root, &root_source_digest, MAX_BUILD_SNAPSHOT_BYTES, &root_source_bytes)
+            graph_source_bytes <- root_source_bytes
             bytes_push_view(&out, "{\n  \"lock-version\": 2,\n  \"resolver\": \"elisapkg-v2\",\n  \"package\": {\n    \"name\": \"")
             bytes_push_array(&out, name)
             bytes_push_view(&out, "\",\n    \"version\": \"")
@@ -2117,7 +2120,9 @@ module Cli:
                 selected_manifest: mutable darray[u8] = []
                 return [] if not read_package_file_into(&selected_manifest_path, &selected_manifest)
                 selected_source_digest: mutable darray[u8] = []
-                return [] if not source_tree_digest_at(selected_path, &selected_source_digest)
+                selected_source_bytes: mutable usize = 0.usize()
+                return [] if graph_source_bytes > MAX_BUILD_SNAPSHOT_BYTES or not source_tree_digest_at_bounded(selected_path, &selected_source_digest, MAX_BUILD_SNAPSHOT_BYTES - graph_source_bytes, &selected_source_bytes)
+                graph_source_bytes <- graph_source_bytes + selected_source_bytes
                 selected_digest: mutable darray[u8] = []
                 selected_digest_bytes: mutable darray[u8] = []
                 return [] if Integrity::sha256(selected_manifest, &selected_digest_bytes) != Integrity::DigestCode.Ok
@@ -5318,7 +5323,7 @@ module Cli:
             return true if PackagePathPolicy::credential_path_forbidden(path)
             return PackagePathPolicy::reserved_source_path_forbidden(path)
 
-        def source_tree_digest_at(root: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+        def source_tree_digest_at_bounded(root: darray[u8]&, out: mutable darray[u8]&, maximum_bytes: usize, bytes_hashed_out: mutable usize&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             # Build inputs are the complete sanitized source tree, not only the
             # selected entry file. The native walker returns a deterministic,
             # NUL-separated list and excludes build state, VCS data, and credential
@@ -5328,6 +5333,7 @@ module Cli:
             # roots are stripped from the fingerprint so the same package remains
             # portable when its containing checkout moves.
             out.resize(0)
+            bytes_hashed_out <- 0.usize()
             return false if root.count == 0.usize() or root.count > 4096.usize()
             root_c: mutable darray[u8] = []
             root_c.resize(root.count + 1.usize())
@@ -5355,6 +5361,7 @@ module Cli:
             return false if collected < 0
             root_prefix: usize = root_real_length + 1.usize()
             fingerprint: mutable darray[u8] = []
+            bytes_hashed: mutable usize = 0.usize()
             cursor: mutable usize = 0.usize()
             while cursor < collected.usize():
                 path: mutable darray[u8] = []
@@ -5373,8 +5380,16 @@ module Cli:
                 # digests. Including the lock itself would make its source
                 # fingerprint self-referential and impossible to stabilize.
                 continue if bytes_equal_view(logical_path, "elisapkg.json") or bytes_equal_view(logical_path, "elisapkg.lock")
+                remaining_bytes: usize = maximum_bytes - bytes_hashed
+                path_c: mutable darray[u8] = []
+                path_with_nul_into(&path, &path_c)
+                path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
+                file_size: i64 = Platform::pkg_package_file_size(path_name)
+                return false if file_size < 0 or file_size > 67108864 or file_size.usize() > remaining_bytes
                 content: mutable darray[u8] = []
                 return false if not read_package_file_into(&path, &content)
+                return false if content.count > remaining_bytes
+                bytes_hashed <- bytes_hashed + content.count
                 digest_bytes: mutable darray[u8] = []
                 return false if Integrity::sha256(content, &digest_bytes) != Integrity::DigestCode.Ok
                 for index in 0..<logical_path.count |fingerprint, logical_path|:
@@ -5389,11 +5404,20 @@ module Cli:
             return false if not Integrity::hex_digest(digest_bytes, &digest_hex)
             for index in 0..<digest_hex.count |out, digest_hex|:
                 out.push(digest_hex[index])
+            bytes_hashed_out <- bytes_hashed
             return true
 
-        def source_tree_digest_into(out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+        def source_tree_digest_at(root: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            bytes_hashed: mutable usize = 0.usize()
+            return source_tree_digest_at_bounded(root, out, MAX_BUILD_SNAPSHOT_BYTES, &bytes_hashed)
+
+        def source_tree_digest_into_bounded(out: mutable darray[u8]&, maximum_bytes: usize, bytes_hashed_out: mutable usize&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             root: mutable darray[u8] = [46]
-            return source_tree_digest_at(root, out)
+            return source_tree_digest_at_bounded(root, out, maximum_bytes, bytes_hashed_out)
+
+        def source_tree_digest_into(out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            bytes_hashed: mutable usize = 0.usize()
+            return source_tree_digest_into_bounded(out, MAX_BUILD_SNAPSHOT_BYTES, &bytes_hashed)
 
         def collect_package_paths(raw: darray[u8]&, target: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             out.resize(0)
@@ -5788,7 +5812,7 @@ module Cli:
             path_join_into(package_root, entry_name, &joined)
             return canonical_existing_path(joined, out)
 
-        def build_local_dependency_aggregate[@r](lock: darray[u8]&, start: darray[u8]&, root_entry: cstr, aggregate: mutable darray[u8]&, has_dependencies: mutable bool&, packages: mutable darray[LocalBuildPackage]& @r, order: mutable darray[usize]& @r) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+        def build_local_dependency_aggregate[@r](lock: darray[u8]&, start: darray[u8]&, root_entry: cstr, source_byte_budget: usize, aggregate: mutable darray[u8]&, has_dependencies: mutable bool&, packages: mutable darray[LocalBuildPackage]& @r, order: mutable darray[usize]& @r) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             aggregate.resize(0)
             has_dependencies <- false
             packages.resize(0)
@@ -5800,6 +5824,7 @@ module Cli:
             root_path: mutable darray[u8] = []
             return false if not canonical_existing_path(start, &root_path)
             total_graph_edges: mutable usize = 0.usize()
+            total_dependency_source_bytes: mutable usize = 0.usize()
             cursor: mutable usize = packages_start + 1.usize()
             while cursor < packages_end:
                 while cursor < packages_end and (lock[cursor] == 32 or lock[cursor] == 9 or lock[cursor] == 10 or lock[cursor] == 13):
@@ -5840,7 +5865,9 @@ module Cli:
                 return false if Integrity::sha256(package_manifest, &manifest_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(manifest_digest_bytes, &manifest_digest)
                 return false if not object_sha256_equals(lock, cursor, record_end, "manifest-digest", manifest_digest)
                 source_digest: mutable darray[u8] @r = []
-                return false if not source_tree_digest_at(canonical_root, &source_digest)
+                package_source_bytes: mutable usize = 0.usize()
+                return false if total_dependency_source_bytes > source_byte_budget or not source_tree_digest_at_bounded(canonical_root, &source_digest, source_byte_budget - total_dependency_source_bytes, &package_source_bytes)
+                total_dependency_source_bytes <- total_dependency_source_bytes + package_source_bytes
                 return false if not object_sha256_equals(lock, cursor, record_end, "source-digest", source_digest)
                 registry_roots: mutable darray[Solver::Constraint] = []
                 has_local_dependency: mutable bool = false
@@ -6049,7 +6076,8 @@ module Cli:
             return EXIT_BUILD if Integrity::sha256(lock_raw, &lock_digest_bytes) != Integrity::DigestCode.Ok
             return EXIT_BUILD if not Integrity::hex_digest(lock_digest_bytes, &lock_digest)
             source_tree_digest: mutable darray[u8] = []
-            return EXIT_BUILD if not source_tree_digest_into(&source_tree_digest)
+            source_tree_bytes: mutable usize = 0.usize()
+            return EXIT_BUILD if not source_tree_digest_into_bounded(&source_tree_digest, MAX_BUILD_SNAPSHOT_BYTES, &source_tree_bytes)
             dependency_aggregate: mutable darray[u8] = []
             dependency_aggregate_digest: mutable darray[u8] = []
             has_local_build_dependencies: mutable bool = false
@@ -6060,7 +6088,7 @@ module Cli:
                 dependency_order: mutable darray[usize] @build_state = []
                 source_snapshot_container_storage: mutable darray[u8] @build_state = []
                 source_snapshot_container_name: mutable cstr = ""
-                if not build_local_dependency_aggregate(lock_raw, start, target_entry_name, &dependency_aggregate, &has_local_build_dependencies, dependency_packages, dependency_order):
+                if source_tree_bytes > MAX_BUILD_SNAPSHOT_BYTES or not build_local_dependency_aggregate(lock_raw, start, target_entry_name, MAX_BUILD_SNAPSHOT_BYTES - source_tree_bytes, &dependency_aggregate, &has_local_build_dependencies, dependency_packages, dependency_order):
                     write_error("error: local dependency lock or library target is invalid; refusing to compile an incomplete graph\n")
                     return EXIT_BUILD
                 if has_local_build_dependencies:
