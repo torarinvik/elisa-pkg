@@ -210,7 +210,8 @@ Timestamp metadata form the trust chain. Top-level Targets cannot directly
 list package targets. A terminating delegation for each disjoint package path
 restricts release authority to the corresponding Targets role; a valid
 signature from any other key does not authorize that package. TUF target length
-and SHA-256 bind the exact deterministic archive bytes. An authenticated elisapkg custom target
+and SHA-256 bind the exact deterministic archive bytes; SHA-256 values use
+exactly 64 lowercase hexadecimal characters. An authenticated elisapkg custom target
 object binds registry identity, normalized package name, exact version,
 dependency declarations, compiler requirements, and archive format to that
 target. Role thresholds, expiry bounds, key custody, recovery operators, and

@@ -34,9 +34,10 @@ registry support is implemented or ready to enable.
   threshold to be a positive integer and reject thresholds larger than the
   number of distinct authorized key IDs.
 - Initially accept only TUF `ed25519` signing keys and signatures and SHA-256
-  target digests. Do not negotiate algorithms from server input. Supporting an
-  additional signature or digest algorithm requires a reviewed profile change,
-  a trusted metadata migration, and compatibility fixtures.
+  target digests encoded as exactly 64 lowercase hexadecimal characters. Do
+  not negotiate algorithms from server input. Supporting an additional
+  signature or digest algorithm requires a reviewed profile change, a trusted
+  metadata migration, and compatibility fixtures.
 
 The initial resource limits are: 1 MiB per metadata file; 64 authorized keys
 per role; 64 signatures per metadata file; 4,096 package-scoped delegated

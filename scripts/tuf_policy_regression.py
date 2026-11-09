@@ -41,6 +41,28 @@ def main() -> int:
         "negative_integer_metadata": b'{"signed":{"version":-1},"signatures":[]}',
         "malformed_metadata": b'{"signed":, "signatures":[]}',
         "empty_metadata": b"",
+        "sha256_hash_metadata": (
+            b'{"signed":{"targets":{"pkg":{"hashes":{"sha256":"'
+            + b"a" * 64
+            + b'"}}}},"signatures":[]}'
+        ),
+        "sha512_hash_metadata": (
+            b'{"signed":{"targets":{"pkg":{"hashes":{"sha512":"'
+            + b"a" * 128
+            + b'"}}}},"signatures":[]}'
+        ),
+        "malformed_hash_metadata": (
+            b'{"signed":{"targets":{"pkg":{"hashes":{"sha256":"'
+            + b"g" * 64
+            + b'"}}}},"signatures":[]}'
+        ),
+        "uppercase_hash_metadata": (
+            b'{"signed":{"targets":{"pkg":{"hashes":{"sha256":"'
+            + b"A" * 64
+            + b'"}}}},"signatures":[]}'
+        ),
+        "empty_hash_metadata": b'{"signed":{"targets":{"pkg":{"hashes":{}}}},"signatures":[]}',
+        "hashes_text_metadata": b'{"signed":{"description":"literal \\"hashes\\":{\\"sha512\\":\\"x\\"}"},"signatures":[]}',
     }
     json_literals = {name: elisa_bytes(value) for name, value in json_cases.items()}
 
@@ -90,6 +112,12 @@ def main() -> i64 can[Memory.Allocate, Abort.Panic]:
     negative_integer_metadata: mutable darray[u8] = [{json_literals['negative_integer_metadata']}]
     malformed_metadata: mutable darray[u8] = [{json_literals['malformed_metadata']}]
     empty_metadata: mutable darray[u8] = []
+    sha256_hash_metadata: mutable darray[u8] = [{json_literals['sha256_hash_metadata']}]
+    sha512_hash_metadata: mutable darray[u8] = [{json_literals['sha512_hash_metadata']}]
+    malformed_hash_metadata: mutable darray[u8] = [{json_literals['malformed_hash_metadata']}]
+    uppercase_hash_metadata: mutable darray[u8] = [{json_literals['uppercase_hash_metadata']}]
+    empty_hash_metadata: mutable darray[u8] = [{json_literals['empty_hash_metadata']}]
+    hashes_text_metadata: mutable darray[u8] = [{json_literals['hashes_text_metadata']}]
     return 34 if Tuf::precheck_metadata_json(valid_metadata) != Tuf::ValidationCode.WellFormed
     return 35 if Tuf::precheck_metadata_json(duplicate_metadata) != Tuf::ValidationCode.InvalidJsonKeys
     return 36 if Tuf::precheck_metadata_json(float_metadata) != Tuf::ValidationCode.NoncanonicalNumber
@@ -98,6 +126,12 @@ def main() -> i64 can[Memory.Allocate, Abort.Panic]:
     return 39 if Tuf::precheck_metadata_json(negative_integer_metadata) != Tuf::ValidationCode.WellFormed
     return 40 if Tuf::precheck_metadata_json(malformed_metadata) != Tuf::ValidationCode.MalformedJson
     return 44 if Tuf::precheck_metadata_json(empty_metadata) != Tuf::ValidationCode.MalformedJson
+    return 50 if Tuf::precheck_sha256_hashes(sha256_hash_metadata) != Tuf::ValidationCode.WellFormed
+    return 51 if Tuf::precheck_sha256_hashes(sha512_hash_metadata) != Tuf::ValidationCode.UnsupportedHashAlgorithm
+    return 52 if Tuf::precheck_sha256_hashes(malformed_hash_metadata) != Tuf::ValidationCode.MalformedHash
+    return 53 if Tuf::precheck_sha256_hashes(empty_hash_metadata) != Tuf::ValidationCode.MalformedHash
+    return 54 if Tuf::precheck_sha256_hashes(hashes_text_metadata) != Tuf::ValidationCode.WellFormed
+    return 55 if Tuf::precheck_sha256_hashes(uppercase_hash_metadata) != Tuf::ValidationCode.MalformedHash
     small_metadata: mutable darray[u8] = []
     append_ascii(&small_metadata, "{{\\\"signed\\\":{{\\\"targets\\\":{{}}}},\\\"signatures\\\":[]}}")
     return 49 if Tuf::precheck_metadata_json(small_metadata) != Tuf::ValidationCode.WellFormed
