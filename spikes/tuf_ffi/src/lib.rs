@@ -54,8 +54,9 @@ pub extern "C" fn elisapkg_tuf_engine_abi_version_v1() -> u32 {
 ///
 /// `metadata` must point to `metadata_len` readable bytes. Each output pointer
 /// must be aligned and writable for its pointee type, and the three output
-/// ranges must not overlap. The input bytes must have passed Elisa's bounded
-/// duplicate-key and canonical-number precheck before this function is called.
+/// ranges must not overlap each other or the input range. The input bytes must
+/// have passed Elisa's bounded duplicate-key and canonical-number precheck
+/// before this function is called.
 #[no_mangle]
 pub unsafe extern "C" fn elisapkg_tuf_engine_verify_root_v1(
     metadata: *const u8,
@@ -280,6 +281,57 @@ mod tests {
             )
         };
         assert_eq!(result, STATUS_INVALID_ARGUMENT);
+        assert_eq!(version, 0xfeed_u64);
+        assert_eq!(key_count, 0xfeed_u32);
+        assert_eq!(threshold, 0xfeed_u32);
+    }
+
+    #[test]
+    fn root_update_abi_rejects_bad_buffers_without_writing_outputs() {
+        let bytes = b"{}";
+        let mut version = 0xfeed_u64;
+        let mut key_count = 0xfeed_u32;
+        let mut threshold = 0xfeed_u32;
+
+        let missing_trusted = unsafe {
+            elisapkg_tuf_engine_verify_root_update_v1(
+                std::ptr::null(),
+                bytes.len(),
+                bytes.as_ptr(),
+                bytes.len(),
+                &mut version,
+                &mut key_count,
+                &mut threshold,
+            )
+        };
+        assert_eq!(missing_trusted, STATUS_INVALID_ARGUMENT);
+
+        let missing_candidate = unsafe {
+            elisapkg_tuf_engine_verify_root_update_v1(
+                bytes.as_ptr(),
+                bytes.len(),
+                std::ptr::null(),
+                bytes.len(),
+                &mut version,
+                &mut key_count,
+                &mut threshold,
+            )
+        };
+        assert_eq!(missing_candidate, STATUS_INVALID_ARGUMENT);
+
+        let oversized_candidate = unsafe {
+            elisapkg_tuf_engine_verify_root_update_v1(
+                bytes.as_ptr(),
+                bytes.len(),
+                bytes.as_ptr(),
+                MAX_ROOT_BYTES + 1,
+                &mut version,
+                &mut key_count,
+                &mut threshold,
+            )
+        };
+        assert_eq!(oversized_candidate, STATUS_INVALID_ARGUMENT);
+
         assert_eq!(version, 0xfeed_u64);
         assert_eq!(key_count, 0xfeed_u32);
         assert_eq!(threshold, 0xfeed_u32);

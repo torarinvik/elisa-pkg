@@ -57,9 +57,10 @@ rotation_documents = [json.loads(path.read_bytes()) for path in rotation_roots]
 if [item["signed"]["version"] for item in rotation_documents] != [1, 2, 3]:
     raise SystemExit("generated root rotation fixtures are not sequential")
 root2 = rotation_roots[1].read_bytes()
+duplicate_root2 = root2.replace(b'"version":2', b'"version":2,"version":2', 1)
 tampered_root2 = root2.replace(b'"consistent_snapshot":false', b'"consistent_snapshot":true', 1)
 unsupported_root2 = root2.replace(b'"spec_version":"1.0.0"', b'"spec_version":"1.0.37"', 1)
-if tampered_root2 == root2 or unsupported_root2 == root2:
+if duplicate_root2 == root2 or tampered_root2 == root2 or unsupported_root2 == root2:
     raise SystemExit("generated root 2 no longer matches expected test transformations")
 
 replacements = {
@@ -72,6 +73,7 @@ replacements = {
     "@@ROOT1_BYTES@@": ", ".join(map(str, rotation_roots[0].read_bytes())),
     "@@ROOT2_BYTES@@": ", ".join(map(str, root2)),
     "@@ROOT3_BYTES@@": ", ".join(map(str, rotation_roots[2].read_bytes())),
+    "@@DUPLICATE_ROOT2_BYTES@@": ", ".join(map(str, duplicate_root2)),
     "@@TAMPERED_ROOT2_BYTES@@": ", ".join(map(str, tampered_root2)),
     "@@UNSUPPORTED_ROOT2_BYTES@@": ", ".join(map(str, unsupported_root2)),
 }
