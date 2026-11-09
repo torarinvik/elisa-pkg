@@ -10,6 +10,8 @@ extern native_tuf_engine_abi_version_v1() -> u32
 extern native_tuf_engine_verify_root_v1(metadata: void&, metadata_len: usize, out_version: mutable u64&, out_key_count: mutable u32&, out_root_threshold: mutable u32&) -> i32
 @link_name("elisapkg_tuf_engine_verify_root_update_v1")
 extern native_tuf_engine_verify_root_update_v1(trusted_root: void&, trusted_root_len: usize, candidate_root: void&, candidate_root_len: usize, out_version: mutable u64&, out_key_count: mutable u32&, out_root_threshold: mutable u32&) -> i32
+@link_name("elisapkg_tuf_engine_check_root_expiry_v1")
+extern native_tuf_engine_check_root_expiry_v1(metadata: void&, metadata_len: usize, now_unix_seconds: i64, now_nanoseconds: u32) -> i32
 
 module TufEngine:
     public:
@@ -19,6 +21,7 @@ module TufEngine:
             InvalidRoot
             UnsupportedSpec
             InternalPanic
+            ExpiredRoot
             InvalidMetadata
 
         def abi_version() -> u32:
@@ -40,6 +43,13 @@ module TufEngine:
             result: i32 = native_tuf_engine_verify_root_update_v1(trusted_bytes_ptr, trusted_root.count, candidate_bytes_ptr, candidate_root.count, version, key_count, root_threshold)
             return status_from_native(result)
 
+        def check_root_expiry(root: darray[u8]&, now_unix_seconds: i64, now_nanoseconds: u32) -> Status can[Unsafe.PointerCast]:
+            return Status.InvalidArgument if root.count == 0.usize() or root.count > max_root_bytes
+            return Status.InvalidMetadata if Tuf::precheck_metadata_json(root) != Tuf::ValidationCode.WellFormed
+            root_bytes_ptr: void& = (&root[0]).cast[void&] can Unsafe.PointerCast
+            result: i32 = native_tuf_engine_check_root_expiry_v1(root_bytes_ptr, root.count, now_unix_seconds, now_nanoseconds)
+            return status_from_native(result)
+
     private:
         const max_root_bytes: usize = 1048576.usize()
 
@@ -48,6 +58,7 @@ module TufEngine:
             return Status.InvalidArgument if result == 1
             return Status.InvalidRoot if result == 2
             return Status.UnsupportedSpec if result == 3
+            return Status.ExpiredRoot if result == 5
             return Status.InternalPanic
 
 module TufEngineProbe:
@@ -87,12 +98,19 @@ module TufEngineProbe:
             root1: mutable darray[u8] = [@@ROOT1_BYTES@@]
             root2: mutable darray[u8] = [@@ROOT2_BYTES@@]
             root3: mutable darray[u8] = [@@ROOT3_BYTES@@]
+            expired_root: mutable darray[u8] = [@@EXPIRED_ROOT_BYTES@@]
+            boundary_root: mutable darray[u8] = [@@BOUNDARY_ROOT_BYTES@@]
             return 12 if TufEngine::verify_root(root1, &version, &key_count, &threshold) != TufEngine::Status.Ok
             return 13 if version != 1.u64() or key_count != 1.u32() or threshold != 1.u32()
             return 14 if TufEngine::verify_root_update(root1, root2, &version, &key_count, &threshold) != TufEngine::Status.Ok
             return 15 if version != 2.u64() or key_count != 1.u32() or threshold != 1.u32()
             return 16 if TufEngine::verify_root_update(root2, root3, &version, &key_count, &threshold) != TufEngine::Status.Ok
             return 17 if version != 3.u64() or key_count != 1.u32() or threshold != 1.u32()
+            return 26 if TufEngine::check_root_expiry(root2, 1700000000.i64(), 0.u32()) != TufEngine::Status.ExpiredRoot
+            return 27 if TufEngine::check_root_expiry(root3, 1700000000.i64(), 0.u32()) != TufEngine::Status.Ok
+            return 28 if TufEngine::check_root_expiry(expired_root, 1700000000.i64(), 0.u32()) != TufEngine::Status.ExpiredRoot
+            return 29 if TufEngine::check_root_expiry(boundary_root, 1700000000.i64(), 0.u32()) != TufEngine::Status.ExpiredRoot
+            return 30 if TufEngine::check_root_expiry(boundary_root, 1700000000.i64(), 1.u32()) != TufEngine::Status.ExpiredRoot
 
             version <- 77.u64()
             key_count <- 77.u32()

@@ -9,6 +9,8 @@ use sigstore_crypto::KeyPair;
 use sigstore_tuf::{canonical_json, Key};
 
 const FAR_FUTURE: &str = "2999-01-01T00:00:00Z";
+const EXPIRED: &str = "2000-01-01T00:00:00Z";
+const EXPIRY_BOUNDARY: &str = "2023-11-14T22:13:20Z";
 
 fn key_entry(key_pair: &KeyPair) -> (String, Value) {
     let public_key = key_pair.public_key_der().expect("public key").to_pem();
@@ -28,12 +30,16 @@ fn signature(signed: &Value, key_id: &str, key_pair: &KeyPair) -> Value {
 }
 
 fn root_signed(version: u64, key_id: &str, key: Value) -> Value {
+    root_signed_with_expiry(version, key_id, key, FAR_FUTURE)
+}
+
+fn root_signed_with_expiry(version: u64, key_id: &str, key: Value, expires: &str) -> Value {
     let role = json!({ "keyids": [key_id], "threshold": 1 });
     json!({
         "_type": "root",
         "spec_version": "1.0.0",
         "version": version,
-        "expires": FAR_FUTURE,
+        "expires": expires,
         "consistent_snapshot": false,
         "keys": { key_id: key },
         "roles": {
@@ -74,7 +80,7 @@ fn main() {
         vec![signature(&root1_signed, &id1, &key1)],
     );
 
-    let root2_signed = root_signed(2, &id2, entry2);
+    let root2_signed = root_signed_with_expiry(2, &id2, entry2, EXPIRED);
     let root2 = envelope(
         root2_signed.clone(),
         vec![
@@ -83,7 +89,7 @@ fn main() {
         ],
     );
 
-    let root3_signed = root_signed(3, &id3, entry3);
+    let root3_signed = root_signed(3, &id3, entry3.clone());
     let root3 = envelope(
         root3_signed.clone(),
         vec![
@@ -92,7 +98,20 @@ fn main() {
         ],
     );
 
+    let expired_root_signed = root_signed_with_expiry(4, &id3, entry3, EXPIRED);
+    let expired_root = envelope(
+        expired_root_signed.clone(),
+        vec![signature(&expired_root_signed, &id3, &key3)],
+    );
+    let boundary_root_signed = root_signed_with_expiry(5, &id3, entry3, EXPIRY_BOUNDARY);
+    let boundary_root = envelope(
+        boundary_root_signed.clone(),
+        vec![signature(&boundary_root_signed, &id3, &key3)],
+    );
+
     write_fixture(&directory, "root1.json", &root1);
     write_fixture(&directory, "root2.json", &root2);
     write_fixture(&directory, "root3.json", &root3);
+    write_fixture(&directory, "root-expired.json", &expired_root);
+    write_fixture(&directory, "root-expiry-boundary.json", &boundary_root);
 }

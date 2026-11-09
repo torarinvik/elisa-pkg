@@ -56,6 +56,18 @@ rotation_roots = [fixture_dir / f"root{version}.json" for version in (1, 2, 3)]
 rotation_documents = [json.loads(path.read_bytes()) for path in rotation_roots]
 if [item["signed"]["version"] for item in rotation_documents] != [1, 2, 3]:
     raise SystemExit("generated root rotation fixtures are not sequential")
+expired_root_path = fixture_dir / "root-expired.json"
+expired_root_document = json.loads(expired_root_path.read_bytes())
+boundary_root_path = fixture_dir / "root-expiry-boundary.json"
+boundary_root_document = json.loads(boundary_root_path.read_bytes())
+if rotation_documents[1]["signed"]["expires"] >= "2023-11-14T22:13:20Z":
+    raise SystemExit("root 2 must be expired at the fixed probe time")
+if rotation_documents[2]["signed"]["expires"] <= "2023-11-14T22:13:20Z":
+    raise SystemExit("root 3 must be unexpired at the fixed probe time")
+if expired_root_document["signed"]["expires"] >= "2023-11-14T22:13:20Z":
+    raise SystemExit("expired root fixture must be expired at the fixed probe time")
+if boundary_root_document["signed"]["expires"] != "2023-11-14T22:13:20Z":
+    raise SystemExit("boundary root fixture must expire exactly at the fixed probe time")
 root2 = rotation_roots[1].read_bytes()
 duplicate_root2 = root2.replace(b'"version":2', b'"version":2,"version":2', 1)
 tampered_root2 = root2.replace(b'"consistent_snapshot":false', b'"consistent_snapshot":true', 1)
@@ -73,6 +85,8 @@ replacements = {
     "@@ROOT1_BYTES@@": ", ".join(map(str, rotation_roots[0].read_bytes())),
     "@@ROOT2_BYTES@@": ", ".join(map(str, root2)),
     "@@ROOT3_BYTES@@": ", ".join(map(str, rotation_roots[2].read_bytes())),
+    "@@EXPIRED_ROOT_BYTES@@": ", ".join(map(str, expired_root_path.read_bytes())),
+    "@@BOUNDARY_ROOT_BYTES@@": ", ".join(map(str, boundary_root_path.read_bytes())),
     "@@DUPLICATE_ROOT2_BYTES@@": ", ".join(map(str, duplicate_root2)),
     "@@TAMPERED_ROOT2_BYTES@@": ", ".join(map(str, tampered_root2)),
     "@@UNSUPPORTED_ROOT2_BYTES@@": ", ".join(map(str, unsupported_root2)),

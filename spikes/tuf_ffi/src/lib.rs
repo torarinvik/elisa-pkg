@@ -18,6 +18,7 @@ const STATUS_INVALID_ARGUMENT: i32 = 1;
 const STATUS_INVALID_ROOT: i32 = 2;
 const STATUS_UNSUPPORTED_SPEC: i32 = 3;
 const STATUS_INTERNAL_PANIC: i32 = 4;
+const STATUS_EXPIRED_ROOT: i32 = 5;
 
 #[derive(Debug, Clone, Copy)]
 struct VerifiedRootSummary {
@@ -30,6 +31,7 @@ struct VerifiedRootSummary {
 enum VerifyError {
     InvalidRoot,
     UnsupportedSpec,
+    ExpiredRoot,
 }
 
 /// Return the ABI version expected by the private Elisa adapter.
@@ -46,9 +48,9 @@ pub extern "C" fn elisapkg_tuf_engine_abi_version_v1() -> u32 {
 /// catches Rust unwinding panics so none cross the C ABI; invalid pointers
 /// remain a caller contract violation, as they do for ordinary C functions.
 ///
-/// Status values are stable within ABI v1: 0 success, 1 invalid argument,
-/// 2 malformed or cryptographically invalid root, 3 unsupported profile
-/// version, and 4 contained Rust panic.
+/// ABI v1 status values are stable: 0 success, 1 invalid argument, 2 malformed
+/// or cryptographically invalid root, 3 unsupported profile version,
+/// 4 contained Rust panic, and 5 expired root for the expiry-check operation.
 ///
 /// # Safety
 ///
@@ -86,6 +88,7 @@ pub unsafe extern "C" fn elisapkg_tuf_engine_verify_root_v1(
         Ok(Ok(summary)) => summary,
         Ok(Err(VerifyError::UnsupportedSpec)) => return STATUS_UNSUPPORTED_SPEC,
         Ok(Err(VerifyError::InvalidRoot)) => return STATUS_INVALID_ROOT,
+        Ok(Err(VerifyError::ExpiredRoot)) => return STATUS_EXPIRED_ROOT,
         Err(_) => return STATUS_INTERNAL_PANIC,
     };
 
@@ -150,6 +153,7 @@ pub unsafe extern "C" fn elisapkg_tuf_engine_verify_root_update_v1(
         Ok(Ok(summary)) => summary,
         Ok(Err(VerifyError::UnsupportedSpec)) => return STATUS_UNSUPPORTED_SPEC,
         Ok(Err(VerifyError::InvalidRoot)) => return STATUS_INVALID_ROOT,
+        Ok(Err(VerifyError::ExpiredRoot)) => return STATUS_EXPIRED_ROOT,
         Err(_) => return STATUS_INTERNAL_PANIC,
     };
 
@@ -161,6 +165,53 @@ pub unsafe extern "C" fn elisapkg_tuf_engine_verify_root_update_v1(
         *out_root_threshold = summary.root_threshold;
     }
     STATUS_OK
+}
+
+/// Check final-root expiry at the caller's fixed refresh-start time.
+///
+/// This is intentionally separate from root-link verification: TUF permits
+/// expired intermediate roots within a valid sequential rotation, but the
+/// final trusted root must be current before refreshing active roles.
+///
+/// Status values match the root verification ABI, with 5 for an expired root.
+///
+/// # Safety
+///
+/// `metadata` must point to `metadata_len` readable bytes. The bytes must have
+/// passed Elisa's bounded duplicate-key and canonical-number precheck.
+/// `now_nanoseconds` must be less than one billion.
+#[no_mangle]
+pub unsafe extern "C" fn elisapkg_tuf_engine_check_root_expiry_v1(
+    metadata: *const u8,
+    metadata_len: usize,
+    now_unix_seconds: i64,
+    now_nanoseconds: u32,
+) -> i32 {
+    if metadata.is_null() || metadata_len == 0 || metadata_len > MAX_ROOT_BYTES {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    if now_nanoseconds >= 1_000_000_000 {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    let now = match jiff::Timestamp::new(now_unix_seconds, now_nanoseconds as i32) {
+        Ok(now) => now,
+        Err(_) => return STATUS_INVALID_ARGUMENT,
+    };
+
+    let verification = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: null and length bounds are checked above. The caller contract
+        // requires `metadata` to address `metadata_len` readable bytes.
+        let bytes = unsafe { slice::from_raw_parts(metadata, metadata_len) };
+        check_root_expiry_bytes(bytes, now)
+    }));
+
+    match verification {
+        Ok(Ok(())) => STATUS_OK,
+        Ok(Err(VerifyError::UnsupportedSpec)) => STATUS_UNSUPPORTED_SPEC,
+        Ok(Err(VerifyError::ExpiredRoot)) => STATUS_EXPIRED_ROOT,
+        Ok(Err(VerifyError::InvalidRoot)) => STATUS_INVALID_ROOT,
+        Err(_) => STATUS_INTERNAL_PANIC,
+    }
 }
 
 fn verify_root_bytes(bytes: &[u8]) -> Result<VerifiedRootSummary, VerifyError> {
@@ -183,6 +234,24 @@ fn verify_root_update_bytes(
         .update_root(candidate_bytes)
         .map_err(|_| VerifyError::InvalidRoot)?;
     summarize_root(trusted.root())
+}
+
+fn check_root_expiry_bytes(bytes: &[u8], now: jiff::Timestamp) -> Result<(), VerifyError> {
+    validate_root_spec_version(bytes)?;
+
+    let trusted = TrustedMetadataSet::from_root(bytes).map_err(|_| VerifyError::InvalidRoot)?;
+    // TUF requires expiry to be later than the fixed refresh start time. The
+    // pinned helper uses `< now`, which would incorrectly accept equality.
+    let expires_at = trusted
+        .root()
+        .expires
+        .parse::<jiff::Timestamp>()
+        .map_err(|_| VerifyError::InvalidRoot)?;
+    if expires_at <= now {
+        Err(VerifyError::ExpiredRoot)
+    } else {
+        Ok(())
+    }
 }
 
 fn validate_root_spec_version(bytes: &[u8]) -> Result<(), VerifyError> {

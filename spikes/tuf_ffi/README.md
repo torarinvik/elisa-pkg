@@ -10,12 +10,15 @@ The ABI accepts at most 1 MiB of root metadata, catches Rust unwinding panics,
 returns stable integer status codes, and writes a verified root summary only
 after parsing and threshold verification succeed. It also checks one root
 rotation link per call; the Elisa caller must persist that candidate before
-passing it as the trusted root for the next link. The ABI does not check final
-root expiry or write trust state. Elisa's bounded TUF JSON precheck runs before
-the foreign call, so duplicate JSON keys and noncanonical numbers never reach
-the upstream parser. The adapter owns no persistent trust state, production
-filesystem I/O, network transport, or package policy; the test-only fixture
-generator writes ephemeral signed roots under the probe's private build dir.
+passing it as the trusted root for the next link. A separate operation checks
+root expiry against the caller's fixed refresh time at nanosecond precision;
+keeping it separate lets a valid chain pass an expired intermediate root while
+requiring the caller to check its final root. The ABI still does not write
+trust state. Elisa's bounded TUF JSON precheck runs before the foreign call, so
+duplicate JSON keys and noncanonical numbers never reach the upstream parser.
+The adapter owns no persistent trust state, production filesystem I/O, network
+transport, or package policy; the test-only fixture generator writes ephemeral
+signed roots under the probe's private build dir.
 The probe's signed GitHub root fixture is copied from the pinned upstream
 `crates/sigstore-tuf/tests/../../sigstore-trust-root/repository/tuf_github_root.json`
 path (SHA-256 `eb303461e0109458144b6ebcbfd62aaa6f6d7481e9ca77504b85f17761661462`);
@@ -46,8 +49,10 @@ emits the Elisa probe object, links it with a tiny Rust process entry point and
 the adapter, and runs it from a private package root. This keeps the spike free
 of C sources. The probe exercises valid-root summary output, tampered signature
 rejection, duplicate-key rejection in Elisa, and spec-version rejection. It
-also generates three ephemeral roots and verifies two consecutive rotations
-through the Elisa ABI, while rejecting a skipped version and invalid signature.
-Signature-threshold edge cases, expiry handling, role/delegation policy,
+also generates three ephemeral roots, makes the intermediate root expired,
+verifies two consecutive rotations through the Elisa ABI, and checks final-root
+expiry separately, including a root expiring exactly at the fixed refresh time.
+It rejects a skipped version, invalid signature, and expired final root.
+Signature-threshold edge cases, role/delegation policy,
 profile-specific hash rules, durable root checkpointing, and injected
 write-failure tests remain required before any integration is considered.
