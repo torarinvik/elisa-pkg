@@ -94,13 +94,16 @@ platform adapter, not a claim that hostile build code is fully contained.
 
 ## D-009: project transaction ownership
 
-Manifest and lock edits acquire an exclusive `.elisapkg/transaction.guard`
-directory before journaling state. Normal lockfile publication uses the same
-journal and guard, and records the replacement bytes before publishing them.
-Recovery claims the guard before replaying a stale journal; an existing guard is
-treated as an active or interrupted transaction and blocks further commands.
-Successful commit, rollback, and recovery remove the guard. A guard left by an
-interrupted process still requires explicit operator recovery.
+Manifest and lock edits hold a persistent `.elisapkg/transaction.flock`
+advisory lock and acquire an exclusive `.elisapkg/transaction.guard` directory
+before journaling state. Normal lockfile publication uses the same journal and
+lock, and records the replacement bytes before publishing them. Recovery must
+acquire the advisory lock before replaying a journal; the kernel releases it if
+the process exits, allowing a later invocation to recover a stale guard. The
+guard remains as a compatibility boundary for concurrent older invocations.
+Guards from versions predating the advisory lock still require explicit
+operator recovery because they cannot be distinguished safely from a live old
+process.
 
 ## D-010: local archive cache identity
 
