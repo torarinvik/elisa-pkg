@@ -47,8 +47,9 @@ per role; 320 keys total in root metadata; 65,536 delegation keys total;
 64 signatures per metadata file; 4,096 package-scoped delegated roles; one
 delegation hop from top-level Targets to a package role; 4,096 targets in each
 Targets role; 4,096-byte target paths; 64 MiB per target artifact; 256
-dependencies per release; 128-byte registry identity tokens; 1,024 sequential
-root updates per refresh; and 64 JSON container levels. The
+dependencies per release; 128-byte registry identity tokens and SemVer
+requirements; 1,024 sequential root updates per refresh; and 64 JSON container
+levels. The
 duplicate-key validator additionally bounds each file to 65,536 total object
 keys, 8,500,000 candidate comparisons, and 65,536 bytes of key-equality
 comparisons; exceeding any of these limits rejects the metadata before trust
@@ -122,6 +123,15 @@ change if they prove too small for a real registry.
   and `archive-format` is `ustar-v1`. Dependency package names and registry
   identities use the same normalized forms, and duplicate registry/package
   pairs are rejected. Unknown fields at any custom schema level are rejected.
+  Requirements are 1–128 ASCII bytes and use a stable three-component version
+  with no prerelease or build metadata: an exact version, `^VERSION`,
+  `~VERSION`, one comparison (`<`, `<=`, `>`, or `>=`), or a non-empty range
+  made from two opposite-direction comparisons. ASCII space, tab, carriage
+  return, and line feed may separate operators and versions or surround the
+  requirement. Reject malformed versions, overflowed caret/tilde bounds, empty
+  ranges, and all other syntax. Elisa parses this grammar when evaluating
+  dependencies; the TUF metadata boundary enforces the 128-byte cap and rejects
+  malformed syntax before exposing custom metadata.
 - The configured registry identity is supplied by local registry configuration
   and must match every release target's `custom.elisapkg.registry`. It is a
   stable label bound to the independently provisioned TUF root; it is not a
