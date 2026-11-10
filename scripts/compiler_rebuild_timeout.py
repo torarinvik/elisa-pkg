@@ -18,7 +18,7 @@ def wait_for_process_group_exit(process_group: int, deadline: float) -> Optional
     """Wait until the rebuild leader and every same-group child have exited."""
     while True:
         if time.monotonic() >= deadline:
-            return False
+            return None
         try:
             os.killpg(process_group, 0)
         except ProcessLookupError:
