@@ -193,3 +193,21 @@ rejected before trust history can advance, protecting expiry checks from a
 wall-clock rollback. A clock without a state digest is malformed and is not
 migrated automatically. Restoring the state and clock together remains outside
 this user-owned local storage check's protection.
+
+The TUF persistence primitive is separate from SemVer package history.
+`Registry::commit_authenticated_tuf_checkpoint_batch` accepts a stable TUF
+registry identity and a canonical batch headed by `elisapkg-tuf-batch:1`, with
+one sorted `role version sha256` row per authenticated role. It validates the
+batch shape, rejects duplicate or unsorted roles, checks every version against
+the saved role floor under lock, and commits all changed floors in one atomic
+replacement. Lower versions fail with rollback; changed bytes at an equal
+version fail with an equivocation status. Each state key contains the SHA-256
+of the registry identity as well as the role, including when
+`ELISAPKG_TRUST_STATE` shares one parent state location across registries. The
+protected sibling files use `.tuf`, `.tuf.lock`, and `.tuf.clock` suffixes and
+the same no-follow reads, protected-parent checks, lock, atomic-write, and
+state-digest-bound wall-clock rules described above. Callers may commit only
+after the complete TUF root, timestamp, snapshot, targets, delegation,
+signature, expiry, and target-authorization chain has succeeded. This storage
+primitive does not implement or enable that verification workflow; remote
+operations remain disabled.

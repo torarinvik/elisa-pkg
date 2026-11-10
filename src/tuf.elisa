@@ -21,6 +21,7 @@ module Tuf:
             NoncanonicalNumber
             UnsupportedHashAlgorithm
             MalformedHash
+            MalformedCheckpointBatch
 
         const enum CheckpointCode of u8:
             Accepted
@@ -43,6 +44,61 @@ module Tuf:
             return CheckpointCode.Equivocation if candidate_version == previous_version and not tuf_bytes_equal(candidate_digest, previous_digest)
             return CheckpointCode.Accepted
 
+        # Batch format used by the protected checkpoint store:
+        # `elisapkg-tuf-batch:1\n` followed by sorted, unique
+        # `role version sha256\n` records. Requiring canonical ordering makes
+        # the complete authenticated role set deterministic and lets storage
+        # merge it with existing checkpoints in linear time.
+        def validate_checkpoint_batch(batch: darray[u8]&) -> ValidationCode can[Memory.Allocate, Abort.Panic]:
+            header: cstr = "elisapkg-tuf-batch:1\n"
+            header_length: usize = tuf_text_length(header)
+            return ValidationCode.ResourceLimit if batch.count > max_metadata_file_bytes
+            return ValidationCode.MalformedCheckpointBatch if batch.count <= header_length or not tuf_starts_with_text(batch, header)
+            cursor: mutable usize = header_length
+            previous_role: mutable darray[u8] = []
+            role_count: mutable usize = 0.usize()
+            while cursor < batch.count |batch, cursor, role_count|:
+                finish: mutable usize = cursor
+                while finish < batch.count and batch[finish] != 10 |batch, finish|:
+                    finish <- finish + 1.usize()
+                return ValidationCode.MalformedCheckpointBatch if finish == cursor or finish == batch.count
+                first_separator: mutable usize = cursor
+                while first_separator < finish and batch[first_separator] != 32 |batch, first_separator|:
+                    first_separator <- first_separator + 1.usize()
+                second_separator: mutable usize = first_separator + 1.usize()
+                while second_separator < finish and batch[second_separator] != 32 |batch, second_separator|:
+                    second_separator <- second_separator + 1.usize()
+                return ValidationCode.MalformedCheckpointBatch if first_separator == cursor or second_separator >= finish or first_separator + 1.usize() == second_separator or second_separator + 1.usize() == finish
+                return ValidationCode.MalformedCheckpointBatch if contains_byte_between(batch, second_separator + 1.usize(), finish, 32)
+                role: mutable darray[u8] = []
+                for index in cursor..<first_separator |role, batch|:
+                    role.push(batch[index])
+                return ValidationCode.MalformedCheckpointBatch if not valid_checkpoint_role(role)
+                return ValidationCode.ResourceLimit if role_count >= max_checkpoint_roles
+                if role_count > 0.usize():
+                    return ValidationCode.MalformedCheckpointBatch if compare_checkpoint_role(previous_role, role) >= 0
+                version: mutable darray[u8] = []
+                for index in (first_separator + 1.usize())..<second_separator |version, batch|:
+                    version.push(batch[index])
+                parsed_version: mutable u64 = 0.u64()
+                return ValidationCode.MalformedCheckpointBatch if not parse_checkpoint_version(version, &parsed_version)
+                return ValidationCode.MalformedHash if not valid_sha256_digest_range(batch, second_separator + 1.usize(), finish)
+                previous_role <- role
+                role_count <- role_count + 1.usize()
+                cursor <- finish + 1.usize()
+            return ValidationCode.MalformedCheckpointBatch if role_count == 0.usize()
+            return ValidationCode.WellFormed
+
+        def valid_checkpoint_role(role: darray[u8]&) -> bool:
+            return false if role.count == 0.usize() or role.count > max_checkpoint_role_bytes
+            first: u8 = role[0]
+            last: u8 = role[role.count - 1.usize()]
+            return false if not checkpoint_role_alphanumeric(first) or not checkpoint_role_alphanumeric(last)
+            for index in 0..<role.count |role, index|:
+                byte: u8 = role[index]
+                return false if not checkpoint_role_alphanumeric(byte) and byte != 45 and byte != 46 and byte != 95
+            return true
+
         # These limits bound a single repository refresh under the current
         # package-scoped delegation model. Changing them requires independent
         # metadata-size and worst-case-work review.
@@ -51,6 +107,8 @@ module Tuf:
         const max_registry_identity_bytes: usize = 128.usize()
         const max_signatures_per_metadata: usize = 64.usize()
         const max_delegated_roles: usize = 4096.usize()
+        const max_checkpoint_roles: usize = 4100.usize()
+        const max_checkpoint_role_bytes: usize = 128.usize()
         const max_delegation_depth: usize = 1.usize()
         const max_targets_per_package_role: usize = 4096.usize()
         const max_root_updates_per_refresh: usize = 1024.usize()
@@ -154,6 +212,51 @@ module Tuf:
 
     private:
         const key_id_size: usize = 64.usize()
+
+        def parse_checkpoint_version(raw: darray[u8]&, out: mutable u64&) -> bool:
+            out <- 0.u64()
+            return false if raw.count == 0.usize() or raw.count > 20.usize()
+            return false if raw.count > 1.usize() and raw[0] == 48
+            value: mutable u64 = 0.u64()
+            for index in 0..<raw.count |raw, value|:
+                byte: u8 = raw[index]
+                return false if byte < 48 or byte > 57
+                digit: u64 = (byte - 48).u64()
+                return false if value > 1844674407370955161.u64() or value == 1844674407370955161.u64() and digit > 5.u64()
+                value <- value * 10.u64() + digit
+            return false if value == 0.u64()
+            out <- value
+            return true
+
+        def compare_checkpoint_role(left: darray[u8]&, right: darray[u8]&) -> i64:
+            common: usize = left.count if left.count < right.count else right.count
+            for index in 0..<common |left, right|:
+                return -1 if left[index] < right[index]
+                return 1 if left[index] > right[index]
+            return -1 if left.count < right.count
+            return 1 if left.count > right.count
+            return 0
+
+        def contains_byte_between(value: darray[u8]&, start: usize, finish: usize, wanted: u8) -> bool:
+            for index in start..<finish |value|:
+                return true if value[index] == wanted
+            return false
+
+        def checkpoint_role_alphanumeric(byte: u8) -> bool:
+            return (byte >= 48 and byte <= 57) or (byte >= 97 and byte <= 122)
+
+        def tuf_text_length(value: cstr) -> usize:
+            cursor: mutable usize = 0.usize()
+            while value[cursor].u8() != 0:
+                cursor <- cursor + 1.usize()
+            return cursor
+
+        def tuf_starts_with_text(value: darray[u8]&, expected: cstr) -> bool:
+            length: usize = tuf_text_length(expected)
+            return false if value.count < length
+            for index in 0..<length |value, expected|:
+                return false if value[index] != expected[index].u8()
+            return true
 
         # TUF's canonical JSON subdialect contains integers only and forbids
         # negative zero. Json::valid_document has already established token

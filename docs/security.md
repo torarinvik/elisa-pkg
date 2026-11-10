@@ -151,6 +151,19 @@ two atomic writes also fails closed. A legacy clock without a state digest is
 malformed and is not migrated automatically. Restoring both user-owned files
 together remains outside this local check's protection because they are not
 anchored in hardware-backed monotonic storage.
+
+The TUF checkpoint store has a separate `.tuf` state file, `.tuf.lock`, and
+`.tuf.clock` sidecar. It accepts only a bounded, canonical sorted batch of
+role, positive 64-bit version, and lowercase SHA-256 digest records. It merges
+the whole batch with per-role floors under one lock, rejects rollback and
+same-version equivocation, then binds the complete replacement bytes to the
+clock sidecar before atomic publication. Rows include a hash of the configured
+registry identity, so sharing `ELISAPKG_TRUST_STATE` does not merge different
+registry histories. The public commit entry point accepts only metadata that
+its caller has already authenticated; it does not establish trust in that
+caller or replace the pending root rotation, signature, expiry, delegation,
+and target verification pipeline. Remote operations stay disabled.
+
 When the default location is used, `HOME` is treated as untrusted input: it
 must be absolute, bounded, and free of control bytes and backslashes. Trailing
 separators are collapsed (while preserving `/`), so equivalent spellings cannot
