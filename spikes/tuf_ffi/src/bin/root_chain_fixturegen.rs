@@ -214,21 +214,9 @@ fn write_package_chain(
         vec![signature(&timestamp_signed, root_key_id, root_key)],
     );
 
-    write_fixture(
-        directory,
-        &format!("{prefix}-timestamp.json"),
-        &timestamp,
-    );
-    write_fixture(
-        directory,
-        &format!("{prefix}-snapshot.json"),
-        &snapshot,
-    );
-    write_fixture(
-        directory,
-        &format!("{prefix}-targets.json"),
-        top_targets,
-    );
+    write_fixture(directory, &format!("{prefix}-timestamp.json"), &timestamp);
+    write_fixture(directory, &format!("{prefix}-snapshot.json"), &snapshot);
+    write_fixture(directory, &format!("{prefix}-targets.json"), top_targets);
     write_fixture(
         directory,
         &format!("{prefix}-package-demo.json"),
