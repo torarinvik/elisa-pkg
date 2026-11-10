@@ -2,6 +2,11 @@
 
 The lockfile records the exact resolution policy and selected package bytes. It is generated but intended to be committed. `--locked` and `--frozen` never edit it; a missing or byte-different lock is an error. Normal `resolve` writes the file only after validation succeeds. `fetch` validates the root manifest fingerprint first; for registry lock v3 it then checks every exact record against freshly authenticated metadata before caching the archive.
 
+Package version strings in both local and registry lock records use the same
+128-byte SemVer limit as package manifests. Lock records are still untrusted
+input and are rejected when their version text is malformed or exceeds that
+bound.
+
 The first local release emits:
 
 ```json
