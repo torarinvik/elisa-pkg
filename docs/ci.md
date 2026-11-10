@@ -77,8 +77,12 @@ using whatever compiler happens to be installed on the runner:
 
 Each Stage0 and Stage1 rebuild runs through
 `scripts/compiler_rebuild_timeout.py`, which enforces a 30-second wall-clock
-limit and kills the rebuild's entire process group at the deadline. A timeout
-fails the workflow; profile and optimize the rebuild before retrying it.
+limit, kills the rebuild's entire process group at the deadline, and reports
+elapsed wall time on success. The CI job gives Stage0 a new empty Go build cache
+and Stage1 a new empty SMT proof cache; it also disables the retained analysis
+server so warm state cannot hide fresh-cache seed timing. A timeout fails the
+workflow; profile and optimize the rebuild before retrying it under the same
+limit.
 
 To update a pin, review the upstream source and compatibility notes, update the
 workflow and this table together, then run the clean seed/build/test sequence
