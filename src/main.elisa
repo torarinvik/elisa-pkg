@@ -60,7 +60,6 @@ module Cli:
             remaining_dependencies: mutable usize
             emitted: mutable bool
 
-        const O_READ: cstr = "rb"
         # Output policy is process-local state set once by the CLI parser. Keep
         # it out of domain records so command APIs remain deterministic values;
         # only the final human-output sink consults these switches.
@@ -266,40 +265,6 @@ module Cli:
             return false if created != 0 and Platform::pkg_is_directory(final_path) != 1
             return Platform::pkg_is_directory(final_path) == 1
 
-        def read_file_into(path: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
-            out.resize(0)
-            path_c: mutable darray[u8] = []
-            path_with_nul_into(path, &path_c)
-            path_name: mutable cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
-            stream: mutable heap void&? = Platform::pkg_fopen(path_name, O_READ)
-            if stream is open_stream:
-                chunk: mutable darray[u8] = []
-                chunk.resize(8192)
-                rounds: mutable usize = 0.usize()
-                oversized: mutable bool = false
-                while rounds < 8192.usize() |out, chunk, stream, rounds|:
-                    chunk_raw: mutable void& = (&chunk[0]).cast[mutable void&] can Unsafe.PointerCast
-                    got: usize = Platform::pkg_fread(chunk_raw, 1, 8192, open_stream)
-                    break if got == 0.usize()
-                    if got > chunk.count:
-                        _ = Platform::pkg_fclose(open_stream)
-                        out.resize(0)
-                        return false
-                    for index in 0..<got |out, chunk|:
-                        out.push(chunk[index])
-                    rounds <- rounds + 1.usize()
-                if rounds == 8192.usize():
-                    chunk.resize(1)
-                    probe_raw: mutable void& = (&chunk[0]).cast[mutable void&] can Unsafe.PointerCast
-                    oversized <- Platform::pkg_fread(probe_raw, 1, 1, open_stream) > 0.usize()
-                failed: bool = Platform::pkg_ferror(open_stream) != 0
-                close_status: i64 = Platform::pkg_fclose(open_stream)
-                if oversized or failed or close_status != 0:
-                    out.resize(0)
-                    return false
-                return true
-            return false
-
         def read_package_file_into(path: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out.resize(0)
             path_snapshot: mutable darray[u8] = []
@@ -363,30 +328,20 @@ module Cli:
             return true
 
         def read_cstr_into(path_name: cstr, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            return false if out.count == 0.usize()
-            stream: mutable heap void&? = Platform::pkg_fopen(path_name, O_READ)
-            if stream is open_stream:
-                out_raw: mutable void& = (&out[0]).cast[mutable void&] can Unsafe.PointerCast
-                got: usize = Platform::pkg_fread(out_raw, 1, out.count, open_stream)
-                if got > out.count:
-                    _ = Platform::pkg_fclose(open_stream)
-                    out.resize(0)
-                    return false
-                oversized: mutable bool = false
-                if got == out.count:
-                    probe: mutable darray[u8] = []
-                    probe.resize(1)
-                    probe_raw: mutable void& = (&probe[0]).cast[mutable void&] can Unsafe.PointerCast
-                    oversized <- Platform::pkg_fread(probe_raw, 1, 1, open_stream) > 0.usize()
-                failed: bool = Platform::pkg_ferror(open_stream) != 0
-                close_status: i64 = Platform::pkg_fclose(open_stream)
-                if failed or oversized or close_status != 0:
-                    out.resize(0)
-                    return false
-                out.resize(got)
-                return true
-            out.resize(0)
-            return false
+            capacity: usize = out.count
+            return false if capacity == 0.usize() or capacity > 67108864.usize()
+            # Reserve one extra byte so a file exactly at the caller's bound
+            # remains distinguishable from an oversized file. Use the
+            # descriptor reader directly so bounded project reads share one
+            # implementation and do not allocate a stdio stream per call.
+            out.resize(capacity + 1.usize())
+            out_raw: mutable u8& = (&out[0]).cast[mutable u8&] can Unsafe.PointerCast
+            loaded: i64 = Platform::pkg_read_package_file(path_name, out_raw, out.count)
+            if loaded < 0 or loaded > capacity.i64():
+                out.resize(0)
+                return false
+            out.resize(loaded.usize())
+            return true
 
         def write_fd_all(fd: i64, value: darray[u8]&) -> bool can[Unsafe.PointerCast, Console.Write]:
             offset: mutable usize = 0.usize()
@@ -583,10 +538,11 @@ module Cli:
             path_c: mutable darray[u8] = []
             path_with_nul_into(path, &path_c)
             path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
-            stream: mutable heap void&? = Platform::pkg_fopen(path_name, O_READ)
-            if stream is open_stream:
-                return Platform::pkg_fclose(open_stream) == 0
-            return false
+            # Treat anything except definite ENOENT as occupied. In
+            # particular, symlinks and special files must not be mistaken for
+            # an available destination just because the regular-file opener
+            # refuses to read them.
+            return Platform::pkg_package_file_size(path_name) != -2
 
         def canonical_entry_within_root(root: darray[u8]&, entry: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             root_path: mutable darray[u8] = []
