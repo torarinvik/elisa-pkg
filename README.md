@@ -123,8 +123,9 @@ complete source-tree digest, and validates the selected package file set.
 Successful preflight does not publish bytes or bypass signing and publisher
 authorization requirements.
 
-`install --local` is the deliberately narrow local deployment path. It resolves
-the local graph, builds the current binary, and writes it to
+`install --local [--bin NAME]` is the deliberately narrow local deployment
+path. It resolves the local graph and builds the first binary target by default,
+or the named binary target with `--bin NAME`, then writes it to
 `$ELISAPKG_INSTALL_PREFIX/bin/<package-name>` (or `$HOME/.local/bin` when the
 override is absent). The destination and its receipt are created through an
 exclusive hard-link publication, so an existing file cannot be replaced. A
