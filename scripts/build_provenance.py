@@ -128,7 +128,15 @@ def git_identity(root: Path, expected: str, label: str, env: Mapping[str, str]) 
     if revision != expected:
         raise ProvenanceError(f"{label} checkout does not match its configured pin")
     status = command_output_allow_empty(
-        ["git", "-C", str(root), "status", "--porcelain=v1", "--untracked-files=all"],
+        [
+            "git",
+            "-C",
+            str(root),
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ],
         clean_env,
     )
     if status:
