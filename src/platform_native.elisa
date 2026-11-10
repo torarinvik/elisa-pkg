@@ -112,6 +112,8 @@ extern native_fork() -> i32
 # C receives `char **` as one pointer-sized argument. Keep its pointer depth
 # typed in the Elisa wrapper and erase it only at this private native boundary.
 extern native_execvp(path: cstr, argv: void&) -> i32
+@link_name("execve")
+extern native_execve(path: cstr, argv: void&, environment: void&) -> i32
 @link_name("_exit")
 extern native_exit(code: i64)
 @link_name("setpgid")
@@ -968,9 +970,9 @@ module PlatformNative:
                 _ = remove_temp_blob(message_path)
                 _ = remove_temp_blob(signature_path)
                 return -38
-            args.push("/usr/bin/env")
-            args.push("-i")
-            args.push("PATH=/usr/bin:/bin")
+            # Use execve with an empty environment directly. A helper such as
+            # `/usr/bin/env -i` still starts under the caller's loader settings,
+            # which could replace the verifier before it clears those values.
             args.push(openssl)
             args.push("pkeyutl")
             args.push("-verify")
@@ -986,6 +988,10 @@ module PlatformNative:
             args.push(signature_name)
             args.push(null)
             child_argv: mutable cstr&& = (&args[0]).cast[mutable cstr&&] can Unsafe.PointerCast
+            empty_environment: mutable darray[cstr] = [null]
+            child_environment: mutable cstr&& = (&empty_environment[0]).cast[mutable cstr&&] can Unsafe.PointerCast
+            raw_child_argv: void& = child_argv.cast[void&] can Unsafe.PointerCast
+            raw_child_environment: void& = child_environment.cast[void&] can Unsafe.PointerCast
             pid: i64 = native_fork()
             result: mutable i64 = -1
             if pid == 0:
@@ -1001,7 +1007,7 @@ module PlatformNative:
                     native_exit(126)
                 if close_inherited_fds() != 0:
                     native_exit(126)
-                _ = execvp("/usr/bin/env", child_argv)
+                _ = native_execve(openssl, raw_child_argv, raw_child_environment)
                 native_exit(127)
             elif pid > 0:
                 status: mutable i32 = 0
