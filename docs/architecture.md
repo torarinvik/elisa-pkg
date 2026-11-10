@@ -22,7 +22,7 @@ The current source units are:
 | `Cache` | Digest-addressed blob paths and byte revalidation | Digest grammar and no-follow blob reads | A pathname is never accepted as proof; callers must publish and quarantine through the CLI transaction. |
 | `Cli` | `run(argc, argv)` | None | The public command surface delegates to private command helpers. |
 
-The current compiler backend requires foreign declarations at compilation-unit scope, so the private `PlatformNative` module keeps those declarations and the descriptor-relative policy helpers together. `Platform` exposes only the reviewed wrapper surface. Callers use qualified names such as `Platform::pkg_fopen`, `Model::Version`, and `Security::remote_fetch_status`; `using` imports are deliberately avoided.
+The current compiler backend requires foreign declarations at compilation-unit scope, so the private `PlatformNative` module keeps those declarations and the descriptor-relative policy helpers together. `Platform` exposes only the reviewed wrapper surface. Callers use qualified names such as `Platform::pkg_read_package_file`, `Model::Version`, and `Security::remote_fetch_status`; `using` imports are deliberately avoided.
 
 The current CLI also has a local deployment path. `install --local` stays in
 the command layer, but delegates digesting and filesystem publication to the
