@@ -92,14 +92,6 @@ static if ELISA_TARGET_OS_MACOS:
 static if ELISA_TARGET_OS_LINUX:
     @link_name("fgetxattr")
     extern native_fgetxattr(fd: i32, name: cstr, value: mutable void&, size: usize) -> i64
-@link_name("fdopen")
-extern native_fdopen(fd: i64, mode: cstr) -> mutable heap void&?
-@link_name("ferror")
-extern native_ferror(stream: heap void&) -> int
-@link_name("fclose")
-extern native_fclose(stream: heap void&) -> int
-@link_name("fread")
-extern native_fread(buffer: mutable void&, size: usize, count: usize, stream: void&) -> usize
 @link_name("fdopendir")
 extern native_fdopendir(fd: i64) -> mutable heap void&?
 @link_name("readdir")
@@ -1216,75 +1208,6 @@ module PlatformNative:
 
         def directory_not_empty_error_code() -> i64:
             return directory_not_empty_error
-
-        def fopen(path: cstr, mode: cstr) -> mutable heap void&? can[Unsafe.PointerCast]:
-            return null if not cstr_equal(mode, "rb") and not cstr_equal(mode, "wxb")
-            if cstr_equal(mode, "rb"):
-                fd: i64 = open_package_file(path)
-                return null if fd < 0
-                if not regular_fd(fd):
-                    _ = native_close(fd)
-                    return null
-                stream: mutable heap void&? = native_fdopen(fd, "rb")
-                if stream is opened:
-                    return opened
-                _ = native_close(fd)
-                return null
-            parent: mutable darray[u8] = []
-            leaf: mutable darray[u8] = []
-            return null if not split_parent_leaf(path, &parent, &leaf)
-            path_snapshot: mutable darray[u8] = []
-            path_length_value: usize = native_strlen(path)
-            for index in 0..<path_length_value |path_snapshot, path|:
-                path_snapshot.push(path[index].u8())
-            path_snapshot.push(0)
-            leaf_snapshot: mutable darray[u8] = []
-            for index in 0..<leaf.count |leaf_snapshot, leaf|:
-                leaf_snapshot.push(leaf[index])
-            parent_name: cstr = (&parent[0]).cast[cstr] can Unsafe.PointerCast
-            directory: i64 = open_directory_path(parent_name)
-            return null if directory < 0
-            leaf_c: mutable darray[u8] = []
-            for index in 0..<leaf_snapshot.count |leaf_c, leaf_snapshot|:
-                leaf_c.push(leaf_snapshot[index])
-            leaf_name: cstr = (&leaf_c[0]).cast[cstr] can Unsafe.PointerCast
-            fd: i64 = native_openat(directory, leaf_name, flags_write_create_exclusive(), 384)
-            directory_close_status: i64 = native_close(directory)
-            if directory_close_status != 0:
-                if fd >= 0:
-                    _ = native_close(fd)
-                    # Exclusive creation succeeded, but the directory handle
-                    # did not close cleanly. Do not leave an unreachable file
-                    # behind when reporting the operation as failed.
-                    cleanup_path: mutable darray[u8] = []
-                    for index in 0..<path_snapshot.count |cleanup_path, path_snapshot|:
-                        cleanup_path.push(path_snapshot[index])
-                    cleanup_name: cstr = (&cleanup_path[0]).cast[cstr] can Unsafe.PointerCast
-                    _ = unlink_kind(cleanup_name, 0)
-                return null
-            return null if fd < 0
-            stream: mutable heap void&? = native_fdopen(fd, "wb")
-            if stream is opened:
-                return opened
-            _ = native_close(fd)
-            # `fdopen` can fail after the exclusive open succeeded. Remove
-            # that newly-created name before reporting the wrapper failure.
-            cleanup_path: mutable darray[u8] = []
-            for index in 0..<path_snapshot.count |cleanup_path, path_snapshot|:
-                cleanup_path.push(path_snapshot[index])
-            cleanup_name: cstr = (&cleanup_path[0]).cast[cstr] can Unsafe.PointerCast
-            _ = unlink_kind(cleanup_name, 0)
-            return null
-
-        def ferror(stream: heap void&) -> int:
-            return native_ferror(stream)
-
-        def fclose(stream: heap void&) -> int:
-            return native_fclose(stream)
-
-        def fread(buffer: mutable void&, size: usize, count: usize, stream: void&) -> usize:
-            return native_fread(buffer, size, count, stream)
-
 
     private:
         def rmdir_secure(path: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
