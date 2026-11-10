@@ -129,9 +129,9 @@ change if they prove too small for a real registry.
   made from two opposite-direction comparisons. ASCII space, tab, carriage
   return, and line feed may separate operators and versions or surround the
   requirement. Reject malformed versions, overflowed caret/tilde bounds, empty
-  ranges, and all other syntax. Elisa parses this grammar when evaluating
-  dependencies; the TUF metadata boundary enforces the 128-byte cap and rejects
-  malformed syntax before exposing custom metadata.
+  ranges, and all other syntax. Elisa's shared requirement parser enforces the
+  128-byte cap, while the TUF metadata boundary independently rejects malformed
+  syntax before exposing custom metadata.
 - The configured registry identity is supplied by local registry configuration
   and must match every release target's `custom.elisapkg.registry`. It is a
   stable label bound to the independently provisioned TUF root; it is not a
