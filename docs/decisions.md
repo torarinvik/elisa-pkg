@@ -264,6 +264,27 @@ must reject it. The root-expiry ABI applies its own `<=` comparison; future
 timestamp, snapshot, and targets operations must enforce the same rule,
 including subsecond timestamps.
 
+The candidate review is version-specific. On 2026-11-10, the latest published
+[`sigstore-tuf` release](https://github.com/sigstore/sigstore-rust/releases)
+was 0.15.1 (signed release commit `fc308a2`); its release notes include API
+stabilization work ahead of 1.0, crypto agility, and a switch to
+`sigstore-crypto` for hashing. The reviewed crate archive
+([`sigstore-tuf` 0.15.1](https://docs.rs/crate/sigstore-tuf/0.15.1)) had SHA-256
+`fb4ea7f5d83c3d2d06397d153de059ff5b6f594fb04c3d8dc1912d127cf105db`. Reviewing
+its source confirmed that several profile gaps remain: metadata parsing accepts any
+`1.x` `spec_version`; integrity checking supports SHA-512 and skips unknown
+algorithms when another supported hash exists; updater cache-store failures are
+logged and ignored; and the filesystem store atomically renames a temporary
+file without syncing the file and parent directory. Its JSON parser first
+materializes a `serde_json::Value`, so duplicate-member rejection still needs
+to happen before the foreign parser, as it does in Elisa. The 0.15.1 release
+therefore is not approved for the package profile or durable trust-state
+ownership. The official [TUF conformance dashboard](https://theupdateframework.github.io/tuf-conformance/)
+was updated 2026-11-09 and
+reports `sigstore-rust` at 119/119; that is general conformance evidence, not a
+result for the previously pinned 0.14.0 build or the 0.15.1 source/profile/ABI
+combination. Re-pin and rerun the exact release before reconsidering it.
+
 A test-only ABI proof is also recorded in
 [`spikes/tuf_ffi`](../spikes/tuf_ffi/README.md), pinned to the same upstream
 commit. On 2026-10-07, four Rust tests passed, and the release static library
