@@ -154,12 +154,14 @@ anchored in hardware-backed monotonic storage.
 
 The TUF checkpoint store has a separate `.tuf` state file, `.tuf.lock`, and
 `.tuf.clock` sidecar. It accepts only a bounded, canonical sorted batch of
-role, positive 64-bit version, and lowercase SHA-256 digest records. It merges
-the whole batch with per-role floors under one lock, rejects rollback and
-same-version equivocation, then binds the complete replacement bytes to the
-clock sidecar before atomic publication. Rows include a hash of the configured
-registry identity, so sharing `ELISAPKG_TRUST_STATE` does not merge different
-registry histories. The public commit entry point accepts only metadata that
+role, positive 64-bit version, and lowercase SHA-256 digest records. Each
+checkpoint digest covers the canonical JSON `signed` object; the TUF verifier
+must separately check parent metadata's hashes and lengths over complete files.
+The store merges the whole batch with per-role floors under one lock, rejects
+rollback and same-version equivocation, then binds the complete replacement
+bytes to the clock sidecar before atomic publication. Rows include a hash of
+the configured registry identity, so sharing `ELISAPKG_TRUST_STATE` does not
+merge different registry histories. The public commit entry point accepts metadata that
 its caller has already authenticated; it does not establish trust in that
 caller or replace the pending root rotation, signature, expiry, delegation,
 and target verification pipeline. Remote operations stay disabled.

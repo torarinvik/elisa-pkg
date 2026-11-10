@@ -211,6 +211,19 @@ module Registry:
             return ResultCode.InvalidConfiguration if not registry_valid_name(package)
             return trust_state_verify(package, version, digest, metadata_digest, expires)
 
+        # Read the durable floors for one stable TUF registry identity. The
+        # result uses the same canonical batch format accepted by the commit
+        # API; an empty result means this identity has no saved checkpoints.
+        # Commit rechecks these floors under its own lock, so a caller must
+        # still handle concurrent refreshes through the commit result.
+        def read_tuf_checkpoint_batch(registry_identity: darray[u8]&, out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            out.resize(0)
+            return ResultCode.InvalidConfiguration if not Tuf::valid_registry_identity_bytes(registry_identity)
+            identity_copy: mutable darray[u8] = []
+            for index in 0..<registry_identity.count |identity_copy, registry_identity|:
+                identity_copy.push(registry_identity[index])
+            return trust_tuf_read_checkpoint_batch(identity_copy, out)
+
         # Atomically persist the complete set of already-authenticated TUF
         # role checkpoints for one stable registry identity. The caller must
         # finish root rotation, signature thresholds, delegations, expiry,
@@ -2406,6 +2419,90 @@ module Registry:
             return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if not trust_state_write(state_path, updated_state)
             return trust_state_finish(lock_fd, ResultCode.Ok)
 
+        def trust_tuf_read_checkpoint_batch(registry_identity: darray[u8]&, out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            out.resize(0)
+            scope_bytes: mutable darray[u8] = []
+            scope: mutable darray[u8] = []
+            return ResultCode.TrustStateUnavailable if Integrity::sha256(registry_identity, &scope_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(scope_bytes, &scope)
+            state_path: mutable darray[u8] = trust_state_path(registry_identity)
+            return ResultCode.TrustStateUnavailable if state_path.count == 0 or state_path.count > 4080.usize()
+            registry_push_text(&state_path, ".tuf")
+            state_path_snapshot: mutable darray[u8] = []
+            registry_push_array(&state_path_snapshot, state_path)
+            lock_path: mutable darray[u8] = []
+            registry_push_array(&lock_path, state_path)
+            registry_push_text(&lock_path, ".lock")
+            return ResultCode.TrustStateUnavailable if lock_path.count > 4096.usize()
+            lock_path_snapshot: mutable darray[u8] = []
+            registry_push_array(&lock_path_snapshot, lock_path)
+            lock_c: mutable darray[u8] = []
+            path_with_nul(lock_path, &lock_c)
+            lock_name: cstr = (&lock_c[0]).cast[cstr] can Unsafe.PointerCast
+            lock_fd: i64 = Platform::pkg_acquire_trust_state_lock(lock_name)
+            return ResultCode.TrustStateUnavailable if lock_fd < 0
+
+            state_path.resize(0)
+            registry_push_array(&state_path, state_path_snapshot)
+            state: mutable darray[u8] = []
+            read_status: ResultCode = trust_tuf_state_read(state_path, &state)
+            return trust_state_finish(lock_fd, read_status) if read_status != ResultCode.Ok
+            if state.count == 0.usize():
+                clock_path: mutable darray[u8] = []
+                registry_push_array(&clock_path, state_path_snapshot)
+                registry_push_text(&clock_path, ".clock")
+                unused_clock: mutable u64 = 0.u64()
+                unused_clock_digest: mutable darray[u8] = []
+                no_clock: mutable bool = false
+                clock_status: ResultCode = trust_clock_read(clock_path, &unused_clock, &unused_clock_digest, &no_clock)
+                return trust_state_finish(lock_fd, clock_status) if clock_status != ResultCode.Ok
+                return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if not no_clock
+                return trust_state_finish(lock_fd, ResultCode.Ok)
+
+            state_path.resize(0)
+            registry_push_array(&state_path, state_path_snapshot)
+            clock_path: mutable darray[u8] = []
+            registry_push_array(&clock_path, state_path_snapshot)
+            registry_push_text(&clock_path, ".clock")
+            observed_clock: mutable u64 = 0.u64()
+            clock_missing: mutable bool = false
+            observed_state_digest: mutable darray[u8] = []
+            clock_status: ResultCode = trust_clock_read(clock_path, &observed_clock, &observed_state_digest, &clock_missing)
+            return trust_state_finish(lock_fd, clock_status) if clock_status != ResultCode.Ok
+            return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if clock_missing
+            current_state_digest: mutable darray[u8] = []
+            return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if not trust_state_digest(state, &current_state_digest) or not bytes_equal(observed_state_digest, current_state_digest)
+            now: i64 = Platform::pkg_wall_clock_seconds()
+            return trust_state_finish(lock_fd, ResultCode.ClockUnavailable) if now < 0
+            return trust_state_finish(lock_fd, ResultCode.ClockRollback) if observed_clock > now.u64()
+
+            prefix: mutable darray[u8] = []
+            registry_push_array(&prefix, scope)
+            prefix.push(58)
+            cursor: mutable usize = Platform::pkg_strlen("elisapkg-tuf-checkpoints:1\n")
+            while cursor < state.count |state, cursor|:
+                key: mutable darray[u8] = []
+                version: mutable darray[u8] = []
+                digest: mutable darray[u8] = []
+                next_cursor: mutable usize = 0.usize()
+                return trust_state_finish(lock_fd, ResultCode.TrustStateMalformed) if not trust_tuf_parse_row(state, cursor, &key, &version, &digest, &next_cursor)
+                if key.count > prefix.count:
+                    matches_scope: mutable bool = true
+                    for index in 0..<prefix.count |key, prefix, matches_scope|:
+                        matches_scope <- false if key[index] != prefix[index]
+                    if matches_scope:
+                        if out.count == 0.usize():
+                            registry_push_text(&out, "elisapkg-tuf-batch:1\n")
+                        for index in prefix.count..<key.count |out, key|:
+                            out.push(key[index])
+                        out.push(32)
+                        registry_push_array(&out, version)
+                        out.push(32)
+                        registry_push_array(&out, digest)
+                        out.push(10)
+                cursor <- next_cursor
+            return trust_state_finish(lock_fd, ResultCode.ResourceLimit) if out.count > 1048576.usize()
+            return trust_state_finish(lock_fd, ResultCode.Ok)
+
         def trust_tuf_state_read(path: darray[u8]&, out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out.resize(0)
             loaded: mutable darray[u8] = []
@@ -2431,7 +2528,8 @@ module Registry:
                 digest: mutable darray[u8] = []
                 next_cursor: mutable usize = 0.usize()
                 return false if not trust_tuf_parse_row(state, cursor, &key, &version, &digest, &next_cursor)
-                return false if not trust_tuf_scoped_role_valid(key) or not trust_tuf_version_valid(version) or not valid_digest(digest)
+                ignored_version: mutable u64 = 0.u64()
+                return false if not trust_tuf_scoped_role_valid(key) or not Tuf::parse_checkpoint_version(version, &ignored_version) or not valid_digest(digest)
                 return false if row_count > 0.usize() and trust_tuf_compare_keys(previous_key, key) >= 0
                 previous_key <- key
                 cursor <- next_cursor
@@ -2541,7 +2639,7 @@ module Registry:
                     continue
                 old_version: mutable u64 = 0.u64()
                 candidate_version: mutable u64 = 0.u64()
-                if not trust_tuf_parse_version(old_version_text, &old_version) or not trust_tuf_parse_version(candidate_version_text, &candidate_version):
+                if not Tuf::parse_checkpoint_version(old_version_text, &old_version) or not Tuf::parse_checkpoint_version(candidate_version_text, &candidate_version):
                     status_out <- ResultCode.TrustStateMalformed
                     return false
                 checkpoint_status: Tuf::CheckpointCode = Tuf::check_authenticated_checkpoint(old_version, old_digest, candidate_version, candidate_digest)
@@ -2605,24 +2703,6 @@ module Registry:
             for index in 65..<key.count |role, key|:
                 role.push(key[index])
             return Tuf::valid_checkpoint_role(role)
-
-        def trust_tuf_version_valid(version: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            ignored: mutable u64 = 0.u64()
-            return trust_tuf_parse_version(version, &ignored)
-
-        def trust_tuf_parse_version(raw: darray[u8]&, out: mutable u64&) -> bool:
-            out <- 0.u64()
-            return false if raw.count == 0.usize() or raw.count > 20.usize() or raw.count > 1.usize() and raw[0] == 48
-            value: mutable u64 = 0.u64()
-            for index in 0..<raw.count |raw, value|:
-                byte: u8 = raw[index]
-                return false if byte < 48 or byte > 57
-                digit: u64 = (byte - 48).u64()
-                return false if value > 1844674407370955161.u64() or value == 1844674407370955161.u64() and digit > 5.u64()
-                value <- value * 10.u64() + digit
-            return false if value == 0.u64()
-            out <- value
-            return true
 
         def trust_tuf_compare_keys(left: darray[u8]&, right: darray[u8]&) -> i64:
             common: usize = left.count if left.count < right.count else right.count

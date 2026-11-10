@@ -30,10 +30,11 @@ module Tuf:
             Equivocation
 
         # Check one already-authenticated role checkpoint before the caller
-        # includes it in the durable registry-state transaction. The caller
-        # must maintain a separate previous version and digest for each
-        # registry/role identity and commit all accepted role checkpoints
-        # atomically only after the complete metadata chain has verified.
+        # includes it in the durable registry-state transaction. Digests are
+        # SHA-256 over the canonical JSON encoding of the signed ROLE object;
+        # parent metadata links still verify the full metadata-file bytes and
+        # length. The caller must maintain separate floors per registry/role
+        # and commit all accepted role checkpoints only after the full chain.
         def check_authenticated_checkpoint(previous_version: u64, previous_digest: darray[u8]&, candidate_version: u64, candidate_digest: darray[u8]&) -> CheckpointCode:
             return CheckpointCode.Malformed if candidate_version == 0.u64() or not valid_sha256_digest(candidate_digest)
             if previous_version == 0.u64():
@@ -46,9 +47,10 @@ module Tuf:
 
         # Batch format used by the protected checkpoint store:
         # `elisapkg-tuf-batch:1\n` followed by sorted, unique
-        # `role version sha256\n` records. Requiring canonical ordering makes
-        # the complete authenticated role set deterministic and lets storage
-        # merge it with existing checkpoints in linear time.
+        # `role version digest\n` records. Each digest is the SHA-256 of that
+        # role's canonical signed object. Canonical ordering makes the
+        # authenticated role set deterministic and lets storage merge it with
+        # existing floors in linear time.
         def validate_checkpoint_batch(batch: darray[u8]&) -> ValidationCode can[Memory.Allocate, Abort.Panic]:
             header: cstr = "elisapkg-tuf-batch:1\n"
             header_length: usize = tuf_text_length(header)
@@ -99,6 +101,23 @@ module Tuf:
                 return false if not checkpoint_role_alphanumeric(byte) and byte != 45 and byte != 46 and byte != 95
             return true
 
+        # Parse one canonical, positive TUF metadata version without allowing
+        # decimal truncation, leading zeroes, or uint64 overflow.
+        def parse_checkpoint_version(raw: darray[u8]&, out: mutable u64&) -> bool:
+            out <- 0.u64()
+            return false if raw.count == 0.usize() or raw.count > 20.usize()
+            return false if raw.count > 1.usize() and raw[0] == 48
+            value: mutable u64 = 0.u64()
+            for index in 0..<raw.count |raw, value|:
+                byte: u8 = raw[index]
+                return false if byte < 48 or byte > 57
+                digit: u64 = (byte - 48).u64()
+                return false if value > 1844674407370955161.u64() or value == 1844674407370955161.u64() and digit > 5.u64()
+                value <- value * 10.u64() + digit
+            return false if value == 0.u64()
+            out <- value
+            return true
+
         # These limits bound a single repository refresh under the current
         # package-scoped delegation model. Changing them requires independent
         # metadata-size and worst-case-work review.
@@ -107,7 +126,10 @@ module Tuf:
         const max_registry_identity_bytes: usize = 128.usize()
         const max_signatures_per_metadata: usize = 64.usize()
         const max_delegated_roles: usize = 4096.usize()
-        const max_checkpoint_roles: usize = 4100.usize()
+        # The batch can contain roles retained from older metadata even when
+        # the current root has revoked or removed them. The byte cap remains
+        # the tighter practical bound for long identities and digest records.
+        const max_checkpoint_roles: usize = 32768.usize()
         const max_checkpoint_role_bytes: usize = 128.usize()
         const max_delegation_depth: usize = 1.usize()
         const max_targets_per_package_role: usize = 4096.usize()
@@ -212,21 +234,6 @@ module Tuf:
 
     private:
         const key_id_size: usize = 64.usize()
-
-        def parse_checkpoint_version(raw: darray[u8]&, out: mutable u64&) -> bool:
-            out <- 0.u64()
-            return false if raw.count == 0.usize() or raw.count > 20.usize()
-            return false if raw.count > 1.usize() and raw[0] == 48
-            value: mutable u64 = 0.u64()
-            for index in 0..<raw.count |raw, value|:
-                byte: u8 = raw[index]
-                return false if byte < 48 or byte > 57
-                digit: u64 = (byte - 48).u64()
-                return false if value > 1844674407370955161.u64() or value == 1844674407370955161.u64() and digit > 5.u64()
-                value <- value * 10.u64() + digit
-            return false if value == 0.u64()
-            out <- value
-            return true
 
         def compare_checkpoint_role(left: darray[u8]&, right: darray[u8]&) -> i64:
             common: usize = left.count if left.count < right.count else right.count

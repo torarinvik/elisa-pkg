@@ -195,15 +195,21 @@ migrated automatically. Restoring the state and clock together remains outside
 this user-owned local storage check's protection.
 
 The TUF persistence primitive is separate from SemVer package history.
-`Registry::commit_authenticated_tuf_checkpoint_batch` accepts a stable TUF
-registry identity and a canonical batch headed by `elisapkg-tuf-batch:1`, with
-one sorted `role version sha256` row per authenticated role. It validates the
-batch shape, rejects duplicate or unsorted roles, checks every version against
-the saved role floor under lock, and commits all changed floors in one atomic
-replacement. Lower versions fail with rollback; changed bytes at an equal
-version fail with an equivocation status. Each state key contains the SHA-256
-of the registry identity as well as the role, including when
-`ELISAPKG_TRUST_STATE` shares one parent state location across registries. The
+`Registry::read_tuf_checkpoint_batch` reads the saved rows for one stable TUF
+registry identity under the state lock and verifies the clock-bound state
+digest; an empty result means that identity has no saved checkpoints. The
+caller uses those floors while verifying an update, then passes the complete
+authenticated role set to `Registry::commit_authenticated_tuf_checkpoint_batch`
+as a canonical batch headed by `elisapkg-tuf-batch:1`, with one sorted
+`role version digest` row per role. Each digest is SHA-256 over the canonical
+JSON `signed` object used by TUF signature checks. The verifier must separately
+validate each parent role's length and SHA-256 over the complete downloaded
+metadata file. The store validates batch shape, rejects duplicate or unsorted
+roles, checks every version against the saved role floor under lock, and commits
+all changed floors in one atomic replacement. Lower versions fail with rollback;
+changed bytes at an equal version fail with an equivocation status. Each state
+key contains the SHA-256 of the registry identity as well as the role, including
+when `ELISAPKG_TRUST_STATE` shares one parent state location across registries. The
 protected sibling files use `.tuf`, `.tuf.lock`, and `.tuf.clock` suffixes and
 the same no-follow reads, protected-parent checks, lock, atomic-write, and
 state-digest-bound wall-clock rules described above. Callers may commit only
