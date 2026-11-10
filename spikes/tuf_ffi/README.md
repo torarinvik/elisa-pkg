@@ -27,6 +27,10 @@ precision. Expired intermediate roots can pass only through sequential
 rotation; final roots and active metadata must be current. The ABI still does
 not own rollback floors or write trust state.
 
+Every Elisa wrapper checks that the linked engine reports ABI version 1 before
+calling any verification symbol. A mismatch returns an explicit `AbiMismatch`
+status without entering the incompatible ABI.
+
 Elisa's bounded TUF JSON prechecks run before the foreign calls, so duplicate
 JSON keys and noncanonical numbers never reach the upstream parser. The adapter
 owns no persistent trust state, production filesystem I/O, network transport,
