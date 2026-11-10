@@ -123,6 +123,8 @@ change if they prove too small for a real registry.
   and `archive-format` is `ustar-v1`. Dependency package names and registry
   identities use the same normalized forms, and duplicate registry/package
   pairs are rejected. Unknown fields at any custom schema level are rejected.
+  The `elisa` value is syntax-checked as a stable requirement, but this release
+  does not compare it against local compiler versions or capabilities.
   Requirements are 1–128 ASCII bytes and use a stable three-component version
   with no prerelease or build metadata: an exact version, `^VERSION`,
   `~VERSION`, one comparison (`<`, `<=`, `>`, or `>=`), or a non-empty range

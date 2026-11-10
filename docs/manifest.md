@@ -8,6 +8,9 @@ keys, unsupported build scripts/plugins, and entries larger than 1 MiB.
 Version strings accept the numeric major/minor/patch form with an optional
 prerelease suffix. SemVer build metadata (`+...`) is outside the v1 version
 grammar because lock identities retain precedence fields only.
+The optional `package.elisa` field must use the stable requirement grammar
+described below. It is currently syntax-checked only; builds do not compare it
+with the selected compiler's version or capabilities.
 
 The minimum package is:
 
