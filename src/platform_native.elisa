@@ -227,6 +227,8 @@ const lock_operation_exclusive: i64 = 2
 const lock_operation_nonblocking: i64 = 4
 
 static if ELISA_TARGET_OS_LINUX:
+    # A zero result means the dirent length or terminating NUL is malformed.
+    # POSIX entries cannot have empty names, so callers must fail closed.
     def dirent_name_length(raw: mutable u8&) -> usize:
         record_length: usize = raw[16].usize() + raw[17].usize() * 256.usize()
         return 0 if record_length <= dirent_name_offset
@@ -241,6 +243,8 @@ static if ELISA_TARGET_OS_LINUX:
     def dirent_type(raw: mutable u8&) -> u8:
         return raw[dirent_type_offset]
 static else:
+    # A zero result means the kernel-provided name length is invalid; callers
+    # must not interpret it as an ignorable empty entry.
     def dirent_name_length(raw: mutable u8&) -> usize:
         length: usize = raw[18].usize() + raw[19].usize() * 256.usize()
         return 0 if length > 255.usize()
@@ -1312,7 +1316,9 @@ module PlatformNative:
                     if entry is record:
                         raw: mutable u8& = record.cast[mutable u8&] can Unsafe.PointerCast
                         name_length: usize = dirent_name_length(raw)
-                        continue if name_length == 0.usize()
+                        if name_length == 0.usize():
+                            _ = native_closedir(opened)
+                            return false
                         continue if name_is_dot(raw, dirent_name_offset, name_length)
                         _ = native_closedir(opened)
                         return false
@@ -2917,10 +2923,10 @@ module PlatformNative:
                     if entry is record:
                         raw: mutable u8& = record.cast[mutable u8&] can Unsafe.PointerCast
                         name_length: usize = dirent_name_length(raw)
+                        return directory_failure(stream) if name_length == 0 or name_length > 255.usize()
                         if not name_is_dot(raw, dirent_name_offset, name_length):
                             visited_nodes <- visited_nodes + 1.usize()
                             return directory_failure(stream) if visited_nodes > max_collect_traversal_nodes
-                        continue if name_length == 0 or name_length > 255.usize()
                         # Some filesystems report DT_UNKNOWN. Credential
                         # exclusions must therefore not depend on d_type.
                         continue if name_is_dot(raw, dirent_name_offset, name_length)
