@@ -25,6 +25,14 @@ registry support is implemented or ready to enable.
   in Elisa, prove conformance with independently generated fixtures,
   differential vectors against a separate TUF implementation, fuzzing, and
   independent review. Never substitute the local detached-signature fixture.
+- Canonicalize only the `signed` object using TUF's OLPC Canonical JSON
+  dialect (`securesystemslib` compatibility), not RFC 8785/JCS. Sort object
+  keys lexically, preserve array order, emit compact JSON with decimal integers
+  only, and escape only quote and backslash in strings; all other string bytes
+  are emitted as UTF-8 without extra escaping. Preserve the original complete
+  metadata bytes for parent-role length and hash checks. Require differential
+  vectors for control characters, non-ASCII strings and keys, integer edges,
+  unknown fields, and escaped input spellings against the pinned reference.
 - Reject duplicate JSON object keys, invalid UTF-8, unpaired UTF-16 surrogate
   escapes, floating-point values, noncanonical integer encodings, malformed
   timestamps, and metadata exceeding configured size, role-count,
