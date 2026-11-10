@@ -107,7 +107,7 @@ module Registry:
         # metadata verification step unnoticed.
         def read_archive(package: darray[u8]&, version: darray[u8]&, metadata: darray[u8]&, archive: darray[u8]&, expected_digest: darray[u8]&, expected_size: u64, out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out.resize(0)
-            return ResultCode.InvalidConfiguration if not valid_package_name(package) or not Archive::is_safe_entry(version) or not Archive::is_safe_entry(archive) or not valid_digest(expected_digest) or expected_size > 67108864
+            return ResultCode.InvalidConfiguration if not valid_package_name(package) or not valid_package_version(version) or not Archive::is_safe_entry(archive) or not valid_digest(expected_digest) or expected_size > 67108864
             root: mutable darray[u8] = []
             return ResultCode.NotConfigured if not configured_root(&root)
             return ResultCode.InvalidConfiguration if not valid_registry_root(root)
@@ -139,7 +139,7 @@ module Registry:
         # authorized. Callers must authenticate metadata before using this
         # check; the function itself treats both inputs as untrusted bytes.
         def release_archive_matches_metadata(package: darray[u8]&, version: darray[u8]&, metadata: darray[u8]&, archive: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            return false if not valid_package_name(package) or not Archive::is_safe_entry(version)
+            return false if not valid_package_name(package) or not valid_package_version(version)
             manifest_name: mutable darray[u8] = [101, 108, 105, 115, 97, 112, 107, 103, 46, 106, 115, 111, 110]
             manifest: mutable darray[u8] = []
             return false if not Archive::read_ustar_entry(archive, manifest_name, &manifest)
@@ -273,7 +273,7 @@ module Registry:
             generation_out <- 0
             snapshot_digest_out.resize(0)
             identity_out.resize(0)
-            return ResultCode.InvalidConfiguration if not valid_package_name(package) or not Archive::is_safe_entry(version)
+            return ResultCode.InvalidConfiguration if not valid_package_name(package) or not valid_package_version(version)
             parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
             return ResultCode.InvalidConfiguration if not SemVer::parse(version, &parsed) or parsed.prerelease
             root: mutable darray[u8] = []
@@ -310,7 +310,7 @@ module Registry:
             digest_out.resize(0)
             archive_size_out <- 0
             metadata_out.resize(0)
-            return ResultCode.InvalidConfiguration if not valid_package_name(package) or not Archive::is_safe_entry(version)
+            return ResultCode.InvalidConfiguration if not valid_package_name(package) or not valid_package_version(version)
             root: mutable darray[u8] = []
             return ResultCode.NotConfigured if not configured_root(&root)
             return ResultCode.InvalidConfiguration if not valid_registry_root(root)
@@ -324,7 +324,7 @@ module Registry:
         # so the signature can be carried into the content-addressed offline cache.
         def read_signature(package: darray[u8]&, version: darray[u8]&, out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out.resize(0)
-            return ResultCode.InvalidConfiguration if not valid_package_name(package) or not Archive::is_safe_entry(version)
+            return ResultCode.InvalidConfiguration if not valid_package_name(package) or not valid_package_version(version)
             root: mutable darray[u8] = []
             return ResultCode.NotConfigured if not configured_root(&root)
             return ResultCode.InvalidConfiguration if not valid_registry_root(root)
@@ -357,7 +357,7 @@ module Registry:
             archive_size_out <- 0
             expires_out <- 0
             dependencies_out.resize(0)
-            return ResultCode.InvalidConfiguration if not valid_package_name(package) or not Archive::is_safe_entry(version) or not valid_digest(expected_metadata_digest)
+            return ResultCode.InvalidConfiguration if not valid_package_name(package) or not valid_package_version(version) or not valid_digest(expected_metadata_digest)
             return ResultCode.MalformedMetadata if metadata.count == 0.usize() or metadata.count > 1048576.usize() or not Json::valid_document(metadata) or not Json::unique_object_keys(metadata) or not metadata_root_object(metadata) or not metadata_allowed_fields(metadata)
             root: mutable darray[u8] = []
             return ResultCode.NotConfigured if not configured_root(&root)
@@ -444,7 +444,7 @@ module Registry:
             digest_out.resize(0)
             metadata_out.resize(0)
             archive_size_out <- 0
-            return ResultCode.InvalidConfiguration if not valid_package_name(package) or not Archive::is_safe_entry(selected)
+            return ResultCode.InvalidConfiguration if not valid_package_name(package) or not valid_package_version(selected)
             metadata_path: mutable darray[u8] = []
             return ResultCode.InvalidConfiguration if not join_path_version(root, package, selected, &metadata_path)
             metadata_path.push(47)
@@ -1051,6 +1051,10 @@ module Registry:
         def valid_package_name(package: darray[u8]&) -> bool:
             return PackageIdentity::valid_name(package)
 
+        def valid_package_version(version: darray[u8]&) -> bool:
+            parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
+            return PackageIdentity::parse_version(version, &parsed)
+
         def join_path_leaf(root: darray[u8]&, package: darray[u8]&, leaf: cstr, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
             out.resize(0)
             return false if root.count == 0 or not valid_registry_root(root)
@@ -1069,7 +1073,7 @@ module Registry:
 
         def join_path_version(root: darray[u8]&, package: darray[u8]&, version: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
             out.resize(0)
-            return false if version.count == 0 or not Archive::is_safe_entry(version)
+            return false if not valid_package_version(version)
             for index in 0..<root.count |out, root|:
                 out.push(root[index])
             out.push(47) if out.count == 0 or out[out.count - 1.usize()] != 47
@@ -1464,8 +1468,7 @@ module Registry:
             archive_out.resize(0)
             digest_out.resize(0)
             size_out <- 0.u64()
-            parsed_version: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-            return false if not PackageIdentity::parse_version(version, &parsed_version)
+            return false if not valid_package_version(version)
             schema: mutable u64 = 0
             return false if not metadata_integer(raw, "schema-version", &schema) or schema != 1
             registry: mutable darray[u8] = []
@@ -2059,7 +2062,7 @@ module Registry:
             return trust_state_record_internal(package, version, digest, metadata_digest, expires, true, generation, index_digest, index_identity, key_fingerprint)
 
         def trust_state_record_internal(package: darray[u8]&, version: darray[u8]&, digest: darray[u8]&, metadata_digest: darray[u8]&, expires: u64, guard_index: bool, index_generation: u64, index_digest: darray[u8]&, index_identity: darray[u8]&, key_fingerprint: darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
-            return ResultCode.InvalidConfiguration if not trust_state_identity_valid(package) or not Archive::is_safe_entry(version) or not valid_digest(digest) or not valid_digest(metadata_digest) or not guard_index and not valid_digest(key_fingerprint)
+            return ResultCode.InvalidConfiguration if not trust_state_identity_valid(package) or not valid_package_version(version) or not valid_digest(digest) or not valid_digest(metadata_digest) or not guard_index and not valid_digest(key_fingerprint)
             parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
             return ResultCode.InvalidConfiguration if not SemVer::parse(version, &parsed) or parsed.prerelease
             return ResultCode.InvalidConfiguration if guard_index and (index_generation == 0 or not valid_digest(index_digest) or not trust_state_identity_valid(index_identity))
@@ -2222,7 +2225,7 @@ module Registry:
             return trust_state_finish(lock_fd, ResultCode.Ok)
 
         def trust_state_verify(package: darray[u8]&, version: darray[u8]&, digest: darray[u8]&, metadata_digest: darray[u8]&, expires: u64) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
-            return ResultCode.InvalidConfiguration if not trust_state_identity_valid(package) or not Archive::is_safe_entry(version) or not valid_digest(digest) or not valid_digest(metadata_digest)
+            return ResultCode.InvalidConfiguration if not trust_state_identity_valid(package) or not valid_package_version(version) or not valid_digest(digest) or not valid_digest(metadata_digest)
             parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
             return ResultCode.InvalidConfiguration if not SemVer::parse(version, &parsed) or parsed.prerelease
             package_value: mutable darray[u8] = []
