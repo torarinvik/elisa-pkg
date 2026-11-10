@@ -350,8 +350,9 @@ publisher authorization.
 `cache verify` treats `.elisapkg/package.tar` and `.elisapkg/package.receipt` as
 an all-or-nothing pair. The receipt records the package identity, manifest
 digest, lock digest, and deterministic archive digest; verification re-reads the
-archive through the no-follow platform seam and recomputes every digest. A
-missing pair member, changed archive, changed lock, or changed manifest is a
+archive through the no-follow platform seam, validates its strict ustar
+structure, and recomputes every digest. A missing pair member, changed archive,
+changed lock, or changed manifest is a
 security failure rather than a cache miss. Before reporting success, it re-reads
 the manifest, lock, archive, and receipt, compares the manifest, lock, and
 receipt bytes with those verified earlier, and recomputes the archive digest.
