@@ -352,8 +352,12 @@ an all-or-nothing pair. The receipt records the package identity, manifest
 digest, lock digest, and deterministic archive digest; verification re-reads the
 archive through the no-follow platform seam and recomputes every digest. A
 missing pair member, changed archive, changed lock, or changed manifest is a
-security failure rather than a cache miss. The archive is also retained as a
-local content-addressed hard-link under `.elisapkg/cache/sha256/<prefix>/`; the
+security failure rather than a cache miss. Before reporting success, it re-reads
+the manifest, lock, archive, and receipt, compares the manifest, lock, and
+receipt bytes with those verified earlier, and recomputes the archive digest.
+Changes during the verification pass fail closed. The archive is also retained
+as a local content-addressed hard-link under
+`.elisapkg/cache/sha256/<prefix>/`; the
 same digest is recomputed from that blob, so a corrupted cache object cannot be
 consumed as a normal miss. Package publication flushes the cache directory after
 linking the verified blob and before publishing the receipt. When a package
