@@ -4631,8 +4631,10 @@ module Cli:
             if version.count > MAX_INSTALL_VERSION_BYTES:
                 write_error("error: local install package versions exceed the bounded receipt limit\n")
                 return EXIT_USAGE
-            if not InstallFaults::use_test_prebuilt_artifact():
-                return EXIT_BUILD if run_build(start, options) != EXIT_OK
+            use_prebuilt_artifact: bool = InstallFaults::use_test_prebuilt_artifact()
+            expected_build_digest: mutable darray[u8] = []
+            if not use_prebuilt_artifact:
+                return EXIT_BUILD if run_build_with_digest(start, options, &expected_build_digest) != EXIT_OK
             artifact: mutable darray[u8] = []
             target_name_c: mutable darray[u8] = []
             path_with_nul_into(&target_name, &target_name_c)
@@ -4649,6 +4651,9 @@ module Cli:
             digest_bytes: mutable darray[u8] = []
             digest: mutable darray[u8] = []
             return 7 if Integrity::sha256(artifact_bytes, &digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(digest_bytes, &digest)
+            if not use_prebuilt_artifact and (expected_build_digest.count != 64.usize() or not bytes_equal(digest, expected_build_digest)):
+                write_error("error: build output changed after compilation; refusing to install an unverified artifact\n")
+                return EXIT_BUILD
             bin_dir: mutable darray[u8] = []
             receipt_dir: mutable darray[u8] = []
             path_join_into(prefix, "bin", &bin_dir)
@@ -5963,6 +5968,11 @@ module Cli:
             return 0
 
         def run_build(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            artifact_digest: mutable darray[u8] = []
+            return run_build_with_digest(start, options, &artifact_digest)
+
+        def run_build_with_digest(start: darray[u8]&, options: Model::CommandOptions, out_artifact_digest: mutable darray[u8]&) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            out_artifact_digest.resize(0.usize())
             aggregate_source_name: mutable cstr = ""
             source_snapshot_roots: mutable darray[u8] = []
             source_snapshot_root: mutable darray[u8] = []
@@ -6383,6 +6393,8 @@ module Cli:
                                 write_ok("built .elisapkg/build/")
                                 write_bytes(1, &artifact_label)
                                 write_ok(" (cached)\n")
+                                for digest_index in 0..<cached_digest.count |out_artifact_digest, cached_digest|:
+                                    out_artifact_digest.push(cached_digest[digest_index])
                                 _ = options
                                 return EXIT_OK
                 # The lock digest includes every resolved local dependency identity and
@@ -6934,6 +6946,8 @@ module Cli:
                 write_ok("built .elisapkg/build/")
                 write_bytes(1, &artifact_label)
                 write_ok("\n")
+                for digest_index in 0..<artifact_digest.count |out_artifact_digest, artifact_digest|:
+                    out_artifact_digest.push(artifact_digest[digest_index])
                 _ = options
                 return EXIT_OK
 

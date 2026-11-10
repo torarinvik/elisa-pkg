@@ -315,7 +315,10 @@ no old installer is still running. `scripts/install_lock_regression.py` checks
 contending processes, crash release, persistent inode behavior, and rejection of
 symlinks, FIFOs, and directories.
 
-Install and uninstall write a durable per-prefix transaction journal before
+Local install carries the digest produced by its own successful build and
+checks the artifact bytes it reads from the build path against that digest, so
+a concurrent build cannot silently substitute a different output. Install and
+uninstall write a durable per-prefix transaction journal before
 changing a binary or receipt. The next operation recovers under the persistent
 kernel lock only when the journal, package identity, digest, receipt, and
 on-disk artifact agree; malformed or externally changed state fails closed
