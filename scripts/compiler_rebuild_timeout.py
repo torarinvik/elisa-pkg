@@ -79,12 +79,14 @@ def main() -> int:
         return_code = process.wait(timeout=max(0.0, deadline - time.monotonic()))
     except subprocess.TimeoutExpired:
         # The rebuild can spawn make, Go, or compiler children. Keep them in
-        # one session and terminate the whole process group at the deadline.
+        # one session and signal the whole process group at the deadline.
         terminate_process_group(process.pid)
-        process.wait()
+        # Reap the leader only if it has already exited. A blocking wait here
+        # would let an uninterruptible child defeat the wall-clock deadline.
+        process.poll()
         print(
             f"error: compiler rebuild exceeded its {TIMEOUT_SECONDS}-second "
-            "wall-clock limit; terminated its process group",
+            "wall-clock limit; sent SIGKILL to its process group",
             file=sys.stderr,
         )
         return 124
@@ -94,10 +96,10 @@ def main() -> int:
     # only the command whose PID Popen tracks.
     if not wait_for_process_group_exit(process.pid, deadline):
         terminate_process_group(process.pid)
-        process.wait()
+        process.poll()
         print(
             f"error: compiler rebuild exceeded its {TIMEOUT_SECONDS}-second "
-            "wall-clock limit; terminated its process group",
+            "wall-clock limit; sent SIGKILL to its process group",
             file=sys.stderr,
         )
         return 124
