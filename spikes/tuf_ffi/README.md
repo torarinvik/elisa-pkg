@@ -72,8 +72,10 @@ Elisa ABI, including snapshot pin length and digest, top-level target and
 delegation counts, and package archive length and digest. Package probes cover
 published and yanked results, distinct revoked-target rejection, a mismatched
 registry, an unlisted version path, and a delegated bad signature; failure
-cases assert that output values are not committed. These fixtures exist only
-in the private temporary directory and are signed with fresh ephemeral keys.
+cases assert that output values are not committed. Top-level Targets cases also
+reject a direct package target and a package delegation whose path names a
+different package. These fixtures exist only in the private temporary
+directory and are signed with fresh ephemeral keys.
 
 Top-level Targets verification bounds target records, rejects direct package
 targets, and checks package delegation names, paths, key IDs, and thresholds.

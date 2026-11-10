@@ -312,11 +312,30 @@ fn main() {
     let archive_bytes = b"elisapkg test-only archive";
     let archive_digest = sha256_hex(archive_bytes);
     let target_path = format!("packages/demo/1.2.3/{archive_digest}.tar");
-    let top_targets_signed_value = top_targets_signed(&id4, entry4);
+    let top_targets_signed_value = top_targets_signed(&id4, entry4.clone());
     let top_targets = envelope(
         top_targets_signed_value.clone(),
         vec![signature(&top_targets_signed_value, &id3, &key3)],
     );
+
+    let mut direct_package_targets_signed = top_targets_signed(&id4, entry4.clone());
+    direct_package_targets_signed["targets"][target_path.as_str()] = json!({
+        "length": archive_bytes.len(),
+        "hashes": { "sha256": archive_digest },
+    });
+    let direct_package_targets = envelope(
+        direct_package_targets_signed.clone(),
+        vec![signature(&direct_package_targets_signed, &id3, &key3)],
+    );
+
+    let mut wrong_scope_targets_signed = top_targets_signed(&id4, entry4);
+    wrong_scope_targets_signed["delegations"]["roles"][0]["paths"] =
+        json!(["packages/other/*/*.tar"]);
+    let wrong_scope_targets = envelope(
+        wrong_scope_targets_signed.clone(),
+        vec![signature(&wrong_scope_targets_signed, &id3, &key3)],
+    );
+
     for (prefix, status, corrupt_signature) in [
         ("published", "published", false),
         ("yanked", "yanked", false),
@@ -338,4 +357,32 @@ fn main() {
             &key4,
         );
     }
+    write_package_chain(
+        &directory,
+        "direct-package",
+        "published",
+        false,
+        &id3,
+        &key3,
+        &direct_package_targets,
+        &target_path,
+        &archive_digest,
+        archive_bytes.len(),
+        &id4,
+        &key4,
+    );
+    write_package_chain(
+        &directory,
+        "wrong-scope",
+        "published",
+        false,
+        &id3,
+        &key3,
+        &wrong_scope_targets,
+        &target_path,
+        &archive_digest,
+        archive_bytes.len(),
+        &id4,
+        &key4,
+    );
 }
