@@ -252,8 +252,10 @@ VCS metadata components (`.git`, `.hg`, `.svn`) and every file or directory
 named `IMPLEMENTATION_PLAN.md` are excluded from the digest and denied to the
 compiler at any depth, with ASCII case-insensitive matching. Only the unique
 private scratch directory and its exact compiler output are reallowed. The
-source walker also fails closed on symlinks instead of omitting them from the
-digest while allowing the compiler's include reader to follow them. The
+source walker also fails closed on symlinks, special files, and path-probe
+failures instead of omitting them from the digest while allowing the compiler's
+include reader to observe a different tree. A directory/file type change
+between the descriptor-relative probes stops enumeration. The
 read-only snapshot root is also explicitly reallowed after its source-state
 and credential denials; writable scratch remains a separate sibling tree.
 

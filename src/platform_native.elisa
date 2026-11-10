@@ -2449,17 +2449,6 @@ module PlatformNative:
             raw: mutable void& = (&stat[0]).cast[mutable void&] can Unsafe.PointerCast
             return native_fstat(fd, raw) == 0 and (read_u16(stat, stat_mode_offset) & 61440.u64()) == regular_mode
 
-        def expected_non_file_errno(value: i64) -> bool:
-            # ENOTDIR/EISDIR cover ordinary files and directories. ELOOP is
-            # deliberately not an expected skip: source collection must fail
-            # closed on symlinks because the compiler's include reader follows
-            # them, while this walker cannot bind their targets into the digest.
-            static if ELISA_TARGET_OS_MACOS:
-                return value == 20 or value == 21
-            static elif ELISA_TARGET_OS_LINUX:
-                return value == 20 or value == 21
-            return false
-
         def limit_bytes(value: i64) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
             out: mutable darray[u8] = []
             out.resize(16)
@@ -2953,8 +2942,11 @@ module PlatformNative:
                         else:
                             file_probe: i64 = open_package_file(child_name)
                             if file_probe < 0:
-                                return directory_failure(stream) if not expected_non_file_errno(-file_probe)
-                                continue
+                                # The directory probe already ruled out a
+                                # stable directory. Any failed file open means
+                                # the entry changed or was unsafe; skipping it
+                                # would produce an incomplete source digest.
+                                return directory_failure(stream)
                             regular: bool = regular_fd(file_probe)
                             close_status: i64 = native_close(file_probe)
                             return directory_failure(stream) if not regular or close_status != 0
