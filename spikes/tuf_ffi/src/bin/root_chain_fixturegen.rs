@@ -273,7 +273,7 @@ fn main() {
         ],
     );
 
-    let expired_root_signed = root_signed_with_expiry(4, &id3, entry3, EXPIRED);
+    let expired_root_signed = root_signed_with_expiry(4, &id3, entry3.clone(), EXPIRED);
     let expired_root = envelope(
         expired_root_signed.clone(),
         vec![signature(&expired_root_signed, &id3, &key3)],
@@ -313,35 +313,39 @@ fn main() {
     let archive_digest = sha256_hex(archive_bytes);
     let target_path = format!("packages/demo/1.2.3/{archive_digest}.tar");
     let top_targets_signed_value = top_targets_signed(&id4, entry4.clone());
-    let top_targets = envelope(
-        top_targets_signed_value.clone(),
-        vec![signature(&top_targets_signed_value, &id3, &key3)],
-    );
-
     let mut direct_package_targets_signed = top_targets_signed(&id4, entry4.clone());
     direct_package_targets_signed["targets"][target_path.as_str()] = json!({
         "length": archive_bytes.len(),
         "hashes": { "sha256": archive_digest },
     });
-    let direct_package_targets = envelope(
-        direct_package_targets_signed.clone(),
-        vec![signature(&direct_package_targets_signed, &id3, &key3)],
-    );
-
-    let mut wrong_scope_targets_signed = top_targets_signed(&id4, entry4);
+    let mut wrong_scope_targets_signed = top_targets_signed(&id4, entry4.clone());
     wrong_scope_targets_signed["delegations"]["roles"][0]["paths"] =
         json!(["packages/other/*/*.tar"]);
-    let wrong_scope_targets = envelope(
-        wrong_scope_targets_signed.clone(),
-        vec![signature(&wrong_scope_targets_signed, &id3, &key3)],
-    );
+    let mut non_terminating_targets_signed = top_targets_signed(&id4, entry4.clone());
+    non_terminating_targets_signed["delegations"]["roles"][0]["terminating"] = json!(false);
+    let mut zero_threshold_targets_signed = top_targets_signed(&id4, entry4.clone());
+    zero_threshold_targets_signed["delegations"]["roles"][0]["threshold"] = json!(0);
+    let mut duplicate_key_targets_signed = top_targets_signed(&id4, entry4.clone());
+    duplicate_key_targets_signed["delegations"]["roles"][0]["keyids"] =
+        json!([id4.clone(), id4.clone()]);
 
-    for (prefix, status, corrupt_signature) in [
-        ("published", "published", false),
-        ("yanked", "yanked", false),
-        ("revoked", "revoked", false),
-        ("bad-signature", "published", true),
-    ] {
+    let valid_top_targets_profiles = [
+        ("published", top_targets_signed_value.clone()),
+        ("yanked", top_targets_signed_value.clone()),
+        ("revoked", top_targets_signed_value.clone()),
+        ("bad-signature", top_targets_signed_value.clone()),
+    ];
+    for (prefix, signed_targets) in valid_top_targets_profiles {
+        let top_targets = envelope(
+            signed_targets.clone(),
+            vec![signature(&signed_targets, &id3, &key3)],
+        );
+        let (status, corrupt_signature) = match prefix {
+            "published" => ("published", false),
+            "yanked" => ("yanked", false),
+            "revoked" => ("revoked", false),
+            _ => ("published", true),
+        };
         write_package_chain(
             &directory,
             prefix,
@@ -357,32 +361,31 @@ fn main() {
             &key4,
         );
     }
-    write_package_chain(
-        &directory,
-        "direct-package",
-        "published",
-        false,
-        &id3,
-        &key3,
-        &direct_package_targets,
-        &target_path,
-        &archive_digest,
-        archive_bytes.len(),
-        &id4,
-        &key4,
-    );
-    write_package_chain(
-        &directory,
-        "wrong-scope",
-        "published",
-        false,
-        &id3,
-        &key3,
-        &wrong_scope_targets,
-        &target_path,
-        &archive_digest,
-        archive_bytes.len(),
-        &id4,
-        &key4,
-    );
+
+    for (prefix, signed_targets) in [
+        ("direct-package", direct_package_targets_signed),
+        ("wrong-scope", wrong_scope_targets_signed),
+        ("non-terminating", non_terminating_targets_signed),
+        ("zero-threshold", zero_threshold_targets_signed),
+        ("duplicate-delegation-key", duplicate_key_targets_signed),
+    ] {
+        let top_targets = envelope(
+            signed_targets.clone(),
+            vec![signature(&signed_targets, &id3, &key3)],
+        );
+        write_package_chain(
+            &directory,
+            prefix,
+            "published",
+            false,
+            &id3,
+            &key3,
+            &top_targets,
+            &target_path,
+            &archive_digest,
+            archive_bytes.len(),
+            &id4,
+            &key4,
+        );
+    }
 }
