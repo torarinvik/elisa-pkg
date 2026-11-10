@@ -1627,6 +1627,7 @@ module PlatformNative:
             return flag_read_only + flag_no_follow + flag_close_on_exec + flag_nonblock
 
         def open_regular_file_at_pinned(directory: i64, leaf_name: cstr, before: darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return -22 if not package_leaf_component_safe(leaf_name)
             pin_flags: i64 = linux_open_path + flag_no_follow + flag_close_on_exec
             pinned: i64 = native_openat(directory, leaf_name, pin_flags)
             return negative_errno() if pinned < 0
@@ -1675,12 +1676,24 @@ module PlatformNative:
                 return -5 if close_status != 0 else -13
             return reopened
 
+        # openat treats slash-containing names as paths and `O_NOFOLLOW` only
+        # protects the final component. Keep these helpers limited to one
+        # ordinary component so callers cannot smuggle traversal through a
+        # supposedly descriptor-relative leaf.
+        def package_leaf_component_safe(name: cstr) -> bool:
+            length: usize = native_strlen(name)
+            return false if length == 0 or length > 4096 or cstr_equal(name, ".") or cstr_equal(name, "..")
+            for index in 0..<length |name|:
+                return false if name[index].u8() == 47
+            return true
+
         # Pin a candidate without invoking a device driver's open operation.
         # Linux uses OPENAT2_REGULAR where available and an O_PATH + procfs
         # reopen fallback on older kernels. macOS has no O_PATH equivalent,
         # so its protected-parent policy combines pre-stat, O_NOFOLLOW, and a
         # post-open inode comparison.
         def open_regular_file_at(directory: i64, leaf_name: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return -22 if not package_leaf_component_safe(leaf_name)
             before: mutable darray[u8] = []
             before.resize(144)
             before_raw: mutable void& = (&before[0]).cast[mutable void&] can Unsafe.PointerCast
@@ -1888,6 +1901,7 @@ module PlatformNative:
             return directory
 
         def open_package_directory_component(directory: i64, component: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return -22 if not package_leaf_component_safe(component)
             before: mutable darray[u8] = []
             before.resize(144)
             before_raw: mutable void& = (&before[0]).cast[mutable void&] can Unsafe.PointerCast
@@ -2853,6 +2867,7 @@ module PlatformNative:
                     finish <- finish + 1.usize()
                 path_out[finish] <- 0
                 component: cstr = (&path_out[start]).cast[cstr] can Unsafe.PointerCast
+                return close_error(directory, -22) if not package_leaf_component_safe(component)
                 created: mutable bool = false
                 if create_missing:
                     mkdir_status: i32 = native_mkdirat(directory, component, 448)
