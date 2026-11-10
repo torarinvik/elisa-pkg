@@ -25,9 +25,10 @@ registry support is implemented or ready to enable.
   in Elisa, prove conformance with independently generated fixtures,
   differential vectors against a separate TUF implementation, fuzzing, and
   independent review. Never substitute the local detached-signature fixture.
-- Reject duplicate JSON object keys, invalid UTF-8, floating-point values,
-  noncanonical integer encodings, malformed timestamps, and metadata exceeding
-  configured size, role-count, delegation-depth, or target-count bounds before
+- Reject duplicate JSON object keys, invalid UTF-8, unpaired UTF-16 surrogate
+  escapes, floating-point values, noncanonical integer encodings, malformed
+  timestamps, and metadata exceeding configured size, role-count,
+  delegation-depth, or target-count bounds before
   it can affect trust state. Preserve and authenticate fields as required by
   TUF. In `custom.elisapkg`, accept only fields defined by its schema version;
   reject unknown fields that could alter package semantics. Require every role

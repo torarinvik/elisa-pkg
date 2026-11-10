@@ -90,10 +90,27 @@ module Json:
                             escape: u8 = raw[cursor]
                             if escape == 117:
                                 return false if cursor + 4.usize() >= raw.count
+                                code_unit: mutable u64 = 0.u64()
                                 for digit in 1..<5 |raw, cursor|:
-                                    code: u8 = raw[cursor + digit]
-                                    return false if not ((code >= 48 and code <= 57) or (code >= 65 and code <= 70) or (code >= 97 and code <= 102))
-                                cursor <- cursor + 5.usize()
+                                    nibble: i64 = json_hex_nibble(raw[cursor + digit])
+                                    return false if nibble < 0
+                                    code_unit <- code_unit * 16.u64() + nibble.u64()
+                                if code_unit >= 55296.u64() and code_unit <= 56319.u64():
+                                    # UTF-16 high surrogates must be followed
+                                    # immediately by one escaped low surrogate.
+                                    # Accepting isolated code units lets JSON
+                                    # consumers disagree about the signed text.
+                                    return false if cursor + 10.usize() >= raw.count or raw[cursor + 5.usize()] != 92 or raw[cursor + 6.usize()] != 117
+                                    low_surrogate: mutable u64 = 0.u64()
+                                    for digit in 7..<11 |raw, cursor|:
+                                        nibble: i64 = json_hex_nibble(raw[cursor + digit])
+                                        return false if nibble < 0
+                                        low_surrogate <- low_surrogate * 16.u64() + nibble.u64()
+                                    return false if low_surrogate < 56320.u64() or low_surrogate > 57343.u64()
+                                    cursor <- cursor + 11.usize()
+                                else:
+                                    return false if code_unit >= 56320.u64() and code_unit <= 57343.u64()
+                                    cursor <- cursor + 5.usize()
                             else:
                                 return false if escape != 34 and escape != 92 and escape != 47 and escape != 98 and escape != 102 and escape != 110 and escape != 114 and escape != 116
                                 cursor <- cursor + 1.usize()
@@ -237,6 +254,12 @@ module Json:
 
         def is_continuation(byte: u8) -> bool:
             return byte >= 128 and byte <= 191
+
+        def json_hex_nibble(byte: u8) -> i64:
+            return (byte - 48).i64() if byte >= 48 and byte <= 57
+            return (byte - 55).i64() if byte >= 65 and byte <= 70
+            return (byte - 87).i64() if byte >= 97 and byte <= 102
+            return -1
 
         def key_hash(raw: darray[u8]&, start: usize, end: usize) -> u32:
             hash: mutable u32 = 2166136261.u32()
