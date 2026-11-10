@@ -66,11 +66,17 @@ verifies two consecutive rotations through the Elisa ABI, and checks final-root
 expiry separately, including equality and subsecond boundaries. It verifies a
 timestamp signature and authenticated snapshot pin, rejects an expired or
 exact-boundary timestamp, and rejects a skipped root version, invalid
-signature, and expired final root. The Rust ABI now has snapshot-chain,
-authenticated pin lookup, top-level Targets verification, and package-target
-verification entry points; the probe does not yet exercise them. Top-level
-Targets verification bounds target records, rejects direct package targets,
-and checks package delegation names, paths, key IDs, and thresholds.
+signature, and expired final root. It now also verifies a generated
+root → timestamp → snapshot → Targets → package-delegation chain through the
+Elisa ABI, including snapshot pin length and digest, top-level target and
+delegation counts, and package archive length and digest. Package probes cover
+published and yanked results, distinct revoked-target rejection, a mismatched
+registry, an unlisted version path, and a delegated bad signature; failure
+cases assert that output values are not committed. These fixtures exist only
+in the private temporary directory and are signed with fresh ephemeral keys.
+
+Top-level Targets verification bounds target records, rejects direct package
+targets, and checks package delegation names, paths, key IDs, and thresholds.
 Package-target verification checks one caller-specified path under the
 `package-<name>` delegated role against its snapshot pin and delegated
 signature threshold, requires one archive per exact version, checks the
@@ -80,6 +86,5 @@ status. Revoked selections fail with a distinct status. The FFI rejects
 malformed stable SemVer requirement syntax. Elisa still has to evaluate the
 dependency and compiler requirements, enumerate all candidates through the
 authenticated role, and compare dependencies with the packaged manifest.
-Signature-threshold edge cases, durable root
-checkpointing, and injected write-failure tests also remain required before
-any integration is considered.
+Signature-threshold edge cases, durable root checkpointing, and injected
+write-failure tests also remain required before any integration is considered.

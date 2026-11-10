@@ -5,6 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use aws_lc_rs::{
+    digest,
     rand::SystemRandom,
     signature::{Ed25519KeyPair, KeyPair as AwsKeyPair},
 };
@@ -88,13 +89,160 @@ fn timestamp_signed(version: u64, expires: &str) -> Value {
     })
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(digest::digest(&digest::SHA256, bytes).as_ref())
+}
+
+fn metadata_pin(version: u64, bytes: &[u8]) -> Value {
+    json!({
+        "version": version,
+        "length": bytes.len(),
+        "hashes": { "sha256": sha256_hex(bytes) },
+    })
+}
+
+fn top_targets_signed(delegated_key_id: &str, delegated_key: Value) -> Value {
+    let profile_bytes = b"TUF test profile";
+    json!({
+        "_type": "targets",
+        "spec_version": "1.0.0",
+        "version": 1,
+        "expires": FAR_FUTURE,
+        "targets": {
+            "metadata/profile.json": {
+                "length": profile_bytes.len(),
+                "hashes": { "sha256": sha256_hex(profile_bytes) },
+            }
+        },
+        "delegations": {
+            "keys": { delegated_key_id: delegated_key },
+            "roles": [{
+                "name": "package-demo",
+                "keyids": [delegated_key_id],
+                "threshold": 1,
+                "terminating": true,
+                "paths": ["packages/demo/*/*.tar"],
+            }],
+        },
+    })
+}
+
+fn package_targets_signed(
+    target_path: &str,
+    archive_digest: &str,
+    archive_length: usize,
+    registry: &str,
+    status: &str,
+) -> Value {
+    json!({
+        "_type": "targets",
+        "spec_version": "1.0.0",
+        "version": 1,
+        "expires": FAR_FUTURE,
+        "targets": {
+            target_path: {
+                "length": archive_length,
+                "hashes": { "sha256": archive_digest },
+                "custom": {
+                    "elisapkg": {
+                        "schema-version": 1,
+                        "registry": registry,
+                        "package": "demo",
+                        "version": "1.2.3",
+                        "dependencies": [],
+                        "elisa": "^1.0.0",
+                        "archive-format": "ustar-v1",
+                        "status": status,
+                    }
+                },
+            }
+        },
+    })
+}
+
+fn write_package_chain(
+    directory: &Path,
+    prefix: &str,
+    status: &str,
+    corrupt_delegated_signature: bool,
+    root_key_id: &str,
+    root_key: &FixtureKeyPair,
+    top_targets: &[u8],
+    target_path: &str,
+    archive_digest: &str,
+    archive_length: usize,
+    delegated_key_id: &str,
+    delegated_key: &FixtureKeyPair,
+) {
+    let delegated_signed = package_targets_signed(
+        target_path,
+        archive_digest,
+        archive_length,
+        "primary",
+        status,
+    );
+    let mut delegated_signature = signature(&delegated_signed, delegated_key_id, delegated_key);
+    if corrupt_delegated_signature {
+        delegated_signature["sig"] = json!("00".repeat(64));
+    }
+    let delegated_targets = envelope(delegated_signed, vec![delegated_signature]);
+
+    let snapshot_signed = json!({
+        "_type": "snapshot",
+        "spec_version": "1.0.0",
+        "version": 1,
+        "expires": FAR_FUTURE,
+        "meta": {
+            "targets.json": metadata_pin(1, top_targets),
+            "package-demo.json": metadata_pin(1, &delegated_targets),
+        },
+    });
+    let snapshot = envelope(
+        snapshot_signed.clone(),
+        vec![signature(&snapshot_signed, root_key_id, root_key)],
+    );
+
+    let timestamp_signed = json!({
+        "_type": "timestamp",
+        "spec_version": "1.0.0",
+        "version": 1,
+        "expires": FAR_FUTURE,
+        "meta": { "snapshot.json": metadata_pin(1, &snapshot) },
+    });
+    let timestamp = envelope(
+        timestamp_signed.clone(),
+        vec![signature(&timestamp_signed, root_key_id, root_key)],
+    );
+
+    write_fixture(
+        directory,
+        &format!("{prefix}-timestamp.json"),
+        &timestamp,
+    );
+    write_fixture(
+        directory,
+        &format!("{prefix}-snapshot.json"),
+        &snapshot,
+    );
+    write_fixture(
+        directory,
+        &format!("{prefix}-targets.json"),
+        top_targets,
+    );
+    write_fixture(
+        directory,
+        &format!("{prefix}-package-demo.json"),
+        &delegated_targets,
+    );
+}
+
 fn envelope(signed: Value, signatures: Vec<Value>) -> Vec<u8> {
     serde_json::to_vec(&json!({ "signed": signed, "signatures": signatures }))
         .expect("metadata envelope")
 }
 
 fn write_fixture(directory: &Path, name: &str, contents: &[u8]) {
-    fs::write(directory.join(name), contents).expect("write generated root fixture");
+    fs::write(directory.join(name), contents).expect("write generated TUF fixture");
 }
 
 fn main() {
@@ -107,9 +255,11 @@ fn main() {
     let key1 = FixtureKeyPair::generate();
     let key2 = FixtureKeyPair::generate();
     let key3 = FixtureKeyPair::generate();
+    let key4 = FixtureKeyPair::generate();
     let (id1, entry1) = key_entry(&key1);
     let (id2, entry2) = key_entry(&key2);
     let (id3, entry3) = key_entry(&key3);
+    let (id4, entry4) = key_entry(&key4);
 
     let root1_signed = root_signed(1, &id1, entry1);
     let root1 = envelope(
@@ -170,4 +320,34 @@ fn main() {
         "timestamp-expiry-boundary.json",
         &boundary_timestamp,
     );
+
+    let archive_bytes = b"elisapkg test-only archive";
+    let archive_digest = sha256_hex(archive_bytes);
+    let target_path = format!("packages/demo/1.2.3/{archive_digest}.tar");
+    let top_targets_signed_value = top_targets_signed(&id4, entry4);
+    let top_targets = envelope(
+        top_targets_signed_value.clone(),
+        vec![signature(&top_targets_signed_value, &id3, &key3)],
+    );
+    for (prefix, status, corrupt_signature) in [
+        ("published", "published", false),
+        ("yanked", "yanked", false),
+        ("revoked", "revoked", false),
+        ("bad-signature", "published", true),
+    ] {
+        write_package_chain(
+            &directory,
+            prefix,
+            status,
+            corrupt_signature,
+            &id3,
+            &key3,
+            &top_targets,
+            &target_path,
+            &archive_digest,
+            archive_bytes.len(),
+            &id4,
+            &key4,
+        );
+    }
 }

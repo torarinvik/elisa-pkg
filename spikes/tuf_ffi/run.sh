@@ -39,6 +39,7 @@ mkdir -m 700 "$WORK/fixtures"
 "$CARGO_BIN" run --locked --release --manifest-path "$SPIKE/Cargo.toml" --bin root_chain_fixturegen -- "$WORK/fixtures"
 
 python3 - "$SPIKE/abi_probe.elisa.in" "$WORK/fixtures/root3.json" "$SPIKE/testdata/github-root.json" "$WORK/fixtures" "$WORK/abi_probe.elisa" <<'PY'
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -114,6 +115,22 @@ duplicate_signature_timestamp = json.dumps(
     timestamp_document_with_duplicate_signature, separators=(",", ":")
 ).encode()
 
+published_delegated_path = fixture_dir / "published-package-demo.json"
+published_delegated_bytes = published_delegated_path.read_bytes()
+published_delegated_document = json.loads(published_delegated_bytes)
+package_target_path = next(iter(published_delegated_document["signed"]["targets"]))
+archive_record = published_delegated_document["signed"]["targets"][package_target_path]
+if package_target_path.split("/")[:3] != ["packages", "demo", "1.2.3"]:
+    raise SystemExit("generated package fixture has an unexpected target path")
+if archive_record["length"] <= 0 or archive_record["hashes"].get("sha256") not in package_target_path:
+    raise SystemExit("generated package fixture path does not bind its archive digest")
+bad_target_path = package_target_path.replace("/1.2.3/", "/1.2.4/")
+if bad_target_path == package_target_path:
+    raise SystemExit("generated package fixture path could not be altered for the negative probe")
+
+def fixture_bytes(prefix, suffix):
+    return (fixture_dir / f"{prefix}-{suffix}.json").read_bytes()
+
 replacements = {
     "@@ROOT_BYTES@@": ", ".join(map(str, raw)),
     "@@ROOT_VERSION@@": str(signed["version"]),
@@ -136,6 +153,29 @@ replacements = {
     "@@OVERSIZED_ROLE_ROOT2_BYTES@@": ", ".join(map(str, oversized_role_root2)),
     "@@OVERSIZED_ROOT_KEYS_BYTES@@": ", ".join(map(str, oversized_root_keys)),
     "@@DUPLICATE_SIGNATURE_TIMESTAMP_BYTES@@": ", ".join(map(str, duplicate_signature_timestamp)),
+    "@@PUBLISHED_TIMESTAMP_BYTES@@": ", ".join(map(str, fixture_bytes("published", "timestamp"))),
+    "@@PUBLISHED_SNAPSHOT_BYTES@@": ", ".join(map(str, fixture_bytes("published", "snapshot"))),
+    "@@PUBLISHED_TARGETS_BYTES@@": ", ".join(map(str, fixture_bytes("published", "targets"))),
+    "@@PUBLISHED_DELEGATED_TARGETS_BYTES@@": ", ".join(map(str, published_delegated_bytes)),
+    "@@YANKED_TIMESTAMP_BYTES@@": ", ".join(map(str, fixture_bytes("yanked", "timestamp"))),
+    "@@YANKED_SNAPSHOT_BYTES@@": ", ".join(map(str, fixture_bytes("yanked", "snapshot"))),
+    "@@YANKED_DELEGATED_TARGETS_BYTES@@": ", ".join(map(str, fixture_bytes("yanked", "package-demo"))),
+    "@@REVOKED_TIMESTAMP_BYTES@@": ", ".join(map(str, fixture_bytes("revoked", "timestamp"))),
+    "@@REVOKED_SNAPSHOT_BYTES@@": ", ".join(map(str, fixture_bytes("revoked", "snapshot"))),
+    "@@REVOKED_DELEGATED_TARGETS_BYTES@@": ", ".join(map(str, fixture_bytes("revoked", "package-demo"))),
+    "@@BAD_SIGNATURE_TIMESTAMP_BYTES@@": ", ".join(map(str, fixture_bytes("bad-signature", "timestamp"))),
+    "@@BAD_SIGNATURE_SNAPSHOT_BYTES@@": ", ".join(map(str, fixture_bytes("bad-signature", "snapshot"))),
+    "@@BAD_SIGNATURE_DELEGATED_TARGETS_BYTES@@": ", ".join(map(str, fixture_bytes("bad-signature", "package-demo"))),
+    "@@PACKAGE_TARGET_PATH_BYTES@@": ", ".join(map(str, package_target_path.encode())),
+    "@@BAD_TARGET_PATH_BYTES@@": ", ".join(map(str, bad_target_path.encode())),
+    "@@ARCHIVE_LENGTH@@": str(archive_record["length"]),
+    "@@ARCHIVE_SHA256_BYTES@@": ", ".join(
+        str(value) for value in bytes.fromhex(archive_record["hashes"]["sha256"])
+    ),
+    "@@DELEGATED_TARGETS_LENGTH@@": str(len(published_delegated_bytes)),
+    "@@DELEGATED_TARGETS_SHA256_BYTES@@": ", ".join(
+        str(value) for value in hashlib.sha256(published_delegated_bytes).digest()
+    ),
     "@@TAMPERED_ROOT2_BYTES@@": ", ".join(map(str, tampered_root2)),
     "@@UNSUPPORTED_ROOT2_BYTES@@": ", ".join(map(str, unsupported_root2)),
 }
