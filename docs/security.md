@@ -254,9 +254,10 @@ checks retain the separate toolchain-directory policy, including its narrow
 euid-owned Homebrew `admin`-group exception; package-source reads do not inherit
 that exception.
 
-Linux uses `openat2(OPENAT2_REGULAR)` when supported. On older kernels it pins
-the leaf with `O_PATH`, checks the pinned inode, then reopens that inode through
-`/proc/self/fd`; it fails closed if procfs is unavailable. macOS has no
+Linux uses `openat2` with `O_NOFOLLOW` and
+`RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS`. If the syscall or flags are unavailable,
+it pins the leaf with `O_PATH`, checks the pinned inode, then reopens that inode
+through `/proc/self/fd`; it fails closed if procfs is unavailable. macOS has no
 equivalent metadata-only open, so it combines the pre-open no-follow stat,
 `O_NOFOLLOW|O_NONBLOCK`, and the post-open inode comparison. This closes the
 stable device-node case and prevents cross-user mutation through ordinary
