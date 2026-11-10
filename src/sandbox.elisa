@@ -118,6 +118,12 @@ module Sandbox:
             bytes_push_view(&profile, "))\n(deny file-map-executable (subpath ")
             return [] if not append_quoted_path(&profile, home_real)
             bytes_push_view(&profile, "))\n")
+            # `/usr` is a system root, but `/usr/local` is commonly writable
+            # by the invoking user (including Intel Homebrew). Do not inherit
+            # that entire prefix as a compiler-readable system directory.
+            # Selected toolchain files and recognized LLVM roots are granted
+            # back individually after this denial.
+            bytes_push_view(&profile, "(deny file-read* (subpath \"/usr/local\"))\n")
             bytes_push_view(&profile, "(deny file-read* (subpath \"/private/tmp\"))\n(deny file-write* (subpath \"/private/tmp\"))\n")
 
             return [] if not append_read_root(&profile, project_real)
@@ -133,6 +139,13 @@ module Sandbox:
                 root: mutable darray[u8] = []
                 return [] if not next_root(tool_roots, &root_cursor, &root)
                 return [] if not append_read_root(&profile, root)
+            for index in 0..<tool_paths.count |tool_paths, profile|:
+                return [] if not append_tool_file_read(&profile, tool_paths[index])
+            local_clang_after_denial: mutable darray[u8] = []
+            if canonical_path("/usr/local/opt/llvm/bin/clang", &local_clang_after_denial) and tool_path_is_selected(tool_paths, local_clang_after_denial):
+                return [] if not append_read_alias_root(&profile, "/usr/local/opt/llvm/lib")
+                return [] if not append_homebrew_llvm_dependency(&profile, "/usr/local", "z3", home_real)
+                return [] if not append_homebrew_llvm_dependency(&profile, "/usr/local", "zstd", home_real)
             for index in 0..<tool_paths.count |tool_paths, profile|:
                 return [] if not append_toolchain_library_root(&profile, tool_paths[index], home_real)
 
@@ -289,6 +302,16 @@ module Sandbox:
                 return true if path[index].u8() == 47
             return false
 
+        def append_tool_file_read(out: mutable darray[u8]&, path: cstr) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return true if Platform::pkg_strlen(path) == 0.usize() or not path_contains_slash(path)
+            canonical: mutable darray[u8] = []
+            return false if not canonical_path(path, &canonical)
+            path_bytes: mutable darray[u8] = []
+            bytes_push_view(&path_bytes, path)
+            if absolute_path(path_bytes) and not bytes_equal(path_bytes, canonical):
+                return false if not append_literal_rule(out, "file-read*", path_bytes)
+            return append_literal_rule(out, "file-read*", canonical)
+
         def parent_directory(path: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
             out.resize(0)
             return false if not absolute_path(path)
@@ -354,14 +377,22 @@ module Sandbox:
             bytes_push_array(&root, directory)
             if leaf_is(directory, "bin") and (leaf_is(canonical, "elisac-stage1") or leaf_is_clang_tool(canonical)):
                 candidate: mutable darray[u8] = []
-                if parent_directory(directory, &candidate) and not path_is_same_or_ancestor(candidate, home):
+                if parent_directory(directory, &candidate) and not path_is_same_or_ancestor(candidate, home) and not is_usr_local_root(candidate):
                     root <- candidate
             elif leaf_is(directory, "scripts") and leaf_is(canonical, "elisac_stage1.sh"):
                 candidate: mutable darray[u8] = []
-                if parent_directory(directory, &candidate) and not path_is_same_or_ancestor(candidate, home):
+                if parent_directory(directory, &candidate) and not path_is_same_or_ancestor(candidate, home) and not is_usr_local_root(candidate):
                     root <- candidate
             return true if path_is_same_or_ancestor(root, home)
+            return true if is_usr_local_root(root)
             append_root(roots, root)
+            return true
+
+        def is_usr_local_root(path: darray[u8]&) -> bool:
+            return false if path.count != 10.usize()
+            expected: cstr = "/usr/local"
+            for index in 0..<10.usize() |path, expected|:
+                return false if path[index] != expected[index].u8()
             return true
 
         def append_toolchain_library_root(out: mutable darray[u8]&, path: cstr, home: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
