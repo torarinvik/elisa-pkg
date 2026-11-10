@@ -1,11 +1,68 @@
-# Manifest policy surface. Parsing and schema validation remain in the command
-# implementation for now; archive path policy is shared through one reviewed
-# module so target and extraction callers cannot drift.
+# Shared package-manifest policy. Keep field-name rules beside the manifest
+# module so project validation and registry archive validation cannot drift.
 
 include "./archive.elisa"
+include "./json.elisa"
+include "./package_identity.elisa"
 
 module Manifest:
     public:
+        # Scan field-name tokens after JSON structural validation. This is a
+        # policy check, not a JSON parser: callers must first run
+        # Json::valid_document and Json::unique_object_keys.
+        def allowed_keys(raw: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            in_string: mutable bool = false
+            escaped: mutable bool = false
+            string_start: mutable usize = 0.usize()
+            braces: mutable i64 = 0
+            brackets: mutable i64 = 0
+            dependency_depth: mutable i64 = 0
+            pending_dependency_object: mutable bool = false
+            for index in 0..<raw.count |raw, in_string, escaped, string_start, braces, brackets, dependency_depth, pending_dependency_object|:
+                byte: u8 = raw[index]
+                if not in_string:
+                    if byte == 34:
+                        in_string <- true
+                        string_start <- index + 1.usize()
+                    elif byte == 123:
+                        braces <- braces + 1
+                        dependency_depth <- braces if pending_dependency_object
+                        pending_dependency_object <- false
+                    elif byte == 125:
+                        dependency_depth <- 0 if dependency_depth == braces
+                        braces <- braces - 1
+                    elif byte == 91:
+                        brackets <- brackets + 1
+                    elif byte == 93:
+                        brackets <- brackets - 1
+                    elif pending_dependency_object:
+                        pending_dependency_object <- false if byte != 32 and byte != 9 and byte != 10 and byte != 13 and byte != 58
+                elif escaped:
+                    escaped <- false
+                elif byte == 92:
+                    escaped <- true
+                elif byte == 34:
+                    after: mutable usize = index + 1.usize()
+                    while after < raw.count and manifest_space(raw[after]) |raw, after|:
+                        after <- after + 1.usize()
+                    if after < raw.count and raw[after] == 58:
+                        key: mutable darray[u8] = []
+                        for key_index in string_start..<index |key, raw|:
+                            key.push(raw[key_index])
+                        known: mutable bool = manifest_key_equals(key, "schema-version") or manifest_key_equals(key, "package") or manifest_key_equals(key, "targets") or manifest_key_equals(key, "dependencies") or manifest_key_equals(key, "dev-dependencies") or manifest_key_equals(key, "include") or manifest_key_equals(key, "exclude") or manifest_key_equals(key, "name") or manifest_key_equals(key, "version") or manifest_key_equals(key, "description") or manifest_key_equals(key, "license") or manifest_key_equals(key, "elisa") or manifest_key_equals(key, "kind") or manifest_key_equals(key, "entry") or manifest_key_equals(key, "registry") or manifest_key_equals(key, "path") or manifest_key_equals(key, "git") or manifest_key_equals(key, "rev")
+                        if braces == 1 and brackets == 0:
+                            top_level_known: bool = manifest_key_equals(key, "schema-version") or manifest_key_equals(key, "package") or manifest_key_equals(key, "targets") or manifest_key_equals(key, "dependencies") or manifest_key_equals(key, "dev-dependencies") or manifest_key_equals(key, "include") or manifest_key_equals(key, "exclude")
+                            return false if not top_level_known
+                        known <- true if dependency_depth > 0 and braces == dependency_depth and PackageIdentity::valid_name(key)
+                        return false if not known
+                        if braces == 1 and (manifest_key_equals(key, "dependencies") or manifest_key_equals(key, "dev-dependencies")):
+                            probe: mutable usize = after + 1.usize()
+                            while probe < raw.count and manifest_space(raw[probe]) |raw, probe|:
+                                probe <- probe + 1.usize()
+                            pending_dependency_object <- probe < raw.count and raw[probe] == 123
+                    in_string <- false
+            return true
+
         def is_safe_relative_entry(entry: darray[u8]&) -> bool:
             return false if not Archive::is_safe_entry(entry)
             segment_start: mutable usize = 0.usize()
@@ -16,4 +73,14 @@ module Manifest:
             return true
 
     private:
-        const manifest_path_policy: cstr = "archive-safe relative paths"
+        def manifest_key_equals(value: darray[u8]&, expected: cstr) -> bool:
+            length: usize = 0.usize()
+            while expected[length].u8() != 0:
+                length <- length + 1.usize()
+            return false if value.count != length
+            for index in 0..<length |value, expected|:
+                return false if value[index] != expected[index].u8()
+            return true
+
+        def manifest_space(byte: u8) -> bool:
+            return byte == 32 or byte == 9 or byte == 10 or byte == 13
