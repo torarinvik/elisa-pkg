@@ -52,21 +52,12 @@ module NativeTrustedPaths:
         def access(path: cstr, mode: i64) -> i64:
             return -22 if mode != 0 and mode != 1
             if mode == 1:
-                parent: mutable darray[u8] = []
                 leaf: mutable darray[u8] = []
-                return -22 if not PlatformNative::split_parent_leaf(path, &parent, &leaf)
                 directory: i64 =
-                    parent_name: cstr = (&parent[0]).cast[cstr] can Unsafe.PointerCast
-                    open_executable_directory_path(parent_name)
+                    parent: mutable darray[u8] = []
+                    -22 if not PlatformNative::split_parent_leaf(path, &parent, &leaf) else open_executable_directory_path(((&parent[0]).cast[cstr] can Unsafe.PointerCast))
                 return directory if directory < 0
-                leaf_name: cstr = (&leaf[0]).cast[cstr] can Unsafe.PointerCast
-                file_descriptor: i64 = PlatformNative::open_regular_file_at(directory, leaf_name)
-                return PlatformNative::close_error(directory, file_descriptor) if file_descriptor < 0
-
-                region access_status_scope:
-                    access_status: i64 = effective_execute_at(directory, leaf_name, file_descriptor)
-                    return PlatformNative::close_two_error(directory, file_descriptor, access_status) if access_status != 0
-                return PlatformNative::close_two_result(directory, file_descriptor, 0)
+                return executable_leaf_status(directory, leaf)
 
             file_descriptor: i64 = PlatformNative::open_package_file(path)
             return file_descriptor if file_descriptor < 0
@@ -101,26 +92,30 @@ module NativeTrustedPaths:
             return (mode & NativeStat::group_or_other_write_mask) == 0.u64()
 
         def trusted_crypto_executable_path(path: cstr, expected_user_identifier: u64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            parent: mutable darray[u8] = []
             leaf: mutable darray[u8] = []
-            return false if not PlatformNative::split_parent_leaf(path, &parent, &leaf)
             directory: i64 =
-                parent_name: cstr = (&parent[0]).cast[cstr] can Unsafe.PointerCast
-                open_crypto_trusted_directory(parent_name, expected_user_identifier)
+                parent: mutable darray[u8] = []
+                -22 if not PlatformNative::split_parent_leaf(path, &parent, &leaf) else open_crypto_trusted_directory(((&parent[0]).cast[cstr] can Unsafe.PointerCast), expected_user_identifier)
             return false if directory < 0
-            leaf_name: cstr = (&leaf[0]).cast[cstr] can Unsafe.PointerCast
-            file_descriptor: i64 = PlatformNative::open_regular_file_at(directory, leaf_name)
-            if file_descriptor < 0:
-                _ = native_close(directory)
-                return false
-            trusted: mutable bool = trusted_regular_file_descriptor(file_descriptor, expected_user_identifier)
-            if trusted:
-                trusted <- effective_execute_at(directory, leaf_name, file_descriptor) == 0
-            file_close_status: i32 = native_close(file_descriptor)
-            region directory_close_status_scope:
-                directory_close_status: i32 = native_close(directory)
-                return false if file_close_status != 0 or directory_close_status != 0
-            return trusted
+            region file_descriptor_scope:
+                file_descriptor: i64 = PlatformNative::open_regular_file_at(directory, ((&leaf[0]).cast[cstr] can Unsafe.PointerCast))
+                if file_descriptor < 0:
+                    _ = native_close(directory)
+                    return false
+                trusted: bool = trusted_regular_file_descriptor(file_descriptor, expected_user_identifier) and effective_execute_at(directory, ((&leaf[0]).cast[cstr] can Unsafe.PointerCast), file_descriptor) == 0
+                file_close_status: i32 = native_close(file_descriptor)
+                return native_close(directory) == 0 and file_close_status == 0 and trusted
+
+        # The regular file `leaf` in the open executable `directory` is
+        # executable for the effective user. Closes `directory`.
+        def executable_leaf_status(directory: i64, leaf: darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            requires directory >= 0
+            file_descriptor: i64 = PlatformNative::open_regular_file_at(directory, ((&leaf[0]).cast[cstr] can Unsafe.PointerCast))
+            return PlatformNative::close_error(directory, file_descriptor) if file_descriptor < 0
+            region access_status_scope:
+                access_status: i64 = effective_execute_at(directory, ((&leaf[0]).cast[cstr] can Unsafe.PointerCast), file_descriptor)
+                return PlatformNative::close_two_error(directory, file_descriptor, access_status) if access_status != 0
+            return PlatformNative::close_two_result(directory, file_descriptor, 0)
 
         # libc applies effective-credential and ACL rules that cannot be
         # reproduced by inspecting mode bits. The parent descriptor is held
