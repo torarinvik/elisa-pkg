@@ -133,22 +133,6 @@ module ProjectFiles:
                 offset <- offset + wrote.usize()
             return true
 
-        # Create and sync an exclusive sibling. The returned path includes its NUL terminator.
-        def stage_file_for_publication(path: darray[u8]&, value: darray[u8]&, temporary_path: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
-            temporary_path.resize(0)
-            return false if not valid_path_bytes(path)
-            template: mutable darray[u8] = []
-            ByteText::append(&template, path)
-            ByteText::append_text(&template, ".tmp.XXXXXX")
-            template.push(0)
-            fd: i64 = Platform::pkg_mkstemp(&template)
-            return false if fd < 0
-            durable: bool = write_fd_all(fd, value) and Platform::pkg_fsync(fd) == 0
-            close_status: i64 = Platform::pkg_close(fd)
-            return false if not durable or close_status != 0
-            ByteText::append(temporary_path, template)
-            return true
-
         def write_cstr_file(path_name: cstr, value: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             # mkstemp provides an exclusive 0600 temporary file; fsync and rename make
             # the lockfile transition atomic and prevent readers from seeing a prefix.
@@ -156,18 +140,22 @@ module ProjectFiles:
             path_length: usize = Platform::pkg_strlen(path_name)
             return false if path_length == 0.usize() or path_length > 4084.usize()
             ByteText::append_text(&path_snapshot, path_name)
+            return replace_file(path_snapshot, value)
+
+        # Atomically replace the destination and sync its parent directory.
+        def replace_file(path: darray[u8]&, value: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             temp_snapshot: mutable darray[u8] = []
-            return false if not stage_file_for_publication(path_snapshot, value, &temp_snapshot)
+            return false if not stage_file_for_publication(path, value, &temp_snapshot)
             temp_c: mutable darray[u8] = []
             ByteText::append(&temp_c, temp_snapshot)
             target_c: mutable darray[u8] = []
-            path_with_nul_into(&path_snapshot, &target_c)
+            path_with_nul_into(path, &target_c)
             temp_name: cstr = (&temp_c[0]).cast[cstr] can Unsafe.PointerCast
             target_name: mutable cstr = (&target_c[0]).cast[cstr] can Unsafe.PointerCast
-            if Platform::pkg_rename(temp_name, target_name) != 0:
-                return false
+            # Preserve the staged name if publication fails.
+            return false if Platform::pkg_rename(temp_name, target_name) != 0
             target_c <- target_c.resize(0)
-            path_with_nul_into(&path_snapshot, &target_c)
+            path_with_nul_into(path, &target_c)
             target_name <- (&target_c[0]).cast[cstr] can Unsafe.PointerCast
             return Platform::pkg_fsync_parent(target_name) == 0
 
@@ -293,6 +281,22 @@ module ProjectFiles:
             return out.count > 0.usize()
 
     private:
+        # Create and sync an exclusive sibling. The returned path includes its NUL terminator.
+        def stage_file_for_publication(path: darray[u8]&, value: darray[u8]&, temporary_path: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            temporary_path.resize(0)
+            return false if not valid_path_bytes(path)
+            template: mutable darray[u8] = []
+            ByteText::append(&template, path)
+            ByteText::append_text(&template, ".tmp.XXXXXX")
+            template.push(0)
+            fd: i64 = Platform::pkg_mkstemp(&template)
+            return false if fd < 0
+            durable: bool = write_fd_all(fd, value) and Platform::pkg_fsync(fd) == 0
+            close_status: i64 = Platform::pkg_close(fd)
+            return false if not durable or close_status != 0
+            ByteText::append(temporary_path, template)
+            return true
+
         def append_directory_prefix(directory: darray[u8]&, out: mutable darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
             out.resize(0)
             ByteText::append(out, directory)
