@@ -7,6 +7,7 @@ set -euo pipefail
 umask 022
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+python3 "$ROOT/scripts/check_source_layout.py"
 "$ROOT/scripts/build.sh"
 BIN="$ROOT/build/elisapkg"
 # Keep every fixture and probe under one private directory so interrupted or

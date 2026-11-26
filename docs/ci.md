@@ -102,7 +102,11 @@ GitHub references: [artifact attestations](https://docs.github.com/en/actions/ho
 
 ## Strict Elisa lint
 
-Run `make lint` with a Stage1 toolchain that supports
+Run `make lint` to check the 600-line source limit and 20-file directory limit
+before checking Elisa semantics. The layout check also runs independently with
+`python3 scripts/check_source_layout.py`.
+
+Use a Stage1 toolchain that supports
 `-Wnever-leak=strict` and `-emit check`. The command checks the full
 package-manager source graph and reports strict lint diagnostics without
 linking an executable. Use `scripts/build.sh --strict` to produce
