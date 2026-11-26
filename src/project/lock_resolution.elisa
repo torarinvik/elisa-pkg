@@ -213,17 +213,24 @@ module LockResolution:
                     return candidate_failure
                 dependencies: mutable darray[Solver::Constraint] = []
                 return provider_failure(Registry::ResultCode.MalformedMetadata, persist_trust) if not Registry::read_dependencies(metadata, &dependencies)
-                return provider_failure(Registry::ResultCode.ResourceLimit, persist_trust) if dependencies.count > Solver::maximum_constraints - pool.loaded_dependency_constraints
-                pool.loaded_dependency_constraints <- pool.loaded_dependency_constraints + dependencies.count
-                for dependency_index in 0..<dependencies.count |dependencies, persist_trust, pool|:
-                    if not ByteText::contains_null_terminator_field(pool.package_queue, dependencies[dependency_index].package):
-                        return provider_failure(Registry::ResultCode.ResourceLimit, persist_trust) if pool.package_total >= LocalBuildPlan::maximum_packages
-                        registry_queue_append(&pool.package_queue, dependencies[dependency_index].package)
-                        pool.package_total <- pool.package_total + 1
+                if enqueue_dependencies(dependencies, persist_trust, pool) is enqueue_failure:
+                    return enqueue_failure
                 candidate_package: darray[u8] = [package[item] for item in 0..<package.count]
                 pool.candidates.push(Solver::Candidate{package: candidate_package, version: parsed, dependencies: dependencies, yanked: yanked})
                 pool.evidence.push(IndexEvidence{generation: evidence.generation, digest: evidence.digest, identity: evidence.identity})
                 return null
+
+        # Count a candidate's dependency constraints against the solver budget
+        # and queue every dependency package not seen before.
+        def enqueue_dependencies(dependencies: darray[Solver::Constraint]&, persist_trust: bool, pool: mutable CandidatePool&) -> darray[u8]? can[Memory.Allocate, Abort.Panic]:
+            return provider_failure(Registry::ResultCode.ResourceLimit, persist_trust) if dependencies.count > Solver::maximum_constraints - pool.loaded_dependency_constraints
+            pool.loaded_dependency_constraints <- pool.loaded_dependency_constraints + dependencies.count
+            for dependency_index in 0..<dependencies.count |dependencies, persist_trust, pool|:
+                if not ByteText::contains_null_terminator_field(pool.package_queue, dependencies[dependency_index].package):
+                    return provider_failure(Registry::ResultCode.ResourceLimit, persist_trust) if pool.package_total >= LocalBuildPlan::maximum_packages
+                    registry_queue_append(&pool.package_queue, dependencies[dependency_index].package)
+                    pool.package_total <- pool.package_total + 1
+            return null
 
         def line_finish(data: darray[u8]&, start: usize) -> usize:
             return while finish < data.count and data[finish] != 10 |finish: usize = start| -> finish:
