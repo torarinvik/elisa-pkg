@@ -130,6 +130,26 @@ PY
   mv "$REGISTRY_GRAPH_ROOT/foo" "$REGISTRY_GRAPH_CASE/unavailable-foo"
   mv "$REGISTRY_GRAPH_ROOT/bar" "$REGISTRY_GRAPH_CASE/unavailable-bar"
   "$BIN" fetch --offline > "$REGISTRY_GRAPH_CASE/offline.stdout"
+  python3 - "$BIN" "$REGISTRY_GRAPH_STATE.clock" <<'PY'
+from pathlib import Path
+import json, subprocess, sys
+
+lock = json.loads(Path("elisapkg.lock").read_text())
+first = lock["packages"][0]
+assert first["name"] == "bar"
+digest = first["archive-digest"].removeprefix("sha256:")
+blob = Path(".elisapkg/cache/sha256") / digest[:2] / digest
+clock = Path(sys.argv[2])
+clock_before = (clock.stat().st_ino, clock.read_bytes())
+hidden = blob.with_suffix(".temporarily-unavailable")
+blob.rename(hidden)
+try:
+    result = subprocess.run([sys.argv[1], "fetch", "--offline"], capture_output=True, timeout=30)
+    assert result.returncode == 5, result
+    assert (clock.stat().st_ino, clock.read_bytes()) == clock_before
+finally:
+    hidden.rename(blob)
+PY
   mv "$REGISTRY_GRAPH_CASE/unavailable-foo" "$REGISTRY_GRAPH_ROOT/foo"
   mv "$REGISTRY_GRAPH_CASE/unavailable-bar" "$REGISTRY_GRAPH_ROOT/bar"
 )
