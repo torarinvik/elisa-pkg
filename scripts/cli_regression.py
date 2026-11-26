@@ -31,9 +31,10 @@ with tempfile.TemporaryDirectory(prefix='cli-review-', dir=ROOT / 'build') as di
     lockfile = project / 'elisapkg.lock'
     local_lock = lockfile.read_bytes()
     lockfile.write_text('{"lock-version":99}\n')
-    result = subprocess.run([BIN, 'fetch', '--offline'], cwd=project,
-                            capture_output=True, timeout=120, check=False)
-    assert result.returncode == 3 and lockfile.read_text() == '{"lock-version":99}\n', result
+    for command in (['fetch', '--offline'], ['resolve', '--locked'], ['resolve', '--frozen']):
+        result = subprocess.run([BIN, *command], cwd=project,
+                                capture_output=True, timeout=120, check=False)
+        assert result.returncode == 3 and lockfile.read_text() == '{"lock-version":99}\n', (command, result)
     lockfile.write_bytes(local_lock)
     for command in [['resolve', 'unexpected'], ['check-manifest', 'unexpected']]:
         result = subprocess.run([BIN, *command], cwd=project, capture_output=True, timeout=120, check=False)
