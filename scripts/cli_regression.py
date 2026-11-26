@@ -125,7 +125,9 @@ with tempfile.TemporaryDirectory(prefix='cli-review-', dir=ROOT / 'build') as di
     assert 'registry is not configured' in colored_fetch.stderr
     root_manifest = project / 'elisapkg.json'
     original_manifest = root_manifest.read_bytes()
-    original_lock = (project / 'elisapkg.lock').read_bytes()
+    lockfile = project / 'elisapkg.lock'
+    original_lock = lockfile.read_bytes()
+    original_lock_inode = lockfile.stat().st_ino
     registry_add = subprocess.run(
         [BIN, 'add', 'foo', '--version', '1.0.0', '--registry', 'primary'], cwd=project,
         env=fetch_environment, capture_output=True, text=True, timeout=120,
@@ -133,7 +135,10 @@ with tempfile.TemporaryDirectory(prefix='cli-review-', dir=ROOT / 'build') as di
     assert registry_add.returncode == 3, registry_add
     assert 'registry is not configured' in registry_add.stderr
     assert root_manifest.read_bytes() == original_manifest
-    assert (project / 'elisapkg.lock').read_bytes() == original_lock
+    assert lockfile.read_bytes() == original_lock
+    assert lockfile.stat().st_ino == original_lock_inode
+    assert not (project / '.elisapkg/transaction.state').exists()
+    assert not (project / '.elisapkg/transaction.guard').exists()
 
     library = work / 'library'
     run([BIN, 'init', library, '--lib'], stdout=subprocess.DEVNULL)
