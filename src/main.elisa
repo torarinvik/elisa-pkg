@@ -1006,92 +1006,6 @@ module Cli:
                         callback_parameter.push(48)
                     ByteText::append_text(&callback_parameter, ".c")
                     callback_parameter.push(0)
-                    # The compiler was resolved against the fixed child PATH above;
-                    # invoking its absolute path keeps execution and sandbox policy aligned.
-                    stage1_env: mutable darray[u8] = []
-                    runtime_env: mutable darray[u8] = []
-                    stale_env: mutable darray[u8] = []
-                    clang_env: mutable darray[u8] = []
-                    sdkroot_env: mutable darray[u8] = []
-                    developer_dir_env: mutable darray[u8] = []
-                    temporary_env: mutable darray[u8] = []
-                    args: mutable darray[cstr] = []
-                    args.push("/usr/bin/sandbox-exec")
-                    args.push("-D")
-                    args.push((&callback_parameter[0]).cast[cstr] can Unsafe.PointerCast)
-                    args.push("-p")
-                    args.push(sandbox_profile_name)
-                    args.push("/usr/bin/env")
-                    args.push("-i")
-                    args.push(Toolchain::isolated_path_environment)
-                    ByteText::append_text(&temporary_env, "TMPDIR=")
-                    ByteText::append_bounded_text(&temporary_env, canonical_sandbox_work_name)
-                    temporary_env.push(0)
-                    args.push((&temporary_env[0]).cast[cstr] can Unsafe.PointerCast)
-                    sandbox_home_env: mutable darray[u8] = []
-                    ByteText::append_text(&sandbox_home_env, "HOME=")
-                    ByteText::append_bounded_text(&sandbox_home_env, canonical_sandbox_work_name)
-                    sandbox_home_env.push(0)
-                    args.push((&sandbox_home_env[0]).cast[cstr] can Unsafe.PointerCast)
-                    fixed_home_env: mutable darray[u8] = []
-                    ByteText::append_text(&fixed_home_env, "CFFIXED_USER_HOME=")
-                    ByteText::append_bounded_text(&fixed_home_env, canonical_sandbox_work_name)
-                    fixed_home_env.push(0)
-                    args.push((&fixed_home_env[0]).cast[cstr] can Unsafe.PointerCast)
-                    cache_home_env: mutable darray[u8] = []
-                    ByteText::append_text(&cache_home_env, "XDG_CACHE_HOME=")
-                    ByteText::append_bounded_text(&cache_home_env, canonical_sandbox_work_name)
-                    cache_home_env.push(0)
-                    args.push((&cache_home_env[0]).cast[cstr] can Unsafe.PointerCast)
-                    args.push("ELISA_STAGE1_SEMANTIC_GATE=1")
-                    if not Platform::pkg_cstr_equal(stage1_bin, ""):
-                        ByteText::append_text(&stage1_env, "ELISA_STAGE1_BIN=")
-                        ByteText::append_bounded_text(&stage1_env, stage1_bin)
-                        stage1_env.push(0)
-                        args.push((&stage1_env[0]).cast[cstr] can Unsafe.PointerCast)
-                    if not Platform::pkg_cstr_equal(runtime_obj, ""):
-                        ByteText::append_text(&runtime_env, "ELISA_RUNTIME_OBJ=")
-                        ByteText::append_bounded_text(&runtime_env, runtime_obj)
-                        runtime_env.push(0)
-                        args.push((&runtime_env[0]).cast[cstr] can Unsafe.PointerCast)
-                    if not Platform::pkg_cstr_equal(allow_stale, ""):
-                        ByteText::append_text(&stale_env, "ELISA_ALLOW_STALE_STAGE1=")
-                        ByteText::append_bounded_text(&stale_env, allow_stale)
-                        stale_env.push(0)
-                        args.push((&stale_env[0]).cast[cstr] can Unsafe.PointerCast)
-                    if clang_tool[0].u8() != 0:
-                        ByteText::append_text(&clang_env, "ELISA_CLANG=")
-                        ByteText::append_bounded_text(&clang_env, clang_tool)
-                        clang_env.push(0)
-                        args.push((&clang_env[0]).cast[cstr] can Unsafe.PointerCast)
-                    if sdk_root.count > 0.usize():
-                        ByteText::append_text(&sdkroot_env, "SDKROOT=")
-                        ByteText::append(&sdkroot_env, sdk_root)
-                        sdkroot_env.push(0)
-                        args.push((&sdkroot_env[0]).cast[cstr] can Unsafe.PointerCast)
-                        ByteText::append_text(&developer_dir_env, "DEVELOPER_DIR=")
-                        ByteText::append(&developer_dir_env, developer_dir)
-                        developer_dir_env.push(0)
-                        args.push((&developer_dir_env[0]).cast[cstr] can Unsafe.PointerCast)
-                    if compiler_is_stage1_wrapper:
-                        # The host stage1 wrapper invokes /bin/ps for its RSS polling;
-                        # macOS marks ps setuid and refuses it inside Seatbelt. The
-                        # wrapper/binary paths have been checked to share the expected
-                        # compiler root. Execute stage1 directly; the package parent
-                        # applies the process group, resource caps, and deadline.
-                        compiler_executable <- stage1_bin
-                    args.push(compiler_executable)
-                    if Platform::pkg_cstr_equal(options.profile, "release"):
-                        args.push("-O2")
-                    else:
-                        args.push("-O0")
-                        args.push("-g")
-                    args.push("-emit")
-                    args.push(emit_kind)
-                    args.push("-o")
-                    args.push(temp_name)
-                    args.push(compiler_source_name)
-                    args.push(null)
                     stdout_template: mutable darray[u8] = []
                     ByteText::append(&stdout_template, sandbox_work_dir)
                     if stdout_template.count == 0.usize() or stdout_template[stdout_template.count - 1.usize()] != 47:
@@ -1149,7 +1063,10 @@ module Cli:
                         CompilerProcess::discard_scratch(sandbox_work_name, temp_name, aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
                         CliOutput::write_error("error: unable to open the private compiler scratch directory\n")
                         return EXIT_BUILD
-                    pid: i64 = CompilerProcess::spawn(&args, &callback_parameter, callback_digits_offset, sandbox_work_directory_fd, compiler_stdout_fd, compiler_stderr_fd)
+                    # The stage1 wrapper polls with setuid ps, which Seatbelt refuses.
+                    # The parent already enforces the compiler deadline and resource limits.
+                    invocation: CompilerProcess::Invocation = CompilerProcess::Invocation{profile: sandbox_profile_name, scratch_directory: canonical_sandbox_work_name, stage1_binary: stage1_bin, runtime_object: runtime_obj, allow_stale: allow_stale, clang: clang_tool, executable: stage1_bin if compiler_is_stage1_wrapper else compiler_executable, release: Platform::pkg_cstr_equal(options.profile, "release"), emit_kind: emit_kind, output_path: temp_name, source_path: compiler_source_name}
+                    pid: i64 = CompilerProcess::spawn(invocation, sdk_root, developer_dir, &callback_parameter, callback_digits_offset, sandbox_work_directory_fd, compiler_stdout_fd, compiler_stderr_fd)
                     _ = Platform::pkg_close(sandbox_work_directory_fd)
                     if pid < 0:
                         CompilerProcess::discard_logs(compiler_stdout_fd, compiler_stderr_fd, compiler_stdout_name, compiler_stderr_name)
