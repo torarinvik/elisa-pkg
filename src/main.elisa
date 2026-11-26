@@ -31,6 +31,7 @@ include "./resolution/resolve.elisa"
 include "./resolution/solver.elisa"
 include "./registry.elisa"
 include "./text/bytes.elisa"
+include "./cli/arguments.elisa"
 
 module Cli:
     private:
@@ -2095,37 +2096,6 @@ module Cli:
                 for index in 0..<last_separator |parent, path|:
                     parent.push(path[index])
             return change_directory(&parent)
-
-        # `init` and dependency mutations have command-specific positional
-        # grammars, so they are dispatched before the common parser below.
-        # Strip the output-only global modes first so those commands still
-        # honor the same quiet/color contract as every other command without
-        # accidentally accepting flags intended for a different operation.
-        def compact_output_modes(argc: i64, slots: mutable cstr&&, out: mutable darray[cstr]&) -> i64 can[Global.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            can Global.Write:
-                out.resize(0)
-                return -1 if argc < 2
-                out.push(slots[0].cast[cstr])
-                out.push(slots[1].cast[cstr])
-                color_seen: mutable bool = false
-                index: mutable i64 = 2
-                while index < argc |slots, out, color_seen, index|:
-                    argument: cstr = slots[index].cast[cstr]
-                    if Platform::pkg_cstr_equal(argument, "--quiet"):
-                        cli_quiet <- true
-                        index <- index + 1
-                        continue
-                    if Platform::pkg_cstr_equal(argument, "--color"):
-                        return -1 if color_seen or index + 1 >= argc
-                        color_value: cstr = slots[index + 1].cast[cstr]
-                        return -1 if not Platform::pkg_cstr_equal(color_value, "auto") and not Platform::pkg_cstr_equal(color_value, "always") and not Platform::pkg_cstr_equal(color_value, "never")
-                        color_seen <- true
-                        index <- index + 2
-                        continue
-                    out.push(argument)
-                    index <- index + 1
-                out.push(null)
-                return out.count.i64() - 1
 
         def run_init(argc: i64, slots: mutable cstr&&) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
@@ -5794,73 +5764,6 @@ module Cli:
                 return status.i64() / 256.i64() if status % 256 == 0
                 return EXIT_CANCEL
 
-        def compact_manifest_args(argc: i64, slots: mutable cstr&&, out: mutable darray[cstr]&) -> i64 can[Global.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            can Global.Write:
-                out.resize(0)
-                return 0 if argc < 2
-                out.push(slots[0].cast[cstr])
-                out.push(slots[1].cast[cstr])
-                index: mutable i64 = 2
-                separator_seen: mutable bool = false
-                color_seen: mutable bool = false
-                while index < argc |slots, out, index, separator_seen, color_seen|:
-                    if Platform::pkg_cstr_equal(slots[index].cast[cstr], "--"):
-                        separator_seen <- true
-                        out.push(slots[index].cast[cstr])
-                        index <- index + 1
-                        continue
-                    if not separator_seen and Platform::pkg_cstr_equal(slots[index].cast[cstr], "--quiet"):
-                        cli_quiet <- true
-                        index <- index + 1
-                        continue
-                    if not separator_seen and Platform::pkg_cstr_equal(slots[index].cast[cstr], "--color"):
-                        return -1 if color_seen or index + 1 >= argc
-                        color_value: cstr = slots[index + 1].cast[cstr]
-                        return -1 if not Platform::pkg_cstr_equal(color_value, "auto") and not Platform::pkg_cstr_equal(color_value, "always") and not Platform::pkg_cstr_equal(color_value, "never")
-                        color_seen <- true
-                        index <- index + 2
-                        continue
-                    if not separator_seen and Platform::pkg_cstr_equal(slots[index].cast[cstr], "--manifest-path"):
-                        index <- index + 2
-                        continue
-                    out.push(slots[index].cast[cstr])
-                    index <- index + 1
-                out.push(null)
-                return out.count.i64() - 1
-
-        # The common parser has already copied these modes into `options` or
-        # process-local output state. Remove them before dispatch so handlers
-        # that inspect argv see only command-specific flags and positionals.
-        # Keep everything after `--` intact because run/test forward that tail
-        # to the selected program.
-        def compact_validated_global_options(argc: i64, slots: mutable cstr&&, out: mutable darray[cstr]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            out.resize(0)
-            return -1 if argc < 2
-            out.push(slots[0].cast[cstr])
-            out.push(slots[1].cast[cstr])
-            index: mutable i64 = 2
-            separator_seen: mutable bool = false
-            while index < argc |slots, out, index, separator_seen|:
-                argument: cstr = slots[index].cast[cstr]
-                if not separator_seen and Platform::pkg_cstr_equal(argument, "--"):
-                    separator_seen <- true
-                    out.push(argument)
-                    index <- index + 1
-                    continue
-                if not separator_seen and (Platform::pkg_cstr_equal(argument, "--locked") or Platform::pkg_cstr_equal(argument, "--offline") or Platform::pkg_cstr_equal(argument, "--frozen") or Platform::pkg_cstr_equal(argument, "--json") or Platform::pkg_cstr_equal(argument, "--verbose") or Platform::pkg_cstr_equal(argument, "--quiet")):
-                    index <- index + 1
-                    continue
-                if not separator_seen and Platform::pkg_cstr_equal(argument, "--color"):
-                    index <- index + 2
-                    continue
-                if not separator_seen and Platform::pkg_cstr_equal(argument, "--manifest-path"):
-                    index <- index + 2
-                    continue
-                out.push(argument)
-                index <- index + 1
-            out.push(null)
-            return out.count.i64() - 1
-
         # ---------- command line --------------------------------------------------------------
 
         def cli_main(argc: i64, argv: mutable void&) -> i64 can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -5880,7 +5783,9 @@ module Cli:
                     return EXIT_OK
                 if Platform::pkg_cstr_equal(command, "init"):
                     init_slots: mutable darray[cstr] = []
-                    init_argc: i64 = compact_output_modes(argc, slots, &init_slots)
+                    quiet: mutable bool = cli_quiet
+                    init_argc: i64 = CliArguments::compact_output_modes(argc, slots, &init_slots, &quiet)
+                    cli_quiet <- quiet
                     return EXIT_USAGE if init_argc < 0
                     return run_init(init_argc, (&init_slots[0]).cast[mutable cstr&&] can Unsafe.PointerCast)
                 manifest_path: mutable darray[u8] = []
@@ -5903,12 +5808,16 @@ module Cli:
                 effective_slots: mutable cstr&& = slots
                 compacted: mutable darray[cstr] = []
                 if has_manifest_path:
-                    effective_argc <- compact_manifest_args(argc, slots, &compacted)
+                    quiet: mutable bool = cli_quiet
+                    effective_argc <- CliArguments::compact_manifest_args(argc, slots, &compacted, &quiet)
+                    cli_quiet <- quiet
                     return EXIT_USAGE if effective_argc <= 0
                     effective_slots <- (&compacted[0]).cast[mutable cstr&&] can Unsafe.PointerCast
                 if Platform::pkg_cstr_equal(command, "add") or Platform::pkg_cstr_equal(command, "remove") or Platform::pkg_cstr_equal(command, "update"):
                     mutation_slots: mutable darray[cstr] = []
-                    mutation_argc: i64 = compact_manifest_args(argc, slots, &mutation_slots)
+                    quiet: mutable bool = cli_quiet
+                    mutation_argc: i64 = CliArguments::compact_manifest_args(argc, slots, &mutation_slots, &quiet)
+                    cli_quiet <- quiet
                     return EXIT_USAGE if mutation_argc < 0
                     mutation_effective_slots: mutable cstr&& = (&mutation_slots[0]).cast[mutable cstr&&] can Unsafe.PointerCast
                     return run_add(mutation_argc, mutation_effective_slots) if Platform::pkg_cstr_equal(command, "add")
@@ -5919,104 +5828,20 @@ module Cli:
                 # non-empty, well-defined byte buffer.
                 start: mutable darray[u8] = [46]
                 options: mutable Model::CommandOptions = Model::CommandOptions{locked: false, offline: false, frozen: false, json: false, verbose: false, profile: "debug", target_name: "", target_kind: "", update_name: ""}
-                flags_ok: mutable bool = true
-                positional_count: mutable i64 = 0
-                separator_seen: mutable bool = false
-                profile_seen: mutable bool = false
-                target_name_seen: mutable bool = false
-                color_seen: mutable bool = false
+                quiet: mutable bool = cli_quiet
                 publish_dry_run: mutable bool = false
-                index: mutable i64 = 2
-                while index < effective_argc |effective_slots, options, flags_ok, positional_count, separator_seen, profile_seen, publish_dry_run, index|:
-                    flag: cstr = effective_slots[index].cast[cstr]
-                    if Platform::pkg_cstr_equal(flag, "--"):
-                        separator_seen <- true
-                        flags_ok <- false if not (Platform::pkg_cstr_equal(command, "run") or Platform::pkg_cstr_equal(command, "test"))
-                        index <- index + 1
-                        continue
-                    if separator_seen:
-                        index <- index + 1
-                        continue
-                    if Platform::pkg_cstr_equal(flag, "--bin") or Platform::pkg_cstr_equal(flag, "--lib") or Platform::pkg_cstr_equal(flag, "--test"):
-                        target_allowed: bool = (Platform::pkg_cstr_equal(command, "build") and (Platform::pkg_cstr_equal(flag, "--bin") or Platform::pkg_cstr_equal(flag, "--lib") or Platform::pkg_cstr_equal(flag, "--test"))) or (Platform::pkg_cstr_equal(command, "run") and Platform::pkg_cstr_equal(flag, "--bin")) or (Platform::pkg_cstr_equal(command, "test") and Platform::pkg_cstr_equal(flag, "--test")) or (Platform::pkg_cstr_equal(command, "install") and Platform::pkg_cstr_equal(flag, "--bin"))
-                        flags_ok <- false if not target_allowed or index + 1 >= effective_argc
-                        if flags_ok:
-                            target_value: cstr = effective_slots[index + 1].cast[cstr]
-                            target_length: usize = Platform::pkg_strlen(target_value)
-                            flags_ok <- false if target_length == 0.usize() or target_length > 64.usize() or target_value[0].u8() == 45 or target_name_seen
-                            if flags_ok:
-                                target_name_seen <- true
-                        index <- index + 2
-                        continue
-                    if Platform::pkg_cstr_equal(flag, "--profile"):
-                        profile_allowed: bool = Platform::pkg_cstr_equal(command, "build") or Platform::pkg_cstr_equal(command, "run") or Platform::pkg_cstr_equal(command, "test") or Platform::pkg_cstr_equal(command, "install")
-                        flags_ok <- false if not profile_allowed or profile_seen or index + 1 >= effective_argc
-                        if flags_ok:
-                            profile_value: cstr = effective_slots[index + 1].cast[cstr]
-                            flags_ok <- false if not Platform::pkg_cstr_equal(profile_value, "debug") and not Platform::pkg_cstr_equal(profile_value, "release")
-                            if flags_ok:
-                                profile_seen <- true
-                        index <- index + 2
-                        continue
-                    options.locked <- true if Platform::pkg_cstr_equal(flag, "--locked")
-                    options.offline <- true if Platform::pkg_cstr_equal(flag, "--offline")
-                    options.frozen <- true if Platform::pkg_cstr_equal(flag, "--frozen")
-                    options.json <- true if Platform::pkg_cstr_equal(flag, "--json")
-                    options.verbose <- true if Platform::pkg_cstr_equal(flag, "--verbose")
-                    cli_quiet <- true if Platform::pkg_cstr_equal(flag, "--quiet")
-                    publish_dry_run <- true if Platform::pkg_cstr_equal(command, "publish") and Platform::pkg_cstr_equal(flag, "--dry-run")
-                    if Platform::pkg_cstr_equal(flag, "--color"):
-                        flags_ok <- false if color_seen or index + 1 >= effective_argc
-                        if flags_ok:
-                            color_value: cstr = effective_slots[index + 1].cast[cstr]
-                            flags_ok <- false if not Platform::pkg_cstr_equal(color_value, "auto") and not Platform::pkg_cstr_equal(color_value, "always") and not Platform::pkg_cstr_equal(color_value, "never")
-                            color_seen <- true if flags_ok
-                        index <- index + 2
-                        continue
-                    flag_length: usize = Platform::pkg_strlen(flag)
-                    is_positional: bool = flag_length > 0.usize() and flag[0].u8() != 45
-                    positional_allowed: bool = (Platform::pkg_cstr_equal(command, "why") and positional_count == 0) or (Platform::pkg_cstr_equal(command, "install") and positional_count == 0) or (Platform::pkg_cstr_equal(command, "uninstall") and positional_count == 0) or (Platform::pkg_cstr_equal(command, "cache") and positional_count == 0) or (Platform::pkg_cstr_equal(command, "fetch") and positional_count < 2)
-                    recognized: mutable bool = is_positional and positional_allowed
-                    recognized <- true if not is_positional and (Platform::pkg_cstr_equal(flag, "--locked") or Platform::pkg_cstr_equal(flag, "--offline") or Platform::pkg_cstr_equal(flag, "--frozen") or Platform::pkg_cstr_equal(flag, "--json") or Platform::pkg_cstr_equal(flag, "--verbose") or Platform::pkg_cstr_equal(flag, "--quiet") or (Platform::pkg_cstr_equal(flag, "--list") and Platform::pkg_cstr_equal(command, "package")) or (Platform::pkg_cstr_equal(flag, "--dry-run") and (Platform::pkg_cstr_equal(command, "cache") or Platform::pkg_cstr_equal(command, "publish"))) or (Platform::pkg_cstr_equal(command, "install") and Platform::pkg_cstr_equal(flag, "--local")) or (Platform::pkg_cstr_equal(command, "uninstall") and Platform::pkg_cstr_equal(flag, "--local")))
-                    cli_json_output <- true if options.json
-                    flags_ok <- false if not recognized
-                    positional_count <- positional_count + 1 if recognized and is_positional
-                    index <- index + 1
+                flags_ok: bool = CliArguments::read_common_flags(effective_argc, effective_slots, command, &options, &quiet, &publish_dry_run)
+                cli_quiet <- quiet
+                cli_json_output <- options.json
                 if not flags_ok:
                     write_error("error: unknown option; run `elisapkg --help`\n")
                     return EXIT_USAGE
                 parsed_options: mutable darray[cstr] = []
-                parsed_argc: i64 = compact_validated_global_options(effective_argc, effective_slots, &parsed_options)
+                parsed_argc: i64 = CliArguments::compact_validated_global_options(effective_argc, effective_slots, &parsed_options)
                 return EXIT_USAGE if parsed_argc < 0
                 effective_argc <- parsed_argc
                 dispatch_slots: mutable cstr&& = (&parsed_options[0]).cast[mutable cstr&&] can Unsafe.PointerCast
-                dispatch_index: mutable i64 = 2
-                dispatch_separator_seen: mutable bool = false
-                while dispatch_index < effective_argc |dispatch_slots, dispatch_index, dispatch_separator_seen, options|:
-                    dispatch_flag: cstr = dispatch_slots[dispatch_index].cast[cstr]
-                    if Platform::pkg_cstr_equal(dispatch_flag, "--"):
-                        dispatch_separator_seen <- true
-                        dispatch_index <- dispatch_index + 1
-                        continue
-                    if dispatch_separator_seen:
-                        dispatch_index <- dispatch_index + 1
-                        continue
-                    if Platform::pkg_cstr_equal(dispatch_flag, "--profile"):
-                        options.profile <- dispatch_slots[dispatch_index + 1].cast[cstr]
-                        dispatch_index <- dispatch_index + 2
-                        continue
-                    if Platform::pkg_cstr_equal(dispatch_flag, "--bin") or Platform::pkg_cstr_equal(dispatch_flag, "--lib") or Platform::pkg_cstr_equal(dispatch_flag, "--test"):
-                        options.target_name <- dispatch_slots[dispatch_index + 1].cast[cstr]
-                        options.target_kind <- "bin" if Platform::pkg_cstr_equal(dispatch_flag, "--bin")
-                        options.target_kind <- "lib" if Platform::pkg_cstr_equal(dispatch_flag, "--lib")
-                        options.target_kind <- "test" if Platform::pkg_cstr_equal(dispatch_flag, "--test")
-                        dispatch_index <- dispatch_index + 2
-                        continue
-                    dispatch_index <- dispatch_index + 1
-                if Platform::pkg_cstr_equal(command, "run") and Platform::pkg_strlen(options.target_kind) == 0.usize():
-                    options.target_kind <- "bin"
-                if Platform::pkg_cstr_equal(command, "test") and Platform::pkg_strlen(options.target_kind) == 0.usize():
-                    options.target_kind <- "test"
+                CliArguments::read_target_flags(effective_argc, dispatch_slots, command, &options)
                 if Platform::pkg_cstr_equal(command, "check-manifest"):
                     return run_check(&start, options)
                 if Platform::pkg_cstr_equal(command, "resolve"):

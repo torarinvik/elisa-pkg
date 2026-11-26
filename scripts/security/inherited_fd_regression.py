@@ -31,7 +31,7 @@ def main() -> int:
         raise SystemExit("error: compiler launch must close inherited descriptors after stdio setup and before exec")
 
     program_start = source.find("def run_program(")
-    program_end = source.find("def compact_manifest_args(", program_start)
+    program_end = source.find("def cli_main(", program_start)
     if program_start < 0 or program_end < 0:
         raise SystemExit("error: could not locate the shared run/test program launcher")
     program_launcher = source[program_start:program_end]

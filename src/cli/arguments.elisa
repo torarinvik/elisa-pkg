@@ -1,0 +1,199 @@
+# The CLI argument grammar and argv compaction. The caller owns output policy
+# and dispatches the command after validation.
+include "../package/model.elisa"
+include "../platform.elisa"
+
+module CliArguments:
+    public:
+        # `init` and dependency mutations have command-specific positional
+        # grammars, so they are dispatched before the common parser below.
+        # Strip the output-only global modes first so those commands still
+        # honor the same quiet/color contract as every other command without
+        # accidentally accepting flags intended for a different operation.
+        def compact_output_modes(argc: i64, slots: mutable cstr&&, out: mutable darray[cstr]&, quiet: mutable bool&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            out.resize(0)
+            return -1 if argc < 2
+            out.push(slots[0].cast[cstr])
+            out.push(slots[1].cast[cstr])
+            color_seen: mutable bool = false
+            index: mutable i64 = 2
+            while index < argc |slots, out, color_seen, index|:
+                argument: cstr = slots[index].cast[cstr]
+                if Platform::pkg_cstr_equal(argument, "--quiet"):
+                    quiet <- true
+                    index <- index + 1
+                    continue
+                if Platform::pkg_cstr_equal(argument, "--color"):
+                    return -1 if color_seen or index + 1 >= argc
+                    color_value: cstr = slots[index + 1].cast[cstr]
+                    return -1 if not valid_color_mode(color_value)
+                    color_seen <- true
+                    index <- index + 2
+                    continue
+                out.push(argument)
+                index <- index + 1
+            out.push(null)
+            return out.count.i64() - 1
+
+        def compact_manifest_args(argc: i64, slots: mutable cstr&&, out: mutable darray[cstr]&, quiet: mutable bool&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            out.resize(0)
+            return 0 if argc < 2
+            out.push(slots[0].cast[cstr])
+            out.push(slots[1].cast[cstr])
+            index: mutable i64 = 2
+            separator_seen: mutable bool = false
+            color_seen: mutable bool = false
+            while index < argc |slots, out, index, separator_seen, color_seen|:
+                if Platform::pkg_cstr_equal(slots[index].cast[cstr], "--"):
+                    separator_seen <- true
+                    out.push(slots[index].cast[cstr])
+                    index <- index + 1
+                    continue
+                if not separator_seen and Platform::pkg_cstr_equal(slots[index].cast[cstr], "--quiet"):
+                    quiet <- true
+                    index <- index + 1
+                    continue
+                if not separator_seen and Platform::pkg_cstr_equal(slots[index].cast[cstr], "--color"):
+                    return -1 if color_seen or index + 1 >= argc
+                    color_value: cstr = slots[index + 1].cast[cstr]
+                    return -1 if not valid_color_mode(color_value)
+                    color_seen <- true
+                    index <- index + 2
+                    continue
+                if not separator_seen and Platform::pkg_cstr_equal(slots[index].cast[cstr], "--manifest-path"):
+                    index <- index + 2
+                    continue
+                out.push(slots[index].cast[cstr])
+                index <- index + 1
+            out.push(null)
+            return out.count.i64() - 1
+
+        # The common parser has already copied these modes into `options` or
+        # process-local output state. Remove them before dispatch so handlers
+        # that inspect argv see only command-specific flags and positionals.
+        # Keep everything after `--` intact because run/test forward that tail
+        # to the selected program.
+        def compact_validated_global_options(argc: i64, slots: mutable cstr&&, out: mutable darray[cstr]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            out.resize(0)
+            return -1 if argc < 2
+            out.push(slots[0].cast[cstr])
+            out.push(slots[1].cast[cstr])
+            index: mutable i64 = 2
+            separator_seen: mutable bool = false
+            while index < argc |slots, out, index, separator_seen|:
+                argument: cstr = slots[index].cast[cstr]
+                if not separator_seen and Platform::pkg_cstr_equal(argument, "--"):
+                    separator_seen <- true
+                    out.push(argument)
+                    index <- index + 1
+                    continue
+                if not separator_seen and (Platform::pkg_cstr_equal(argument, "--locked") or Platform::pkg_cstr_equal(argument, "--offline") or Platform::pkg_cstr_equal(argument, "--frozen") or Platform::pkg_cstr_equal(argument, "--json") or Platform::pkg_cstr_equal(argument, "--verbose") or Platform::pkg_cstr_equal(argument, "--quiet")):
+                    index <- index + 1
+                    continue
+                if not separator_seen and Platform::pkg_cstr_equal(argument, "--color"):
+                    index <- index + 2
+                    continue
+                if not separator_seen and Platform::pkg_cstr_equal(argument, "--manifest-path"):
+                    index <- index + 2
+                    continue
+                out.push(argument)
+                index <- index + 1
+            out.push(null)
+            return out.count.i64() - 1
+
+        def read_common_flags(argc: i64, slots: mutable cstr&&, command: cstr, options: mutable Model::CommandOptions&, quiet: mutable bool&, publish_dry_run: mutable bool&) -> bool can[Unsafe.PointerCast]:
+            flags_ok: mutable bool = true
+            positional_count: mutable i64 = 0
+            separator_seen: mutable bool = false
+            profile_seen: mutable bool = false
+            target_name_seen: mutable bool = false
+            color_seen: mutable bool = false
+            index: mutable i64 = 2
+            while index < argc |slots, options, flags_ok, positional_count, separator_seen, profile_seen, publish_dry_run, index|:
+                flag: cstr = slots[index].cast[cstr]
+                if Platform::pkg_cstr_equal(flag, "--"):
+                    separator_seen <- true
+                    flags_ok <- false if not (Platform::pkg_cstr_equal(command, "run") or Platform::pkg_cstr_equal(command, "test"))
+                    index <- index + 1
+                    continue
+                if separator_seen:
+                    index <- index + 1
+                    continue
+                if Platform::pkg_cstr_equal(flag, "--bin") or Platform::pkg_cstr_equal(flag, "--lib") or Platform::pkg_cstr_equal(flag, "--test"):
+                    target_allowed: bool = (Platform::pkg_cstr_equal(command, "build") and (Platform::pkg_cstr_equal(flag, "--bin") or Platform::pkg_cstr_equal(flag, "--lib") or Platform::pkg_cstr_equal(flag, "--test"))) or (Platform::pkg_cstr_equal(command, "run") and Platform::pkg_cstr_equal(flag, "--bin")) or (Platform::pkg_cstr_equal(command, "test") and Platform::pkg_cstr_equal(flag, "--test")) or (Platform::pkg_cstr_equal(command, "install") and Platform::pkg_cstr_equal(flag, "--bin"))
+                    flags_ok <- false if not target_allowed or index + 1 >= argc
+                    if flags_ok:
+                        target_value: cstr = slots[index + 1].cast[cstr]
+                        target_length: usize = Platform::pkg_strlen(target_value)
+                        flags_ok <- false if target_length == 0.usize() or target_length > 64.usize() or target_value[0].u8() == 45 or target_name_seen
+                        if flags_ok:
+                            target_name_seen <- true
+                    index <- index + 2
+                    continue
+                if Platform::pkg_cstr_equal(flag, "--profile"):
+                    profile_allowed: bool = Platform::pkg_cstr_equal(command, "build") or Platform::pkg_cstr_equal(command, "run") or Platform::pkg_cstr_equal(command, "test") or Platform::pkg_cstr_equal(command, "install")
+                    flags_ok <- false if not profile_allowed or profile_seen or index + 1 >= argc
+                    if flags_ok:
+                        profile_value: cstr = slots[index + 1].cast[cstr]
+                        flags_ok <- false if not Platform::pkg_cstr_equal(profile_value, "debug") and not Platform::pkg_cstr_equal(profile_value, "release")
+                        if flags_ok:
+                            profile_seen <- true
+                    index <- index + 2
+                    continue
+                options.locked <- true if Platform::pkg_cstr_equal(flag, "--locked")
+                options.offline <- true if Platform::pkg_cstr_equal(flag, "--offline")
+                options.frozen <- true if Platform::pkg_cstr_equal(flag, "--frozen")
+                options.json <- true if Platform::pkg_cstr_equal(flag, "--json")
+                options.verbose <- true if Platform::pkg_cstr_equal(flag, "--verbose")
+                quiet <- true if Platform::pkg_cstr_equal(flag, "--quiet")
+                publish_dry_run <- true if Platform::pkg_cstr_equal(command, "publish") and Platform::pkg_cstr_equal(flag, "--dry-run")
+                if Platform::pkg_cstr_equal(flag, "--color"):
+                    flags_ok <- false if color_seen or index + 1 >= argc
+                    if flags_ok:
+                        color_value: cstr = slots[index + 1].cast[cstr]
+                        flags_ok <- false if not valid_color_mode(color_value)
+                        color_seen <- true if flags_ok
+                    index <- index + 2
+                    continue
+                flag_length: usize = Platform::pkg_strlen(flag)
+                is_positional: bool = flag_length > 0.usize() and flag[0].u8() != 45
+                positional_allowed: bool = (Platform::pkg_cstr_equal(command, "why") and positional_count == 0) or (Platform::pkg_cstr_equal(command, "install") and positional_count == 0) or (Platform::pkg_cstr_equal(command, "uninstall") and positional_count == 0) or (Platform::pkg_cstr_equal(command, "cache") and positional_count == 0) or (Platform::pkg_cstr_equal(command, "fetch") and positional_count < 2)
+                recognized: mutable bool = is_positional and positional_allowed
+                recognized <- true if not is_positional and (Platform::pkg_cstr_equal(flag, "--locked") or Platform::pkg_cstr_equal(flag, "--offline") or Platform::pkg_cstr_equal(flag, "--frozen") or Platform::pkg_cstr_equal(flag, "--json") or Platform::pkg_cstr_equal(flag, "--verbose") or Platform::pkg_cstr_equal(flag, "--quiet") or (Platform::pkg_cstr_equal(flag, "--list") and Platform::pkg_cstr_equal(command, "package")) or (Platform::pkg_cstr_equal(flag, "--dry-run") and (Platform::pkg_cstr_equal(command, "cache") or Platform::pkg_cstr_equal(command, "publish"))) or (Platform::pkg_cstr_equal(command, "install") and Platform::pkg_cstr_equal(flag, "--local")) or (Platform::pkg_cstr_equal(command, "uninstall") and Platform::pkg_cstr_equal(flag, "--local")))
+                flags_ok <- false if not recognized
+                positional_count <- positional_count + 1 if recognized and is_positional
+                index <- index + 1
+            return flags_ok
+
+        def read_target_flags(argc: i64, dispatch_slots: mutable cstr&&, command: cstr, options: mutable Model::CommandOptions&) -> void can[Unsafe.PointerCast]:
+            dispatch_index: mutable i64 = 2
+            dispatch_separator_seen: mutable bool = false
+            while dispatch_index < argc |dispatch_slots, dispatch_index, dispatch_separator_seen, options|:
+                dispatch_flag: cstr = dispatch_slots[dispatch_index].cast[cstr]
+                if Platform::pkg_cstr_equal(dispatch_flag, "--"):
+                    dispatch_separator_seen <- true
+                    dispatch_index <- dispatch_index + 1
+                    continue
+                if dispatch_separator_seen:
+                    dispatch_index <- dispatch_index + 1
+                    continue
+                if Platform::pkg_cstr_equal(dispatch_flag, "--profile"):
+                    options.profile <- dispatch_slots[dispatch_index + 1].cast[cstr]
+                    dispatch_index <- dispatch_index + 2
+                    continue
+                if Platform::pkg_cstr_equal(dispatch_flag, "--bin") or Platform::pkg_cstr_equal(dispatch_flag, "--lib") or Platform::pkg_cstr_equal(dispatch_flag, "--test"):
+                    options.target_name <- dispatch_slots[dispatch_index + 1].cast[cstr]
+                    options.target_kind <- "bin" if Platform::pkg_cstr_equal(dispatch_flag, "--bin")
+                    options.target_kind <- "lib" if Platform::pkg_cstr_equal(dispatch_flag, "--lib")
+                    options.target_kind <- "test" if Platform::pkg_cstr_equal(dispatch_flag, "--test")
+                    dispatch_index <- dispatch_index + 2
+                    continue
+                dispatch_index <- dispatch_index + 1
+            if Platform::pkg_cstr_equal(command, "run") and Platform::pkg_strlen(options.target_kind) == 0.usize():
+                options.target_kind <- "bin"
+            if Platform::pkg_cstr_equal(command, "test") and Platform::pkg_strlen(options.target_kind) == 0.usize():
+                options.target_kind <- "test"
+
+    private:
+        def valid_color_mode(value: cstr) -> bool:
+            return Platform::pkg_cstr_equal(value, "auto") or Platform::pkg_cstr_equal(value, "always") or Platform::pkg_cstr_equal(value, "never")
