@@ -58,6 +58,29 @@ module Registry:
             return read_index_with_key_fingerprint(package, out, yanked_flags_out, generation_out, snapshot_digest_out, identity_out, &key_fingerprint)
 
     private:
+        # Check `expires` against the current wall clock.
+        def metadata_expiry_result(expires: u64) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            now: i64 = Platform::wall_clock_seconds()
+            return ResultCode.ClockUnavailable if now < 0
+            return rollback_store_result(RollbackStore::metadata_expiry_status(expires, now.u64()))
+
+        # Record a release against the package's current authenticated index.
+        # A nonzero `expected_generation` also requires that index to be the
+        # exact snapshot (generation, digest, identity) that selected it.
+        def record_at_current_index(package: darray[u8]&, version: darray[u8]&, digest: darray[u8]&, metadata_digest: darray[u8]&, expires: u64, expected_generation: u64, expected_digest: darray[u8]&, expected_identity: darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            versions: mutable darray[u8] = []
+            generation: mutable u64 = 0
+            index_digest: mutable darray[u8] = []
+            index_identity: mutable darray[u8] = []
+            key_fingerprint: mutable darray[u8] = []
+            region index_status_scope:
+                yanked_flags: mutable darray[u8] = []
+                index_status: ResultCode = read_index_with_key_fingerprint(package, &versions, &yanked_flags, &generation, &index_digest, &index_identity, &key_fingerprint)
+                return index_status if index_status != ResultCode.Ok
+            return ResultCode.RollbackDetected if expected_generation != 0 and (generation != expected_generation or not ByteText::equal(index_digest, expected_digest) or not ByteText::equal(index_identity, expected_identity))
+            return ResultCode.NoMatchingVersion if not SignedRegistryIndex::contains_version(versions, version)
+            return rollback_store_result(RollbackStore::record_release(package, version, digest, metadata_digest, expires, generation, index_digest, index_identity, key_fingerprint))
+
         def read_index_with_key_fingerprint(package: darray[u8]&, out: mutable darray[u8]&, yanked_flags_out: mutable darray[u8]&, generation_out: mutable u64&, snapshot_digest_out: mutable darray[u8]&, identity_out: mutable darray[u8]&, key_fingerprint_out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out.resize(0)
             yanked_flags_out.resize(0)
@@ -121,22 +144,11 @@ module Registry:
         # or restoring a project cannot reset rollback protection.
         def record_trusted(package: darray[u8]&, version: darray[u8]&, digest: darray[u8]&, metadata_digest: darray[u8]&, expires: u64) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             return ResultCode.InvalidConfiguration if not PackageIdentity::valid_name(package)
-            now: i64 = Platform::wall_clock_seconds()
-            return ResultCode.ClockUnavailable if now < 0
             region expiry_status_scope:
-                expiry_status: ResultCode = rollback_store_result(RollbackStore::metadata_expiry_status(expires, now.u64()))
+                expiry_status: ResultCode = metadata_expiry_result(expires)
                 return expiry_status if expiry_status != ResultCode.Ok
-            versions: mutable darray[u8] = []
-            yanked_flags: mutable darray[u8] = []
-            generation: mutable u64 = 0
-            index_digest: mutable darray[u8] = []
-            index_identity: mutable darray[u8] = []
-            key_fingerprint: mutable darray[u8] = []
-            region index_status_scope:
-                index_status: ResultCode = read_index_with_key_fingerprint(package, &versions, &yanked_flags, &generation, &index_digest, &index_identity, &key_fingerprint)
-                return index_status if index_status != ResultCode.Ok
-            return ResultCode.NoMatchingVersion if not SignedRegistryIndex::contains_version(versions, version)
-            return rollback_store_result(RollbackStore::record_release(package, version, digest, metadata_digest, expires, generation, index_digest, index_identity, key_fingerprint))
+            empty_identity: darray[u8] = []
+            return record_at_current_index(package, version, digest, metadata_digest, expires, 0, empty_identity, empty_identity)
 
         # Commit a selected release only while the exact authenticated index
         # snapshot that authorized it is still the highest snapshot recorded
@@ -147,23 +159,10 @@ module Registry:
             return ResultCode.InvalidConfiguration if:
                 not PackageIdentity::valid_name(package) or generation == 0 or not Integrity::valid_sha256_hex(index_digest)
                 not Integrity::valid_sha256_hex(metadata_digest) or not Integrity::valid_sha256_hex(digest)
-            now: i64 = Platform::wall_clock_seconds()
-            return ResultCode.ClockUnavailable if now < 0
             region expiry_status_scope:
-                expiry_status: ResultCode = rollback_store_result(RollbackStore::metadata_expiry_status(expires, now.u64()))
+                expiry_status: ResultCode = metadata_expiry_result(expires)
                 return expiry_status if expiry_status != ResultCode.Ok
-            versions: mutable darray[u8] = []
-            yanked_flags: mutable darray[u8] = []
-            current_generation: mutable u64 = 0
-            current_digest: mutable darray[u8] = []
-            current_identity: mutable darray[u8] = []
-            key_fingerprint: mutable darray[u8] = []
-            region index_status_scope:
-                index_status: ResultCode = read_index_with_key_fingerprint(package, &versions, &yanked_flags, &current_generation, &current_digest, &current_identity, &key_fingerprint)
-                return index_status if index_status != ResultCode.Ok
-            return ResultCode.RollbackDetected if current_generation != generation or not ByteText::equal(current_digest, index_digest) or not ByteText::equal(current_identity, index_identity)
-            return ResultCode.NoMatchingVersion if not SignedRegistryIndex::contains_version(versions, version)
-            return rollback_store_result(RollbackStore::record_release(package, version, digest, metadata_digest, expires, generation, index_digest, index_identity, key_fingerprint))
+            return record_at_current_index(package, version, digest, metadata_digest, expires, generation, index_digest, index_identity)
 
         # Check an identity against persisted signed metadata evidence and
         # advance the state-bound wall-clock floor while holding the same lock
