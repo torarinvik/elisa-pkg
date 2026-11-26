@@ -28,6 +28,8 @@ module InstallRecords:
             return true
 
     public:
+        const max_record_bytes: usize = 8192.usize()
+
         def encode_receipt(name: darray[u8]&, version: darray[u8]&, destination: darray[u8]&, digest: darray[u8]&, out: mutable darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
             out.resize(0)
             bytes_push_view(out, "elisapkg-install-receipt:1\nname:")
@@ -57,6 +59,11 @@ module InstallRecords:
             out_name.resize(0)
             out_version.resize(0)
             out_digest.resize(0)
+            return false if raw.count > max_record_bytes
+            journal_operation: mutable darray[u8] = []
+            journal_name: mutable darray[u8] = []
+            journal_version: mutable darray[u8] = []
+            journal_digest: mutable darray[u8] = []
             operation_prefix: mutable darray[u8] = []
             bytes_push_view(&operation_prefix, "elisapkg-install-transaction:1\noperation:")
             operation_start: usize = operation_prefix.count
@@ -68,18 +75,18 @@ module InstallRecords:
                 bytes_push_view(&candidate, operation)
                 bytes_push_view(&candidate, "\nname:")
                 if bytes_starts_with(raw, candidate):
-                    bytes_push_view(out_operation, operation)
+                    bytes_push_view(&journal_operation, operation)
                     operation_end <- candidate.count
                     break
-            return false if out_operation.count == 0.usize()
+            return false if journal_operation.count == 0.usize()
             name_start: usize = operation_end
             name_end: mutable usize = name_start
             while name_end < raw.count and raw[name_end] != 10:
                 name_end <- name_end + 1.usize()
             return false if name_end == name_start or name_end >= raw.count or name_end - name_start > PackageIdentity::max_name_bytes
-            for index in name_start..<name_end |raw, out_name|:
-                out_name.push(raw[index])
-            return false if not PackageIdentity::valid_name(out_name)
+            for index in name_start..<name_end |raw, journal_name|:
+                journal_name.push(raw[index])
+            return false if not PackageIdentity::valid_name(journal_name)
             version_key: mutable darray[u8] = []
             bytes_push_view(&version_key, "\nversion:")
             return false if name_end + version_key.count >= raw.count
@@ -90,17 +97,21 @@ module InstallRecords:
             while version_end < raw.count and raw[version_end] != 10:
                 version_end <- version_end + 1
             return false if version_end == version_start or version_end >= raw.count or version_end - version_start > SemVer::max_version_bytes
-            for index in version_start..<version_end |raw, out_version|:
-                out_version.push(raw[index])
+            for index in version_start..<version_end |raw, journal_version|:
+                journal_version.push(raw[index])
             parsed_version: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-            return false if not PackageIdentity::parse_version(out_version, &parsed_version)
+            return false if not PackageIdentity::parse_version(journal_version, &parsed_version)
             digest_key: mutable darray[u8] = []
             bytes_push_view(&digest_key, "artifact-digest:sha256:")
             digest_start: usize = version_end + 1.usize() + digest_key.count
             return false if digest_start > raw.count or raw.count != digest_start + 65.usize()
             for index in 0..<digest_key.count |raw, digest_key, version_end|:
                 return false if raw[version_end + 1.usize() + index] != digest_key[index]
-            for index in 0..<64 |raw, out_digest, digest_start|:
-                out_digest.push(raw[digest_start + index])
-            return false if raw[raw.count - 1.usize()] != 10 or not valid_install_digest(out_digest)
+            for index in 0..<64 |raw, journal_digest, digest_start|:
+                journal_digest.push(raw[digest_start + index])
+            return false if raw[raw.count - 1.usize()] != 10 or not valid_install_digest(journal_digest)
+            out_operation <- journal_operation
+            out_name <- journal_name
+            out_version <- journal_version
+            out_digest <- journal_digest
             return true
