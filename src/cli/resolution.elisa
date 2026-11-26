@@ -58,24 +58,11 @@ module ResolutionCommand:
                             not ByteText::equal(alias, dependency_name) or ByteText::equal(alias, root_name)
                     else:
                         return CliStatus::resolution_failed if ByteText::equal(alias, root_name)
-                    region updated_scope:
-                        updated: darray[u8] = ManifestEdits::append_path(raw, alias, dependency_path) if local_form else ManifestEdits::append_registry(raw, alias, requirement)
-                        if updated.count == 0.usize():
-                            CliOutput::write_error("error: could not add the dependency; check for a duplicate name or a manifest limit\n")
-                            return CliStatus::resolution_failed
-                        return CliStatus::security_failed if not ProjectTransaction::begin(raw)
-                        if not ProjectTransaction::publish_manifest(updated):
-                            _ = ProjectTransaction::restore()
-                            return CliStatus::source_failed
-                    options: Model::CommandOptions = Model::CommandOptions{locked: false, offline: false, frozen: false, json: false, verbose: false, profile: "debug", target_name: "", target_kind: "", update_name: ""}
-                    resolve(&root, options, true, false)
-                if resolved != CliStatus::success:
-                    region restored_scope:
-                        restored: bool = ProjectTransaction::restore()
-                        if not restored:
-                            CliOutput::write_error("error: dependency edit failed and the original manifest could not be restored\n")
-                            return CliStatus::security_failed
-                    return resolved
+                    region publish_status_scope:
+                        publish_status: i64 = publish_manifest_edit(raw, ManifestEdits::append_path(raw, alias, dependency_path) if local_form else ManifestEdits::append_registry(raw, alias, requirement), "error: could not add the dependency; check for a duplicate name or a manifest limit\n")
+                        return publish_status if publish_status != CliStatus::success
+                    resolve(&root, edit_options(), true, false)
+                return restore_after_failure(resolved, "error: dependency edit failed and the original manifest could not be restored\n") if resolved != CliStatus::success
                 return CliStatus::security_failed if not ProjectTransaction::commit()
                 report_added(local_form, alias, dependency_path, requirement)
                 return CliStatus::success
@@ -215,24 +202,11 @@ module ResolutionCommand:
                     return CliStatus::usage if:
                         not ProjectFiles::read_c_string_into("elisapkg.json", &raw)
                         not ProjectManifest::validate_at(raw, &root, &root_name, &root_version)
-                    region updated_scope:
-                        updated: darray[u8] = ManifestEdits::remove(raw, alias)
-                        if updated.count == 0.usize():
-                            CliOutput::write_error("error: dependency is not declared; no manifest or lockfile mutation was performed\n")
-                            return CliStatus::resolution_failed
-                        return CliStatus::security_failed if not ProjectTransaction::begin(raw)
-                        if not ProjectTransaction::publish_manifest(updated):
-                            _ = ProjectTransaction::restore()
-                            return CliStatus::source_failed
-                    options: Model::CommandOptions = Model::CommandOptions{locked: false, offline: false, frozen: false, json: false, verbose: false, profile: "debug", target_name: "", target_kind: "", update_name: ""}
-                    resolve(&root, options, true, false)
-                if resolved != CliStatus::success:
-                    region restored_scope:
-                        restored: bool = ProjectTransaction::restore()
-                        if not restored:
-                            CliOutput::write_error("error: dependency removal failed and the original manifest could not be restored\n")
-                            return CliStatus::security_failed
-                    return resolved
+                    region publish_status_scope:
+                        publish_status: i64 = publish_manifest_edit(raw, ManifestEdits::remove(raw, alias), "error: dependency is not declared; no manifest or lockfile mutation was performed\n")
+                        return publish_status if publish_status != CliStatus::success
+                    resolve(&root, edit_options(), true, false)
+                return restore_after_failure(resolved, "error: dependency removal failed and the original manifest could not be restored\n") if resolved != CliStatus::success
                 return CliStatus::security_failed if not ProjectTransaction::commit()
                 CliOutput::write_ok("removed dependency ")
                 CliOutput::write_bytes(1, &alias)
@@ -260,17 +234,11 @@ module ResolutionCommand:
                             not ProjectManifest::validate_at(raw, &root, &root_name, &root_version)
                             wanted.count > 0.usize() and ByteText::equal(wanted, root_name)
                     return CliStatus::security_failed if not ProjectTransaction::begin(raw)
-                    options: Model::CommandOptions = Model::CommandOptions{locked: false, offline: false, frozen: false, json: false, verbose: false, profile: "debug", target_name: "", target_kind: "", update_name: ""}
+                    options: Model::CommandOptions = edit_options()
                     if wanted.count > 0.usize():
                         options.update_name <- slots[2].cast[cstr]
                     resolve(&root, options, true, false)
-                if resolved != CliStatus::success:
-                    region restored_scope:
-                        restored: bool = ProjectTransaction::restore()
-                        if not restored:
-                            CliOutput::write_error("error: update failed and the original manifest or lockfile could not be restored\n")
-                            return CliStatus::security_failed
-                    return resolved
+                return restore_after_failure(resolved, "error: update failed and the original manifest or lockfile could not be restored\n") if resolved != CliStatus::success
                 if wanted.count > 0.usize():
                     lock: mutable darray[u8] = []
                     lock <- lock.resize(ProjectFiles::project_document_limit)
@@ -282,6 +250,29 @@ module ResolutionCommand:
                 return CliStatus::success
 
     private:
+        def edit_options() -> Model::CommandOptions:
+            return Model::CommandOptions{locked: false, offline: false, frozen: false, json: false, verbose: false, profile: "debug", target_name: "", target_kind: "", update_name: ""}
+
+        # Restore the manifest and lockfile after a failed edit. Returns the
+        # failure, or a security failure when the restore itself fails.
+        def restore_after_failure(failure: i64, message: cstr) -> CliStatus::ExitStatus can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global{Read,Write}:
+                return failure if ProjectTransaction::restore()
+                CliOutput::write_error(message)
+                return CliStatus::security_failed
+
+        # Begin a transaction over `raw` and publish the edited manifest
+        # `updated`. An empty `updated` means the edit was rejected.
+        def publish_manifest_edit(raw: darray[u8]&, updated: darray[u8]&, rejected_message: cstr) -> CliStatus::ExitStatus can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global{Read,Write}:
+                if updated.count == 0.usize():
+                    CliOutput::write_error(rejected_message)
+                    return CliStatus::resolution_failed
+                return CliStatus::security_failed if not ProjectTransaction::begin(raw)
+                return CliStatus::success if ProjectTransaction::publish_manifest(updated)
+                _ = ProjectTransaction::restore()
+                return CliStatus::source_failed
+
         def report_added(local_form: bool, alias: darray[u8]&, dependency_path: darray[u8]&, requirement: darray[u8]&) -> void can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
                 CliOutput::write_ok("added ")
