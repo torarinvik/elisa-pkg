@@ -1,0 +1,83 @@
+# Check ACL policy on already-open filesystem descriptors.
+include "./errors.elisa"
+include "./libc.elisa"
+include "./linux_access_acl.elisa"
+
+module NativeTrustedAcl:
+    public:
+        def trusted_acl_fd(fd: i64, is_directory: bool) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            static if ELISA_TARGET_OS_MACOS:
+                native_errno()[0] <- 0
+                if native_acl_get_fd_np(fd.i32(), 256) is acl:
+                    entry_slot: mutable darray[u8&?] = [null]
+                    entry_out: mutable void& = (&entry_slot[0]).cast[mutable void&] can Unsafe.PointerCast
+                    entry_id: mutable i32 = 0
+                    safe: mutable bool = true
+                    while safe:
+                        native_errno()[0] <- 0
+                        entry_status: i32 = native_acl_get_entry(acl, entry_id, entry_out)
+                        if entry_status == 0:
+                            entry_id <- -1
+                            if entry_slot[0] is entry:
+                                tag: mutable i32 = 0
+                                if native_acl_get_tag_type(entry, &tag) != 0 or tag != 2:
+                                    # ACL_EXTENDED_DENY is the only extended
+                                    # ACE accepted. Any allow or unknown tag
+                                    # could grant mutation outside mode bits.
+                                    safe <- false
+                            else:
+                                safe <- false
+                        else:
+                            end_errno: i64 = NativeErrors::current_errno()
+                            if entry_id == -1 and end_errno == 22:
+                                break
+                            safe <- false
+                    acl_value: void& = acl.cast[void&] can Unsafe.PointerCast
+                    return native_acl_free(acl_value) == 0 and safe
+                return NativeErrors::current_errno() == 2
+            static elif ELISA_TARGET_OS_LINUX:
+                return trusted_linux_acl_fd(fd, is_directory)
+            static else:
+                return true
+
+    private:
+        # Linux stores POSIX access/default ACLs in xattrs. Inspect the already
+        # opened inode so pathname replacement cannot change the policy being
+        # checked. Any named user/group entry is rejected, even when read-only;
+        # base ACL permissions must also remain non-writable outside the owner
+        # class. A default ACL can affect future children, so trusted
+        # directories carrying one fail closed.
+        static if ELISA_TARGET_OS_LINUX:
+            def trusted_linux_acl_fd(fd: i64, is_directory: bool) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+                access_acl: mutable darray[u8] = []
+                access_status: i64 = read_linux_acl_xattr(fd, "system.posix_acl_access", &access_acl)
+                return false if access_status < 0
+                return false if access_status == 1 and not LinuxAccessAcl::is_safe(access_acl)
+                if is_directory:
+                    default_acl: mutable darray[u8] = []
+                    default_status: i64 = read_linux_acl_xattr(fd, "system.posix_acl_default", &default_acl)
+                    return false if default_status < 0 or default_status == 1
+                return true
+
+            # Return 0 for an absent/unsupported POSIX ACL attribute, 1 for a
+            # bounded value, and -1 for every other read or format failure.
+            # ENOTSUP means this filesystem cannot store the ACL class being
+            # queried; inability to read an existing attribute is not treated
+            # as absence.
+            def read_linux_acl_xattr(fd: i64, name: cstr, out: mutable darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+                out.resize(0)
+                out.resize(LinuxAccessAcl::read_capacity)
+                loaded: i64 =
+                    raw: mutable void& = (&out[0]).cast[mutable void&] can Unsafe.PointerCast
+                    native_errno()[0] <- 0
+                    native_fgetxattr(fd.i32(), name, raw, out.count)
+                if loaded < 0:
+                    errno_value: i64 = NativeErrors::current_errno()
+                    out.resize(0)
+                    return 0 if errno_value == 61 or errno_value == 95
+                    return -1
+                if loaded < 4 or loaded > LinuxAccessAcl::read_capacity.i64() or (loaded - 4) % 8 != 0:
+                    out.resize(0)
+                    return -1
+                out.resize(loaded.usize())
+                return 1

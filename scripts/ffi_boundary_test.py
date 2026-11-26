@@ -20,6 +20,8 @@ NATIVE_MODULES = {
         "src/platform/process.elisa",
         "src/platform/snapshot_tree.elisa",
         "src/platform/staging_tree.elisa",
+        "src/platform/trusted_acl.elisa",
+        "src/platform/trusted_paths.elisa",
     )
 }
 GENERATED_DIRECTORIES = {".git", ".elisapkg", ".ruff_cache", "build"}
