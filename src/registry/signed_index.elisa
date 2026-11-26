@@ -1,0 +1,144 @@
+# Verify signed index snapshots and persist their rollback floors before use.
+include "../integrity.elisa"
+include "../platform.elisa"
+include "../text/bytes.elisa"
+include "../trust.elisa"
+include "./files.elisa"
+include "./index_snapshot.elisa"
+include "./rollback_store.elisa"
+include "./trust_identity.elisa"
+
+module SignedRegistryIndex:
+    public:
+        const enum Code of u8:
+            InvalidConfiguration
+            MissingIndex
+            ResourceLimit
+            MalformedMetadata
+            MissingSignature
+            MissingTrustRoot
+            TrustStateUnavailable
+            Ok
+            InvalidSignature
+            ClockUnavailable
+            TrustStateMalformed
+            TrustRootChanged
+            NotConfigured
+            ClockRollback
+            RollbackDetected
+            DigestMismatch
+            ExpiredMetadata
+            ExpiryHorizon
+
+        def read(root: darray[u8]&, package: darray[u8]&, key_path: darray[u8]&, out: mutable darray[u8]&, yanked_flags_out: mutable darray[u8]&, generation_out: mutable u64&, snapshot_digest_out: mutable darray[u8]&, identity_out: mutable darray[u8]&, key_fingerprint_out: mutable darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            out.resize(0)
+            yanked_flags_out.resize(0)
+            generation_out <- 0
+            snapshot_digest_out.resize(0)
+            identity_out.resize(0)
+            key_fingerprint_out.resize(0)
+            index_path: mutable darray[u8] = []
+            return Code.InvalidConfiguration if not RegistryFiles::join_path_leaf(root, package, "index", &index_path)
+            snapshot: mutable darray[u8] = []
+            loaded: i64 = RegistryFiles::read_trusted_file(index_path, 1048576.usize(), &snapshot)
+            return Code.MissingIndex if loaded == -2
+            return Code.ResourceLimit if loaded == -27
+            return Code.InvalidConfiguration if loaded < 0
+            return Code.MalformedMetadata if loaded == 0 or snapshot.count > 1048576
+
+            signature_path: mutable darray[u8] = []
+            return Code.InvalidConfiguration if not RegistryFiles::join_path_leaf(root, package, "index.sig", &signature_path)
+            signature: mutable darray[u8] = []
+            signature_size: i64 = RegistryFiles::read_trusted_file(signature_path, 64.usize(), &signature)
+            return Code.MissingSignature if signature_size < 0 or signature_size != 64
+            public_key: mutable darray[u8] = []
+            return Code.MissingTrustRoot if RegistryFiles::read_trusted_file(key_path, 32.usize(), &public_key) != 32
+            key_fingerprint_bytes: mutable darray[u8] = []
+            sha_status: Integrity::DigestCode = Integrity::sha256(public_key, &key_fingerprint_bytes)
+            return Code.TrustStateUnavailable if sha_status != Integrity::DigestCode.Ok
+            key_fingerprint_hex: mutable darray[u8] = []
+            return Code.TrustStateUnavailable if not Integrity::hex_digest(key_fingerprint_bytes, &key_fingerprint_hex)
+            trust_status: Trust::VerificationCode = Trust::verify_detached("ed25519", public_key, snapshot, signature)
+            return Code.InvalidSignature if trust_status != Trust::VerificationCode.Valid
+
+            versions: mutable darray[u8] = []
+            yanked_flags: mutable darray[u8] = []
+            snapshot_root: mutable darray[u8] = []
+            snapshot_package: mutable darray[u8] = []
+            generation: mutable u64 = 0
+            expires: mutable u64 = 0
+            return Code.MalformedMetadata if not RegistryIndexSnapshot::parse(snapshot, &snapshot_root, &snapshot_package, &generation, &expires, &versions, &yanked_flags)
+            return Code.InvalidSignature if not ByteText::equal(snapshot_root, root) or not ByteText::equal(snapshot_package, package)
+            now: i64 = Platform::pkg_wall_clock_seconds()
+            return Code.ClockUnavailable if now < 0
+            expiry_status: Code = rollback_result(RollbackStore::metadata_expiry_status(expires, now.u64()))
+            return expiry_status if expiry_status != Code.Ok
+
+            snapshot_digest_bytes: mutable darray[u8] = []
+            snapshot_digest: mutable darray[u8] = []
+            return Code.TrustStateUnavailable if Integrity::sha256(snapshot, &snapshot_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(snapshot_digest_bytes, &snapshot_digest)
+            index_identity: mutable darray[u8] = []
+            return Code.TrustStateUnavailable if not TrustIdentity::index(root, package, &index_identity)
+            state_status: Code = record_index_generation(index_identity, generation, snapshot_digest, expires, key_fingerprint_hex)
+            return state_status if state_status != Code.Ok
+            for index in 0..<versions.count |out, versions|:
+                out.push(versions[index])
+            for index in 0..<yanked_flags.count |yanked_flags_out, yanked_flags|:
+                yanked_flags_out.push(yanked_flags[index])
+            generation_out <- generation
+            for index in 0..<snapshot_digest.count |snapshot_digest_out, snapshot_digest|:
+                snapshot_digest_out.push(snapshot_digest[index])
+            for index in 0..<index_identity.count |identity_out, index_identity|:
+                identity_out.push(index_identity[index])
+            for index in 0..<key_fingerprint_hex.count |key_fingerprint_out, key_fingerprint_hex|:
+                key_fingerprint_out.push(key_fingerprint_hex[index])
+            return Code.Ok
+
+        def contains_version(versions: darray[u8]&, version: darray[u8]&) -> bool:
+            cursor: mutable usize = 0
+            while cursor < versions.count |versions, version, cursor|:
+                finish: mutable usize = cursor
+                while finish < versions.count and versions[finish] != 10 |versions, finish|:
+                    finish <- finish + 1
+                return false if finish == versions.count
+                return true if ByteText::range_equals(versions, cursor, finish, version)
+                cursor <- finish + 1
+            return false
+
+        def filter_yanked_versions(index: darray[u8]&, yanked_flags: darray[u8]&, eligible_out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            eligible_out.resize(0)
+            cursor: mutable usize = 0.usize()
+            ordinal: mutable usize = 0.usize()
+            while cursor < index.count:
+                finish: mutable usize = cursor
+                while finish < index.count and index[finish] != 10 |index, finish|:
+                    finish <- finish + 1.usize()
+                return false if finish == index.count or finish == cursor or ordinal >= yanked_flags.count or yanked_flags[ordinal] > 1
+                if yanked_flags[ordinal] == 0:
+                    for item in cursor..<(finish + 1.usize()) |eligible_out, index|:
+                        eligible_out.push(index[item])
+                ordinal <- ordinal + 1.usize()
+                cursor <- finish + 1.usize()
+            return ordinal == yanked_flags.count
+
+    private:
+        def record_index_generation(identity: darray[u8]&, generation: u64, snapshot_digest: darray[u8]&, expires: u64, key_fingerprint: darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            generation_version: mutable darray[u8] = []
+            ByteText::append_text(&generation_version, "0.0.")
+            ByteText::append_decimal(&generation_version, generation)
+            return rollback_result(RollbackStore::record_index(identity, generation_version, snapshot_digest, snapshot_digest, expires, key_fingerprint))
+
+        def rollback_result(status: RollbackStore::Code) -> Code:
+            return match status:
+                RollbackStore::Code.Ok: Code.Ok
+                RollbackStore::Code.TrustStateUnavailable: Code.TrustStateUnavailable
+                RollbackStore::Code.TrustStateMalformed: Code.TrustStateMalformed
+                RollbackStore::Code.TrustRootChanged: Code.TrustRootChanged
+                RollbackStore::Code.InvalidConfiguration: Code.InvalidConfiguration
+                RollbackStore::Code.NotConfigured: Code.NotConfigured
+                RollbackStore::Code.ClockRollback: Code.ClockRollback
+                RollbackStore::Code.RollbackDetected: Code.RollbackDetected
+                RollbackStore::Code.DigestMismatch: Code.DigestMismatch
+                RollbackStore::Code.ExpiredMetadata: Code.ExpiredMetadata
+                RollbackStore::Code.ExpiryHorizon: Code.ExpiryHorizon
+                RollbackStore::Code.MissingTrustRoot: Code.MissingTrustRoot
