@@ -1,0 +1,111 @@
+# Filesystem operations for the file-backed registry and its trust state.
+include "../package/package_identity.elisa"
+include "../platform.elisa"
+include "../project/files.elisa"
+include "./root.elisa"
+
+module RegistryFiles:
+    public:
+        def path_is_same_or_beneath(candidate: darray[u8]&, parent: darray[u8]&) -> bool:
+            return false if parent.count == 0 or candidate.count < parent.count
+            for index in 0..<parent.count |candidate, parent|:
+                return false if candidate[index] != parent[index]
+            return true if candidate.count == parent.count
+            return true if parent.count == 1 and parent[0] == 47
+            return candidate[parent.count] == 47
+
+        def canonical_path(path: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            out.resize(0)
+            path_c: mutable darray[u8] = []
+            ProjectFiles::path_with_nul_into(path, &path_c)
+            path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
+            resolved: mutable darray[u8] = []
+            resolved.resize(4096)
+            if Platform::pkg_realpath(path_name, &resolved) is canonical:
+                length: usize = Platform::pkg_strlen(canonical)
+                return false if length == 0 or length > 4096
+                for index in 0..<length |out, canonical|:
+                    out.push(canonical[index].u8())
+                return true
+            return false
+
+        def join_path_leaf(root: darray[u8]&, package: darray[u8]&, leaf: cstr, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            out.resize(0)
+            return false if root.count == 0 or not RegistryRoot::valid(root)
+            for index in 0..<root.count |out, root|:
+                out.push(root[index])
+            if package.count > 0:
+                out.push(47) if out.count == 0 or out[out.count - 1.usize()] != 47
+                for index in 0..<package.count |out, package|:
+                    out.push(package[index])
+            leaf_length: usize = Platform::pkg_strlen(leaf)
+            if leaf_length > 0:
+                out.push(47) if out.count == 0 or out[out.count - 1.usize()] != 47
+                for index in 0..<leaf_length |out, leaf|:
+                    out.push(leaf[index].u8())
+            return out.count <= 4096
+
+        def join_path_version(root: darray[u8]&, package: darray[u8]&, version: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            out.resize(0)
+            return false if not PackageIdentity::valid_version(version)
+            for index in 0..<root.count |out, root|:
+                out.push(root[index])
+            out.push(47) if out.count == 0 or out[out.count - 1.usize()] != 47
+            for index in 0..<package.count |out, package|:
+                out.push(package[index])
+            out.push(47) if out.count == 0 or out[out.count - 1.usize()] != 47
+            for index in 0..<version.count |out, version|:
+                out.push(version[index])
+            return out.count <= 4096
+
+        def sibling_path(path: darray[u8]&, leaf: cstr, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            out.resize(0)
+            cursor: mutable usize = path.count
+            while cursor > 0 and path[cursor - 1] != 47:
+                cursor <- cursor - 1
+            return false if cursor == 0
+            for index in 0..<cursor |out, path|:
+                out.push(path[index])
+            leaf_length: usize = Platform::pkg_strlen(leaf)
+            for index in 0..<leaf_length |out, leaf|:
+                out.push(leaf[index].u8())
+            return out.count <= 4096
+
+        def read_file(path: darray[u8]&, maximum: usize, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            out.resize(0)
+            return false if path.count == 0.usize() or path.count > 4096.usize()
+            for index in 0..<path.count |path|:
+                return false if path[index] == 0
+            path_c: mutable darray[u8] = []
+            ProjectFiles::path_with_nul_into(path, &path_c)
+            path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
+            resolved: mutable darray[u8] = []
+            resolved.resize(4096)
+            canonical: mutable cstr = ""
+            if Platform::pkg_realpath(path_name, &resolved) is found:
+                canonical <- found
+            else:
+                return false
+            canonical_length: usize = Platform::pkg_strlen(canonical)
+            return false if canonical_length != path.count
+            for index in 0..<path.count |path, canonical|:
+                return false if path[index] != canonical[index].u8()
+            return Platform::pkg_read_bounded_file(path, maximum, out)
+
+        def read_trusted_file(path: darray[u8]&, maximum: usize, out: mutable darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            out.resize(0)
+            return -22 if maximum == 0.usize() or maximum > 1048576.usize()
+            path_c: mutable darray[u8] = []
+            ProjectFiles::path_with_nul_into(path, &path_c)
+            path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
+            out.resize(maximum + 1.usize())
+            raw: mutable u8& = (&out[0]).cast[mutable u8&] can Unsafe.PointerCast
+            loaded: i64 = Platform::pkg_read_trusted_file(path_name, raw, out.count)
+            if loaded < 0:
+                out.resize(0)
+                return loaded
+            if loaded > maximum.i64():
+                out.resize(0)
+                return -27
+            out.resize(loaded.usize())
+            return loaded

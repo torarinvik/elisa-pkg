@@ -24,6 +24,8 @@ include "./registry/trust_clock_record.elisa"
 include "./registry/trust_identity.elisa"
 include "./registry/trust_paths.elisa"
 include "./registry/rollback_records.elisa"
+include "./registry/files.elisa"
+include "./project/files.elisa"
 
 module Registry:
     public:
@@ -95,7 +97,7 @@ module Registry:
             snapshot_digest_out.resize(0)
             identity_out.resize(0)
             key_fingerprint_out.resize(0)
-            return ResultCode.InvalidConfiguration if not valid_package_name(package)
+            return ResultCode.InvalidConfiguration if not PackageIdentity::valid_name(package)
             root: mutable darray[u8] = []
             return ResultCode.NotConfigured if not configured_root(&root)
             return ResultCode.InvalidConfiguration if not RegistryRoot::valid(root)
@@ -114,7 +116,7 @@ module Registry:
         # metadata verification step unnoticed.
         def read_archive(package: darray[u8]&, version: darray[u8]&, metadata: darray[u8]&, archive: darray[u8]&, expected_digest: darray[u8]&, expected_size: u64, out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out.resize(0)
-            return ResultCode.InvalidConfiguration if not valid_package_name(package) or not PackageIdentity::valid_version(version) or not Archive::is_safe_entry(archive) or not Integrity::valid_sha256_hex(expected_digest) or expected_size > Archive::max_archive_bytes.u64()
+            return ResultCode.InvalidConfiguration if not PackageIdentity::valid_name(package) or not PackageIdentity::valid_version(version) or not Archive::is_safe_entry(archive) or not Integrity::valid_sha256_hex(expected_digest) or expected_size > Archive::max_archive_bytes.u64()
             root: mutable darray[u8] = []
             return ResultCode.NotConfigured if not configured_root(&root)
             return ResultCode.InvalidConfiguration if not RegistryRoot::valid(root)
@@ -126,12 +128,12 @@ module Registry:
             return ResultCode.MalformedMetadata if not ByteText::equal(metadata_archive, archive)
             return ResultCode.DigestMismatch if not ByteText::equal(metadata_digest, expected_digest) or metadata_size != expected_size
             path: mutable darray[u8] = []
-            return ResultCode.InvalidConfiguration if not join_path_version(root, package, version, &path)
+            return ResultCode.InvalidConfiguration if not RegistryFiles::join_path_version(root, package, version, &path)
             path.push(47)
             for index in 0..<archive.count |path, archive|:
                 path.push(archive[index])
             verified_archive: mutable darray[u8] = []
-            return ResultCode.ArchiveMissing if not read_file(path, Archive::max_archive_bytes, &verified_archive)
+            return ResultCode.ArchiveMissing if not RegistryFiles::read_file(path, Archive::max_archive_bytes, &verified_archive)
             return ResultCode.DigestMismatch if verified_archive.count.u64() != expected_size
             digest_bytes: mutable darray[u8] = []
             digest: mutable darray[u8] = []
@@ -146,7 +148,7 @@ module Registry:
         # authorized. Callers must authenticate metadata before using this
         # check; the function itself treats both inputs as untrusted bytes.
         def release_archive_matches_metadata(package: darray[u8]&, version: darray[u8]&, metadata: darray[u8]&, archive: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            return false if not valid_package_name(package) or not PackageIdentity::valid_version(version)
+            return false if not PackageIdentity::valid_name(package) or not PackageIdentity::valid_version(version)
             manifest_name: mutable darray[u8] = [101, 108, 105, 115, 97, 112, 107, 103, 46, 106, 115, 111, 110]
             manifest: mutable darray[u8] = []
             return false if not Archive::read_ustar_entry(archive, manifest_name, &manifest)
@@ -173,7 +175,7 @@ module Registry:
         # trust state. This is separate from the project lockfile so deleting
         # or restoring a project cannot reset rollback protection.
         def record_trusted(package: darray[u8]&, version: darray[u8]&, digest: darray[u8]&, metadata_digest: darray[u8]&, expires: u64) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
-            return ResultCode.InvalidConfiguration if not registry_valid_name(package)
+            return ResultCode.InvalidConfiguration if not PackageIdentity::valid_name(package)
             now: i64 = Platform::pkg_wall_clock_seconds()
             return ResultCode.ClockUnavailable if now < 0
             expiry_status: ResultCode = metadata_expiry_status(expires, now.u64())
@@ -195,7 +197,7 @@ module Registry:
         # one trust-state lock acquisition, closing the gap between index read
         # and package trust publication.
         def record_trusted_at_index(package: darray[u8]&, version: darray[u8]&, digest: darray[u8]&, metadata_digest: darray[u8]&, expires: u64, generation: u64, index_digest: darray[u8]&, index_identity: darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
-            return ResultCode.InvalidConfiguration if not registry_valid_name(package) or generation == 0 or not Integrity::valid_sha256_hex(index_digest)
+            return ResultCode.InvalidConfiguration if not PackageIdentity::valid_name(package) or generation == 0 or not Integrity::valid_sha256_hex(index_digest)
             return ResultCode.InvalidConfiguration if not Integrity::valid_sha256_hex(metadata_digest) or not Integrity::valid_sha256_hex(digest)
             now: i64 = Platform::pkg_wall_clock_seconds()
             return ResultCode.ClockUnavailable if now < 0
@@ -218,7 +220,7 @@ module Registry:
         # used by writers. Offline callers invoke this only after authenticating
         # the cached metadata and archive bytes.
         def verify_trusted(package: darray[u8]&, version: darray[u8]&, digest: darray[u8]&, metadata_digest: darray[u8]&, expires: u64) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
-            return ResultCode.InvalidConfiguration if not registry_valid_name(package)
+            return ResultCode.InvalidConfiguration if not PackageIdentity::valid_name(package)
             return trust_state_verify(package, version, digest, metadata_digest, expires)
 
         # Read the durable floors for one stable TUF registry identity. The
@@ -280,7 +282,7 @@ module Registry:
             generation_out <- 0
             snapshot_digest_out.resize(0)
             identity_out.resize(0)
-            return ResultCode.InvalidConfiguration if not valid_package_name(package) or not PackageIdentity::valid_version(version)
+            return ResultCode.InvalidConfiguration if not PackageIdentity::valid_name(package) or not PackageIdentity::valid_version(version)
             parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
             return ResultCode.InvalidConfiguration if not SemVer::parse(version, &parsed) or parsed.prerelease
             root: mutable darray[u8] = []
@@ -317,7 +319,7 @@ module Registry:
             digest_out.resize(0)
             archive_size_out <- 0
             metadata_out.resize(0)
-            return ResultCode.InvalidConfiguration if not valid_package_name(package) or not PackageIdentity::valid_version(version)
+            return ResultCode.InvalidConfiguration if not PackageIdentity::valid_name(package) or not PackageIdentity::valid_version(version)
             root: mutable darray[u8] = []
             return ResultCode.NotConfigured if not configured_root(&root)
             return ResultCode.InvalidConfiguration if not RegistryRoot::valid(root)
@@ -331,12 +333,12 @@ module Registry:
         # so the signature can be carried into the content-addressed offline cache.
         def read_signature(package: darray[u8]&, version: darray[u8]&, out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out.resize(0)
-            return ResultCode.InvalidConfiguration if not valid_package_name(package) or not PackageIdentity::valid_version(version)
+            return ResultCode.InvalidConfiguration if not PackageIdentity::valid_name(package) or not PackageIdentity::valid_version(version)
             root: mutable darray[u8] = []
             return ResultCode.NotConfigured if not configured_root(&root)
             return ResultCode.InvalidConfiguration if not RegistryRoot::valid(root)
             metadata_path: mutable darray[u8] = []
-            return ResultCode.InvalidConfiguration if not join_path_version(root, package, version, &metadata_path)
+            return ResultCode.InvalidConfiguration if not RegistryFiles::join_path_version(root, package, version, &metadata_path)
             metadata_path.push(47)
             metadata_path.push(109)
             metadata_path.push(101)
@@ -350,7 +352,7 @@ module Registry:
             metadata_path.push(115)
             metadata_path.push(105)
             metadata_path.push(103)
-            return ResultCode.MissingSignature if not read_file(metadata_path, 64.usize(), out)
+            return ResultCode.MissingSignature if not RegistryFiles::read_file(metadata_path, 64.usize(), out)
             return ResultCode.MissingSignature if out.count != 64.usize()
             return ResultCode.Ok
 
@@ -364,7 +366,7 @@ module Registry:
             archive_size_out <- 0
             expires_out <- 0
             dependencies_out.resize(0)
-            return ResultCode.InvalidConfiguration if not valid_package_name(package) or not PackageIdentity::valid_version(version) or not Integrity::valid_sha256_hex(expected_metadata_digest)
+            return ResultCode.InvalidConfiguration if not PackageIdentity::valid_name(package) or not PackageIdentity::valid_version(version) or not Integrity::valid_sha256_hex(expected_metadata_digest)
             return ResultCode.MalformedMetadata if metadata.count == 0.usize() or metadata.count > 1048576.usize() or not Json::valid_document(metadata) or not Json::unique_object_keys(metadata) or not ReleaseMetadata::has_root_object(metadata) or not ReleaseMetadata::allowed_fields(metadata)
             root: mutable darray[u8] = []
             return ResultCode.NotConfigured if not configured_root(&root)
@@ -380,7 +382,7 @@ module Registry:
             trust_root_status: ResultCode = configured_trust_root(root, &key_path)
             return trust_root_status if trust_root_status != ResultCode.Ok
             public_key: mutable darray[u8] = []
-            return ResultCode.MissingTrustRoot if read_trusted_file(key_path, 32.usize(), &public_key) != 32
+            return ResultCode.MissingTrustRoot if RegistryFiles::read_trusted_file(key_path, 32.usize(), &public_key) != 32
             trust_status: Trust::VerificationCode = Trust::verify_detached("ed25519", public_key, metadata, signature)
             return ResultCode.InvalidSignature if trust_status != Trust::VerificationCode.Valid
             verified_expires: mutable u64 = 0
@@ -408,7 +410,7 @@ module Registry:
             generation_out <- 0
             snapshot_digest_out.resize(0)
             identity_out.resize(0)
-            return ResultCode.InvalidConfiguration if not valid_package_name(package)
+            return ResultCode.InvalidConfiguration if not PackageIdentity::valid_name(package)
             root: mutable darray[u8] = []
             return ResultCode.NotConfigured if not configured_root(&root)
             return ResultCode.InvalidConfiguration if not RegistryRoot::valid(root)
@@ -451,9 +453,9 @@ module Registry:
             digest_out.resize(0)
             metadata_out.resize(0)
             archive_size_out <- 0
-            return ResultCode.InvalidConfiguration if not valid_package_name(package) or not PackageIdentity::valid_version(selected)
+            return ResultCode.InvalidConfiguration if not PackageIdentity::valid_name(package) or not PackageIdentity::valid_version(selected)
             metadata_path: mutable darray[u8] = []
-            return ResultCode.InvalidConfiguration if not join_path_version(root, package, selected, &metadata_path)
+            return ResultCode.InvalidConfiguration if not RegistryFiles::join_path_version(root, package, selected, &metadata_path)
             metadata_path.push(47)
             metadata_path.push(109)
             metadata_path.push(101)
@@ -469,7 +471,7 @@ module Registry:
             metadata_path.push(111)
             metadata_path.push(110)
             metadata: mutable darray[u8] = []
-            return ResultCode.MalformedMetadata if not read_file(metadata_path, Json::max_document_bytes, &metadata)
+            return ResultCode.MalformedMetadata if not RegistryFiles::read_file(metadata_path, Json::max_document_bytes, &metadata)
             return ResultCode.MalformedMetadata if not Json::valid_document(metadata) or not Json::unique_object_keys(metadata) or not ReleaseMetadata::has_root_object(metadata)
             return ResultCode.MalformedMetadata if not ReleaseMetadata::allowed_fields(metadata)
             selected_archive: mutable darray[u8] = []
@@ -478,11 +480,11 @@ module Registry:
             return ResultCode.MalformedMetadata if not ReleaseMetadata::match_identity_fields(metadata, root, package, selected, &selected_archive, &selected_digest, &selected_archive_size)
             return ResultCode.RollbackDetected if selected_version_below(selected, previous_version)
             signature_path: mutable darray[u8] = []
-            return ResultCode.InvalidConfiguration if not sibling_path(metadata_path, "metadata.sig", &signature_path)
+            return ResultCode.InvalidConfiguration if not RegistryFiles::sibling_path(metadata_path, "metadata.sig", &signature_path)
             signature: mutable darray[u8] = []
-            return ResultCode.MissingSignature if not read_file(signature_path, 64.usize(), &signature)
+            return ResultCode.MissingSignature if not RegistryFiles::read_file(signature_path, 64.usize(), &signature)
             public_key: mutable darray[u8] = []
-            return ResultCode.MissingTrustRoot if read_trusted_file(key_path, 32.usize(), &public_key) != 32
+            return ResultCode.MissingTrustRoot if RegistryFiles::read_trusted_file(key_path, 32.usize(), &public_key) != 32
             trust_status: Trust::VerificationCode = Trust::verify_detached("ed25519", public_key, metadata, signature)
             return ResultCode.InvalidSignature if trust_status != Trust::VerificationCode.Valid
             expires: mutable u64 = 0
@@ -503,18 +505,18 @@ module Registry:
                 archive_size_out <- selected_archive_size
                 return ResultCode.Ok
             archive_path: mutable darray[u8] = []
-            return ResultCode.InvalidConfiguration if not join_path_version(root, package, selected, &archive_path)
+            return ResultCode.InvalidConfiguration if not RegistryFiles::join_path_version(root, package, selected, &archive_path)
             archive_path.push(47)
             for index in 0..<selected_archive.count |archive_path, selected_archive|:
                 archive_path.push(selected_archive[index])
             archive_c: mutable darray[u8] = []
-            path_with_nul(archive_path, &archive_c)
+            ProjectFiles::path_with_nul_into(archive_path, &archive_c)
             archive_name: cstr = (&archive_c[0]).cast[cstr] can Unsafe.PointerCast
             actual_size: i64 = Platform::pkg_package_file_size(archive_name)
             return ResultCode.ArchiveMissing if actual_size < 0
             return ResultCode.DigestMismatch if actual_size.u64() != selected_archive_size
             archive_bytes: mutable darray[u8] = []
-            return ResultCode.ArchiveMissing if not read_file(archive_path, Archive::max_archive_bytes, &archive_bytes)
+            return ResultCode.ArchiveMissing if not RegistryFiles::read_file(archive_path, Archive::max_archive_bytes, &archive_bytes)
             return ResultCode.DigestMismatch if archive_bytes.count.u64() != selected_archive_size
             actual_digest_bytes: mutable darray[u8] = []
             actual_digest: mutable darray[u8] = []
@@ -559,9 +561,6 @@ module Registry:
 
     private:
 
-        def registry_valid_name(value: darray[u8]&) -> bool:
-            return PackageIdentity::valid_name(value)
-
         def trust_state_has_override() -> bool:
             override: u8&? = Platform::pkg_getenv("ELISAPKG_TRUST_STATE")
             return true if override is configured
@@ -600,127 +599,14 @@ module Registry:
                         segment_length: usize = index - segment_start
                         return ResultCode.InvalidConfiguration if segment_length == 0.usize() or segment_length == 1.usize() and value[segment_start].u8() == 46 or segment_length == 2.usize() and value[segment_start].u8() == 46 and value[segment_start + 1.usize()].u8() == 46
                         segment_start <- index + 1.usize()
-                return ResultCode.InvalidConfiguration if path_is_same_or_beneath(out, registry_root)
+                return ResultCode.InvalidConfiguration if RegistryFiles::path_is_same_or_beneath(out, registry_root)
                 canonical_registry: mutable darray[u8] = []
                 canonical_trust: mutable darray[u8] = []
-                return ResultCode.InvalidConfiguration if not canonical_path(registry_root, &canonical_registry)
-                return ResultCode.MissingTrustRoot if not canonical_path(out, &canonical_trust)
-                return ResultCode.InvalidConfiguration if path_is_same_or_beneath(canonical_trust, canonical_registry)
+                return ResultCode.InvalidConfiguration if not RegistryFiles::canonical_path(registry_root, &canonical_registry)
+                return ResultCode.MissingTrustRoot if not RegistryFiles::canonical_path(out, &canonical_trust)
+                return ResultCode.InvalidConfiguration if RegistryFiles::path_is_same_or_beneath(canonical_trust, canonical_registry)
                 return ResultCode.Ok
             return ResultCode.MissingTrustRoot
-
-        def path_is_same_or_beneath(candidate: darray[u8]&, parent: darray[u8]&) -> bool:
-            return false if parent.count == 0 or candidate.count < parent.count
-            for index in 0..<parent.count |candidate, parent|:
-                return false if candidate[index] != parent[index]
-            return true if candidate.count == parent.count
-            return true if parent.count == 1 and parent[0] == 47
-            return candidate[parent.count] == 47
-
-        def canonical_path(path: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            out.resize(0)
-            path_c: mutable darray[u8] = []
-            path_with_nul(path, &path_c)
-            path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
-            resolved: mutable darray[u8] = []
-            resolved.resize(4096)
-            if Platform::pkg_realpath(path_name, &resolved) is canonical:
-                length: usize = Platform::pkg_strlen(canonical)
-                return false if length == 0 or length > 4096
-                for index in 0..<length |out, canonical|:
-                    out.push(canonical[index].u8())
-                return true
-            return false
-
-        def valid_package_name(package: darray[u8]&) -> bool:
-            return PackageIdentity::valid_name(package)
-
-        def join_path_leaf(root: darray[u8]&, package: darray[u8]&, leaf: cstr, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            out.resize(0)
-            return false if root.count == 0 or not RegistryRoot::valid(root)
-            for index in 0..<root.count |out, root|:
-                out.push(root[index])
-            if package.count > 0:
-                out.push(47) if out.count == 0 or out[out.count - 1.usize()] != 47
-                for index in 0..<package.count |out, package|:
-                    out.push(package[index])
-            leaf_length: usize = Platform::pkg_strlen(leaf)
-            if leaf_length > 0:
-                out.push(47) if out.count == 0 or out[out.count - 1.usize()] != 47
-                for index in 0..<leaf_length |out, leaf|:
-                    out.push(leaf[index].u8())
-            return out.count <= 4096
-
-        def join_path_version(root: darray[u8]&, package: darray[u8]&, version: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            out.resize(0)
-            return false if not PackageIdentity::valid_version(version)
-            for index in 0..<root.count |out, root|:
-                out.push(root[index])
-            out.push(47) if out.count == 0 or out[out.count - 1.usize()] != 47
-            for index in 0..<package.count |out, package|:
-                out.push(package[index])
-            out.push(47) if out.count == 0 or out[out.count - 1.usize()] != 47
-            for index in 0..<version.count |out, version|:
-                out.push(version[index])
-            return out.count <= 4096
-
-        def sibling_path(path: darray[u8]&, leaf: cstr, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            out.resize(0)
-            cursor: mutable usize = path.count
-            while cursor > 0 and path[cursor - 1] != 47:
-                cursor <- cursor - 1
-            return false if cursor == 0
-            for index in 0..<cursor |out, path|:
-                out.push(path[index])
-            leaf_length: usize = Platform::pkg_strlen(leaf)
-            for index in 0..<leaf_length |out, leaf|:
-                out.push(leaf[index].u8())
-            return out.count <= 4096
-
-        def path_with_nul(path: darray[u8]&, out: mutable darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
-            out.resize(0)
-            for index in 0..<path.count |out, path|:
-                out.push(path[index])
-            out.push(0)
-
-        def read_file(path: darray[u8]&, maximum: usize, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            out.resize(0)
-            return false if path.count == 0.usize() or path.count > 4096.usize()
-            for index in 0..<path.count |path|:
-                return false if path[index] == 0
-            path_c: mutable darray[u8] = []
-            path_with_nul(path, &path_c)
-            path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
-            resolved: mutable darray[u8] = []
-            resolved.resize(4096)
-            canonical: mutable cstr = ""
-            if Platform::pkg_realpath(path_name, &resolved) is found:
-                canonical <- found
-            else:
-                return false
-            canonical_length: usize = Platform::pkg_strlen(canonical)
-            return false if canonical_length != path.count
-            for index in 0..<path.count |path, canonical|:
-                return false if path[index] != canonical[index].u8()
-            return Platform::pkg_read_bounded_file(path, maximum, out)
-
-        def read_trusted_file(path: darray[u8]&, maximum: usize, out: mutable darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            out.resize(0)
-            return -22 if maximum == 0.usize() or maximum > 1048576.usize()
-            path_c: mutable darray[u8] = []
-            path_with_nul(path, &path_c)
-            path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
-            out.resize(maximum + 1.usize())
-            raw: mutable u8& = (&out[0]).cast[mutable u8&] can Unsafe.PointerCast
-            loaded: i64 = Platform::pkg_read_trusted_file(path_name, raw, out.count)
-            if loaded < 0:
-                out.resize(0)
-                return loaded
-            if loaded > maximum.i64():
-                out.resize(0)
-                return -27
-            out.resize(loaded.usize())
-            return loaded
 
         def read_verified_index(root: darray[u8]&, package: darray[u8]&, key_path: darray[u8]&, out: mutable darray[u8]&, yanked_flags_out: mutable darray[u8]&, generation_out: mutable u64&, snapshot_digest_out: mutable darray[u8]&, identity_out: mutable darray[u8]&, key_fingerprint_out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             out.resize(0)
@@ -730,21 +616,21 @@ module Registry:
             identity_out.resize(0)
             key_fingerprint_out.resize(0)
             index_path: mutable darray[u8] = []
-            return ResultCode.InvalidConfiguration if not join_path_leaf(root, package, "index", &index_path)
+            return ResultCode.InvalidConfiguration if not RegistryFiles::join_path_leaf(root, package, "index", &index_path)
             snapshot: mutable darray[u8] = []
-            loaded: i64 = read_trusted_file(index_path, 1048576.usize(), &snapshot)
+            loaded: i64 = RegistryFiles::read_trusted_file(index_path, 1048576.usize(), &snapshot)
             return ResultCode.MissingIndex if loaded == -2
             return ResultCode.ResourceLimit if loaded == -27
             return ResultCode.InvalidConfiguration if loaded < 0
             return ResultCode.MalformedMetadata if loaded == 0 or snapshot.count > 1048576
 
             signature_path: mutable darray[u8] = []
-            return ResultCode.InvalidConfiguration if not join_path_leaf(root, package, "index.sig", &signature_path)
+            return ResultCode.InvalidConfiguration if not RegistryFiles::join_path_leaf(root, package, "index.sig", &signature_path)
             signature: mutable darray[u8] = []
-            signature_size: i64 = read_trusted_file(signature_path, 64.usize(), &signature)
+            signature_size: i64 = RegistryFiles::read_trusted_file(signature_path, 64.usize(), &signature)
             return ResultCode.MissingSignature if signature_size < 0 or signature_size != 64
             public_key: mutable darray[u8] = []
-            return ResultCode.MissingTrustRoot if read_trusted_file(key_path, 32.usize(), &public_key) != 32
+            return ResultCode.MissingTrustRoot if RegistryFiles::read_trusted_file(key_path, 32.usize(), &public_key) != 32
             key_fingerprint_bytes: mutable darray[u8] = []
             sha_status: Integrity::DigestCode = Integrity::sha256(public_key, &key_fingerprint_bytes)
             return ResultCode.TrustStateUnavailable if sha_status != Integrity::DigestCode.Ok
@@ -792,7 +678,7 @@ module Registry:
             root_status: ResultCode = configured_trust_root(registry_root, &key_path)
             return root_status if root_status != ResultCode.Ok
             public_key: mutable darray[u8] = []
-            return ResultCode.MissingTrustRoot if read_trusted_file(key_path, 32.usize(), &public_key) != 32
+            return ResultCode.MissingTrustRoot if RegistryFiles::read_trusted_file(key_path, 32.usize(), &public_key) != 32
             fingerprint_bytes: mutable darray[u8] = []
             return ResultCode.TrustStateUnavailable if Integrity::sha256(public_key, &fingerprint_bytes) != Integrity::DigestCode.Ok
             fingerprint_hex: mutable darray[u8] = []
@@ -832,7 +718,7 @@ module Registry:
         def trust_state_read(path: darray[u8]&, out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out.resize(0)
             loaded: mutable darray[u8] = []
-            read_status: i64 = read_trusted_file(path, 1048576.usize(), &loaded)
+            read_status: i64 = RegistryFiles::read_trusted_file(path, 1048576.usize(), &loaded)
             if read_status < 0:
                 # Only the descriptor-relative ENOENT result is an empty
                 # history. Insecure parents, symlinks, and unreadable files
@@ -932,7 +818,7 @@ module Registry:
             for index in 0..<temp_path_snapshot.count |temp_name_buffer, temp_path_snapshot|:
                 temp_name_buffer.push(temp_path_snapshot[index])
             path_c: mutable darray[u8] = []
-            path_with_nul(stable_path, &path_c)
+            ProjectFiles::path_with_nul_into(stable_path, &path_c)
             temp_name: cstr = (&temp_name_buffer[0]).cast[cstr] can Unsafe.PointerCast
             path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
             if Platform::pkg_rename(temp_name, path_name) != 0:
@@ -941,7 +827,7 @@ module Registry:
                 # could have been replaced concurrently.
                 return false
             sync_path: mutable darray[u8] = []
-            path_with_nul(stable_path, &sync_path)
+            ProjectFiles::path_with_nul_into(stable_path, &sync_path)
             sync_name: cstr = (&sync_path[0]).cast[cstr] can Unsafe.PointerCast
             return Platform::pkg_fsync_parent(sync_name) == 0
 
@@ -981,7 +867,7 @@ module Registry:
             lock_path_snapshot: mutable darray[u8] = []
             ByteText::append(&lock_path_snapshot, lock_path)
             lock_c: mutable darray[u8] = []
-            path_with_nul(lock_path, &lock_c)
+            ProjectFiles::path_with_nul_into(lock_path, &lock_c)
             lock_name: cstr = (&lock_c[0]).cast[cstr] can Unsafe.PointerCast
             lock_fd: i64 = Platform::pkg_acquire_trust_state_lock(lock_name)
             return ResultCode.TrustStateUnavailable if lock_fd < 0
@@ -1000,7 +886,7 @@ module Registry:
                 if not ByteText::equal(current_index_identity, index_identity):
                     return trust_state_finish(lock_fd, ResultCode.InvalidConfiguration)
             state_identity: mutable darray[u8] = []
-            if registry_valid_name(package):
+            if PackageIdentity::valid_name(package):
                 if not TrustIdentity::package(root_after_fingerprint, package, &state_identity):
                     return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable)
             else:
@@ -1065,7 +951,7 @@ module Registry:
             previous_metadata_digest: mutable darray[u8] = []
             find_status: mutable ResultCode = ResultCode.Ok
             if state.count > 0:
-                if registry_valid_name(package):
+                if PackageIdentity::valid_name(package):
                     find_status <- trust_state_find_package_history(state, root_after_clock, package, &previous_version, &previous_digest, &previous_metadata_digest)
                 else:
                     find_status <- trust_state_find(state, package, &previous_version, &previous_digest, &previous_metadata_digest)
@@ -1150,7 +1036,7 @@ module Registry:
             lock_path_snapshot: mutable darray[u8] = []
             ByteText::append(&lock_path_snapshot, lock_path)
             lock_c: mutable darray[u8] = []
-            path_with_nul(lock_path, &lock_c)
+            ProjectFiles::path_with_nul_into(lock_path, &lock_c)
             lock_name: cstr = (&lock_c[0]).cast[cstr] can Unsafe.PointerCast
             lock_fd: i64 = Platform::pkg_acquire_trust_state_lock(lock_name)
             return ResultCode.TrustStateUnavailable if lock_fd < 0
@@ -1256,7 +1142,7 @@ module Registry:
             lock_path_snapshot: mutable darray[u8] = []
             ByteText::append(&lock_path_snapshot, lock_path)
             lock_c: mutable darray[u8] = []
-            path_with_nul(lock_path, &lock_c)
+            ProjectFiles::path_with_nul_into(lock_path, &lock_c)
             lock_name: cstr = (&lock_c[0]).cast[cstr] can Unsafe.PointerCast
             lock_fd: i64 = Platform::pkg_acquire_trust_state_lock(lock_name)
             return ResultCode.TrustStateUnavailable if lock_fd < 0
@@ -1334,7 +1220,7 @@ module Registry:
             lock_path_snapshot: mutable darray[u8] = []
             ByteText::append(&lock_path_snapshot, lock_path)
             lock_c: mutable darray[u8] = []
-            path_with_nul(lock_path, &lock_c)
+            ProjectFiles::path_with_nul_into(lock_path, &lock_c)
             lock_name: cstr = (&lock_c[0]).cast[cstr] can Unsafe.PointerCast
             lock_fd: i64 = Platform::pkg_acquire_trust_state_lock(lock_name)
             return ResultCode.TrustStateUnavailable if lock_fd < 0
@@ -1404,7 +1290,7 @@ module Registry:
         def trust_tuf_state_read(path: darray[u8]&, out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out.resize(0)
             loaded: mutable darray[u8] = []
-            read_status: i64 = read_trusted_file(path, CheckpointRecords::maximum_state_bytes, &loaded)
+            read_status: i64 = RegistryFiles::read_trusted_file(path, CheckpointRecords::maximum_state_bytes, &loaded)
             if read_status < 0:
                 return ResultCode.Ok if read_status == -2
                 return ResultCode.TrustStateUnavailable
@@ -1426,7 +1312,7 @@ module Registry:
             state_digest.resize(0)
             missing <- false
             loaded: mutable darray[u8] = []
-            read_status: i64 = read_trusted_file(path, 128.usize(), &loaded)
+            read_status: i64 = RegistryFiles::read_trusted_file(path, 128.usize(), &loaded)
             if read_status < 0:
                 if read_status == -2:
                     missing <- true
