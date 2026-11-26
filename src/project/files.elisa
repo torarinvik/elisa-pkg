@@ -13,19 +13,24 @@ module ProjectFiles:
         # value for an I/O or durability failure. Callers that tolerate a
         # concurrent writer must distinguish EEXIST from failed publication.
         def write_cstr_file_noclobber_status(path_name: cstr, value: darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
-            # Link the fsynced temporary into place so an existing destination can
-            # never be replaced by a rename race. The temporary is removed after the
-            # link, leaving one durable directory entry for the caller to own.
             path_snapshot: mutable darray[u8] = []
             path_length: usize = Platform::pkg_strlen(path_name)
             return -22 if path_length == 0.usize() or path_length > maximum_publication_path_bytes
             ByteText::append_text(&path_snapshot, path_name)
+            return publish_file_exclusively(path_snapshot, value)
+
+        # Publish by link and return the native status so callers can handle EEXIST.
+        def publish_file_exclusively(path: darray[u8]&, value: darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            # Link the fsynced temporary into place so an existing destination can
+            # never be replaced by a rename race. The temporary is removed after the
+            # link, leaving one durable directory entry for the caller to own.
+            return -22 if path.count > maximum_publication_path_bytes or not valid_path_bytes(path)
             temp_snapshot: mutable darray[u8] = []
-            return -5 if not stage_file_for_publication(path_snapshot, value, &temp_snapshot)
+            return -5 if not stage_file_for_publication(path, value, &temp_snapshot)
             temp_c: mutable darray[u8] = []
             ByteText::append(&temp_c, temp_snapshot)
             target_c: mutable darray[u8] = []
-            path_with_nul_into(&path_snapshot, &target_c)
+            path_with_nul_into(path, &target_c)
             temp_name: mutable cstr = (&temp_c[0]).cast[cstr] can Unsafe.PointerCast
             target_name: mutable cstr = (&target_c[0]).cast[cstr] can Unsafe.PointerCast
             link_status: i64 = Platform::pkg_link(temp_name, target_name)
@@ -45,7 +50,7 @@ module ProjectFiles:
                 # retired. Leave the evidence for a later recovery pass.
                 return -5
             target_c <- target_c.resize(0)
-            path_with_nul_into(&path_snapshot, &target_c)
+            path_with_nul_into(path, &target_c)
             target_name <- (&target_c[0]).cast[cstr] can Unsafe.PointerCast
             if Platform::pkg_fsync_parent(target_name) != 0:
                 # The link is visible, but its directory durability is unknown.
