@@ -169,6 +169,31 @@ module CompilerProcess:
                 return "error: unable to remove the verified build source snapshots\n"
             return ""
 
+        struct LogCapture:
+            descriptor: i64
+            diagnostic: cstr
+
+        # Keep the template buffer in the caller through collection and cleanup.
+        def open_log_capture(directory: darray[u8]&, capture_stdout: bool, path: mutable darray[u8]&) -> LogCapture can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            path.resize(0)
+            ByteText::append(path, directory)
+            if path.count == 0.usize() or path[path.count - 1.usize()] != 47:
+                path.push(47)
+            ByteText::append_text(path, "compiler.stdout.XXXXXX" if capture_stdout else "compiler.stderr.XXXXXX")
+            path.push(0)
+            descriptor: i64 = Platform::pkg_mkstemp(path)
+            if descriptor < 0:
+                diagnostic: cstr = "error: unable to create the private compiler stdout capture\n" if capture_stdout else "error: unable to create the private compiler stderr capture\n"
+                return LogCapture{descriptor: descriptor, diagnostic: diagnostic}
+            return LogCapture{descriptor: descriptor, diagnostic: ""} if descriptor >= 3
+            raised_descriptor: i64 = Platform::pkg_dup_fd_min(descriptor, 3)
+            _ = Platform::pkg_close(descriptor)
+            if raised_descriptor < 0:
+                _ = Platform::pkg_unlink((&path[0]).cast[cstr] can Unsafe.PointerCast)
+                diagnostic: cstr = "error: unable to secure the compiler stdout capture descriptor\n" if capture_stdout else "error: unable to secure the compiler stderr capture descriptor\n"
+                return LogCapture{descriptor: raised_descriptor, diagnostic: diagnostic}
+            return LogCapture{descriptor: raised_descriptor, diagnostic: ""}
+
         # Attempt every close and unlink even if forwarding fails.
         def collect_logs(stdout_descriptor: i64, stderr_descriptor: i64, stdout_path: cstr, stderr_path: cstr) -> bool can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
