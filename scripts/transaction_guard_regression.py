@@ -136,6 +136,14 @@ def main() -> int:
         # A modern guard can be recovered after a crash before journal publication.
         guard.mkdir(mode=0o700)
         (state / "transaction.manifest").write_bytes(original_manifest)
+        unexpected = guard / "unexpected"
+        unexpected.write_bytes(b"preserve this file")
+        run("check-manifest", cwd=project, expected=5)
+        if unexpected.read_bytes() != b"preserve this file":
+            raise SystemExit("partial recovery modified unexpected guard contents")
+        if manifest.read_bytes() != original_manifest or lock.exists():
+            raise SystemExit("failed partial recovery touched the manifest or lockfile")
+        unexpected.unlink()
         run("check-manifest", cwd=project, expected=0)
         if guard.exists() or (state / "transaction.manifest").exists():
             raise SystemExit("recovery retained files from a partially prepared journal")
