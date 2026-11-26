@@ -116,8 +116,6 @@ module CheckpointStore:
             ByteText::append(&lock_path, state_path)
             ByteText::append_text(&lock_path, ".lock")
             return Code.TrustStateUnavailable if lock_path.count > 4096.usize()
-            lock_path_snapshot: mutable darray[u8] = []
-            ByteText::append(&lock_path_snapshot, lock_path)
             lock_c: mutable darray[u8] = []
             ProjectFiles::path_with_nul_into(lock_path, &lock_c)
             lock_name: cstr = (&lock_c[0]).cast[cstr] can Unsafe.PointerCast
@@ -161,30 +159,29 @@ module CheckpointStore:
             prefix: mutable darray[u8] = []
             ByteText::append(&prefix, scope_digest)
             prefix.push(58)
+            batch: mutable darray[u8] = []
             cursor: mutable usize = CheckpointRecords::header_length()
-            while cursor < state.count |state, cursor|:
+            while cursor < state.count |state, cursor, prefix, batch|:
                 key: mutable darray[u8] = []
                 version: mutable darray[u8] = []
                 digest: mutable darray[u8] = []
                 next_cursor: mutable usize = 0.usize()
                 return finish(lock_fd, Code.TrustStateMalformed) if not CheckpointRecords::parse_row(state, cursor, &key, &version, &digest, &next_cursor)
-                if key.count > prefix.count:
-                    matches_scope: mutable bool = true
-                    for index in 0..<prefix.count |key, prefix, matches_scope|:
-                        matches_scope <- false if key[index] != prefix[index]
-                    if matches_scope:
-                        if out.count == 0.usize():
-                            ByteText::append_text(out, "elisapkg-tuf-batch:1\n")
-                        for index in prefix.count..<key.count |out, key|:
-                            out.push(key[index])
-                        out.push(32)
-                        ByteText::append(out, version)
-                        out.push(32)
-                        ByteText::append(out, digest)
-                        out.push(10)
+                if key.count > prefix.count and ByteText::starts_with(key, prefix):
+                    if batch.count == 0.usize():
+                        ByteText::append_text(&batch, "elisapkg-tuf-batch:1\n")
+                    for index in prefix.count..<key.count |batch, key|:
+                        batch.push(key[index])
+                    batch.push(32)
+                    ByteText::append(&batch, version)
+                    batch.push(32)
+                    ByteText::append(&batch, digest)
+                    batch.push(10)
                 cursor <- next_cursor
-            return finish(lock_fd, Code.ResourceLimit) if out.count > 1048576.usize()
-            return finish(lock_fd, Code.Ok)
+            close_status: Code = finish(lock_fd, Code.ResourceLimit if batch.count > Tuf::max_metadata_file_bytes else Code.Ok)
+            return close_status if close_status != Code.Ok
+            ByteText::append(out, batch)
+            return Code.Ok
 
     private:
         def trust_tuf_state_read(path: darray[u8]&, out: mutable darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
