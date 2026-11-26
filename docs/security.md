@@ -237,7 +237,8 @@ limitation and are a release gate for hostile remote builds.
 
 Immediately before `exec`, compiler, `run`, and `test` children close every
 inherited descriptor numbered 3 or higher, preserving only standard input,
-output, and error. A close failure stops execution. This prevents a caller's
+output, and error. macOS enumerates the child descriptor table. Linux requires
+`close_range` for subprocess launch. A lookup or close failure stops execution. This prevents a caller's
 open files, sockets, and credential-agent descriptors from becoming ambient
 capabilities in package code. The compiler and shared `run`/`test` launch paths
 are covered by `scripts/security/inherited_fd_regression.py`.

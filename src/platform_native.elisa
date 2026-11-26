@@ -54,30 +54,20 @@ module PlatformNative:
             return native_open("/dev/null", 0)
         def close(fd: i64) -> i64:
             return native_close(fd)
-        # Run only in a post-fork child. Linux uses close_range; older kernels
-        # fall back to the descriptor-table limit. macOS uses that same checked
-        # fallback. Any close error other than EBADF aborts the child before
-        # exec, so unknown handles cannot
-        # cross the compiler boundary silently.
-        def close_inherited_fds() -> i64:
+        # Run only in a post-fork child. The current soft descriptor limit
+        # does not bound descriptors that were inherited above that limit.
+        def close_inherited_fds() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             static if ELISA_TARGET_OS_LINUX:
                 while true:
-                    close_range_status: i64 = native_syscall(436, 3, 4294967295, 0)
-                    return 0 if close_range_status == 0
+                    close_status: i64 = native_syscall(436, 3, 4294967295, 0)
+                    return 0 if close_status == 0
                     errno_value: i64 = current_errno()
                     continue if errno_value == 4
-                    break if errno_value == 38
                     return negative_value(errno_value)
-            descriptor_limit: i64 = native_getdtablesize().i64()
-            return -5 if descriptor_limit < 3
-            fd: mutable i64 = 3
-            while fd < descriptor_limit |fd, descriptor_limit|:
-                close_status: i64 = native_close(fd)
-                if close_status != 0:
-                    errno_value: i64 = current_errno()
-                    return negative_value(errno_value) if errno_value != 9
-                fd <- fd + 1
-            return 0
+                return -5
+            static else:
+                return close_macos_inherited_descriptors()
+
         def fsync(fd: i64) -> i64:
             return native_fsync(fd)
         def waitpid(pid: i64, status: mutable i32&, options: i64) -> i64:
@@ -766,6 +756,28 @@ module PlatformNative:
             return result
 
     private:
+        static if ELISA_TARGET_OS_MACOS:
+            def close_macos_inherited_descriptors() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+                descriptor_list_flavor: i32 = 1
+                entry_bytes: usize = 8.usize()
+                process: i32 = native_getpid()
+                capacity: i32 = native_proc_pidinfo(process, descriptor_list_flavor, 0.u64(), null, 0)
+                return -5 if capacity <= 0 or capacity > 8388608 or capacity % 8 != 0
+                entries: mutable darray[u8] = []
+                entries.resize(capacity.usize())
+                buffer: mutable void& = (&entries[0]).cast[mutable void&] can Unsafe.PointerCast
+                native_errno()[0] <- 0
+                received: i32 = native_proc_pidinfo(process, descriptor_list_flavor, 0.u64(), buffer, capacity)
+                return -5 if received < 0 or received >= capacity or received % 8 != 0
+                return negative_errno() if received == 0 and current_errno() != 0
+                for index in 0..<(received.usize() / entry_bytes) |entries, entry_bytes|:
+                    offset: usize = index * entry_bytes
+                    descriptor: u64 = entries[offset].u64() + entries[offset + 1.usize()].u64() * 256.u64() + entries[offset + 2.usize()].u64() * 65536.u64() + entries[offset + 3.usize()].u64() * 16777216.u64()
+                    return -5 if descriptor > 2147483647.u64()
+                    if descriptor >= 3.u64() and native_close(descriptor.i64()) != 0:
+                        return negative_errno()
+                return 0
+
         def read_regular_descriptor(fd: i64, output: mutable u8&, capacity: usize) -> i64 can[Unsafe.PointerCast]:
             used: mutable usize = 0.usize()
             while used < capacity |output, used, capacity, fd|:
