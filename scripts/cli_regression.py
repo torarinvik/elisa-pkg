@@ -125,6 +125,7 @@ with tempfile.TemporaryDirectory(prefix='cli-review-', dir=ROOT / 'build') as di
         [BIN, 'fetch', '--locked'], cwd=project, env=fetch_environment,
         capture_output=True, text=True, timeout=120, check=False)
     assert invalid_fetch.returncode == 3, invalid_fetch
+    assert 'elisapkg.lock is invalid or does not match the current project' in invalid_fetch.stderr
     assert lockfile.read_text() == invalid_registry_lock
     lockfile.write_bytes(saved_lock)
     colored_fetch = subprocess.run(
