@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+lint_flags=()
+case "${1:-}" in
+  "") ;;
+  --strict) lint_flags=(-Wnever-leak=strict) ;;
+  *) echo "usage: scripts/build.sh [--strict]" >&2; exit 2 ;;
+esac
+if [[ $# -gt 1 ]]; then
+  echo "usage: scripts/build.sh [--strict]" >&2
+  exit 2
+fi
+
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 COMPILER_ROOT="${ELISA_COMPILER_ROOT:-}"
 if [[ -z "$COMPILER_ROOT" ]]; then
@@ -12,6 +23,9 @@ STAGE1="${ELISA_STAGE1_BIN:-$COMPILER_ROOT/bin/elisac-stage1}"
 WRAPPER="${ELISA_COMPILER_WRAPPER:-$COMPILER_ROOT/scripts/elisac_stage1.sh}"
 RUNTIME="${ELISA_RUNTIME_OBJ:-$COMPILER_ROOT/build/runtime/elisacore_runtime.o}"
 OUT="$ROOT/build/elisapkg"
+if [[ ${1:-} == --strict ]]; then
+  OUT="$ROOT/build/elisapkg-strict"
+fi
 if [[ ! -x "$WRAPPER" ]]; then
   echo "error: compiler wrapper is not executable: $WRAPPER" >&2
   exit 2
@@ -31,5 +45,5 @@ mkdir -p "$ROOT/build"
 ELISA_STAGE1_BIN="$STAGE1" \
 ELISA_ALLOW_STALE_STAGE1="${ELISA_ALLOW_STALE_STAGE1:-0}" \
 ELISA_RUNTIME_OBJ="$RUNTIME" \
-  "$WRAPPER" -emit exe -o "$OUT" "$ROOT/src/main.elisa"
+  "$WRAPPER" ${lint_flags[@]+"${lint_flags[@]}"} -emit exe -o "$OUT" "$ROOT/src/main.elisa"
 echo "built $OUT"

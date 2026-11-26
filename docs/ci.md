@@ -98,3 +98,11 @@ the signed TUF metadata chain. This workflow also cannot prove that repository
 branch rules or organization-level Actions settings are correctly configured.
 
 GitHub references: [artifact attestations](https://docs.github.com/en/actions/how-tos/secure-your-work/use-artifact-attestations/use-artifact-attestations) and [the `actions/attest` action](https://github.com/actions/attest).
+
+## Strict Elisa lint
+
+Run `make lint` with a Stage1 toolchain that supports
+`-Wnever-leak=strict`. The command compiles the package manager with the
+strict diagnostics enabled and writes `build/elisapkg-strict`. The current
+CI compiler pin predates this flag. Upgrade and verify that pin before making
+the strict lint part of the release build.
