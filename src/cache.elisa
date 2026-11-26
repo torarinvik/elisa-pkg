@@ -37,25 +37,15 @@ module Cache:
 
         def verify_blob(digest: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             ignored_content: mutable darray[u8] = []
-            return read_verified_blob(digest, &ignored_content)
+            return read_verified_blob(digest, Integrity::max_input, &ignored_content)
 
-        def read_verified_blob(digest: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+        def read_verified_blob(digest: darray[u8]&, maximum_bytes: usize, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out.resize(0)
             path: mutable darray[u8] = []
             return false if not blob_path(digest, &path)
-            path_c: mutable darray[u8] = []
-            for index in 0..<path.count |path_c, path|:
-                path_c.push(path[index])
-            path_c.push(0)
-            path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
-            file_size: i64 = Platform::pkg_package_file_size(path_name)
-            return false if file_size < 0 or file_size > 67108864
+            return false if maximum_bytes > Integrity::max_input
             content: mutable darray[u8] = []
-            content.resize(file_size.usize() + 1.usize())
-            content_raw: mutable u8& = (&content[0]).cast[mutable u8&] can Unsafe.PointerCast
-            read_size: i64 = Platform::pkg_read_package_file(path_name, content_raw, content.count)
-            return false if read_size < 0 or read_size != file_size
-            content.resize(read_size.usize())
+            return false if not read_bounded_path(path, maximum_bytes, &content)
             digest_bytes: mutable darray[u8] = []
             actual: mutable darray[u8] = []
             return false if Integrity::sha256(content, &digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(digest_bytes, &actual)
@@ -63,7 +53,31 @@ module Cache:
             out <- content
             return true
 
+        def read_registry_signature(digest: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            out.resize(0)
+            path: mutable darray[u8] = []
+            return false if not registry_signature_path(digest, &path)
+            signature: mutable darray[u8] = []
+            return false if not read_bounded_path(path, 64.usize(), &signature) or signature.count != 64.usize()
+            out <- signature
+            return true
+
     private:
+        def read_bounded_path(path: darray[u8]&, maximum_bytes: usize, content: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            path_c: mutable darray[u8] = []
+            for index in 0..<path.count |path_c, path|:
+                path_c.push(path[index])
+            path_c.push(0)
+            path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
+            file_size: i64 = Platform::pkg_package_file_size(path_name)
+            return false if file_size < 0 or file_size.usize() > maximum_bytes
+            content.resize(file_size.usize() + 1.usize())
+            content_raw: mutable u8& = (&content[0]).cast[mutable u8&] can Unsafe.PointerCast
+            read_size: i64 = Platform::pkg_read_package_file(path_name, content_raw, content.count)
+            return false if read_size < 0 or read_size != file_size
+            content.resize(read_size.usize())
+            return true
+
         def append_literal(out: mutable darray[u8]&, suffix: cstr) -> void can[Memory.Allocate, Abort.Panic]:
             length: usize = Platform::pkg_strlen(suffix)
             for index in 0..<length |out, suffix|:
