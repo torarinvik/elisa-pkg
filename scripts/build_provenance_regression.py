@@ -196,14 +196,18 @@ def main() -> int:
                 raise SystemExit("error: release archive verifier accepted a noncanonical archive")
         invalid_archive.unlink()
 
-        for invalid_bytes in (archive_bytes[:-4], archive_bytes + gzip.compress(b"extra")):
+        for invalid_bytes in (
+            archive_bytes[:-4],
+            archive_bytes + gzip.compress(b"extra"),
+            gzip.compress(expanded_archive[:-1] + b"\x01"),
+        ):
             invalid_archive.write_bytes(invalid_bytes)
             try:
                 provenance.verify_archive(invalid_archive, artifact_digest, binary.stat().st_size, manifest_bytes)
             except provenance.ProvenanceError:
                 pass
             else:
-                raise SystemExit("error: release archive verifier accepted an invalid gzip stream")
+                raise SystemExit("error: release archive verifier accepted invalid gzip or tar padding")
         invalid_archive.unlink()
 
         provenance.generate_candidate(**inputs)

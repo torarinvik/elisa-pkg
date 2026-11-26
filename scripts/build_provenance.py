@@ -214,8 +214,7 @@ def atomic_write(path: Path, content: bytes, mode: int = 0o644) -> None:
                 pass
 
 
-def add_tar_file(archive: tarfile.TarFile, path: Path, name: str, mode: int) -> None:
-    size = path.stat().st_size
+def archive_entry(name: str, size: int, mode: int) -> tarfile.TarInfo:
     info = tarfile.TarInfo(name)
     info.size = size
     info.mode = mode
@@ -225,8 +224,12 @@ def add_tar_file(archive: tarfile.TarFile, path: Path, name: str, mode: int) -> 
     info.gname = "root"
     info.mtime = 0
     info.type = tarfile.REGTYPE
+    return info
+
+
+def add_tar_file(archive: tarfile.TarFile, path: Path, name: str, mode: int) -> None:
     with path.open("rb") as stream:
-        archive.addfile(info, stream)
+        archive.addfile(archive_entry(name, os.fstat(stream.fileno()).st_size, mode), stream)
 
 
 def verify_archive(
@@ -236,54 +239,41 @@ def verify_archive(
     # between recording its digest and opening it for packaging.
     try:
         with gzip.open(path, "rb") as expanded:
-            verify_gzip_size(expanded, expected_binary_size, len(expected_manifest))
-            expanded.seek(0)
-            with tarfile.open(fileobj=expanded, mode="r|") as archive:
-                binary_entry = require_archive_entry(archive, "elisapkg", expected_binary_size, 0o755)
-                with archive.extractfile(binary_entry) as binary:
-                    digest = hashlib.sha256()
-                    for chunk in iter(lambda: binary.read(1024 * 1024), b""):
-                        digest.update(chunk)
-                manifest_entry = require_archive_entry(
-                    archive, "elisapkg.provenance.json", len(expected_manifest), 0o644
-                )
-                with archive.extractfile(manifest_entry) as manifest:
-                    if digest.hexdigest() != expected_binary_digest or (
-                        manifest.read(MAX_MANIFEST_BYTES + 1) != expected_manifest
-                    ):
-                        raise ProvenanceError("release archive inputs changed during packaging")
-                if archive.next() is not None:
-                    raise ProvenanceError("release archive contains unexpected trailing members")
+            binary_entry = archive_entry("elisapkg", expected_binary_size, 0o755)
+            manifest_entry = archive_entry("elisapkg.provenance.json", len(expected_manifest), 0o644)
+            verify_entry_header(expanded, binary_entry)
+            digest = hashlib.sha256()
+            remaining = expected_binary_size
+            while remaining:
+                chunk = expanded.read(min(remaining, 1024 * 1024))
+                if not chunk:
+                    raise ProvenanceError("release archive executable is truncated")
+                digest.update(chunk)
+                remaining -= len(chunk)
+            if digest.hexdigest() != expected_binary_digest:
+                raise ProvenanceError("release archive executable differs from provenance")
+            verify_zero_padding(expanded, -expected_binary_size % tarfile.BLOCKSIZE)
+            verify_entry_header(expanded, manifest_entry)
+            if expanded.read(len(expected_manifest)) != expected_manifest:
+                raise ProvenanceError("release archive manifest differs from provenance")
+            verify_zero_padding(expanded, -len(expected_manifest) % tarfile.BLOCKSIZE)
+            # The two terminating blocks precede the final record padding.
+            verify_zero_padding(expanded, 2 * tarfile.BLOCKSIZE)
+            verify_zero_padding(expanded, -expanded.tell() % tarfile.RECORDSIZE)
+            if expanded.read(1):
+                raise ProvenanceError("release archive expands beyond the expected tar size")
     except (tarfile.TarError, gzip.BadGzipFile, EOFError, zlib.error) as error:
         raise ProvenanceError(f"could not read release archive: {error}") from error
 
 
-def verify_gzip_size(expanded: gzip.GzipFile, binary_size: int, manifest_size: int) -> None:
-    tar_size = 2 * tarfile.BLOCKSIZE
-    for size in (binary_size, manifest_size):
-        tar_size += tarfile.BLOCKSIZE
-        tar_size += (size + tarfile.BLOCKSIZE - 1) // tarfile.BLOCKSIZE * tarfile.BLOCKSIZE
-    expected_size = (tar_size + tarfile.RECORDSIZE - 1) // tarfile.RECORDSIZE * tarfile.RECORDSIZE
-    remaining = expected_size
-    while remaining:
-        chunk = expanded.read(min(remaining, 1024 * 1024))
-        if not chunk:
-            raise ProvenanceError("release archive expands to less than the expected tar size")
-        remaining -= len(chunk)
-    # Reading through EOF validates the gzip checksum and trailer.
-    if expanded.read(1):
-        raise ProvenanceError("release archive expands beyond the expected tar size")
+def verify_entry_header(expanded: gzip.GzipFile, entry: tarfile.TarInfo) -> None:
+    if expanded.read(tarfile.BLOCKSIZE) != entry.tobuf(format=tarfile.USTAR_FORMAT):
+        raise ProvenanceError(f"release archive has a noncanonical {entry.name} header")
 
 
-def require_archive_entry(
-    archive: tarfile.TarFile, name: str, size: int, mode: int
-) -> tarfile.TarInfo:
-    entry = archive.next()
-    if entry is None or entry.name != name or entry.type != tarfile.REGTYPE or entry.size != size:
-        raise ProvenanceError(f"release archive has an invalid {name} entry")
-    if (entry.uid, entry.gid, entry.mtime, entry.mode) != (0, 0, 0, mode):
-        raise ProvenanceError(f"release archive {name} metadata is not normalized")
-    return entry
+def verify_zero_padding(expanded: gzip.GzipFile, size: int) -> None:
+    if expanded.read(size) != bytes(size):
+        raise ProvenanceError("release archive has missing or nonzero tar padding")
 
 
 def create_archive(
