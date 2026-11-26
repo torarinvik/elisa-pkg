@@ -82,21 +82,22 @@ module Lockfile:
                 packages_end >= lock.count or packages_start >= packages_end
                 lock[packages_start] != 91 or lock[packages_end] != 93
             starts: mutable darray[usize] = []
-            previous_name: mutable darray[u8] = []
+            previous_start: mutable usize = 0
+            previous_end: mutable usize = 0
             cursor: mutable usize = packages_start + 1.usize()
             while true:
                 cursor <- Json::skip_whitespace(lock, cursor, packages_end)
                 return false if cursor >= packages_end or lock[cursor] != 123 or starts.count >= maximum_registry_records
                 record_end: usize = Json::object_end(lock, cursor)
                 return false if record_end <= cursor or record_end >= packages_end
-                package_name: mutable darray[u8] = []
+                name_start: mutable usize = 0
+                name_end: mutable usize = 0
                 return false if:
-                    not Json::object_string_value(lock, cursor, record_end, "name", &package_name)
-                    not PackageIdentity::valid_name(package_name)
-                # The record index is searched by name. Strict ordering also
-                # prevents multiple records from representing one package.
-                return false if previous_name.count > 0.usize() and not ByteText::less(previous_name, package_name)
-                previous_name <- package_name
+                    not Json::object_string_span(lock, cursor, record_end, "name", &name_start, &name_end)
+                    not PackageIdentity::valid_name_segment(lock, name_start, name_end)
+                    previous_end > previous_start and not name_precedes(lock, previous_start, previous_end, name_start, name_end)
+                previous_start <- name_start
+                previous_end <- name_end
                 starts <- starts.push(cursor)
                 cursor <- record_end + 1.usize()
                 cursor <- Json::skip_whitespace(lock, cursor, packages_end)
@@ -164,6 +165,17 @@ module Lockfile:
             return true
 
     private:
+        def name_precedes(lock: darray[u8]&, left_start: usize, left_end: usize, right_start: usize, right_end: usize) -> bool:
+            requires left_start <= left_end and left_end <= lock.count
+            requires right_start <= right_end and right_end <= lock.count
+            left_length: usize = left_end - left_start
+            right_length: usize = right_end - right_start
+            shared_length: usize = left_length if left_length < right_length else right_length
+            for offset in 0..<shared_length |lock, left_start, right_start|:
+                return true if lock[left_start + offset] < lock[right_start + offset]
+                return false if lock[left_start + offset] > lock[right_start + offset]
+            return left_length < right_length
+
         const invalid_record_name: i64 = 2
 
         def compare_record_name(lock: darray[u8]&, record_start: usize, wanted: darray[u8]&) -> i64:
