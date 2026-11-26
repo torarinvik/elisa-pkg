@@ -290,11 +290,12 @@ module RollbackStore:
                         trust_state_find(observation.state, release.package, &previous_version, &previous_digest, &previous_metadata_digest)
                 return find_status if find_status != Code.Ok
             return null if previous_version.count == 0.usize()
-            previous: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-            return Code.TrustStateMalformed if not SemVer::parse(previous_version, &previous)
-            return Code.RollbackDetected if SemVer::compare(parsed, previous) < 0
-            return Code.DigestMismatch if SemVer::compare(parsed, previous) == 0 and (not ByteText::equal(previous_digest, release.digest) or not ByteText::equal(previous_metadata_digest, release.metadata_digest))
-            return null if SemVer::compare(parsed, previous) != 0 or not observation.key_pin_found
+            region previous_scope:
+                previous: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
+                return Code.TrustStateMalformed if not SemVer::parse(previous_version, &previous)
+                return Code.RollbackDetected if SemVer::compare(parsed, previous) < 0
+                return Code.DigestMismatch if SemVer::compare(parsed, previous) == 0 and (not ByteText::equal(previous_digest, release.digest) or not ByteText::equal(previous_metadata_digest, release.metadata_digest))
+                return null if SemVer::compare(parsed, previous) != 0 or not observation.key_pin_found
             # The same release is already recorded under a pinned key: only advance the clock.
             return Code.Ok if observation.observed_clock == observation.now
             return Code.TrustStateUnavailable if not TrustStorage::write_clock(clock_path_for(state_path), observation.now, observation.current_state_digest)
@@ -329,14 +330,15 @@ module RollbackStore:
             state <- state.push(32)
             ByteText::append(&state, release.metadata_digest)
             state <- state.push(10)
-            updated_state_digest: mutable darray[u8] = []
-            return Code.TrustStateUnavailable if not Integrity::sha256_hex(state, &updated_state_digest)
-            # Bind the proposed state bytes into the sidecar before publishing
-            # the state. A crash between these atomic writes leaves a mismatch,
-            # which fails closed instead of accepting either history.
-            return Code.TrustStateUnavailable if:
-                not TrustStorage::write_clock(clock_path_for(state_path), observation.now, updated_state_digest)
-                not TrustStorage::write(state_path, state)
+            region updated_state_digest_scope:
+                updated_state_digest: mutable darray[u8] = []
+                return Code.TrustStateUnavailable if not Integrity::sha256_hex(state, &updated_state_digest)
+                # Bind the proposed state bytes into the sidecar before publishing
+                # the state. A crash between these atomic writes leaves a mismatch,
+                # which fails closed instead of accepting either history.
+                return Code.TrustStateUnavailable if:
+                    not TrustStorage::write_clock(clock_path_for(state_path), observation.now, updated_state_digest)
+                    not TrustStorage::write(state_path, state)
             return Code.Ok
 
         def trust_state_read(path: darray[u8]&, out: mutable darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:

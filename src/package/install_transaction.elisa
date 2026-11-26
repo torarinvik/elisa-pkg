@@ -103,17 +103,18 @@ module InstallTransaction:
             operation: mutable darray[u8] = []
             name: mutable darray[u8] = []
             version: mutable darray[u8] = []
-            targets: mutable RecoveryTargets = RecoveryTargets{transaction_path: transaction_path, destination: [], receipt_path: [], destination_state: -2, receipt_state: -2, expected_receipt: [], expected_digest: []}
-            return false if not InstallRecords::parse_journal(raw, &operation, &name, &version, &targets.expected_digest)
-            return false if not locate_targets(prefix, name, version, &targets)
-            if ByteText::equal_text(operation, "install"):
-                return false if not recover_install(targets, out_install_published)
-            else:
-                return false if not recover_uninstall(targets)
-            ByteText::append(out_operation, operation)
-            ByteText::append(out_name, name)
-            ByteText::append(out_version, version)
-            ByteText::append(out_digest, targets.expected_digest)
+            region targets_scope:
+                targets: mutable RecoveryTargets = RecoveryTargets{transaction_path: transaction_path, destination: [], receipt_path: [], destination_state: -2, receipt_state: -2, expected_receipt: [], expected_digest: []}
+                return false if not InstallRecords::parse_journal(raw, &operation, &name, &version, &targets.expected_digest)
+                return false if not locate_targets(prefix, name, version, &targets)
+                if ByteText::equal_text(operation, "install"):
+                    return false if not recover_install(targets, out_install_published)
+                else:
+                    return false if not recover_uninstall(targets)
+                ByteText::append(out_operation, operation)
+                ByteText::append(out_name, name)
+                ByteText::append(out_version, version)
+                ByteText::append(out_digest, targets.expected_digest)
             return true
 
     private:
@@ -148,12 +149,13 @@ module InstallTransaction:
 
         def locate_targets(prefix: darray[u8]&, name: darray[u8]&, version: darray[u8]&, targets: mutable RecoveryTargets&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             binary_directory: mutable darray[u8] = []
-            receipt_directory: mutable darray[u8] = []
-            ProjectFiles::path_join_into(prefix, "bin", &binary_directory)
-            ProjectFiles::path_join_into(prefix, "share/elisapkg/receipts", &receipt_directory)
-            return false if not InstallPrefix::trusted_directory(binary_directory) or not InstallPrefix::trusted_directory(receipt_directory)
-            ProjectFiles::path_join_bytes_into(binary_directory, name, &targets.destination)
-            ProjectFiles::path_join_bytes_into(receipt_directory, name, &targets.receipt_path)
+            region receipt_directory_scope:
+                receipt_directory: mutable darray[u8] = []
+                ProjectFiles::path_join_into(prefix, "bin", &binary_directory)
+                ProjectFiles::path_join_into(prefix, "share/elisapkg/receipts", &receipt_directory)
+                return false if not InstallPrefix::trusted_directory(binary_directory) or not InstallPrefix::trusted_directory(receipt_directory)
+                ProjectFiles::path_join_bytes_into(binary_directory, name, &targets.destination)
+                ProjectFiles::path_join_bytes_into(receipt_directory, name, &targets.receipt_path)
             return false if not ProjectFiles::valid_path_bytes(targets.destination) or not ProjectFiles::valid_path_bytes(targets.receipt_path)
             targets.destination_state <- path_state(targets.destination)
             targets.receipt_state <- path_state(targets.receipt_path)
@@ -175,16 +177,17 @@ module InstallTransaction:
                 actual_digest: mutable darray[u8] = []
                 return false if not Integrity::sha256_hex(artifact, &actual_digest) or not ByteText::equal(actual_digest, targets.expected_digest)
             destination_c: darray[u8] = terminated_path(targets.destination)
-            destination_name: cstr = (&destination_c[0]).cast[cstr] can Unsafe.PointerCast
-            if targets.receipt_state == -2:
-                return false if:
-                    Platform::change_mode(destination_name, 493.u16()) != 0
-                    not publish_local_install_receipt(targets.receipt_path, targets.expected_receipt)
-            else:
-                existing_receipt: mutable darray[u8] = []
-                return false if:
-                    not read_trusted_install_file(targets.receipt_path, InstallRecords::maximum_record_bytes, &existing_receipt) or not ByteText::equal(existing_receipt, targets.expected_receipt)
-                    Platform::access_path(destination_name, 1) != 0
+            region destination_name_scope:
+                destination_name: cstr = (&destination_c[0]).cast[cstr] can Unsafe.PointerCast
+                if targets.receipt_state == -2:
+                    return false if:
+                        Platform::change_mode(destination_name, 493.u16()) != 0
+                        not publish_local_install_receipt(targets.receipt_path, targets.expected_receipt)
+                else:
+                    existing_receipt: mutable darray[u8] = []
+                    return false if:
+                        not read_trusted_install_file(targets.receipt_path, InstallRecords::maximum_record_bytes, &existing_receipt) or not ByteText::equal(existing_receipt, targets.expected_receipt)
+                        Platform::access_path(destination_name, 1) != 0
             # Recovery may observe names published before a previous process
             # reported a directory-sync failure. Make both names durable
             # before retiring the only recovery record.

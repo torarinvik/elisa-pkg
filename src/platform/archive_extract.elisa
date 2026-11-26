@@ -96,27 +96,29 @@ module NativeArchiveExtract:
             write_failed: bool = not write_payload(file, archive, data_start, size)
             sync_status: i64 = native_fsync(file)
             close_status: i64 = native_close(file)
-            directory_sync: i64 = native_fsync(parent) if not write_failed and sync_status == 0 and close_status == 0 else -5
-            if write_failed or sync_status != 0 or close_status != 0 or directory_sync != 0:
-                _ =
-                    cleanup_name: cstr = (&leaf_snapshot[0]).cast[cstr] can Unsafe.PointerCast
-                    native_unlinkat(parent, cleanup_name, 0)
-                _ = native_close(parent)
-                return -5
+            region directory_sync_scope:
+                directory_sync: i64 = native_fsync(parent) if not write_failed and sync_status == 0 and close_status == 0 else -5
+                if write_failed or sync_status != 0 or close_status != 0 or directory_sync != 0:
+                    _ =
+                        cleanup_name: cstr = (&leaf_snapshot[0]).cast[cstr] can Unsafe.PointerCast
+                        native_unlinkat(parent, cleanup_name, 0)
+                    _ = native_close(parent)
+                    return -5
             return -5 if native_close(parent) != 0
             return 0
 
         # Write `size` payload bytes starting at `data_start`, retrying on EINTR.
         def write_payload(file: i64, archive: darray[u8]&, data_start: usize, size: usize) -> bool:
             requires data_start <= archive.count and size <= archive.count - data_start
-            written: mutable usize = 0.usize()
-            while written < size |archive, data_start, file, written, size|:
-                amount: i64 =
-                    data: void& = (&archive[data_start + written]).cast[void&] can Unsafe.PointerCast
-                    native_write(file, data, size - written)
-                continue if amount < 0 and NativeErrors::current_errno() == 4
-                return false if amount <= 0 or amount > (size - written).i64()
-                written <- written + amount.usize()
+            region written_scope:
+                written: mutable usize = 0.usize()
+                while written < size |archive, data_start, file, written, size|:
+                    amount: i64 =
+                        data: void& = (&archive[data_start + written]).cast[void&] can Unsafe.PointerCast
+                        native_write(file, data, size - written)
+                    continue if amount < 0 and NativeErrors::current_errno() == 4
+                    return false if amount <= 0 or amount > (size - written).i64()
+                    written <- written + amount.usize()
             return true
         def extraction_failure(root: i64, seen: darray[u8]&, created_directories: darray[u8]&, errno_value: i64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             cleanup_ok: mutable bool = NativeStagingTree::remove_files(root, seen)
