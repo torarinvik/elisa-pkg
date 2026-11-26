@@ -390,11 +390,11 @@ module Cli:
             object_finish: usize = Json::root_object_end(raw, object_start)
             schema_version: mutable u64 = 0.u64()
             return false if not Json::object_unsigned_value(raw, object_start, object_finish, "schema-version", &schema_version) or schema_version != 1.u64()
-            return false if not valid_optional_package_strings(raw)
-            return false if not valid_include_array(raw) or not valid_exclude_array(raw)
+            return false if not Manifest::valid_optional_package_strings(raw)
+            return false if not Manifest::valid_pattern_array(raw, "include") or not Manifest::valid_pattern_array(raw, "exclude")
             return false if not valid_target_objects(raw, root)
-            return false if not valid_dependency_map(raw, "dependencies")
-            return false if not valid_dependency_map(raw, "dev-dependencies")
+            return false if not Manifest::valid_dependency_map(raw, "dependencies")
+            return false if not Manifest::valid_dependency_map(raw, "dev-dependencies")
             return false if not dependency_map_empty(raw, "dev-dependencies")
             name: mutable darray[u8] = []
             version: mutable darray[u8] = []
@@ -601,7 +601,7 @@ module Cli:
                         return false if object_start >= dependency_end or object_end <= object_start or raw[object_start] != 123 or object_end > dependency_end
                         dep_path: mutable darray[u8] = []
                         return false if not Json::object_string_value(raw, object_start, object_end, "path", &dep_path)
-                        return false if not valid_dependency_path(dep_path)
+                        return false if not Manifest::valid_dependency_path(dep_path)
                         parent_root: mutable darray[u8] = []
                         if package_root.count > 0.usize() and not (package_root.count == 1.usize() and package_root[0] == 46):
                             for root_index in 0..<package_root.count |parent_root, package_root|:
@@ -1177,15 +1177,6 @@ module Cli:
                     return canonical_registry_lock(name, version, raw, root, registry_roots, preferred_lock, unlock, true)
                 return canonical_transitive_local_lock(name, version, raw, root)
 
-        def valid_dependency_path(path: darray[u8]&) -> bool:
-            return false if path.count == 0.usize() or path.count > 4096.usize()
-            return false if path[0] == 47 or path[0] == 92
-            for index in 0..<path.count |path|:
-                byte: u8 = path[index]
-                return false if byte == 0 or byte < 32 or byte == 127 or byte == 34 or byte == 92
-            return false if ByteText::count_text(path, "//") > 0.usize()
-            return true
-
         def normalize_relative_path(path: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
             out.resize(0)
             segment_start: mutable usize = 0.usize()
@@ -1234,138 +1225,6 @@ module Cli:
                 return true if segment_end - cursor == alias.count and ByteText::range_equals(seen, cursor, segment_end, alias)
                 cursor <- segment_end + 1.usize()
             return false
-
-        def valid_dependency_object(raw: darray[u8]&, object_start: usize, object_end: usize) -> bool can[Memory.Allocate, Abort.Panic]:
-            has_path: bool = Json::object_has_key(raw, object_start, object_end, "path")
-            has_registry: bool = Json::object_has_key(raw, object_start, object_end, "registry")
-            has_version: bool = Json::object_has_key(raw, object_start, object_end, "version")
-            has_git: bool = Json::object_has_key(raw, object_start, object_end, "git")
-            has_rev: bool = Json::object_has_key(raw, object_start, object_end, "rev")
-            return false if has_path and (has_registry or has_version)
-            if has_path:
-                return false if not SchemaFields::valid(raw, object_start, object_end, SchemaFields::Kind.ManifestPathDependency)
-                path: mutable darray[u8] = []
-                return false if not Json::object_string_value(raw, object_start, object_end, "path", &path)
-                return valid_dependency_path(path)
-            if has_registry or has_version:
-                return false if has_git or has_rev or not has_registry or not has_version
-                return false if not SchemaFields::valid(raw, object_start, object_end, SchemaFields::Kind.RegistryDependency)
-                registry: mutable darray[u8] = []
-                requirement: mutable darray[u8] = []
-                return false if not Json::object_string_value(raw, object_start, object_end, "registry", &registry) or not Json::object_string_value(raw, object_start, object_end, "version", &requirement)
-                return false if not ByteText::equal_text(registry, "primary")
-                parsed_requirement: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
-                return SemVer::parse_requirement(requirement, &parsed_requirement)
-            return false
-
-        def valid_optional_package_strings(raw: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            package_start: usize = Json::root_value_offset(raw, "package")
-            package_end: usize = Json::object_end(raw, package_start)
-            return false if package_start >= raw.count or package_end <= package_start
-            return false if not SchemaFields::valid(raw, package_start, package_end, SchemaFields::Kind.ManifestPackage)
-            description_value: mutable darray[u8] = []
-            return false if Json::object_has_key(raw, package_start, package_end, "description") and not Json::object_string_value(raw, package_start, package_end, "description", &description_value)
-            license_value: mutable darray[u8] = []
-            return false if Json::object_has_key(raw, package_start, package_end, "license") and not Json::object_string_value(raw, package_start, package_end, "license", &license_value)
-            elisa_value: mutable darray[u8] = []
-            if Json::object_has_key(raw, package_start, package_end, "elisa"):
-                return false if not Json::object_string_value(raw, package_start, package_end, "elisa", &elisa_value)
-                requirement: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
-                return false if not SemVer::parse_requirement(elisa_value, &requirement)
-            return true
-
-        def valid_pattern_array(raw: darray[u8]&, key: cstr) -> bool:
-            pattern_start: usize = Json::root_value_offset(raw, key)
-            return true if pattern_start >= raw.count
-            return false if raw[pattern_start] != 91
-            pattern_end: usize = Json::array_end(raw, pattern_start)
-            return false if pattern_end <= pattern_start
-            cursor: mutable usize = pattern_start + 1.usize()
-            pattern_count: mutable usize = 0.usize()
-            while cursor < pattern_end |raw, cursor, pattern_count|:
-                while cursor < pattern_end and (raw[cursor] == 32 or raw[cursor] == 9 or raw[cursor] == 10 or raw[cursor] == 13) |raw, cursor|:
-                    cursor <- cursor + 1.usize()
-                return true if cursor == pattern_end
-                return false if pattern_count >= 4096.usize()
-                return false if raw[cursor] != 34
-                cursor <- cursor + 1.usize()
-                pattern: mutable darray[u8] = []
-                while cursor < pattern_end and raw[cursor] != 34 |raw, cursor, pattern|:
-                    return false if raw[cursor] == 92 or raw[cursor] < 32 or raw[cursor] == 127
-                    return false if pattern.count >= 4096.usize()
-                    pattern.push(raw[cursor])
-                    cursor <- cursor + 1.usize()
-                return false if cursor >= pattern_end or not PackageSelection::valid_publish_pattern(pattern)
-                pattern_count <- pattern_count + 1.usize()
-                cursor <- cursor + 1.usize()
-                while cursor < pattern_end and (raw[cursor] == 32 or raw[cursor] == 9 or raw[cursor] == 10 or raw[cursor] == 13) |raw, cursor|:
-                    cursor <- cursor + 1.usize()
-                return true if cursor == pattern_end
-                return false if raw[cursor] != 44
-                cursor <- cursor + 1.usize()
-            return false
-
-        def valid_include_array(raw: darray[u8]&) -> bool:
-            return valid_pattern_array(raw, "include")
-
-        def valid_exclude_array(raw: darray[u8]&) -> bool:
-            return valid_pattern_array(raw, "exclude")
-
-        def valid_dependency_map(raw: darray[u8]&, wanted: cstr) -> bool can[Memory.Allocate, Abort.Panic]:
-            dependency_start: usize = Json::root_value_offset(raw, wanted)
-            return true if dependency_start >= raw.count
-            dependency_end: usize = Json::object_end(raw, dependency_start)
-            return false if dependency_end <= dependency_start or raw[dependency_start] != 123
-            seen: mutable darray[u8] = []
-            dependency_count: mutable usize = 0.usize()
-            in_string: mutable bool = false
-            escaped: mutable bool = false
-            string_start: mutable usize = 0.usize()
-            braces: mutable i64 = 1
-            brackets: mutable i64 = 0
-            for index in (dependency_start + 1.usize())..<dependency_end |raw, seen, dependency_count, in_string, escaped, string_start, braces, brackets|:
-                byte: u8 = raw[index]
-                if not in_string:
-                    if byte == 34:
-                        in_string <- true
-                        string_start <- index + 1.usize()
-                    elif byte == 123:
-                        braces <- braces + 1
-                    elif byte == 125:
-                        braces <- braces - 1
-                    elif byte == 91:
-                        brackets <- brackets + 1
-                    elif byte == 93:
-                        brackets <- brackets - 1
-                elif escaped:
-                    escaped <- false
-                elif byte == 92:
-                    escaped <- true
-                elif byte == 34:
-                    after: mutable usize = index + 1.usize()
-                    while after < dependency_end and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
-                        after <- after + 1.usize()
-                    direct_key: bool = braces == 1 and brackets == 0 and after < dependency_end and raw[after] == 58
-                    if direct_key:
-                        return false if dependency_count >= MAX_DEPENDENCIES
-                        dependency_count <- dependency_count + 1.usize()
-                        alias: mutable darray[u8] = []
-                        for key_index in string_start..<index |alias, raw|:
-                            alias.push(raw[key_index])
-                        return false if not valid_package_name(alias) or dependency_alias_seen(seen, alias)
-                        seen.push(0) if seen.count > 0.usize()
-                        for alias_index in 0..<alias.count |seen, alias|:
-                            seen.push(alias[alias_index])
-                        seen.push(0)
-                        after <- after + 1.usize()
-                        while after < dependency_end and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
-                            after <- after + 1.usize()
-                        return false if after >= dependency_end or raw[after] != 123
-                        value_end: usize = Json::object_end(raw, after)
-                        return false if value_end > dependency_end
-                        return false if not valid_dependency_object(raw, after, value_end)
-                    in_string <- false
-            return true
 
         # ---------- project discovery and commands -------------------------------------------
 
@@ -1486,7 +1345,7 @@ module Cli:
                 requirement: mutable darray[u8] = []
                 if local_form:
                     ByteText::append_bounded_text(&dependency_path, slots[4].cast[cstr])
-                    return EXIT_USAGE if not valid_dependency_path(dependency_path)
+                    return EXIT_USAGE if not Manifest::valid_dependency_path(dependency_path)
                     dependency_name: mutable darray[u8] = []
                     dependency_version: mutable darray[u8] = []
                     return EXIT_RESOLVE if not load_package_at(&dependency_path, &dependency_name, &dependency_version)
@@ -3453,7 +3312,7 @@ module Cli:
                 source_type: mutable darray[u8] = []
                 if Json::object_string_value(lock, source_start, source_end, "type", &source_type) and ByteText::equal_text(source_type, "path"):
                     relative: mutable darray[u8] = []
-                    return false if not Json::object_string_value(lock, source_start, source_end, "path", &relative) or not valid_dependency_path(relative)
+                    return false if not Json::object_string_value(lock, source_start, source_end, "path", &relative) or not Manifest::valid_dependency_path(relative)
                     relative_c: mutable darray[u8] = []
                     ProjectFiles::path_with_nul_into(&relative, &relative_c)
                     relative_name: cstr = (&relative_c[0]).cast[cstr] can Unsafe.PointerCast
@@ -3530,7 +3389,7 @@ module Cli:
                 source_type: mutable darray[u8] = []
                 relative_path: mutable darray[u8] = []
                 return false if not Json::object_string_value(lock, source_start, source_end, "type", &source_type) or not ByteText::equal_text(source_type, "path")
-                return false if not Json::object_string_value(lock, source_start, source_end, "path", &relative_path) or not valid_dependency_path(relative_path)
+                return false if not Json::object_string_value(lock, source_start, source_end, "path", &relative_path) or not Manifest::valid_dependency_path(relative_path)
                 return false if packages.count > 0.usize() and not ByteText::less(packages[packages.count - 1.usize()].name, package_name)
                 relative_c: mutable darray[u8] = []
                 ProjectFiles::path_with_nul_into(&relative_path, &relative_c)
