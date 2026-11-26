@@ -266,26 +266,12 @@ module ProjectTransaction:
                         report_recovery_error("error: unrecognized project transaction state; preserve .elisapkg/transaction.* for recovery\n")
                         return false
                 original_manifest: mutable darray[u8] = []
-                original_manifest <- original_manifest.resize(ProjectFiles::project_document_limit)
-                return false if not ProjectFiles::read_c_string_into(original_manifest_path, &original_manifest)
                 current_manifest: mutable darray[u8] = []
-                current_manifest <- current_manifest.resize(ProjectFiles::project_document_limit)
-                return false if not ProjectFiles::read_c_string_into(live_manifest_path, &current_manifest)
+                return false if not read_document(original_manifest_path, &original_manifest) or not read_document(live_manifest_path, &current_manifest)
                 manifest_is_original: bool = ByteText::equal(current_manifest, original_manifest)
-                if has_manifest_intent(state):
-                    new_manifest: mutable darray[u8] = []
-                    new_manifest <- new_manifest.resize(ProjectFiles::project_document_limit)
-                    return false if not ProjectFiles::read_c_string_into(staged_manifest_path, &new_manifest)
-                    if not manifest_is_original and not ByteText::equal(current_manifest, new_manifest):
-                        report_recovery_error("error: transaction recovery found an external manifest edit; recovery files were retained\n")
-                        return false
-                elif not manifest_is_original:
-                    report_recovery_error("error: transaction recovery found an external manifest edit; recovery files were retained\n")
-                    return false
-                original_lock_present: bool =
-                    original_lock_state: i64 = Platform::package_file_size(original_lock_path)
-                    return false if original_lock_state < 0 and original_lock_state != -2
-                    original_lock_state >= 0
+                return false if not manifest_edit_expected(state, manifest_is_original, current_manifest)
+                original_lock_present: mutable bool = false
+                return false if not file_present(original_lock_path, &original_lock_present)
                 if ByteText::equal_text(state, prepared_with_lock) and not original_lock_present:
                     report_recovery_error("error: transaction recovery is missing the original lockfile backup; recovery files were retained\n")
                     return false
@@ -293,55 +279,75 @@ module ProjectTransaction:
                     report_recovery_error("error: transaction recovery found an unexpected lockfile backup; recovery files were retained\n")
                     return false
                 original_lock: mutable darray[u8] = []
-                if original_lock_present:
-                    original_lock <- original_lock.resize(ProjectFiles::project_document_limit)
-                    return false if not ProjectFiles::read_c_string_into(original_lock_path, &original_lock)
-                current_lock_present: bool =
-                    current_lock_state: i64 = Platform::package_file_size(live_lock_path)
-                    return false if current_lock_state < 0 and current_lock_state != -2
-                    current_lock_state >= 0
-                new_lock_state: i64 = Platform::package_file_size(staged_lock_path)
-                return false if new_lock_state < 0 and new_lock_state != -2
-                new_lock_missing_state: i64 = Platform::package_file_size(staged_missing_lock_path)
-                return false if:
-                    new_lock_missing_state < 0 and new_lock_missing_state != -2
-                    new_lock_state >= 0 and new_lock_missing_state >= 0
-                if new_lock_missing_state >= 0:
-                    missing_lock_marker: mutable darray[u8] = []
-                    missing_lock_marker <- missing_lock_marker.resize(64)
-                    return false if not ProjectFiles::read_c_string_into(staged_missing_lock_path, &missing_lock_marker) or not ByteText::equal_text(missing_lock_marker, "missing\n")
-                region lock_is_original_scope:
-                    lock_is_original: mutable bool = not current_lock_present and not original_lock_present
-                    if current_lock_present:
-                        current_lock: mutable darray[u8] = []
-                        current_lock <- current_lock.resize(ProjectFiles::project_document_limit)
-                        return false if not ProjectFiles::read_c_string_into(live_lock_path, &current_lock)
-                        lock_is_original <- original_lock_present and ByteText::equal(current_lock, original_lock)
-                        if new_lock_state >= 0:
-                            new_lock: mutable darray[u8] = []
-                            new_lock <- new_lock.resize(ProjectFiles::project_document_limit)
-                            return false if not ProjectFiles::read_c_string_into(staged_lock_path, &new_lock)
-                            if not lock_is_original and not ByteText::equal(current_lock, new_lock):
-                                report_recovery_error("error: transaction recovery found an external lockfile edit; recovery files were retained\n")
-                                return false
-                        elif not lock_is_original:
-                            report_recovery_error("error: transaction recovery found an external lockfile edit; recovery files were retained\n")
-                            return false
-                    elif original_lock_present and new_lock_missing_state < 0:
-                        report_recovery_error("error: transaction recovery found an external lockfile edit; recovery files were retained\n")
-                        return false
-                    if not manifest_is_original:
-                        return false if not ProjectFiles::write_c_string_file(live_manifest_path, &original_manifest)
-                    if not lock_is_original:
-                        if original_lock_present:
-                            return false if not ProjectFiles::write_c_string_file(live_lock_path, &original_lock)
-                        else:
-                            return false if not ProjectFiles::remove_c_string_file(live_lock_path)
+                return false if original_lock_present and not read_document(original_lock_path, &original_lock)
+                lock_is_original: mutable bool = false
+                return false if not classify_live_lock(original_lock_present, original_lock, &lock_is_original)
+                return false if not manifest_is_original and not ProjectFiles::write_c_string_file(live_manifest_path, &original_manifest)
+                if not lock_is_original:
+                    if original_lock_present:
+                        return false if not ProjectFiles::write_c_string_file(live_lock_path, &original_lock)
+                    else:
+                        return false if not ProjectFiles::remove_c_string_file(live_lock_path)
                 region restored_state_scope:
                     restored_state: mutable darray[u8] = []
                     ByteText::append_text(&restored_state, rolled_back)
                     return false if not ProjectFiles::write_c_string_file(phase_path, &restored_state)
                 return remove_transaction_files()
+
+        def read_document(path: cstr, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            out.resize(ProjectFiles::project_document_limit)
+            return ProjectFiles::read_c_string_into(path, out)
+
+        # Whether a regular file exists at `path`. Returns false when its
+        # state cannot be determined.
+        def file_present(path: cstr, present: mutable bool&) -> bool can[Unsafe.PointerCast]:
+            file_state: i64 = Platform::package_file_size(path)
+            return false if file_state < 0 and file_state != -2
+            present <- file_state >= 0
+            return true
+
+        # A live manifest may differ from the original only when the journal
+        # records a manifest intent and the live file is the staged one.
+        def manifest_edit_expected(state: darray[u8]&, manifest_is_original: bool, current_manifest: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            return true if manifest_is_original
+            if has_manifest_intent(state):
+                new_manifest: mutable darray[u8] = []
+                return false if not read_document(staged_manifest_path, &new_manifest)
+                return true if ByteText::equal(current_manifest, new_manifest)
+            report_recovery_error("error: transaction recovery found an external manifest edit; recovery files were retained\n")
+            return false
+
+        # Decide whether the live lockfile is still the original. A live lock
+        # that is neither the original nor the staged replacement, or a
+        # missing lock the transaction did not intend, is an external edit.
+        def classify_live_lock(original_lock_present: bool, original_lock: darray[u8]&, lock_is_original: mutable bool&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            current_lock_present: mutable bool = false
+            return false if not file_present(live_lock_path, &current_lock_present)
+            new_lock_state: i64 = Platform::package_file_size(staged_lock_path)
+            return false if new_lock_state < 0 and new_lock_state != -2
+            new_lock_missing_state: i64 = Platform::package_file_size(staged_missing_lock_path)
+            return false if:
+                new_lock_missing_state < 0 and new_lock_missing_state != -2
+                new_lock_state >= 0 and new_lock_missing_state >= 0
+            if new_lock_missing_state >= 0:
+                missing_lock_marker: mutable darray[u8] = []
+                missing_lock_marker <- missing_lock_marker.resize(64)
+                return false if not ProjectFiles::read_c_string_into(staged_missing_lock_path, &missing_lock_marker) or not ByteText::equal_text(missing_lock_marker, "missing\n")
+            lock_is_original <- not current_lock_present and not original_lock_present
+            if not current_lock_present:
+                return true if not original_lock_present or new_lock_missing_state >= 0
+                report_recovery_error("error: transaction recovery found an external lockfile edit; recovery files were retained\n")
+                return false
+            current_lock: mutable darray[u8] = []
+            return false if not read_document(live_lock_path, &current_lock)
+            lock_is_original <- original_lock_present and ByteText::equal(current_lock, original_lock)
+            return true if original_lock_present and ByteText::equal(current_lock, original_lock)
+            if new_lock_state >= 0:
+                new_lock: mutable darray[u8] = []
+                return false if not read_document(staged_lock_path, &new_lock)
+                return true if ByteText::equal(current_lock, new_lock)
+            report_recovery_error("error: transaction recovery found an external lockfile edit; recovery files were retained\n")
+            return false
 
     public:
         def recover() -> bool can[Global{Read,Write}, Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
