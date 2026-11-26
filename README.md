@@ -92,6 +92,7 @@ Run project commands from the project directory. Where supported, `--manifest-pa
 | Add a sibling library | `add my-lib --path ../my-lib` | Adds a local dependency whose manifest name is `my-lib`. Local dependency builds require exactly one library target per dependency. |
 | Review dependency selections | `tree` or `why my-lib` | Displays the locked graph or explains why a package is present. |
 | Check a committed lockfile | `resolve --frozen` | Verifies the lockfile without rewriting it. |
+| Verify locked dependencies | `fetch --locked` | Checks local sources and verifies signed releases from the configured file-backed registry. Use `fetch --offline` to check cached registry releases. |
 | Inspect normalized metadata | `metadata --json` | Prints machine-readable package metadata. |
 | Build a release binary | `build --bin app --profile release` | Places the binary under `.elisapkg/build/release/`. |
 | Run a test target | `test --test app-tests` | Builds and runs a test target you have declared in the manifest. |

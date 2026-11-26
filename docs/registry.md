@@ -8,7 +8,8 @@ network API. Production remote metadata uses the TUF profile in
 content-addressed cache behavior may be reused after TUF authenticates the
 target metadata and exact bytes.
 
-`elisapkg fetch PACKAGE VERSION` reads a deterministic file-backed registry
+`elisapkg fetch PACKAGE VERSION` accepts an exact stable version such as
+`1.2.3` and reads a deterministic file-backed registry
 when `ELISAPKG_REGISTRY_DIR` is set. `elisapkg fetch` with no package arguments
 walks every registry record in a validated lockfile v3 and verifies/caches the
 exact locked bytes. This provider is an isolated local test seam: metadata is

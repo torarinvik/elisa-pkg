@@ -2,7 +2,7 @@
 
 Network source acquisition is disabled in the current binary. `elisapkg fetch`
 verifies local path sources against the lockfile. When `ELISAPKG_REGISTRY_DIR`
-is configured, `fetch PACKAGE REQUIREMENT` also verifies detached Ed25519
+is configured, `fetch PACKAGE VERSION` also verifies detached Ed25519
 metadata, expiry, archive size, and archive digest for a local registry
 artifact. Remote fetches, real `publish`, and remote `install NAME` fail with
 security status 5 until the TUF verifier, provider, network transport, and
