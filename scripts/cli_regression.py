@@ -35,6 +35,18 @@ with tempfile.TemporaryDirectory(prefix='cli-review-', dir=ROOT / 'build') as di
     for command in [['resolve', '--list'], ['build', '--dry-run'], ['build', '--version']]:
         result = subprocess.run([BIN, *command], cwd=project, capture_output=True, timeout=120, check=False)
         assert result.returncode == 2, (command, result)
+    blocked_project = work / 'blocked'
+    run([BIN, 'init', blocked_project], stdout=subprocess.DEVNULL)
+    state = blocked_project / '.elisapkg'
+    state.mkdir(exist_ok=True)
+    guard = state / 'transaction.guard'
+    guard.write_bytes(b'not a transaction directory')
+    result = subprocess.run([BIN, 'check-manifest', '--unexpected'], cwd=blocked_project,
+                            capture_output=True, timeout=120, check=False)
+    assert result.returncode == 2 and guard.read_bytes() == b'not a transaction directory', result
+    result = subprocess.run([BIN, 'check-manifest'], cwd=blocked_project,
+                            capture_output=True, timeout=120, check=False)
+    assert result.returncode == 5, result
     duplicate_manifest_path = subprocess.run([BIN, 'check-manifest', '--manifest-path', project / 'elisapkg.json', '--manifest-path', project / 'elisapkg.json'], capture_output=True, timeout=120, check=False)
     assert duplicate_manifest_path.returncode == 2, duplicate_manifest_path
     result = subprocess.run([BIN, 'update', 'missing'], cwd=project, capture_output=True, timeout=120, check=False)
