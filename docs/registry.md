@@ -148,7 +148,7 @@ to prevent an accidentally or maliciously long replay window. The expiry shown
 above is a placeholder: publishers must write a fresh integer Unix timestamp
 within that 30-day horizon before signing. A detached signature or trust root that is missing,
 malformed, unavailable, or invalid fails closed. The Ed25519 provider is the
-small FFI seam in `src/platform_native.elisa`; signature policy remains in
+Elisa implementation in `src/platform/ed25519.elisa`. Signature policy lives in
 `src/trust.elisa` and `src/registry.elisa`.
 
 The archive reader verifies the strict deterministic ustar subset again at the

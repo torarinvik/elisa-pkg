@@ -9,7 +9,12 @@ ROOT = Path(__file__).resolve().parents[1]
 FFI_DECLARATIONS = (ROOT / "src/platform/libc.elisa").resolve()
 NATIVE_MODULES = {
     (ROOT / path).resolve()
-    for path in ("src/platform_native.elisa", "src/platform/errors.elisa", "src/platform/process.elisa")
+    for path in (
+        "src/platform_native.elisa",
+        "src/platform/ed25519.elisa",
+        "src/platform/errors.elisa",
+        "src/platform/process.elisa",
+    )
 }
 GENERATED_DIRECTORIES = {".git", ".elisapkg", ".ruff_cache", "build"}
 FORBIDDEN_NATIVE_SUFFIXES = {".c", ".h", ".cc", ".cpp", ".cxx", ".hpp"}
