@@ -1,0 +1,135 @@
+# Read, resolve, verify, and cache one registry release for `fetch`.
+include "../cache/registry.elisa"
+include "../integrity.elisa"
+include "../json.elisa"
+include "../package/model.elisa"
+include "../package/package_identity.elisa"
+include "../project/lockfile.elisa"
+include "../project/schema_fields.elisa"
+include "../registry.elisa"
+include "../resolution/semver.elisa"
+include "../resolution/solver.elisa"
+include "../text/bytes.elisa"
+include "./output.elisa"
+include "./status.elisa"
+
+module FetchRelease:
+    public:
+        # A registry release as a lock record names it.
+        struct LockedRelease:
+            package: mutable darray[u8]
+            version: mutable darray[u8]
+            parsed_version: mutable Model::Version
+            archive: mutable darray[u8]
+            digest: mutable darray[u8]
+            metadata_digest: mutable darray[u8]
+            archive_size: mutable u64
+
+        # A release the registry resolved, with the index evidence it was read under.
+        struct ResolvedRelease:
+            selected: mutable darray[u8]
+            archive: mutable darray[u8]
+            digest: mutable darray[u8]
+            archive_size: mutable u64
+            metadata: mutable darray[u8]
+            index_generation: mutable u64
+            index_digest: mutable darray[u8]
+            index_identity: mutable darray[u8]
+
+        def empty_locked() -> LockedRelease:
+            return LockedRelease{package: [], version: [], parsed_version: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false},
+                                 archive: [], digest: [], metadata_digest: [], archive_size: 0}
+
+        def empty_resolved() -> ResolvedRelease:
+            return ResolvedRelease{selected: [], archive: [], digest: [], archive_size: 0, metadata: [], index_generation: 0, index_digest: [], index_identity: []}
+
+        # Read one schema-valid registry lock record spanning `start..finish`.
+        def read_locked(lock: darray[u8]&, start: usize, finish: usize, out: mutable LockedRelease&) -> bool can[Memory.Allocate, Abort.Panic]:
+            return SchemaFields::valid(lock, start, finish, SchemaFields::Kind.RegistryLockRecord) and
+                   Json::object_string_value(lock, start, finish, "name", &out.package) and
+                   Json::object_string_value(lock, start, finish, "version", &out.version) and
+                   PackageIdentity::valid_name(out.package) and
+                   SemVer::parse(out.version, &out.parsed_version) and not out.parsed_version.prerelease and
+                   Lockfile::read_registry_archive(lock, start, finish, &out.archive) and
+                   Lockfile::read_sha256_field(lock, start, finish, "archive-digest", &out.digest) and
+                   Lockfile::read_sha256_field(lock, start, finish, "metadata-digest", &out.metadata_digest) and
+                   Json::object_unsigned_value(lock, start, finish, "archive-size", &out.archive_size)
+
+        # Resolve `requirement` for `package`. A failure is reported as
+        # "error: MESSAGE[CONTEXT PACKAGE]" and mapped to a security failure
+        # or to `other_failure`.
+        def resolve(package: darray[u8]&, requirement: darray[u8]&, context: cstr, other_failure: i64, out: mutable ResolvedRelease&) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                previous_version: Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
+                status: Registry::ResultCode = Registry::resolve_with_index_evidence(package, requirement, previous_version, &out.selected, &out.archive, &out.digest, &out.archive_size,
+                                                                                     &out.metadata, &out.index_generation, &out.index_digest, &out.index_identity)
+                return CliStatus::success if status == Registry::ResultCode.Ok
+                report_registry_error(status, context, package)
+                return CliStatus::security_failed if Registry::is_security_failure(status)
+                return other_failure
+
+        # Verify the signed metadata snapshot of a resolved release, download
+        # its archive, record it in the trust state, and store it in the cache.
+        # `locked` selects the wording for a release taken from the lock.
+        def verify_and_cache(package: darray[u8]&, version: darray[u8]&, resolved: ResolvedRelease&, metadata_digest: darray[u8]&, locked: bool) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                metadata_expires: mutable u64 = 0
+                return CliStatus::security_failed if not Json::object_unsigned_value(resolved.metadata, 0, Json::object_end(resolved.metadata, 0), "expires", &metadata_expires)
+                metadata_signature: mutable darray[u8] = []
+                return CliStatus::security_failed if Registry::read_signature(package, resolved.selected, &metadata_signature) != Registry::ResultCode.Ok
+                snapshot_expires: mutable u64 = 0
+                region snapshot_status_scope:
+                    snapshot: mutable ResolvedRelease = empty_resolved()
+                    snapshot_dependencies: mutable darray[Solver::Constraint] = []
+                    snapshot_status: Registry::ResultCode = Registry::verify_metadata_snapshot(package, resolved.selected, metadata_digest, resolved.metadata, metadata_signature, &snapshot.archive, &snapshot.digest, &snapshot.archive_size, &snapshot_expires, &snapshot_dependencies)
+                    return CliStatus::security_failed if:
+                        snapshot_status != Registry::ResultCode.Ok
+                        snapshot_expires != metadata_expires
+                        not ByteText::equal(snapshot.archive, resolved.archive)
+                        not ByteText::equal(snapshot.digest, resolved.digest)
+                        snapshot.archive_size != resolved.archive_size
+                archive_bytes: mutable darray[u8] = []
+                region archive_status_scope:
+                    archive_status: Registry::ResultCode = Registry::read_archive(package, version, resolved.metadata, resolved.archive, resolved.digest, resolved.archive_size, &archive_bytes)
+                    if archive_status != Registry::ResultCode.Ok:
+                        report_registry_error(archive_status, " for locked " if locked else "", package)
+                        return CliStatus::security_failed if Registry::is_security_failure(archive_status)
+                        return CliStatus::source_failed
+                region trust_status_scope:
+                    trust_status: Registry::ResultCode = Registry::record_trusted_at_index(package, version, resolved.digest, metadata_digest, snapshot_expires, resolved.index_generation, resolved.index_digest, resolved.index_identity)
+                    if trust_status != Registry::ResultCode.Ok:
+                        report_registry_error(trust_status, " while recording locked " if locked else " while recording ", package)
+                        return CliStatus::security_failed
+                return CliStatus::security_failed if not RegistryCache::store_metadata(metadata_digest, resolved.metadata, metadata_signature)
+                return CliStatus::source_failed if not RegistryCache::store_archive(resolved.digest, archive_bytes)
+                return CliStatus::security_failed if not RegistryCache::store_receipt(package, version, resolved.archive, resolved.archive_size, resolved.digest, metadata_digest, metadata_expires)
+                report_verified("verified locked registry artifact " if locked else "verified registry artifact ", package, version, resolved.digest, " (cached)\n")
+                return CliStatus::success
+
+        def report_verified(prefix: cstr, package: darray[u8]&, version: darray[u8]&, digest: darray[u8]&, suffix: cstr) -> void can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                CliOutput::write_ok(prefix)
+                CliOutput::write_bytes(1, package)
+                CliOutput::write_ok(" ")
+                CliOutput::write_bytes(1, version)
+                CliOutput::write_ok(" sha256:")
+                CliOutput::write_bytes(1, digest)
+                CliOutput::write_ok(suffix)
+
+        def report_cached_release_error(message: cstr, package: darray[u8]&, version: darray[u8]&) -> void can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                CliOutput::write_error(message)
+                CliOutput::write_bytes(2, package)
+                CliOutput::write_error(" ")
+                CliOutput::write_bytes(2, version)
+                CliOutput::write_error("\n")
+
+        # Print "error: MESSAGE", then CONTEXT and PACKAGE when CONTEXT is not empty.
+        def report_registry_error(status: Registry::ResultCode, context: cstr, package: darray[u8]&) -> void can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                CliOutput::write_error("error: ")
+                CliOutput::write_error(Registry::result_message(status))
+                if context[0].u8() != 0:
+                    CliOutput::write_error(context)
+                    CliOutput::write_bytes(2, package)
+                CliOutput::write_error("\n")
