@@ -470,22 +470,9 @@ module BuildCommand:
                         CompilerProcess::discard_scratch(sandbox_work_name, temp_name, aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
                         CliOutput::write_error("error: sandboxed compiler process failed or could not be reaped\n")
                         return CliStatus::build_failed
-                    temporary_size: i64 = Platform::pkg_package_file_size(temp_name)
-                    if temporary_size <= 0:
-                        CompilerProcess::discard_scratch(sandbox_work_name, temp_name, aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
-                        return CliStatus::build_failed
-                    temporary_path: mutable darray[u8] = []
-                    ByteText::append_bounded_text(&temporary_path, temp_name)
                     artifact_content: mutable darray[u8] = []
-                    artifact_digest_bytes: mutable darray[u8] = []
                     artifact_digest: mutable darray[u8] = []
-                    if not read_package_file(&temporary_path, &artifact_content):
-                        CompilerProcess::discard_scratch(sandbox_work_name, temp_name, aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
-                        return CliStatus::build_failed
-                    if Integrity::sha256(artifact_content, &artifact_digest_bytes) != Integrity::DigestCode.Ok:
-                        CompilerProcess::discard_scratch(sandbox_work_name, temp_name, aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
-                        return CliStatus::build_failed
-                    if not Integrity::hex_digest(artifact_digest_bytes, &artifact_digest):
+                    if not capture_compiler_output(temp_name, &artifact_content, &artifact_digest):
                         CompilerProcess::discard_scratch(sandbox_work_name, temp_name, aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
                         return CliStatus::build_failed
                     # Detach the compiler-owned output inode before validating the source
@@ -501,14 +488,7 @@ module BuildCommand:
                     # to the inputs that were presented to the compiler. Revalidate the
                     # exact manifest and lock too: local lock validation recomputes every
                     # transitive dependency source digest, including paths outside the root.
-                    manifest_after_build: mutable darray[u8] = []
-                    manifest_after_build.resize(ProjectFiles::project_document_limit)
-                    lock_after_build: mutable darray[u8] = []
-                    lock_after_build.resize(ProjectFiles::project_document_limit)
-                    if not ProjectFiles::read_cstr_into("elisapkg.json", &manifest_after_build) or not ProjectFiles::read_cstr_into("elisapkg.lock", &lock_after_build):
-                        CompilerProcess::discard_scratch(sandbox_work_name, temp_name, aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
-                        return CliStatus::build_failed
-                    if not ByteText::equal(manifest_after_build, manifest_raw) or not ByteText::equal(lock_after_build, lock_raw) or not LockValidation::matches_manifest(manifest_raw, lock_raw, root_name, root_version, start):
+                    if not project_inputs_unchanged(manifest_raw, lock_raw, root_name, root_version, start):
                         CompilerProcess::discard_scratch(sandbox_work_name, temp_name, aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
                         return CliStatus::build_failed
                     post_source_tree_digest: mutable darray[u8] = []
@@ -563,6 +543,24 @@ module BuildCommand:
                         out_artifact_digest[digest_index] <- artifact_digest[digest_index]
                     _ = options
                     return CliStatus::success
+
+        def capture_compiler_output(path: cstr, content: mutable darray[u8]&, digest: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return false if Platform::pkg_package_file_size(path) <= 0
+            path_bytes: mutable darray[u8] = []
+            ByteText::append_bounded_text(&path_bytes, path)
+            return read_package_file(&path_bytes, content) and Integrity::sha256_hex(content, digest)
+
+        def project_inputs_unchanged(manifest: darray[u8]&, lock: darray[u8]&, root_name: darray[u8]&, root_version: darray[u8]&, start: darray[u8]&) -> bool can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            current_manifest: mutable darray[u8] = []
+            current_manifest.resize(ProjectFiles::project_document_limit)
+            current_lock: mutable darray[u8] = []
+            current_lock.resize(ProjectFiles::project_document_limit)
+            return false if:
+                not ProjectFiles::read_cstr_into("elisapkg.json", &current_manifest)
+                not ProjectFiles::read_cstr_into("elisapkg.lock", &current_lock)
+                not ByteText::equal(current_manifest, manifest)
+                not ByteText::equal(current_lock, lock)
+            return LockValidation::matches_manifest(manifest, lock, root_name, root_version, start) can Global.Read
 
         def read_package_file(path: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return Platform::pkg_read_bounded_file(path, Integrity::max_input, out)
