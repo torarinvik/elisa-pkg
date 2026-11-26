@@ -3094,41 +3094,11 @@ module Cli:
             return false if value[0] != 115 or value[1] != 104 or value[2] != 97 or value[3] != 50 or value[4] != 53 or value[5] != 54 or value[6] != 58
             return Integrity::valid_sha256_hex_range(value, 7.usize(), value.count)
 
-        def registry_lock_satisfies_constraint(lock: darray[u8]&, packages_start: usize, packages_end: usize, wanted: Solver::Constraint) -> bool can[Memory.Allocate, Abort.Panic]:
-            requirement: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
-            return false if not SemVer::parse_requirement(wanted.requirement, &requirement)
-            cursor: mutable usize = packages_start + 1.usize()
-            found: mutable bool = false
-            while cursor < packages_end |lock, packages_start, packages_end, wanted, cursor, found|:
-                while cursor < packages_end and (lock[cursor] == 32 or lock[cursor] == 9 or lock[cursor] == 10 or lock[cursor] == 13) |lock, cursor|:
-                    cursor <- cursor + 1.usize()
-                break if cursor == packages_end
-                return false if lock[cursor] != 123
-                record_end: usize = json_object_end(lock, cursor)
-                return false if record_end <= cursor or record_end >= packages_end
-                package: mutable darray[u8] = []
-                version_text: mutable darray[u8] = []
-                return false if not object_string_value(lock, cursor, record_end, "name", &package) or not object_string_value(lock, cursor, record_end, "version", &version_text)
-                if bytes_equal(package, wanted.package):
-                    return false if found
-                    parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-                    return false if not SemVer::parse(version_text, &parsed) or parsed.prerelease or not SemVer::matches(requirement, parsed)
-                    found <- true
-                cursor <- record_end + 1.usize()
-                while cursor < packages_end and (lock[cursor] == 32 or lock[cursor] == 9 or lock[cursor] == 10 or lock[cursor] == 13) |lock, cursor|:
-                    cursor <- cursor + 1.usize()
-                if cursor < packages_end:
-                    return false if lock[cursor] != 44
-                    cursor <- cursor + 1.usize()
-            return found
-
         def registry_lock_satisfies_roots(lock: darray[u8]&, packages_start: usize, packages_end: usize, roots: darray[Solver::Constraint]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            # A registry lock is still project input. Check every direct
-            # manifest requirement against the exact version recorded in the
-            # lock before offline/frozen callers trust cached bytes. The same
-            # helper is used for dependency edges restored from signed metadata.
-            for root_index in 0..<roots.count |lock, packages_start, packages_end, roots, root_index|:
-                return false if not registry_lock_satisfies_constraint(lock, packages_start, packages_end, roots[root_index])
+            starts: mutable darray[usize] = []
+            return false if not registry_lock_record_starts(lock, packages_start, packages_end, &starts)
+            for root_index in 0..<roots.count |lock, starts, roots|:
+                return false if not indexed_registry_constraint_matches(lock, starts, roots[root_index])
             return true
 
         def lock_matches_manifest(manifest: darray[u8]&, lock: darray[u8]&, name: darray[u8]&, version: darray[u8]&, start: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -3595,12 +3565,10 @@ module Cli:
             requirement: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
             return SemVer::parse_requirement(wanted.requirement, &requirement) and SemVer::matches(requirement, version)
 
-        def registry_offline_graph_closure(manifest: darray[u8]&, lock: darray[u8]&, packages_start: usize, packages_end: usize) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+        def registry_offline_graph_closure(manifest: darray[u8]&, lock: darray[u8]&, starts: darray[usize]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             roots: mutable darray[Solver::Constraint] = []
             has_local: mutable bool = false
             return EXIT_RESOLVE if not collect_registry_roots(manifest, &roots, &has_local) or has_local or roots.count == 0.usize()
-            starts: mutable darray[usize] = []
-            return EXIT_RESOLVE if not registry_lock_record_starts(lock, packages_start, packages_end, &starts)
             reachable: mutable darray[u8] = []
             reachable_count: mutable usize = 0.usize()
             for index in 0..<roots.count |roots, reachable, reachable_count|:
@@ -3662,7 +3630,9 @@ module Cli:
             packages_start: usize = json_key_value_offset(lock, "packages")
             packages_end: usize = json_array_end(lock, packages_start)
             return EXIT_RESOLVE if packages_start >= lock.count or packages_end <= packages_start
-            closure_status: i64 = registry_offline_graph_closure(manifest, lock, packages_start, packages_end)
+            starts: mutable darray[usize] = []
+            return EXIT_RESOLVE if not registry_lock_record_starts(lock, packages_start, packages_end, &starts)
+            closure_status: i64 = registry_offline_graph_closure(manifest, lock, starts)
             if closure_status != EXIT_OK:
                 write_error("error: offline registry lock does not match its signed dependency graph\n") if closure_status == EXIT_RESOLVE
                 return closure_status
@@ -3714,8 +3684,8 @@ module Cli:
                 metadata_dependencies: mutable darray[Solver::Constraint] = []
                 metadata_status: Registry::ResultCode = Registry::verify_metadata_snapshot(package, version_text, metadata_digest, cached_metadata, cached_signature, &resolved_archive, &resolved_digest, &resolved_size, &metadata_expires, &metadata_dependencies)
                 return EXIT_SECURITY if metadata_status != Registry::ResultCode.Ok or not bytes_equal(resolved_archive, archive) or not bytes_equal(resolved_digest, digest) or resolved_size != archive_size or metadata_expires != expires
-                for dependency_index in 0..<metadata_dependencies.count |lock, packages_start, packages_end, metadata_dependencies, dependency_index|:
-                    return EXIT_SECURITY if not registry_lock_satisfies_constraint(lock, packages_start, packages_end, metadata_dependencies[dependency_index])
+                for dependency_index in 0..<metadata_dependencies.count |lock, starts, metadata_dependencies, dependency_index|:
+                    return EXIT_SECURITY if not indexed_registry_constraint_matches(lock, starts, metadata_dependencies[dependency_index])
                 archive_bytes: mutable darray[u8] = []
                 return EXIT_SECURITY if not Cache::read_verified_blob(digest, archive_size.usize(), &archive_bytes) or archive_bytes.count.u64() != archive_size or not Registry::release_archive_matches_metadata(package, version_text, cached_metadata, archive_bytes)
                 # Only authenticated cache content may advance the durable
