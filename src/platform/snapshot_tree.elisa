@@ -42,33 +42,37 @@ module NativeSnapshotTree:
             source_status: mutable darray[u8]
 
         def snapshot_package_tree_into(source_root: cstr, destination: cstr, maximum_bytes: usize) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            byte_limit: usize = maximum_bytes if maximum_bytes < snapshot_maximum_total_bytes else snapshot_maximum_total_bytes
             roots: mutable SnapshotRoots = SnapshotRoots{source_name: [], destination_name: [], source_length: 0.usize(), source_file_descriptor: -1, destination_file_descriptor: -1, source_status: []}
             region open_status_scope:
                 open_status: i64 = open_snapshot_roots(source_root, destination, &roots)
                 return open_status if open_status != 0
-            paths: mutable darray[u8] = []
-            collected: i64 = collect_source_paths(roots, &paths)
-            return PlatformNative::close_two_error(roots.source_file_descriptor, roots.destination_file_descriptor, collected) if collected < 0
+            return copy_snapshot(roots, maximum_bytes if maximum_bytes < snapshot_maximum_total_bytes else snapshot_maximum_total_bytes)
+
+        # Collect and copy every source path, then flush and close both roots.
+        # Returns the copied byte count, or a negative errno after removing
+        # whatever was copied.
+        def copy_snapshot(roots: SnapshotRoots&, byte_limit: usize) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             copied_paths: mutable darray[u8] = []
             created_directories: mutable darray[u8] = []
             total_bytes: mutable usize = 0.usize()
+            copy_status: i64 = collect_and_copy(roots, byte_limit, &copied_paths, &created_directories, &total_bytes)
+            return copy_status if copy_status != 0
+            return snapshot_copy_failure(roots.source_file_descriptor, roots.destination_file_descriptor, copied_paths, created_directories, NativeErrors::negative_errno()) if native_fsync(roots.destination_file_descriptor) != 0
+            return snapshot_copy_failure(-1, roots.destination_file_descriptor, copied_paths, created_directories, -5) if native_close(roots.source_file_descriptor) != 0
+            return total_bytes.i64() if native_close(roots.destination_file_descriptor) == 0
+            _ = cleanup_package_snapshot_contents(((&roots.destination_name[0]).cast[cstr] can Unsafe.PointerCast))
+            return -5
+
+        # Collect the source paths and copy them. Any failure closes both
+        # roots and removes what was copied. Returns 0 or a negative errno.
+        def collect_and_copy(roots: SnapshotRoots&, byte_limit: usize, copied_paths: mutable darray[u8]&, created_directories: mutable darray[u8]&, total_bytes: mutable usize&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            paths: mutable darray[u8] = []
+            collected: i64 = collect_source_paths(roots, &paths)
+            return PlatformNative::close_two_error(roots.source_file_descriptor, roots.destination_file_descriptor, collected) if collected < 0
             region copy_status_scope:
-                copy_status: i64 = copy_collected_paths(roots, paths, collected.usize(), byte_limit, &copied_paths, &created_directories, &total_bytes)
+                copy_status: i64 = copy_collected_paths(roots, paths, collected.usize(), byte_limit, copied_paths, created_directories, total_bytes)
                 return snapshot_copy_failure(roots.source_file_descriptor, roots.destination_file_descriptor, copied_paths, created_directories, copy_status) if copy_status != 0
-            if native_fsync(roots.destination_file_descriptor) != 0:
-                return snapshot_copy_failure(roots.source_file_descriptor, roots.destination_file_descriptor, copied_paths, created_directories, NativeErrors::negative_errno())
-            region source_close_scope:
-                source_close: i32 = native_close(roots.source_file_descriptor)
-                if source_close != 0:
-                    return snapshot_copy_failure(-1, roots.destination_file_descriptor, copied_paths, created_directories, -5)
-            destination_close: i32 = native_close(roots.destination_file_descriptor)
-            if destination_close != 0:
-                region cleanup_status_scope:
-                    cleanup_status: i64 = cleanup_package_snapshot_contents((&roots.destination_name[0]).cast[cstr] can Unsafe.PointerCast)
-                    return -5 if cleanup_status != 0
-                return -5
-            return total_bytes.i64()
+            return 0
 
         def terminated_copy(text: cstr, length: usize) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
             copy: mutable darray[u8] = []
