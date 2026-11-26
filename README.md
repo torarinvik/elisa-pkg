@@ -109,6 +109,6 @@ The local registry fixture verifies detached Ed25519 signatures, expiry, cached 
 | [CI and regression checks](docs/ci.md) | Development checks and host requirements |
 | [TUF profile](docs/tuf-profile.md) | Requirements for future production registry support |
 
-Source lives in `src/`, build and regression tooling in `scripts/`, and experimental work in `spikes/`. With the toolchain configured, `make build` builds the CLI and `make test` runs the smoke suite on a supported build host.
+Source lives in `src/`. Build and regression tooling lives in `scripts/`. With the toolchain configured, `make build` builds the CLI and `make test` runs the smoke suite on a supported build host.
 
 See [LICENSE](LICENSE) for license terms.

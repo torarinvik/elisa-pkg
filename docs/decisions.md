@@ -287,28 +287,12 @@ reports `sigstore-rust` at 119/119; that is general conformance evidence, not a
 result for the previously pinned 0.14.0 build or the 0.15.1 source/profile/ABI
 combination. Re-pin and rerun the exact release before reconsidering it.
 
-A test-only ABI proof is also recorded in
-[`spikes/tuf_ffi`](../spikes/tuf_ffi/README.md), pinned to the same upstream
-commit. On 2026-10-07, four Rust tests passed, and the release static library
-linked to an Elisa-emitted object and ran on Vast Linux x86_64. The
-cross-language probe accepted the signed fixture root (version 9, eight keys,
-root threshold three), verified two consecutive root rotations, rejected a
-skipped version, tampered signature, and spec version `1.0.37`, rejected
-duplicate keys in Elisa before FFI, and left output fields untouched on
-failures. This establishes only the v1 ABI layout and bounded root-verification
-operations on one target. The Rust entry point depends on the Elisa precheck to
-reject duplicate keys and noncanonical numbers; the prototype has no durable
-root checkpoint implementation, complete role refresh, delegation, cache
-writes, transport, or supported-platform CI coverage. Separate ABI operations
-can check final-root expiry and verify a timestamp against a root, returning
-its snapshot pin. They enforce the TUF-required strict expiry boundary at a
-caller-supplied fixed time with seconds and nanoseconds. The Elisa probe cases
-for timestamp verification have not yet run on Vast because the instance
-refuses the SSH connection. The prototype does not own rollback floors or the
-complete refresh workflow. The ABI source also enforces the selected Ed25519
-root-key profile and includes the pinned ECDSA GitHub root as a negative case;
-that case has not yet run on Vast. It is not approval to ship the engine or
-enable remote operations.
+An exploratory Rust FFI prototype linked an Elisa-emitted object on Linux
+x86-64 and exercised bounded TUF root verification and rotation. The
+prototype remains in Git history under `spikes/tuf_ffi`. That experiment
+did not establish durable rollback protection, complete metadata refresh,
+delegation, or compatibility across supported platforms. The package manager
+does not use the prototype.
 
 The fixture in D-011 remains a local implementation test only. Its custom
 single-key index and signed metadata are not a compatible TUF implementation
