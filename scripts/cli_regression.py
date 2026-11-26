@@ -47,11 +47,12 @@ with tempfile.TemporaryDirectory(prefix='cli-review-', dir=ROOT / 'build') as di
     after = lock.stat()
     assert (before.st_ino, before.st_mtime_ns) == (after.st_ino, after.st_mtime_ns)
 
-    quiet_cache_verify = subprocess.run(
-        [BIN, 'cache', 'verify', '--quiet'], cwd=project,
-        capture_output=True, text=True, timeout=120, check=False)
-    assert quiet_cache_verify.returncode == 0, quiet_cache_verify
-    assert quiet_cache_verify.stdout == ''
+    for cache_arguments in (['verify', '--quiet'], ['--quiet', 'verify']):
+        quiet_cache_verify = subprocess.run(
+            [BIN, 'cache', *cache_arguments], cwd=project,
+            capture_output=True, text=True, timeout=120, check=False)
+        assert quiet_cache_verify.returncode == 0, quiet_cache_verify
+        assert quiet_cache_verify.stdout == ''
     quiet_cache_gc = subprocess.run(
         [BIN, 'cache', 'gc', '--dry-run', '--quiet'], cwd=project,
         capture_output=True, text=True, timeout=120, check=False)
