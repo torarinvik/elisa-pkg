@@ -9,6 +9,7 @@ include "./package/ustar_fields.elisa"
 include "./platform/libc.elisa"
 
 include "./platform/abi.elisa"
+include "./platform/stat.elisa"
 include "./platform/linux_access_acl.elisa"
 
 module PlatformNative:
@@ -150,8 +151,8 @@ module PlatformNative:
             if native_fstat(fd, raw_stat) != 0:
                 errno_value: i64 = current_errno()
                 return close_two_error(directory, fd, negative_value(errno_value))
-            file_device: u64 = read_stat_device(stat)
-            file_inode: u64 = read_u64(stat, stat_inode_offset)
+            file_device: u64 = NativeStat::device(stat)
+            file_inode: u64 = NativeStat::inode(stat)
             read_size: i64 = read_regular_descriptor(fd, output, capacity)
             result: i64 = close_two_result(directory, fd, read_size)
             return result if result < 0
@@ -1262,10 +1263,10 @@ module PlatformNative:
             if native_fstat(pinned, pinned_raw) != 0:
                 errno_value: i64 = negative_errno()
                 return close_error(pinned, errno_value)
-            pinned_mode: u64 = read_u16(pinned_stat, stat_mode_offset) & 61440.u64()
+            pinned_mode: u64 = NativeStat::file_type(pinned_stat)
             if pinned_mode != regular_mode:
                 return close_error(pinned, package_nonregular_file_error(pinned_mode))
-            if not same_stat_identity(before, pinned_stat):
+            if not NativeStat::same_identity(before, pinned_stat):
                 return close_error(pinned, -13)
 
             descriptor_path: mutable darray[u8] = []
@@ -1294,7 +1295,7 @@ module PlatformNative:
             if native_fstat(reopened, reopened_raw) != 0:
                 errno_value: i64 = negative_errno()
                 return close_two_error(pinned, reopened, errno_value)
-            same: bool = (read_u16(reopened_stat, stat_mode_offset) & 61440.u64()) == regular_mode and same_stat_identity(pinned_stat, reopened_stat)
+            same: bool = (NativeStat::file_type(reopened_stat)) == regular_mode and NativeStat::same_identity(pinned_stat, reopened_stat)
             close_status: i32 = native_close(pinned)
             if not same or close_status != 0:
                 _ = native_close(reopened)
@@ -1324,7 +1325,7 @@ module PlatformNative:
             before_raw: mutable void& = (&before[0]).cast[mutable void&] can Unsafe.PointerCast
             if native_fstatat(directory, leaf_name, before_raw, at_no_follow) != 0:
                 return negative_errno()
-            before_mode: u64 = read_u16(before, stat_mode_offset) & 61440.u64()
+            before_mode: u64 = NativeStat::file_type(before)
             return package_nonregular_file_error(before_mode) if before_mode != regular_mode
             if platform_is_linux:
                 how: mutable darray[u8] = []
@@ -1342,7 +1343,7 @@ module PlatformNative:
                     if native_fstat(opened, after_raw) != 0:
                         errno_value: i64 = negative_errno()
                         return close_error(opened, errno_value)
-                    if (read_u16(after, stat_mode_offset) & 61440.u64()) != regular_mode or not same_stat_identity(before, after):
+                    if (NativeStat::file_type(after)) != regular_mode or not NativeStat::same_identity(before, after):
                         return close_error(opened, -13)
                     return opened
                 open_errno: i64 = current_errno()
@@ -1358,10 +1359,10 @@ module PlatformNative:
                 if native_fstat(opened, after_raw) != 0:
                     errno_value: i64 = negative_errno()
                     return close_error(opened, errno_value)
-                after_mode: u64 = read_u16(after, stat_mode_offset) & 61440.u64()
+                after_mode: u64 = NativeStat::file_type(after)
                 if after_mode != regular_mode:
                     return close_error(opened, package_nonregular_file_error(after_mode))
-                if not same_stat_identity(before, after):
+                if not NativeStat::same_identity(before, after):
                     return close_error(opened, -13)
                 return opened
 
@@ -1370,10 +1371,10 @@ module PlatformNative:
             stat.resize(stat_buffer_bytes)
             raw: mutable void& = (&stat[0]).cast[mutable void&] can Unsafe.PointerCast
             return false if native_fstat(fd, raw) != 0
-            mode: u64 = read_u16(stat, stat_mode_offset)
-            owner: u64 = read_u32(stat, stat_uid_offset)
-            return false if (mode & 61440.u64()) != directory_mode
-            if (mode & 18.u64()) != 0.u64():
+            mode: u64 = NativeStat::mode(stat)
+            owner: u64 = NativeStat::owner(stat)
+            return false if (mode & NativeStat::file_type_mask) != directory_mode
+            if (mode & NativeStat::group_or_other_write_mask) != 0.u64():
                 # The only writable shared directory accepted for source
                 # traversal is a root-owned sticky directory (for example,
                 # /tmp). The sticky bit limits replacement to the owner of
@@ -1392,7 +1393,7 @@ module PlatformNative:
             before_raw: mutable void& = (&before[0]).cast[mutable void&] can Unsafe.PointerCast
             if native_fstatat(directory, component, before_raw, at_no_follow) != 0:
                 return negative_errno()
-            before_mode: u64 = read_u16(before, stat_mode_offset) & 61440.u64()
+            before_mode: u64 = NativeStat::file_type(before)
             if before_mode != directory_mode:
                 return -symlink_error if before_mode == symlink_mode
                 return -20
@@ -1404,7 +1405,7 @@ module PlatformNative:
             if native_fstat(next, after_raw) != 0:
                 errno_value: i64 = negative_errno()
                 return close_error(next, errno_value)
-            if (read_u16(after, stat_mode_offset) & 61440.u64()) != directory_mode or not same_stat_identity(before, after) or not executable_source_directory_fd(next, expected_uid):
+            if (NativeStat::file_type(after)) != directory_mode or not NativeStat::same_identity(before, after) or not executable_source_directory_fd(next, expected_uid):
                 return close_error(next, -13)
             return next
 
@@ -1532,7 +1533,7 @@ module PlatformNative:
             before_raw: mutable void& = (&before[0]).cast[mutable void&] can Unsafe.PointerCast
             if native_fstatat(directory, component, before_raw, at_no_follow) != 0:
                 return negative_errno()
-            before_mode: u64 = read_u16(before, stat_mode_offset) & 61440.u64()
+            before_mode: u64 = NativeStat::file_type(before)
             if before_mode != directory_mode:
                 return -symlink_error if before_mode == symlink_mode
                 return -20
@@ -1544,7 +1545,7 @@ module PlatformNative:
             if native_fstat(next, after_raw) != 0:
                 errno_value: i64 = negative_errno()
                 return close_error(next, errno_value)
-            if (read_u16(after, stat_mode_offset) & 61440.u64()) != directory_mode or not same_stat_identity(before, after) or not package_source_directory_fd(next):
+            if (NativeStat::file_type(after)) != directory_mode or not NativeStat::same_identity(before, after) or not package_source_directory_fd(next):
                 return close_error(next, -13)
             return next
 
@@ -1658,8 +1659,8 @@ module PlatformNative:
             if native_fstat(fd, fd_stat_raw) != 0:
                 errno_value: i64 = current_errno()
                 return close_two_error(directory, fd, negative_value(errno_value))
-            fd_device: u64 = read_stat_device(fd_stat)
-            fd_inode: u64 = read_u64(fd_stat, stat_inode_offset)
+            fd_device: u64 = NativeStat::device(fd_stat)
+            fd_inode: u64 = NativeStat::inode(fd_stat)
             return close_two_error(directory, fd, -13) if fd_device != expected_device or fd_inode != expected_inode
             path_stat: mutable darray[u8] = []
             path_stat.resize(stat_buffer_bytes)
@@ -1667,9 +1668,9 @@ module PlatformNative:
             if native_fstatat(directory, leaf_name, path_stat_raw, at_no_follow) != 0:
                 errno_value: i64 = current_errno()
                 return close_two_error(directory, fd, negative_value(errno_value))
-            path_mode: u64 = read_u16(path_stat, stat_mode_offset)
-            return close_two_error(directory, fd, -13) if (path_mode & 61440.u64()) != regular_mode
-            return close_two_error(directory, fd, -13) if read_stat_device(path_stat) != fd_device or read_u64(path_stat, stat_inode_offset) != fd_inode
+            path_mode: u64 = NativeStat::mode(path_stat)
+            return close_two_error(directory, fd, -13) if (path_mode & NativeStat::file_type_mask) != regular_mode
+            return close_two_error(directory, fd, -13) if NativeStat::device(path_stat) != fd_device or NativeStat::inode(path_stat) != fd_inode
             # POSIX has no unlink-if-inode primitive: this is the narrowest
             # descriptor-relative check available, but a same-UID actor can
             # still replace the leaf between fstatat and unlinkat.
@@ -1766,9 +1767,9 @@ module PlatformNative:
             result: mutable i64 = 0
             if is_move:
                 if new_result == 0:
-                    new_mode: u64 = read_u16(new_stat, stat_mode_offset)
-                    return close_two_error(old_directory, new_directory, -40) if (new_mode & 61440.u64()) == symlink_mode
-                    return close_two_error(old_directory, new_directory, -21) if (new_mode & 61440.u64()) != regular_mode
+                    new_mode: u64 = NativeStat::mode(new_stat)
+                    return close_two_error(old_directory, new_directory, -40) if (new_mode & NativeStat::file_type_mask) == symlink_mode
+                    return close_two_error(old_directory, new_directory, -21) if (new_mode & NativeStat::file_type_mask) != regular_mode
                 if new_result != 0 and new_errno != 2:
                     return close_two_error(old_directory, new_directory, -new_errno)
                 old_move_leaf: mutable darray[u8] = []
@@ -1815,30 +1816,15 @@ module PlatformNative:
             return -5 if left_status != 0 or right_status != 0
             return result
 
-        def read_u16(value: darray[u8]&, offset: usize) -> u64:
-            return value[offset].u64() + value[offset + 1.usize()].u64() * 256.u64()
-
-        def read_u32(value: darray[u8]&, offset: usize) -> u64:
-            return value[offset].u64() + value[offset + 1.usize()].u64() * 256.u64() + value[offset + 2.usize()].u64() * 65536.u64() + value[offset + 3.usize()].u64() * 16777216.u64()
-
-        def read_u64(value: darray[u8]&, offset: usize) -> u64:
-            return read_u32(value, offset) + read_u32(value, offset + 4.usize()) * 4294967296.u64()
-
-        def read_stat_device(value: darray[u8]&) -> u64:
-            static if ELISA_TARGET_OS_MACOS:
-                return read_u32(value, 0.usize())
-            static else:
-                return read_u64(value, 0.usize())
-
         def trusted_fd(fd: i64, expected_uid: u64, expected_kind: u64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             stat: mutable darray[u8] = []
             stat.resize(stat_buffer_bytes)
             raw: mutable void& = (&stat[0]).cast[mutable void&] can Unsafe.PointerCast
             return false if native_fstat(fd, raw) != 0
-            mode: u64 = read_u16(stat, stat_mode_offset)
-            owner: u64 = read_u32(stat, stat_uid_offset)
-            return false if (mode & 61440.u64()) != expected_kind or (owner != 0.u64() and owner != expected_uid)
-            return (mode & 18.u64()) == 0.u64()
+            mode: u64 = NativeStat::mode(stat)
+            owner: u64 = NativeStat::owner(stat)
+            return false if (mode & NativeStat::file_type_mask) != expected_kind or (owner != 0.u64() and owner != expected_uid)
+            return (mode & NativeStat::group_or_other_write_mask) == 0.u64()
 
         def trusted_crypto_executable_path(path: cstr, expected_uid: u64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             parent: mutable darray[u8] = []
@@ -1870,7 +1856,7 @@ module PlatformNative:
             fd_stat_raw: mutable void& = (&fd_stat[0]).cast[mutable void&] can Unsafe.PointerCast
             if native_fstat(fd, fd_stat_raw) != 0:
                 return negative_errno()
-            return -21 if (read_u16(fd_stat, stat_mode_offset) & 61440.u64()) != regular_mode
+            return -21 if (NativeStat::file_type(fd_stat)) != regular_mode
             access_status: i32 = native_faccessat(directory.i32(), leaf_name, 1, access_effective_ids + access_no_follow)
             return negative_errno() if access_status != 0
             path_stat: mutable darray[u8] = []
@@ -1878,8 +1864,8 @@ module PlatformNative:
             path_stat_raw: mutable void& = (&path_stat[0]).cast[mutable void&] can Unsafe.PointerCast
             if native_fstatat(directory, leaf_name, path_stat_raw, at_no_follow) != 0:
                 return negative_errno()
-            return -21 if (read_u16(path_stat, stat_mode_offset) & 61440.u64()) != regular_mode
-            return -13 if not same_stat_identity(path_stat, fd_stat)
+            return -21 if (NativeStat::file_type(path_stat)) != regular_mode
+            return -13 if not NativeStat::same_identity(path_stat, fd_stat)
             return 0
 
         def trusted_regular_fd(fd: i64, expected_uid: u64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -1893,11 +1879,11 @@ module PlatformNative:
             stat.resize(stat_buffer_bytes)
             raw: mutable void& = (&stat[0]).cast[mutable void&] can Unsafe.PointerCast
             return false if native_fstat(fd, raw) != 0
-            mode: u64 = read_u16(stat, stat_mode_offset)
-            owner: u64 = read_u32(stat, stat_uid_offset)
+            mode: u64 = NativeStat::mode(stat)
+            owner: u64 = NativeStat::owner(stat)
             # mkdtemp creates staging roots as euid-owned 0700 directories.
             # Reject special bits and every group/other permission as well.
-            return false if (mode & 61440.u64()) != directory_mode or owner != expected_uid or (mode & 4095.u64()) != 448.u64()
+            return false if (mode & NativeStat::file_type_mask) != directory_mode or owner != expected_uid or (mode & 4095.u64()) != 448.u64()
             return trusted_acl_fd(fd, true)
 
         def trusted_acl_fd(fd: i64, is_directory: bool) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -2034,11 +2020,11 @@ module PlatformNative:
             stat.resize(stat_buffer_bytes)
             raw: mutable void& = (&stat[0]).cast[mutable void&] can Unsafe.PointerCast
             return false if native_fstat(fd, raw) != 0
-            mode: u64 = read_u16(stat, stat_mode_offset)
-            owner: u64 = read_u32(stat, stat_uid_offset)
-            return false if (mode & 61440.u64()) != directory_mode
+            mode: u64 = NativeStat::mode(stat)
+            owner: u64 = NativeStat::owner(stat)
+            return false if (mode & NativeStat::file_type_mask) != directory_mode
             if owner == 0.u64():
-                return false if (mode & 18.u64()) != 0.u64()
+                return false if (mode & NativeStat::group_or_other_write_mask) != 0.u64()
             else:
                 return false if expected_uid == 0.u64() or owner != expected_uid
                 return false if (mode & 2.u64()) != 0.u64()
@@ -2049,7 +2035,7 @@ module PlatformNative:
                     # already obtain root, while ordinary local accounts
                     # cannot replace the provider through this directory.
                     static if ELISA_TARGET_OS_MACOS:
-                        return false if read_u32(stat, stat_gid_offset) != macos_admin_gid()
+                        return false if NativeStat::group(stat) != macos_admin_gid()
                     static else:
                         return false
             return trusted_acl_fd(fd, true)
@@ -2103,7 +2089,7 @@ module PlatformNative:
             stat: mutable darray[u8] = []
             stat.resize(stat_buffer_bytes)
             raw: mutable void& = (&stat[0]).cast[mutable void&] can Unsafe.PointerCast
-            return native_fstat(fd, raw) == 0 and (read_u16(stat, stat_mode_offset) & 61440.u64()) == regular_mode
+            return native_fstat(fd, raw) == 0 and (NativeStat::file_type(stat)) == regular_mode
 
         def limit_bytes(value: i64) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
             out: mutable darray[u8] = []
@@ -2193,7 +2179,7 @@ module PlatformNative:
             destination_stat_raw: mutable void& = (&destination_stat[0]).cast[mutable void&] can Unsafe.PointerCast
             if native_fstat(source_fd, source_stat_raw) != 0 or native_fstat(destination_fd, destination_stat_raw) != 0:
                 return close_two_error(source_fd, destination_fd, -5)
-            return close_two_error(source_fd, destination_fd, -22) if same_stat_identity(source_stat, destination_stat)
+            return close_two_error(source_fd, destination_fd, -22) if NativeStat::same_identity(source_stat, destination_stat)
             if snapshot_path_is_descendant(source_name, destination_name):
                 destination_relative: mutable darray[u8] = []
                 for index in (source_length + 1.usize())..<destination_length |destination_relative, destination_name|:
@@ -2223,7 +2209,7 @@ module PlatformNative:
             current_source_stat: mutable darray[u8] = []
             current_source_stat.resize(stat_buffer_bytes)
             current_source_raw: mutable void& = (&current_source_stat[0]).cast[mutable void&] can Unsafe.PointerCast
-            same_source: mutable bool = native_fstat(current_source_fd, current_source_raw) == 0 and same_stat_identity(source_stat, current_source_stat)
+            same_source: mutable bool = native_fstat(current_source_fd, current_source_raw) == 0 and NativeStat::same_identity(source_stat, current_source_stat)
             current_close: i32 = native_close(current_source_fd)
             if not same_source or current_close != 0:
                 return close_two_error(source_fd, destination_fd, -13)
@@ -2528,9 +2514,6 @@ module PlatformNative:
             for index in 0..<length |path, wanted|:
                 return false if path[index] != wanted[index].u8()
             return true
-
-        def same_stat_identity(left: darray[u8]&, right: darray[u8]&) -> bool:
-            return read_stat_device(left) == read_stat_device(right) and read_u64(left, stat_inode_offset) == read_u64(right, stat_inode_offset)
 
         def snapshot_path_is_descendant(root: darray[u8]&, candidate: darray[u8]&) -> bool:
             return false if candidate.count <= root.count
