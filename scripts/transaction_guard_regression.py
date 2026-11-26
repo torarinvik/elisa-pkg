@@ -70,6 +70,12 @@ def main() -> int:
         if (state / "transaction.state").exists() or guard.exists():
             raise SystemExit("successful transaction recovery retained its journal")
 
+        # A writer acquires the flock before it creates its guard or journal.
+        with transaction_flock.open("r+b") as descriptor:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            run("check-manifest", cwd=project, expected=5)
+        run("check-manifest", cwd=project, expected=0)
+
         # The manifest replacement intent is durable before publication. A
         # crash on either side of the manifest rename must safely roll back.
         (state / "transaction.manifest").write_bytes(original_manifest)
