@@ -33,13 +33,13 @@ module ManifestEdits:
             end: mutable usize = 0.usize()
             return [] if not Manifest::find_dependency_span(raw, alias, &start, &end)
             probe: mutable usize = end
-            while probe < dependency_end and (raw[probe] == 32 or raw[probe] == 9 or raw[probe] == 10 or raw[probe] == 13) |raw, probe|:
+            while probe < dependency_end and is_json_whitespace(raw[probe]) |raw, probe|:
                 probe <- probe + 1.usize()
             if probe < dependency_end and raw[probe] == 44:
                 end <- probe + 1.usize()
             else:
                 probe <- start
-                while probe > dependency_start + 1.usize() and (raw[probe - 1.usize()] == 32 or raw[probe - 1.usize()] == 9 or raw[probe - 1.usize()] == 10 or raw[probe - 1.usize()] == 13) |raw, probe|:
+                while probe > dependency_start + 1.usize() and is_json_whitespace(raw[probe - 1.usize()]) |raw, probe|:
                     probe <- probe - 1.usize()
                 start <- probe - 1.usize() if probe > dependency_start and raw[probe - 1.usize()] == 44
             out: mutable darray[u8] = []
@@ -50,6 +50,9 @@ module ManifestEdits:
             return out
 
     private:
+        def is_json_whitespace(byte: u8) -> bool:
+            return byte == 32 or byte == 9 or byte == 10 or byte == 13
+
         def append_text(out: mutable darray[u8]&, text: dstr&) -> void can[Memory.Allocate, Abort.Panic]:
             for index in 0..<text.count |out, text|:
                 out.push(text[index].u8())
@@ -77,19 +80,17 @@ module ManifestEdits:
         def append_object_member(raw: darray[u8]&, object_start: usize, entry: dstr&, create_dependencies: bool) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
             object_end: usize = Json::object_end(raw, object_start)
             return [] if object_start >= object_end or object_end >= raw.count
-            has_existing: mutable bool = false
-            for index in (object_start + 1.usize())..<object_end |raw, has_existing|:
-                byte: u8 = raw[index]
-                if byte != 32 and byte != 9 and byte != 10 and byte != 13:
-                    has_existing <- true
-                    break
+            insertion: mutable usize = object_end
+            while insertion > object_start + 1.usize() and is_json_whitespace(raw[insertion - 1.usize()]) |raw, insertion|:
+                insertion <- insertion - 1.usize()
+            has_existing: bool = insertion > object_start + 1.usize()
             separator_bytes: usize = 2.usize() if has_existing else 0.usize()
             wrapper_bytes: usize = 18.usize() if create_dependencies else 0.usize()
             return [] if raw.count > Json::max_document_bytes
             remaining: usize = Json::max_document_bytes - raw.count
             return [] if separator_bytes + wrapper_bytes > remaining or entry.count > remaining - separator_bytes - wrapper_bytes
             out: mutable darray[u8] = []
-            for index in 0..<object_end |out, raw|:
+            for index in 0..<insertion |out, raw|:
                 out.push(raw[index])
             if has_existing:
                 ByteText::append_text(&out, ", ")
@@ -98,6 +99,6 @@ module ManifestEdits:
             append_text(&out, entry)
             if create_dependencies:
                 out.push(125)
-            for index in object_end..<raw.count |out, raw|:
+            for index in insertion..<raw.count |out, raw|:
                 out.push(raw[index])
             return out
