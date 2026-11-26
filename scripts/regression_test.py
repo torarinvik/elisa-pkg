@@ -86,7 +86,7 @@ def run(args, **kwargs):
 with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as directory:
     work = Path(directory)
     lines = [f'include "{ROOT}/src/registry.elisa"',
-             f'include "{ROOT}/src/manifest.elisa"',
+             f'include "{ROOT}/src/package/manifest.elisa"',
              f'include "{ROOT}/src/cache.elisa"',
              'def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:']
     lines.extend([

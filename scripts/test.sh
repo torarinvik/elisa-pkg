@@ -118,8 +118,8 @@ done
 SEMVER_PROBE="$TEST_TMP/semver-probe-$$.elisa"
 SEMVER_BIN="$TEST_TMP/semver-probe-$$"
 cat > "$SEMVER_PROBE" <<EOF
-include "$ROOT/src/model.elisa"
-include "$ROOT/src/semver.elisa"
+include "$ROOT/src/package/model.elisa"
+include "$ROOT/src/resolution/semver.elisa"
 
 def main() -> i64:
     caret: mutable darray[u8] = [94, 49, 46, 50, 46, 51]
@@ -168,7 +168,7 @@ ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_COMPILER_ROOT/build/runtime/elisa
 RESOLVE_PROBE="$TEST_TMP/resolve-probe-$$.elisa"
 RESOLVE_BIN="$TEST_TMP/resolve-probe-$$"
 cat > "$RESOLVE_PROBE" <<EOF
-include "$ROOT/src/resolve.elisa"
+include "$ROOT/src/resolution/resolve.elisa"
 
 def same(value: darray[u8]&, expected: cstr) -> bool:
     length: mutable usize = 0.usize()
@@ -232,7 +232,7 @@ ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_COMPILER_ROOT/build/runtime/elisa
 SOLVER_PROBE="$TEST_TMP/solver-probe-$$.elisa"
 SOLVER_BIN="$TEST_TMP/solver-probe-$$"
 cat > "$SOLVER_PROBE" <<EOF
-include "$ROOT/src/solver.elisa"
+include "$ROOT/src/resolution/solver.elisa"
 
 def main() -> i64 can[Memory.Allocate, Abort.Panic]:
     a: mutable darray[u8] = [97]

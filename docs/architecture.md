@@ -56,3 +56,8 @@ Future implementation modules should follow the same pattern:
 - `Integrity` owns digest calculation and known-answer vectors; expose bytes or encoded digests, never mutable hash state.
 
 Each module must have one owner for its invariants, explicit public data contracts, and a `private:` section for parsing cursors, filesystem paths, mutable caches, and other implementation details. Cross-module calls should use qualified names so a future member cannot silently shadow a security-sensitive helper.
+
+Package schema and identity modules live in `src/package/`. Version ranges
+and dependency selection live in `src/resolution/`. These directories group
+source by responsibility. The Elisa module names and public interfaces stay
+independent of the directory layout.

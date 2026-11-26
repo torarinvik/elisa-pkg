@@ -27,7 +27,7 @@ Prerelease requirements and candidates remain rejected until the requirement
 model stores complete prerelease identity. Conflicts must be reported rather
 than silently selecting multiple copies. The current in-memory selector is a
 pure provider-free primitive; the backtracking provider contract is tracked in
-`src/resolve.elisa` before registry support is enabled.
+`src/resolution/resolve.elisa` before registry support is enabled.
 
 ## D-004: canonical bytes
 
