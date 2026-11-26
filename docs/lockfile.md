@@ -80,6 +80,7 @@ root and dependency source drift in frozen resolution.
 Local graph fingerprinting is bounded to 256 MiB of source file bytes across
 the root and all reachable path dependencies, with the existing 64 MiB per-file
 limit. Larger graphs fail resolution before generating a lockfile; build
-snapshots retain the same 256 MiB aggregate cap.
+snapshots enforce the same 256 MiB aggregate cap during copying. Each package
+snapshot may copy up to 64 MiB within the remaining aggregate budget.
 
 Canonical bytes are UTF-8, two-space indentation, LF endings, deterministic member ordering, sorted package and edge arrays, and exactly one terminal newline. The resolver version is part of the format so changing candidate ordering or trust policy cannot silently reuse an old result.

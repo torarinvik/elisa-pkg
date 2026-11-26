@@ -547,8 +547,8 @@ module PlatformNative:
         # O_NOFOLLOW and read only through that descriptor. The destination
         # root is left in place on success and on failure; any entries written
         # before a failure are removed before the error is returned.
-        def snapshot_package_tree(source_root: cstr, destination: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            return snapshot_package_tree_into(source_root, destination)
+        def snapshot_package_tree(source_root: cstr, destination: cstr, maximum_bytes: usize) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return snapshot_package_tree_into(source_root, destination, maximum_bytes)
 
         # Remove all contents below a private snapshot root without following
         # symlinks. The verified root itself remains empty for its caller to
@@ -2130,7 +2130,8 @@ module PlatformNative:
         const snapshot_max_total_bytes: usize = 67108864.usize()
         const snapshot_io_buffer_bytes: usize = 65536.usize()
 
-        def snapshot_package_tree_into(source_root: cstr, destination: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+        def snapshot_package_tree_into(source_root: cstr, destination: cstr, maximum_bytes: usize) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            byte_limit: usize = maximum_bytes if maximum_bytes < snapshot_max_total_bytes else snapshot_max_total_bytes
             source_length: usize = native_strlen(source_root)
             destination_length: usize = native_strlen(destination)
             return -22 if not SnapshotPaths::absolute_path_safe(source_root, source_length) or not SnapshotPaths::absolute_path_safe(destination, destination_length)
@@ -2231,7 +2232,7 @@ module PlatformNative:
                 if PackagePathPolicy::credential_path_forbidden(relative) or PackagePathPolicy::reserved_source_path_forbidden(relative):
                     return snapshot_copy_failure(source_fd, destination_fd, copied_paths, created_directories, -13)
 
-                copy_result <- snapshot_copy_one(source_fd, destination_fd, relative, &copied_paths, &created_directories, &total_bytes)
+                copy_result <- snapshot_copy_one(source_fd, destination_fd, relative, &copied_paths, &created_directories, &total_bytes, byte_limit)
                 if copy_result != 0:
                     return snapshot_copy_failure(source_fd, destination_fd, copied_paths, created_directories, copy_result)
 
@@ -2247,7 +2248,7 @@ module PlatformNative:
                 return -5
             return total_bytes.i64()
 
-        def snapshot_copy_one(source_root: i64, destination_root: i64, relative: darray[u8]&, copied_paths: mutable darray[u8]&, created_directories: mutable darray[u8]&, total_bytes: mutable usize&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+        def snapshot_copy_one(source_root: i64, destination_root: i64, relative: darray[u8]&, copied_paths: mutable darray[u8]&, created_directories: mutable darray[u8]&, total_bytes: mutable usize&, byte_limit: usize) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             source_parent_path: mutable darray[u8] = []
             source_leaf_offset: mutable usize = 0.usize()
             source_created_directories: mutable darray[u8] = []
@@ -2286,7 +2287,7 @@ module PlatformNative:
             buffer.resize(snapshot_io_buffer_bytes)
             buffer_raw: mutable void& = (&buffer[0]).cast[mutable void&] can Unsafe.PointerCast
             failed: mutable i64 = 0
-            while true |buffer_raw, source_file, destination_file, total_bytes, failed|:
+            while true |buffer_raw, source_file, destination_file, total_bytes, byte_limit, failed|:
                 amount: i64 = native_read(source_file, buffer_raw, buffer.count)
                 if amount < 0:
                     errno_value: i64 = current_errno()
@@ -2294,7 +2295,7 @@ module PlatformNative:
                     failed <- negative_value(errno_value)
                     break
                 break if amount == 0
-                if amount > buffer.count.i64() or amount.usize() > snapshot_max_total_bytes - total_bytes:
+                if amount > buffer.count.i64() or amount.usize() > byte_limit - total_bytes:
                     failed <- -75
                     break
                 written: mutable usize = 0.usize()
