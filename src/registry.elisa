@@ -23,6 +23,7 @@ include "./registry/checkpoint_records.elisa"
 include "./registry/trust_clock_record.elisa"
 include "./registry/trust_identity.elisa"
 include "./registry/trust_paths.elisa"
+include "./registry/rollback_records.elisa"
 
 module Registry:
     public:
@@ -567,7 +568,7 @@ module Registry:
             return false
 
         def trust_state_legacy_override_status(state: darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic]:
-            return ResultCode.Ok if not trust_state_is_v2(state)
+            return ResultCode.Ok if not RollbackRecords::version_2(state)
             return ResultCode.Ok if not trust_state_has_override()
             empty_identity: mutable darray[u8] = []
             unused_version: mutable darray[u8] = []
@@ -597,11 +598,11 @@ module Registry:
             if state.count == 0:
                 ByteText::append_text(out, "elisapkg-trust-state:4\n")
                 return ResultCode.Ok
-            if trust_state_is_v4(state):
+            if RollbackRecords::version_4(state):
                 for index in 0..<state.count |out, state|:
                     out.push(state[index])
                 return ResultCode.Ok
-            return ResultCode.TrustStateMalformed if not trust_state_is_v2(state) and not trust_state_is_v3(state)
+            return ResultCode.TrustStateMalformed if not RollbackRecords::version_2(state) and not RollbackRecords::version_3(state)
             empty_identity: mutable darray[u8] = []
             unused_version: mutable darray[u8] = []
             unused_digest: mutable darray[u8] = []
@@ -916,136 +917,23 @@ module Registry:
             # Version 2 is accepted only for safe migration. Versions 3 and 4
             # scope package identities to the registry root; v4 also records
             # each registry's configured signing-key fingerprint.
-            return ResultCode.TrustStateMalformed if loaded.count == 0 or loaded.count > 1048576 or (not trust_state_is_v2(loaded) and not trust_state_is_v3(loaded) and not trust_state_is_v4(loaded))
+            return ResultCode.TrustStateMalformed if loaded.count == 0 or loaded.count > 1048576 or (not RollbackRecords::version_2(loaded) and not RollbackRecords::version_3(loaded) and not RollbackRecords::version_4(loaded))
             for index in 0..<loaded.count |out, loaded|:
                 out.push(loaded[index])
             return ResultCode.Ok
 
-        def trust_state_is_v2(state: darray[u8]&) -> bool:
-            return ByteText::starts_with_text(state, "elisapkg-trust-state:2\n")
-
-        def trust_state_is_v3(state: darray[u8]&) -> bool:
-            return ByteText::starts_with_text(state, "elisapkg-trust-state:3\n")
-
-        def trust_state_is_v4(state: darray[u8]&) -> bool:
-            return ByteText::starts_with_text(state, "elisapkg-trust-state:4\n")
+        def rollback_result(status: RollbackRecords::Code) -> ResultCode:
+            return match status:
+                RollbackRecords::Code.Ok: ResultCode.Ok
+                RollbackRecords::Code.Malformed: ResultCode.TrustStateMalformed
+                RollbackRecords::Code.MissingPin: ResultCode.TrustStateUnavailable
+                RollbackRecords::Code.RootChanged: ResultCode.TrustRootChanged
 
         def trust_state_find(state: darray[u8]&, package: darray[u8]&, version_out: mutable darray[u8]&, digest_out: mutable darray[u8]&, metadata_digest_out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic]:
-            version_out.resize(0)
-            digest_out.resize(0)
-            metadata_digest_out.resize(0)
-            is_v2: bool = trust_state_is_v2(state)
-            is_v3: bool = trust_state_is_v3(state)
-            is_v4: bool = trust_state_is_v4(state)
-            return ResultCode.TrustStateMalformed if not is_v2 and not is_v3 and not is_v4
-            cursor: mutable usize = 23.usize()
-            found: mutable bool = false
-            while cursor < state.count:
-                finish: mutable usize = cursor
-                while finish < state.count and state[finish] != 10 |state, finish|:
-                    finish <- finish + 1.usize()
-                # Every record is newline-terminated. A truncated final line
-                # must not be treated as durable trust history.
-                return ResultCode.TrustStateMalformed if finish == cursor or finish == state.count
-                first_separator: mutable usize = cursor
-                while first_separator < finish and state[first_separator] != 32 |state, first_separator|:
-                    first_separator <- first_separator + 1.usize()
-                second_separator: mutable usize = first_separator + 1.usize()
-                while second_separator < finish and state[second_separator] != 32 |state, second_separator|:
-                    second_separator <- second_separator + 1.usize()
-                third_separator: mutable usize = second_separator + 1.usize()
-                while third_separator < finish and state[third_separator] != 32 |state, third_separator|:
-                    third_separator <- third_separator + 1.usize()
-                return ResultCode.TrustStateMalformed if first_separator == cursor or second_separator >= finish or third_separator >= finish or first_separator + 1.usize() == second_separator or second_separator + 1.usize() == third_separator or third_separator + 1.usize() >= finish
-                line_package: mutable darray[u8] = []
-                line_version: mutable darray[u8] = []
-                line_digest: mutable darray[u8] = []
-                line_metadata_digest: mutable darray[u8] = []
-                for index in cursor..<first_separator |line_package, state|:
-                    line_package.push(state[index])
-                return ResultCode.TrustStateMalformed if is_v2 and ByteText::starts_with_text(line_package, "@package:")
-                return ResultCode.TrustStateMalformed if (is_v3 or is_v4) and registry_valid_name(line_package)
-                for index in (first_separator + 1.usize())..<second_separator |line_version, state|:
-                    line_version.push(state[index])
-                for index in (second_separator + 1.usize())..<third_separator |line_digest, state|:
-                    line_digest.push(state[index])
-                for index in (third_separator + 1.usize())..<finish |line_metadata_digest, state|:
-                    line_metadata_digest.push(state[index])
-                return ResultCode.TrustStateMalformed if not TrustIdentity::valid(line_package) or not Integrity::valid_sha256_hex(line_digest) or not Integrity::valid_sha256_hex(line_metadata_digest)
-                parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-                return ResultCode.TrustStateMalformed if not SemVer::parse(line_version, &parsed) or parsed.prerelease
-                previous: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-                should_copy: mutable bool = false
-                if ByteText::equal(line_package, package):
-                    if found:
-                        return ResultCode.TrustStateMalformed if not SemVer::parse(version_out, &previous)
-                        return ResultCode.TrustStateMalformed if SemVer::compare(parsed, previous) < 0
-                        return ResultCode.TrustStateMalformed if SemVer::compare(parsed, previous) == 0 and (not ByteText::equal(digest_out, line_digest) or not ByteText::equal(metadata_digest_out, line_metadata_digest))
-                        should_copy <- SemVer::compare(parsed, previous) > 0
-                    else:
-                        should_copy <- true
-                    if should_copy:
-                        version_out.resize(0)
-                        digest_out.resize(0)
-                        metadata_digest_out.resize(0)
-                        for index in 0..<line_version.count |version_out, line_version|:
-                            version_out.push(line_version[index])
-                        for index in 0..<line_digest.count |digest_out, line_digest|:
-                            digest_out.push(line_digest[index])
-                        for index in 0..<line_metadata_digest.count |metadata_digest_out, line_metadata_digest|:
-                            metadata_digest_out.push(line_metadata_digest[index])
-                    found <- true
-                cursor <- finish + 1.usize()
-            return ResultCode.Ok
+            return rollback_result(RollbackRecords::find(state, package, version_out, digest_out, metadata_digest_out))
 
         def trust_state_check_root_pin(state: darray[u8]&, root_key_identity: darray[u8]&, key_fingerprint: darray[u8]&, require_existing: bool, compare_key: bool, found_out: mutable bool&) -> ResultCode can[Memory.Allocate, Abort.Panic]:
-            found_out <- false
-            pinned_version: mutable darray[u8] = []
-            pinned_digest: mutable darray[u8] = []
-            pinned_metadata_digest: mutable darray[u8] = []
-            find_status: ResultCode = trust_state_find(state, root_key_identity, &pinned_version, &pinned_digest, &pinned_metadata_digest) if state.count > 0 else ResultCode.Ok
-            return find_status if find_status != ResultCode.Ok
-            if pinned_version.count == 0:
-                return ResultCode.TrustStateUnavailable if require_existing or trust_state_is_v4(state) and trust_state_has_root_scoped_history(state, root_key_identity)
-                return ResultCode.Ok
-            return ResultCode.TrustStateMalformed if not ByteText::equal_text(pinned_version, "0.0.0") or not ByteText::equal(pinned_digest, pinned_metadata_digest)
-            return ResultCode.TrustRootChanged if compare_key and not ByteText::equal(pinned_digest, key_fingerprint)
-            found_out <- true
-            return ResultCode.Ok
-
-        def trust_state_has_root_scoped_history(state: darray[u8]&, root_key_identity: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            return false if not trust_state_is_v4(state) or state.count <= 23.usize()
-            return true if not ByteText::starts_with_text(root_key_identity, "@root-key:") or root_key_identity.count != 74.usize()
-            root_hash: mutable darray[u8] = []
-            for index in 0..<64.usize() |root_hash, root_key_identity|:
-                root_hash.push(root_key_identity[10.usize() + index])
-            package_prefix: mutable darray[u8] = []
-            ByteText::append_text(&package_prefix, "@package:")
-            ByteText::append(&package_prefix, root_hash)
-            package_prefix.push(58)
-            index_prefix: mutable darray[u8] = []
-            ByteText::append_text(&index_prefix, "@index:")
-            ByteText::append(&index_prefix, root_hash)
-            index_prefix.push(58)
-            cursor: mutable usize = 23.usize()
-            while cursor < state.count:
-                finish: mutable usize = cursor
-                while finish < state.count and state[finish] != 10 |state, finish|:
-                    finish <- finish + 1.usize()
-                return true if finish == state.count
-                identity_end: mutable usize = cursor
-                while identity_end < finish and state[identity_end] != 32 |state, identity_end|:
-                    identity_end <- identity_end + 1.usize()
-                return true if identity_end == cursor or identity_end == finish
-                package_match: mutable bool = identity_end - cursor >= package_prefix.count
-                index_match: mutable bool = identity_end - cursor >= index_prefix.count
-                for index in 0..<package_prefix.count |state, cursor, identity_end, package_prefix, package_match|:
-                    package_match <- false if state[cursor + index] != package_prefix[index]
-                for index in 0..<index_prefix.count |state, cursor, identity_end, index_prefix, index_match|:
-                    index_match <- false if state[cursor + index] != index_prefix[index]
-                return true if package_match or index_match
-                cursor <- finish + 1.usize()
-            return false
+            return rollback_result(RollbackRecords::check_root_pin(state, root_key_identity, key_fingerprint, require_existing, compare_key, found_out))
 
         # Package release history is scoped to the configured registry even
         # when callers deliberately share one trust-state file. The default
@@ -1067,7 +955,7 @@ module Registry:
             # row is a genuinely new package for this registry. Only v2 can
             # carry a legacy plain-name row that is eligible for safe default
             # path migration.
-            return ResultCode.Ok if not trust_state_is_v2(state)
+            return ResultCode.Ok if not RollbackRecords::version_2(state)
             legacy_version: mutable darray[u8] = []
             legacy_digest: mutable darray[u8] = []
             legacy_metadata_digest: mutable darray[u8] = []
