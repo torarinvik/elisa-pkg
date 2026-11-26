@@ -154,9 +154,9 @@ module Cli:
                 raw: mutable darray[u8] = []
                 raw <- raw.resize(ProjectFiles::project_document_limit)
                 return CliStatus::usage if not ProjectFiles::read_c_string_into("elisapkg.json", &raw)
-                selected_name: mutable darray[u8] = []
-                selected_kind: mutable darray[u8] = []
                 region selected_entry_scope:
+                    selected_name: mutable darray[u8] = []
+                    selected_kind: mutable darray[u8] = []
                     selected_entry: mutable darray[u8] = []
                     return CliStatus::usage if not ManifestTargets::select_target(raw, options.target_name, options.target_kind, &selected_name, &selected_kind, &selected_entry) or not ByteText::equal_text(selected_kind, "test")
                 # Reusing the normal build path keeps dependency, lock, and compiler-
@@ -196,16 +196,13 @@ module Cli:
                     paths: mutable darray[u8] = []
                     return CliStatus::usage if not PackageAssembly::collect_paths(raw, entry, &paths)
                 archive: mutable darray[u8] = []
-                return CliStatus::security_failed if not PackageAssembly::archive_bytes(raw, entry, &archive) or not Archive::verify_ustar_archive(archive)
-                region archive_repeat_scope:
-                    archive_repeat: mutable darray[u8] = []
-                    return CliStatus::security_failed if not PackageAssembly::archive_bytes(raw, entry, &archive_repeat) or not Archive::verify_ustar_archive(archive_repeat) or not ByteText::equal(archive_repeat, archive)
+                return CliStatus::security_failed if not reproducible_archive(raw, entry, &archive)
                 region source_digest_after_scope:
                     source_digest_after: mutable darray[u8] = []
                     return CliStatus::security_failed if not SourceFingerprint::current(&source_digest_after) or not ByteText::equal(source_digest_after, source_digest)
-                manifest_after: mutable darray[u8] = []
-                manifest_after <- manifest_after.resize(ProjectFiles::project_document_limit)
                 region lock_after_scope:
+                    manifest_after: mutable darray[u8] = []
+                    manifest_after <- manifest_after.resize(ProjectFiles::project_document_limit)
                     lock_after: mutable darray[u8] = []
                     lock_after <- lock_after.resize(ProjectFiles::project_document_limit)
                     return CliStatus::security_failed if:
@@ -220,6 +217,14 @@ module Cli:
                 CliOutput::write_ok("publish dry-run: manifest, lockfile, source tree, and package file selection are valid\n")
                 CliOutput::write_error("note: signing and authenticated publication are still required\n")
                 return CliStatus::success
+
+        # Build the package archive twice; both builds must be valid and
+        # byte-identical.
+        def reproducible_archive(raw: darray[u8]&, entry: darray[u8]&, archive: mutable darray[u8]&) -> bool can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                return false if not PackageAssembly::archive_bytes(raw, entry, archive) or not Archive::verify_ustar_archive(archive)
+                archive_repeat: mutable darray[u8] = []
+                return PackageAssembly::archive_bytes(raw, entry, &archive_repeat) and Archive::verify_ustar_archive(archive_repeat) and ByteText::equal(archive_repeat, archive)
 
         # Parse `init [--lib|--bin] [PATH]`. Returns the status to exit with
         # for invalid arguments or `--help`, or null to continue.
