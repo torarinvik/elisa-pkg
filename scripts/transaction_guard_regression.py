@@ -150,6 +150,19 @@ def main() -> int:
             raise SystemExit("recovery did not restore the repaired lock backup")
         lock.unlink()
 
+        # Final markers survive interrupted cleanup. Once present, recovery
+        # must finish cleanup without replaying backups or requiring the guard.
+        for terminal_state in (b"complete\n", b"restored\n"):
+            journal.write_bytes(terminal_state)
+            leftover = state / "transaction.new-manifest"
+            leftover.write_bytes(new_manifest)
+            run("check-manifest", cwd=project, expected=0)
+            if manifest.read_bytes() != original_manifest or lock.exists():
+                raise SystemExit(f"cleanup replayed an already finalized transaction: {terminal_state!r}")
+            if journal.exists() or leftover.exists() or guard.exists():
+                raise SystemExit(f"cleanup retained a finalized transaction: {terminal_state!r}")
+            run("check-manifest", cwd=project, expected=0)
+
         # A modern guard can be recovered after a crash before journal publication.
         guard.mkdir(mode=0o700)
         (state / "transaction.manifest").write_bytes(original_manifest)
