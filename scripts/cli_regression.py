@@ -44,6 +44,17 @@ with tempfile.TemporaryDirectory(prefix='cli-review-', dir=ROOT / 'build') as di
     result = subprocess.run([BIN, 'check-manifest', '--unexpected'], cwd=blocked_project,
                             capture_output=True, timeout=120, check=False)
     assert result.returncode == 2 and guard.read_bytes() == b'not a transaction directory', result
+    for command in (
+        ['add'],
+        ['add', 'foo', '--path', '/absolute'],
+        ['add', 'foo', '--version', 'not-a-version', '--registry', 'primary'],
+        ['remove', 'INVALID'],
+        ['update', 'foo', 'extra'],
+    ):
+        result = subprocess.run([BIN, *command], cwd=blocked_project,
+                                capture_output=True, timeout=120, check=False)
+        assert result.returncode == 2, (command, result)
+        assert guard.read_bytes() == b'not a transaction directory'
     result = subprocess.run([BIN, 'check-manifest'], cwd=blocked_project,
                             capture_output=True, timeout=120, check=False)
     assert result.returncode == 5, result
