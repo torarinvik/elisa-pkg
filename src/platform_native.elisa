@@ -10,6 +10,7 @@ include "./platform/libc.elisa"
 
 include "./platform/abi.elisa"
 include "./platform/stat.elisa"
+include "./platform/process_values.elisa"
 include "./platform/linux_access_acl.elisa"
 
 module PlatformNative:
@@ -670,7 +671,7 @@ module PlatformNative:
             stamp.resize(16)
             raw: mutable void& = (&stamp[0]).cast[mutable void&] can Unsafe.PointerCast
             return -1 if native_clock_gettime(0, raw) != 0
-            seconds: i64 = read_i64(stamp, 0)
+            seconds: i64 = NativeProcessValues::seconds(stamp)
             return -1 if seconds < 0
             return seconds
 
@@ -847,8 +848,8 @@ module PlatformNative:
 
         def sleep_milliseconds(duration: i64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return -22 if duration <= 0
-            request: mutable darray[u8] = timespec_bytes(duration / 1000, (duration % 1000) * 1000000)
-            remaining: mutable darray[u8] = timespec_bytes(0, 0)
+            request: mutable darray[u8] = NativeProcessValues::timespec_bytes(duration / 1000, (duration % 1000) * 1000000)
+            remaining: mutable darray[u8] = NativeProcessValues::timespec_bytes(0, 0)
             request_raw: void& = (&request[0]).cast[void&] can Unsafe.PointerCast
             remaining_raw: mutable void& = (&remaining[0]).cast[mutable void&] can Unsafe.PointerCast
             while true |request, remaining, request_raw, remaining_raw|:
@@ -880,9 +881,9 @@ module PlatformNative:
                 now: i64 = monotonic_milliseconds()
                 return -5 if now < 0
                 return -110 if now >= deadline
-                pause: mutable darray[u8] = timespec_bytes(0, 10000000)
+                pause: mutable darray[u8] = NativeProcessValues::timespec_bytes(0, 10000000)
                 pause_raw: void& = (&pause[0]).cast[void&] can Unsafe.PointerCast
-                remaining: mutable darray[u8] = timespec_bytes(0, 0)
+                remaining: mutable darray[u8] = NativeProcessValues::timespec_bytes(0, 0)
                 remaining_raw: mutable void& = (&remaining[0]).cast[mutable void&] can Unsafe.PointerCast
                 if native_nanosleep(pause_raw, remaining_raw) != 0 and current_errno() != 4:
                     return negative_errno()
@@ -898,13 +899,13 @@ module PlatformNative:
                 cpu <- 120
                 file_size <- 67108864
             return -22 if cpu == 0 or file_size == 0
-            cpu_limit: mutable darray[u8] = limit_bytes(cpu)
-            file_limit: mutable darray[u8] = limit_bytes(file_size)
+            cpu_limit: mutable darray[u8] = NativeProcessValues::limit_bytes(cpu)
+            file_limit: mutable darray[u8] = NativeProcessValues::limit_bytes(file_size)
             cpu_raw: void& = (&cpu_limit[0]).cast[void&] can Unsafe.PointerCast
             file_raw: void& = (&file_limit[0]).cast[void&] can Unsafe.PointerCast
             return negative_errno() if native_setrlimit(0, cpu_raw) != 0
             return negative_errno() if native_setrlimit(1, file_raw) != 0
-            core_limit: mutable darray[u8] = limit_bytes(0)
+            core_limit: mutable darray[u8] = NativeProcessValues::limit_bytes(0)
             core_raw: void& = (&core_limit[0]).cast[void&] can Unsafe.PointerCast
             return negative_errno() if native_setrlimit(4, core_raw) != 0
             return 0
@@ -933,9 +934,9 @@ module PlatformNative:
                 if now >= deadline:
                     reap_status: i64 = terminate_and_reap(pid, status)
                     return reap_status if reap_status != 0 else -110
-                pause: mutable darray[u8] = timespec_bytes(0, 10000000)
+                pause: mutable darray[u8] = NativeProcessValues::timespec_bytes(0, 10000000)
                 pause_raw: void& = (&pause[0]).cast[void&] can Unsafe.PointerCast
-                remaining: mutable darray[u8] = timespec_bytes(0, 0)
+                remaining: mutable darray[u8] = NativeProcessValues::timespec_bytes(0, 0)
                 remaining_raw: mutable void& = (&remaining[0]).cast[mutable void&] can Unsafe.PointerCast
                 sleep_status: i64 = native_nanosleep(pause_raw, remaining_raw)
                 if sleep_status != 0 and current_errno() != 4:
@@ -2090,51 +2091,12 @@ module PlatformNative:
             raw: mutable void& = (&stat[0]).cast[mutable void&] can Unsafe.PointerCast
             return native_fstat(fd, raw) == 0 and (NativeStat::file_type(stat)) == regular_mode
 
-        def limit_bytes(value: i64) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
-            out: mutable darray[u8] = []
-            out.resize(16)
-            unsigned: mutable u64 = value.u64()
-            for index in 0..<8 |out, unsigned|:
-                out[index] <- (unsigned & 255.u64()).u8()
-                unsigned <- unsigned / 256.u64()
-            for index in 8..<16 |out|:
-                out[index] <- out[index - 8.usize()]
-            return out
-
-        def timespec_bytes(seconds: i64, nanoseconds: i64) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
-            out: mutable darray[u8] = []
-            out.resize(16)
-            values: darray[i64] = [seconds, nanoseconds]
-            for word in 0..<2 |out, values, word|:
-                value: mutable u64 = values[word].u64()
-                for byte in 0..<8 |out, value, word, byte|:
-                    out[word * 8.usize() + byte] <- (value & 255.u64()).u8()
-                    value <- value / 256.u64()
-            return out
-
         def monotonic_milliseconds() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             stamp: mutable darray[u8] = []
-            stamp.resize(16)
+            stamp.resize(NativeProcessValues::record_bytes)
             raw: mutable void& = (&stamp[0]).cast[mutable void&] can Unsafe.PointerCast
             return -1 if native_clock_gettime(monotonic_clock_id, raw) != 0
-            seconds: i64 = read_i64(stamp, 0)
-            nanos: i64 = read_i64(stamp, 8)
-            # Treat malformed native data as a clock failure. The final
-            # addition is checked separately because a near-limit timespec can
-            # overflow even when seconds itself fits in i64.
-            return -1 if seconds < 0 or nanos < 0 or nanos >= 1000000000
-            milliseconds: i64 = nanos / 1000000
-            maximum: i64 = 9223372036854775807
-            whole_seconds: i64 = maximum / 1000
-            remainder: i64 = maximum - whole_seconds * 1000
-            return maximum if seconds > whole_seconds or (seconds == whole_seconds and milliseconds > remainder)
-            return seconds * 1000 + milliseconds
-
-        def read_i64(value: darray[u8]&, offset: usize) -> i64:
-            out: mutable u64 = 0
-            for index in 0..<8 |value, offset, out, index|:
-                out <- out + (value[offset + index].u64() << (index * 8.usize()))
-            return out.i64()
+            return NativeProcessValues::milliseconds(stamp)
 
         const snapshot_max_entries: usize = 512.usize()
         const snapshot_collection_entries: usize = snapshot_max_entries + 2.usize()

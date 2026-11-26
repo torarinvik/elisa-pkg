@@ -1,0 +1,45 @@
+# Native timespec and resource-limit layouts on the supported 64-bit targets.
+
+module NativeProcessValues:
+    private:
+        def read_i64(value: darray[u8]&, offset: usize) -> i64:
+            out: mutable u64 = 0
+            for index in 0..<8 |value, offset, out, index|:
+                out <- out + (value[offset + index].u64() << (index * 8.usize()))
+            return out.i64()
+
+    public:
+        const record_bytes: usize = 16.usize()
+
+        def limit_bytes(value: i64) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
+            return timespec_bytes(value, value)
+
+        def timespec_bytes(seconds: i64, nanoseconds: i64) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
+            out: mutable darray[u8] = []
+            out.resize(record_bytes)
+            values: darray[i64] = [seconds, nanoseconds]
+            for word in 0..<2 |out, values, word|:
+                value: mutable u64 = values[word].u64()
+                for byte in 0..<8 |out, value, word, byte|:
+                    out[word * 8.usize() + byte] <- (value & 255.u64()).u8()
+                    value <- value / 256.u64()
+            return out
+
+        def seconds(stamp: darray[u8]&) -> i64:
+            return -1 if stamp.count < record_bytes
+            return read_i64(stamp, 0.usize())
+
+        def milliseconds(stamp: darray[u8]&) -> i64:
+            return -1 if stamp.count < record_bytes
+            seconds: i64 = read_i64(stamp, 0.usize())
+            nanos: i64 = read_i64(stamp, 8.usize())
+            # Treat malformed native data as a clock failure. The final
+            # addition is checked separately because a near-limit timespec can
+            # overflow even when seconds itself fits in i64.
+            return -1 if seconds < 0 or nanos < 0 or nanos >= 1000000000
+            milliseconds: i64 = nanos / 1000000
+            maximum: i64 = 9223372036854775807
+            whole_seconds: i64 = maximum / 1000
+            remainder: i64 = maximum - whole_seconds * 1000
+            return maximum if seconds > whole_seconds or (seconds == whole_seconds and milliseconds > remainder)
+            return seconds * 1000 + milliseconds
