@@ -9,6 +9,7 @@ include "./package/ustar_fields.elisa"
 include "./platform/libc.elisa"
 
 include "./platform/abi.elisa"
+include "./platform/linux_access_acl.elisa"
 
 module PlatformNative:
     public:
@@ -1949,7 +1950,7 @@ module PlatformNative:
                 access_acl: mutable darray[u8] = []
                 access_status: i64 = read_linux_acl_xattr(fd, "system.posix_acl_access", &access_acl)
                 return false if access_status < 0
-                return false if access_status == 1 and not linux_access_acl_safe(access_acl)
+                return false if access_status == 1 and not LinuxAccessAcl::is_safe(access_acl)
                 if (read_u16(stat, stat_mode_offset) & 61440.u64()) == directory_mode:
                     default_acl: mutable darray[u8] = []
                     default_status: i64 = read_linux_acl_xattr(fd, "system.posix_acl_default", &default_acl)
@@ -1964,7 +1965,7 @@ module PlatformNative:
             def read_linux_acl_xattr(fd: i64, name: cstr, out: mutable darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
                 out.resize(0)
                 buffer: mutable darray[u8] = []
-                buffer.resize(linux_acl_xattr_capacity)
+                buffer.resize(LinuxAccessAcl::read_capacity)
                 raw: mutable void& = (&buffer[0]).cast[mutable void&] can Unsafe.PointerCast
                 native_errno()[0] <- 0
                 loaded: i64 = native_fgetxattr(fd.i32(), name, raw, buffer.count)
@@ -1972,50 +1973,11 @@ module PlatformNative:
                     errno_value: i64 = current_errno()
                     return 0 if errno_value == 61 or errno_value == 95
                     return -1
-                return -1 if loaded < 4 or loaded > linux_acl_xattr_capacity.i64() or (loaded - 4) % 8 != 0
+                return -1 if loaded < 4 or loaded > LinuxAccessAcl::read_capacity.i64() or (loaded - 4) % 8 != 0
                 buffer.resize(loaded.usize())
                 for index in 0..<buffer.count |out, buffer|:
                     out.push(buffer[index])
                 return 1
-
-            def linux_access_acl_safe(raw: darray[u8]&) -> bool:
-                return false if raw.count < 28 or raw.count > linux_acl_xattr_capacity
-                return false if (raw.count - 4.usize()) % 8.usize() != 0.usize()
-                return false if read_u32(raw, 0.usize()) != linux_acl_xattr_version
-                entries: usize = (raw.count - 4.usize()) / 8.usize()
-                return false if entries < 3.usize() or entries > 32.usize()
-                previous_tag: mutable u64 = 0.u64()
-                owner_seen: mutable bool = false
-                group_seen: mutable bool = false
-                mask_seen: mutable bool = false
-                other_seen: mutable bool = false
-                for entry_index in 0..<entries |raw, previous_tag, owner_seen, group_seen, mask_seen, other_seen|:
-                    offset: usize = 4.usize() + entry_index * 8.usize()
-                    tag: u64 = read_u16(raw, offset)
-                    permissions: u64 = read_u16(raw, offset + 2.usize())
-                    identifier: u64 = read_u32(raw, offset + 4.usize())
-                    return false if tag <= previous_tag or permissions > 7.u64()
-                    previous_tag <- tag
-                    if tag == linux_acl_tag_user_object:
-                        return false if entry_index != 0.usize() or owner_seen or identifier != linux_acl_undefined_id
-                        owner_seen <- true
-                    elif tag == linux_acl_tag_user or tag == linux_acl_tag_group:
-                        # Named entries can grant access beyond the owner and
-                        # owning group. Reject them even when currently masked
-                        # to read-only, including for secret trust files.
-                        return false
-                    elif tag == linux_acl_tag_group_object:
-                        return false if not owner_seen or group_seen or mask_seen or other_seen or identifier != linux_acl_undefined_id or (permissions & 2.u64()) != 0.u64()
-                        group_seen <- true
-                    elif tag == linux_acl_tag_mask:
-                        return false if not group_seen or mask_seen or other_seen or identifier != linux_acl_undefined_id or (permissions & 2.u64()) != 0.u64()
-                        mask_seen <- true
-                    elif tag == linux_acl_tag_other:
-                        return false if not group_seen or other_seen or identifier != linux_acl_undefined_id or (permissions & 2.u64()) != 0.u64()
-                        other_seen <- true
-                    else:
-                        return false
-                return owner_seen and group_seen and other_seen and previous_tag == linux_acl_tag_other
 
         def open_trusted_directory(path: cstr, expected_uid: u64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return walk_trusted_directory(path, expected_uid, false)

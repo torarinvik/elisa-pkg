@@ -1,0 +1,39 @@
+# Decode the Linux POSIX access ACL xattr for trusted filesystem objects.
+
+module LinuxAccessAcl:
+    private:
+        const header_bytes: usize = 4.usize()
+        const entry_bytes: usize = 8.usize()
+        const user_object: u64 = 1.u64()
+        const group_object: u64 = 4.u64()
+        const mask: u64 = 16.u64()
+        const other: u64 = 32.u64()
+        const undefined_identifier: u64 = 4294967295.u64()
+
+        def little_endian(raw: darray[u8]&, offset: usize, width: usize) -> u64:
+            value: mutable u64 = 0.u64()
+            scale: mutable u64 = 1.u64()
+            for index in 0..<width |raw, offset, value, scale|:
+                value <- value + raw[offset + index].u64() * scale
+                scale <- scale * 256.u64()
+            return value
+
+    public:
+        # Space for the Linux header and up to 32 ACL entries.
+        const read_capacity: usize = header_bytes + 32.usize() * entry_bytes
+
+        def is_safe(raw: darray[u8]&) -> bool:
+            # Only owner, owning group, optional mask, and other may appear.
+            # Named users and groups are forbidden even if their access is masked.
+            return false if raw.count != 28.usize() and raw.count != 36.usize()
+            return false if little_endian(raw, 0.usize(), header_bytes) != 2.u64()
+            entries: usize = (raw.count - header_bytes) / entry_bytes
+            for index in 0..<entries |raw, entries|:
+                offset: usize = header_bytes + index * entry_bytes
+                expected_tag: u64 = user_object if index == 0.usize() else group_object if index == 1.usize() else other if index == entries - 1.usize() else mask
+                return false if little_endian(raw, offset, 2.usize()) != expected_tag
+                permissions: u64 = little_endian(raw, offset + 2.usize(), 2.usize())
+                return false if permissions > 7.u64()
+                return false if index != 0.usize() and (permissions & 2.u64()) != 0.u64()
+                return false if little_endian(raw, offset + 4.usize(), 4.usize()) != undefined_identifier
+            return true
