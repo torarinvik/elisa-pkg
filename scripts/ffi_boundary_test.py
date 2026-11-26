@@ -34,6 +34,10 @@ C_INT_RETURN_SYMBOLS = {
     "native_closedir",
     "native_fork",
     "native_execvp",
+    "native_execve",
+    "native_acl_get_entry",
+    "native_acl_get_tag_type",
+    "native_acl_free",
     "native_setpgid",
     "native_getpid",
     "native_waitpid",
@@ -42,7 +46,13 @@ C_INT_RETURN_SYMBOLS = {
     "native_nanosleep",
     "native_setrlimit",
 }
-C_SSIZE_T_RETURN_SYMBOLS = {"native_fgetxattr"}
+C_SSIZE_T_RETURN_SYMBOLS = {"native_fgetxattr", "native_read", "native_write"}
+ADDITIONAL_SCALAR_RETURNS = {
+    "native_geteuid": "u32",
+    "native_lseek": "i64",
+    "native_strlen": "usize",
+    "native_syscall": "i64",
+}
 
 
 def source_files():
@@ -59,28 +69,26 @@ def source_files():
 
 def main() -> int:
     native_source = FFI_DECLARATIONS.read_text(encoding="utf-8")
-    extern_returns = dict(
-        re.findall(
-            r"(?m)^\s*extern\s+(native_[A-Za-z0-9_]+)\([^\n]*\)\s*->\s*([A-Za-z0-9_]+)",
-            native_source,
-        )
-    )
-    bad_c_int_returns = sorted(
-        name for name in C_INT_RETURN_SYMBOLS if extern_returns.get(name) != "i32"
-    )
-    if bad_c_int_returns:
-        print("error: POSIX C int returns must use i32 at the FFI boundary", flush=True)
-        for name in bad_c_int_returns:
-            print(f"  {name}: expected i32, got {extern_returns.get(name, 'missing')}", flush=True)
-        return 1
-
-    bad_ssize_t_returns = sorted(
-        name for name in C_SSIZE_T_RETURN_SYMBOLS if extern_returns.get(name) != "i64"
-    )
-    if bad_ssize_t_returns:
-        print("error: 64-bit POSIX ssize_t returns must use i64 at the FFI boundary", flush=True)
-        for name in bad_ssize_t_returns:
-            print(f"  {name}: expected i64, got {extern_returns.get(name, 'missing')}", flush=True)
+    extern_returns: dict[str, set[str]] = {}
+    for name, return_type in re.findall(
+        r"(?m)^\s*extern\s+(native_[A-Za-z0-9_]+)\([^\n]*\)\s*->\s*([A-Za-z0-9_]+)",
+        native_source,
+    ):
+        extern_returns.setdefault(name, set()).add(return_type)
+    expected_returns = {
+        **dict.fromkeys(C_INT_RETURN_SYMBOLS, "i32"),
+        **dict.fromkeys(C_SSIZE_T_RETURN_SYMBOLS, "i64"),
+        **ADDITIONAL_SCALAR_RETURNS,
+    }
+    mismatches = [
+        (name, expected, extern_returns.get(name, set()))
+        for name, expected in sorted(expected_returns.items())
+        if extern_returns.get(name) != {expected}
+    ]
+    if mismatches:
+        print("error: incorrect POSIX scalar returns at the FFI boundary", flush=True)
+        for name, expected, actual in mismatches:
+            print(f"  {name}: expected {expected}, got {', '.join(sorted(actual)) or 'missing'}", flush=True)
         return 1
 
     sources = list(source_files())
