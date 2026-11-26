@@ -41,6 +41,7 @@ include "./project/transaction.elisa"
 include "./project/lockfile.elisa"
 include "./project/build_cache.elisa"
 include "./project/build_receipt.elisa"
+include "./project/build_paths.elisa"
 include "./project/schema_fields.elisa"
 
 module Cli:
@@ -573,7 +574,7 @@ module Cli:
                         child_root_raw: mutable darray[u8] = []
                         ProjectFiles::path_join_into(&parent_root, dep_path_name, &child_root_raw)
                         child_root: mutable darray[u8] = []
-                        return false if not normalize_relative_path(&child_root_raw, &child_root)
+                        return false if not ProjectFiles::normalize_relative_path(&child_root_raw, &child_root)
                         child_name: mutable darray[u8] = []
                         child_version: mutable darray[u8] = []
                         return false if not load_package_at(&child_root, &child_name, &child_version)
@@ -1137,45 +1138,6 @@ module Cli:
                         ByteText::append_bounded_text(&unlock, options.update_name)
                     return canonical_registry_lock(name, version, raw, root, registry_roots, preferred_lock, unlock, true)
                 return canonical_transitive_local_lock(name, version, raw, root)
-
-        def normalize_relative_path(path: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            out.resize(0)
-            segment_start: mutable usize = 0.usize()
-            index: mutable usize = 0.usize()
-            while index <= path.count |path, out, segment_start, index|:
-                at_end: bool = index == path.count
-                if at_end or path[index] == 47:
-                    segment_length: usize = index - segment_start
-                    if segment_length > 0.usize() and not (segment_length == 1.usize() and path[segment_start] == 46):
-                        is_parent: bool = segment_length == 2.usize() and path[segment_start] == 46 and path[segment_start + 1.usize()] == 46
-                        if is_parent:
-                            if out.count > 0.usize():
-                                last: mutable usize = out.count
-                                while last > 0.usize() and out[last - 1.usize()] != 47 |out, last|:
-                                    last <- last - 1.usize()
-                                previous_parent: bool = out.count - last == 2.usize() and out[last] == 46 and out[last + 1.usize()] == 46
-                                if previous_parent:
-                                    out.push(47)
-                                    out.push(46)
-                                    out.push(46)
-                                else:
-                                    # `last` points to the component start;
-                                    # remove its preceding separator as well.
-                                    if last > 0.usize() and out[last - 1.usize()] == 47:
-                                        out.resize(last - 1.usize())
-                                    else:
-                                        out.resize(last)
-                            else:
-                                out.push(46)
-                                out.push(46)
-                        else:
-                            if out.count > 0.usize():
-                                out.push(47)
-                            for part in segment_start..<index |path, out|:
-                                out.push(path[part])
-                    segment_start <- index + 1.usize()
-                index <- index + 1.usize()
-            return out.count > 0.usize()
 
         def dependency_alias_seen(seen: darray[u8]&, alias: darray[u8]&) -> bool:
             cursor: mutable usize = 0.usize()
@@ -3250,59 +3212,6 @@ module Cli:
                 CliOutput::write_ok("\n")
                 return EXIT_OK
 
-        def sandbox_dependency_roots(lock: darray[u8]&, start: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            out.resize(0)
-            return true if not Lockfile::version_is(lock, 2)
-            packages_start: usize = Json::root_value_offset(lock, "packages")
-            packages_end: usize = Json::array_end(lock, packages_start)
-            return false if packages_start >= lock.count or packages_end <= packages_start or lock[packages_start] != 91
-            cursor: mutable usize = packages_start + 1.usize()
-            count: mutable usize = 0.usize()
-            while cursor < packages_end |lock, cursor, count, out, start|:
-                while cursor < packages_end and (lock[cursor] == 32 or lock[cursor] == 9 or lock[cursor] == 10 or lock[cursor] == 13) |lock, cursor|:
-                    cursor <- cursor + 1.usize()
-                break if cursor >= packages_end or lock[cursor] == 93
-                return false if lock[cursor] != 123 or count >= MAX_DEPENDENCIES
-                record_end: usize = Json::object_end(lock, cursor)
-                return false if record_end <= cursor or record_end >= packages_end
-                source_start: mutable usize = 0.usize()
-                source_end: mutable usize = 0.usize()
-                return false if not Json::object_value_span(lock, cursor, record_end, "source", &source_start, &source_end)
-                source_type: mutable darray[u8] = []
-                if Json::object_string_value(lock, source_start, source_end, "type", &source_type) and ByteText::equal_text(source_type, "path"):
-                    relative: mutable darray[u8] = []
-                    return false if not Json::object_string_value(lock, source_start, source_end, "path", &relative) or not Manifest::valid_dependency_path(relative)
-                    relative_c: mutable darray[u8] = []
-                    ProjectFiles::path_with_nul_into(&relative, &relative_c)
-                    relative_name: cstr = (&relative_c[0]).cast[cstr] can Unsafe.PointerCast
-                    joined: mutable darray[u8] = []
-                    ProjectFiles::path_join_into(start, relative_name, &joined)
-                    normalized: mutable darray[u8] = []
-                    return false if not normalize_relative_path(joined, &normalized)
-                    normalized_c: mutable darray[u8] = []
-                    ProjectFiles::path_with_nul_into(&normalized, &normalized_c)
-                    normalized_name: cstr = (&normalized_c[0]).cast[cstr] can Unsafe.PointerCast
-                    resolved: mutable darray[u8] = []
-                    resolved.resize(4096)
-                    if Platform::pkg_realpath(normalized_name, &resolved) is canonical:
-                        canonical_root: mutable darray[u8] = []
-                        length: usize = Platform::pkg_strlen(canonical)
-                        return false if length == 0.usize() or length >= 4096.usize()
-                        for index in 0..<length |canonical_root, canonical|:
-                            canonical_root.push(canonical[index].u8())
-                        for root_index in 0..<canonical_root.count |out, canonical_root|:
-                            out.push(canonical_root[root_index])
-                        out.push(0)
-                    else:
-                        return false
-                cursor <- record_end + 1.usize()
-                while cursor < packages_end and (lock[cursor] == 32 or lock[cursor] == 9 or lock[cursor] == 10 or lock[cursor] == 13) |lock, cursor|:
-                    cursor <- cursor + 1.usize()
-                if cursor < packages_end and lock[cursor] == 44:
-                    cursor <- cursor + 1.usize()
-                count <- count + 1.usize()
-            return true
-
         def select_unique_library_entry(raw: darray[u8]&, package_root: darray[u8]&, out: mutable darray[u8]&, relative_out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out.resize(0)
             relative_out.resize(0)
@@ -3568,7 +3477,7 @@ module Cli:
                         CliOutput::write_error("error: HOME must name an existing directory to construct the build sandbox\n")
                         return EXIT_BUILD
                     dependency_roots: mutable darray[u8] = []
-                    return EXIT_BUILD if not sandbox_dependency_roots(lock_raw, start, &dependency_roots)
+                    return EXIT_BUILD if not BuildPaths::sandbox_dependency_roots(lock_raw, start, &dependency_roots)
                     tool_paths: mutable darray[cstr] = []
                     if not compiler_is_stage1_wrapper:
                         tool_paths.push(compiler)

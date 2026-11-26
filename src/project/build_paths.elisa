@@ -1,0 +1,51 @@
+# Resolve the local dependency roots used to construct the build sandbox.
+include "../package/manifest.elisa"
+include "./files.elisa"
+include "./lockfile.elisa"
+
+module BuildPaths:
+    public:
+        def sandbox_dependency_roots(lock: darray[u8]&, start: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            out.resize(0)
+            return true if not Lockfile::version_is(lock, 2)
+            packages_start: usize = Json::root_value_offset(lock, "packages")
+            packages_end: usize = Json::array_end(lock, packages_start)
+            return false if packages_start >= lock.count or packages_end <= packages_start or packages_end >= lock.count or lock[packages_start] != 91
+            cursor: mutable usize = packages_start + 1.usize()
+            count: mutable usize = 0.usize()
+            while cursor < packages_end |lock, cursor, count, out, start|:
+                while cursor < packages_end and (lock[cursor] == 32 or lock[cursor] == 9 or lock[cursor] == 10 or lock[cursor] == 13) |lock, cursor|:
+                    cursor <- cursor + 1.usize()
+                break if cursor >= packages_end or lock[cursor] == 93
+                return false if lock[cursor] != 123 or count >= maximum_dependencies
+                record_end: usize = Json::object_end(lock, cursor)
+                return false if record_end <= cursor or record_end >= packages_end
+                source_start: mutable usize = 0.usize()
+                source_end: mutable usize = 0.usize()
+                return false if not Json::object_value_span(lock, cursor, record_end, "source", &source_start, &source_end)
+                source_type: mutable darray[u8] = []
+                if Json::object_string_value(lock, source_start, source_end, "type", &source_type) and ByteText::equal_text(source_type, "path"):
+                    relative: mutable darray[u8] = []
+                    return false if not Json::object_string_value(lock, source_start, source_end, "path", &relative) or not Manifest::valid_dependency_path(relative)
+                    relative_c: mutable darray[u8] = []
+                    ProjectFiles::path_with_nul_into(&relative, &relative_c)
+                    relative_name: cstr = (&relative_c[0]).cast[cstr] can Unsafe.PointerCast
+                    joined: mutable darray[u8] = []
+                    ProjectFiles::path_join_into(start, relative_name, &joined)
+                    normalized: mutable darray[u8] = []
+                    return false if not ProjectFiles::normalize_relative_path(joined, &normalized)
+                    canonical_root: mutable darray[u8] = []
+                    return false if not ProjectFiles::canonical_existing_path(normalized, &canonical_root)
+                    ByteText::append(out, canonical_root)
+                    out.push(0)
+                cursor <- record_end + 1.usize()
+                while cursor < packages_end and (lock[cursor] == 32 or lock[cursor] == 9 or lock[cursor] == 10 or lock[cursor] == 13) |lock, cursor|:
+                    cursor <- cursor + 1.usize()
+                if cursor < packages_end:
+                    return false if lock[cursor] != 44
+                    cursor <- cursor + 1.usize()
+                count <- count + 1.usize()
+            return true
+
+    private:
+        const maximum_dependencies: usize = 4096.usize()
