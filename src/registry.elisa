@@ -18,6 +18,7 @@ include "./resolution/solver.elisa"
 include "./trust.elisa"
 include "./tuf.elisa"
 include "./registry/index_snapshot.elisa"
+include "./registry/release_metadata.elisa"
 
 module Registry:
     public:
@@ -63,7 +64,7 @@ module Registry:
         # public record; keeping this buffer at the call boundary preserves
         # ownership and makes the limitation explicit.
         def read_dependencies(metadata: darray[u8]&, out: mutable darray[Solver::Constraint]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            return metadata_dependencies(metadata, out)
+            return ReleaseMetadata::dependencies(metadata, out)
 
         # Return the authenticated registry's bounded version index. Its exact
         # bytes are bound to a signed, expiring per-package snapshot, whose
@@ -108,17 +109,17 @@ module Registry:
         # metadata verification step unnoticed.
         def read_archive(package: darray[u8]&, version: darray[u8]&, metadata: darray[u8]&, archive: darray[u8]&, expected_digest: darray[u8]&, expected_size: u64, out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out.resize(0)
-            return ResultCode.InvalidConfiguration if not valid_package_name(package) or not valid_package_version(version) or not Archive::is_safe_entry(archive) or not Integrity::valid_sha256_hex(expected_digest) or expected_size > Archive::max_archive_bytes.u64()
+            return ResultCode.InvalidConfiguration if not valid_package_name(package) or not PackageIdentity::valid_version(version) or not Archive::is_safe_entry(archive) or not Integrity::valid_sha256_hex(expected_digest) or expected_size > Archive::max_archive_bytes.u64()
             root: mutable darray[u8] = []
             return ResultCode.NotConfigured if not configured_root(&root)
             return ResultCode.InvalidConfiguration if not RegistryRoot::valid(root)
-            return ResultCode.MalformedMetadata if metadata.count == 0.usize() or metadata.count > Json::max_document_bytes or not Json::valid_document(metadata) or not Json::unique_object_keys(metadata) or not metadata_root_object(metadata) or not metadata_allowed_fields(metadata)
+            return ResultCode.MalformedMetadata if metadata.count == 0.usize() or metadata.count > Json::max_document_bytes or not Json::valid_document(metadata) or not Json::unique_object_keys(metadata) or not ReleaseMetadata::has_root_object(metadata) or not ReleaseMetadata::allowed_fields(metadata)
             metadata_archive: mutable darray[u8] = []
             metadata_digest: mutable darray[u8] = []
             metadata_size: mutable u64 = 0
-            return ResultCode.MalformedMetadata if not metadata_identity(metadata, root, package, version, &metadata_archive, &metadata_digest, &metadata_size)
-            return ResultCode.MalformedMetadata if not bytes_equal(metadata_archive, archive)
-            return ResultCode.DigestMismatch if not bytes_equal(metadata_digest, expected_digest) or metadata_size != expected_size
+            return ResultCode.MalformedMetadata if not ReleaseMetadata::match_identity_fields(metadata, root, package, version, &metadata_archive, &metadata_digest, &metadata_size)
+            return ResultCode.MalformedMetadata if not RegistryBytes::equal(metadata_archive, archive)
+            return ResultCode.DigestMismatch if not RegistryBytes::equal(metadata_digest, expected_digest) or metadata_size != expected_size
             path: mutable darray[u8] = []
             return ResultCode.InvalidConfiguration if not join_path_version(root, package, version, &path)
             path.push(47)
@@ -129,7 +130,7 @@ module Registry:
             return ResultCode.DigestMismatch if verified_archive.count.u64() != expected_size
             digest_bytes: mutable darray[u8] = []
             digest: mutable darray[u8] = []
-            return ResultCode.DigestMismatch if Integrity::sha256(verified_archive, &digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(digest_bytes, &digest) or not bytes_equal(digest, expected_digest)
+            return ResultCode.DigestMismatch if Integrity::sha256(verified_archive, &digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(digest_bytes, &digest) or not RegistryBytes::equal(digest, expected_digest)
             return ResultCode.MalformedMetadata if not release_archive_matches_metadata(package, version, metadata, verified_archive)
             for index in 0..<verified_archive.count |verified_archive, out|:
                 out.push(verified_archive[index])
@@ -140,27 +141,27 @@ module Registry:
         # authorized. Callers must authenticate metadata before using this
         # check; the function itself treats both inputs as untrusted bytes.
         def release_archive_matches_metadata(package: darray[u8]&, version: darray[u8]&, metadata: darray[u8]&, archive: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            return false if not valid_package_name(package) or not valid_package_version(version)
+            return false if not valid_package_name(package) or not PackageIdentity::valid_version(version)
             manifest_name: mutable darray[u8] = [101, 108, 105, 115, 97, 112, 107, 103, 46, 106, 115, 111, 110]
             manifest: mutable darray[u8] = []
             return false if not Archive::read_ustar_entry(archive, manifest_name, &manifest)
-            return false if manifest.count == 0 or manifest.count > 1048576 or not Json::valid_utf8(manifest) or not Json::valid_document(manifest) or not Json::unique_object_keys(manifest) or not Manifest::allowed_keys(manifest) or not metadata_root_object(manifest)
+            return false if manifest.count == 0 or manifest.count > 1048576 or not Json::valid_utf8(manifest) or not Json::valid_document(manifest) or not Json::unique_object_keys(manifest) or not Manifest::allowed_keys(manifest) or not ReleaseMetadata::has_root_object(manifest)
             for index in 0..<manifest.count |manifest|:
                 return false if manifest[index] == 0
             schema: mutable u64 = 0
-            return false if not metadata_integer(manifest, "schema-version", &schema) or schema != 1
-            package_start: usize = metadata_value_start(manifest, "package")
+            return false if not ReleaseMetadata::unsigned_field(manifest, "schema-version", &schema) or schema != 1
+            package_start: usize = ReleaseMetadata::value_start(manifest, "package")
             package_end: usize = Json::object_end(manifest, package_start)
             return false if package_start >= manifest.count or manifest[package_start] != 123 or package_end <= package_start or package_end >= manifest.count
             manifest_package: mutable darray[u8] = []
             manifest_version: mutable darray[u8] = []
             return false if not Json::object_string_value(manifest, package_start, package_end, "name", &manifest_package) or not Json::object_string_value(manifest, package_start, package_end, "version", &manifest_version)
-            return false if not bytes_equal(manifest_package, package) or not bytes_equal(manifest_version, version)
-            return false if not metadata_optional_object_empty(manifest, "dev-dependencies")
+            return false if not RegistryBytes::equal(manifest_package, package) or not RegistryBytes::equal(manifest_version, version)
+            return false if not ReleaseMetadata::optional_object_empty(manifest, "dev-dependencies")
             signed_dependencies: mutable darray[Solver::Constraint] = []
             manifest_dependencies: mutable darray[Solver::Constraint] = []
-            return false if not metadata_dependencies(metadata, &signed_dependencies) or not metadata_dependencies(manifest, &manifest_dependencies)
-            return false if not registry_dependency_sets_equal(signed_dependencies, manifest_dependencies)
+            return false if not ReleaseMetadata::dependencies(metadata, &signed_dependencies) or not ReleaseMetadata::dependencies(manifest, &manifest_dependencies)
+            return false if not ReleaseMetadata::dependency_sets_equal(signed_dependencies, manifest_dependencies)
             return true
 
         # Record the authenticated immutable package identity in user-owned
@@ -203,7 +204,7 @@ module Registry:
             key_fingerprint: mutable darray[u8] = []
             index_status: ResultCode = read_index_with_key_fingerprint(package, &versions, &yanked_flags, &current_generation, &current_digest, &current_identity, &key_fingerprint)
             return index_status if index_status != ResultCode.Ok
-            return ResultCode.RollbackDetected if current_generation != generation or not bytes_equal(current_digest, index_digest) or not bytes_equal(current_identity, index_identity)
+            return ResultCode.RollbackDetected if current_generation != generation or not RegistryBytes::equal(current_digest, index_digest) or not RegistryBytes::equal(current_identity, index_identity)
             return ResultCode.NoMatchingVersion if not registry_index_contains_version(versions, version)
             return trust_state_record_at_index(package, version, digest, metadata_digest, expires, generation, index_digest, index_identity, key_fingerprint)
 
@@ -274,7 +275,7 @@ module Registry:
             generation_out <- 0
             snapshot_digest_out.resize(0)
             identity_out.resize(0)
-            return ResultCode.InvalidConfiguration if not valid_package_name(package) or not valid_package_version(version)
+            return ResultCode.InvalidConfiguration if not valid_package_name(package) or not PackageIdentity::valid_version(version)
             parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
             return ResultCode.InvalidConfiguration if not SemVer::parse(version, &parsed) or parsed.prerelease
             root: mutable darray[u8] = []
@@ -311,7 +312,7 @@ module Registry:
             digest_out.resize(0)
             archive_size_out <- 0
             metadata_out.resize(0)
-            return ResultCode.InvalidConfiguration if not valid_package_name(package) or not valid_package_version(version)
+            return ResultCode.InvalidConfiguration if not valid_package_name(package) or not PackageIdentity::valid_version(version)
             root: mutable darray[u8] = []
             return ResultCode.NotConfigured if not configured_root(&root)
             return ResultCode.InvalidConfiguration if not RegistryRoot::valid(root)
@@ -325,7 +326,7 @@ module Registry:
         # so the signature can be carried into the content-addressed offline cache.
         def read_signature(package: darray[u8]&, version: darray[u8]&, out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out.resize(0)
-            return ResultCode.InvalidConfiguration if not valid_package_name(package) or not valid_package_version(version)
+            return ResultCode.InvalidConfiguration if not valid_package_name(package) or not PackageIdentity::valid_version(version)
             root: mutable darray[u8] = []
             return ResultCode.NotConfigured if not configured_root(&root)
             return ResultCode.InvalidConfiguration if not RegistryRoot::valid(root)
@@ -358,18 +359,18 @@ module Registry:
             archive_size_out <- 0
             expires_out <- 0
             dependencies_out.resize(0)
-            return ResultCode.InvalidConfiguration if not valid_package_name(package) or not valid_package_version(version) or not Integrity::valid_sha256_hex(expected_metadata_digest)
-            return ResultCode.MalformedMetadata if metadata.count == 0.usize() or metadata.count > 1048576.usize() or not Json::valid_document(metadata) or not Json::unique_object_keys(metadata) or not metadata_root_object(metadata) or not metadata_allowed_fields(metadata)
+            return ResultCode.InvalidConfiguration if not valid_package_name(package) or not PackageIdentity::valid_version(version) or not Integrity::valid_sha256_hex(expected_metadata_digest)
+            return ResultCode.MalformedMetadata if metadata.count == 0.usize() or metadata.count > 1048576.usize() or not Json::valid_document(metadata) or not Json::unique_object_keys(metadata) or not ReleaseMetadata::has_root_object(metadata) or not ReleaseMetadata::allowed_fields(metadata)
             root: mutable darray[u8] = []
             return ResultCode.NotConfigured if not configured_root(&root)
             return ResultCode.InvalidConfiguration if not RegistryRoot::valid(root)
             verified_archive: mutable darray[u8] = []
             verified_digest: mutable darray[u8] = []
             verified_archive_size: mutable u64 = 0
-            return ResultCode.MalformedMetadata if not metadata_identity(metadata, root, package, version, &verified_archive, &verified_digest, &verified_archive_size)
+            return ResultCode.MalformedMetadata if not ReleaseMetadata::match_identity_fields(metadata, root, package, version, &verified_archive, &verified_digest, &verified_archive_size)
             metadata_digest_bytes: mutable darray[u8] = []
             metadata_digest: mutable darray[u8] = []
-            return ResultCode.DigestMismatch if Integrity::sha256(metadata, &metadata_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(metadata_digest_bytes, &metadata_digest) or not bytes_equal(metadata_digest, expected_metadata_digest)
+            return ResultCode.DigestMismatch if Integrity::sha256(metadata, &metadata_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(metadata_digest_bytes, &metadata_digest) or not RegistryBytes::equal(metadata_digest, expected_metadata_digest)
             key_path: mutable darray[u8] = []
             trust_root_status: ResultCode = configured_trust_root(root, &key_path)
             return trust_root_status if trust_root_status != ResultCode.Ok
@@ -378,12 +379,12 @@ module Registry:
             trust_status: Trust::VerificationCode = Trust::verify_detached("ed25519", public_key, metadata, signature)
             return ResultCode.InvalidSignature if trust_status != Trust::VerificationCode.Valid
             verified_expires: mutable u64 = 0
-            return ResultCode.MalformedMetadata if not metadata_integer(metadata, "expires", &verified_expires)
+            return ResultCode.MalformedMetadata if not ReleaseMetadata::unsigned_field(metadata, "expires", &verified_expires)
             now: i64 = Platform::pkg_wall_clock_seconds()
             return ResultCode.ClockUnavailable if now < 0
             expiry_status: ResultCode = metadata_expiry_status(verified_expires, now.u64())
             return expiry_status if expiry_status != ResultCode.Ok
-            return ResultCode.MalformedMetadata if not metadata_dependencies(metadata, dependencies_out)
+            return ResultCode.MalformedMetadata if not ReleaseMetadata::dependencies(metadata, dependencies_out)
             for index in 0..<verified_archive.count |archive_out, verified_archive|:
                 archive_out.push(verified_archive[index])
             for index in 0..<verified_digest.count |digest_out, verified_digest|:
@@ -445,7 +446,7 @@ module Registry:
             digest_out.resize(0)
             metadata_out.resize(0)
             archive_size_out <- 0
-            return ResultCode.InvalidConfiguration if not valid_package_name(package) or not valid_package_version(selected)
+            return ResultCode.InvalidConfiguration if not valid_package_name(package) or not PackageIdentity::valid_version(selected)
             metadata_path: mutable darray[u8] = []
             return ResultCode.InvalidConfiguration if not join_path_version(root, package, selected, &metadata_path)
             metadata_path.push(47)
@@ -464,12 +465,12 @@ module Registry:
             metadata_path.push(110)
             metadata: mutable darray[u8] = []
             return ResultCode.MalformedMetadata if not read_file(metadata_path, Json::max_document_bytes, &metadata)
-            return ResultCode.MalformedMetadata if not Json::valid_document(metadata) or not Json::unique_object_keys(metadata) or not metadata_root_object(metadata)
-            return ResultCode.MalformedMetadata if not metadata_allowed_fields(metadata)
+            return ResultCode.MalformedMetadata if not Json::valid_document(metadata) or not Json::unique_object_keys(metadata) or not ReleaseMetadata::has_root_object(metadata)
+            return ResultCode.MalformedMetadata if not ReleaseMetadata::allowed_fields(metadata)
             selected_archive: mutable darray[u8] = []
             selected_digest: mutable darray[u8] = []
             selected_archive_size: mutable u64 = 0
-            return ResultCode.MalformedMetadata if not metadata_identity(metadata, root, package, selected, &selected_archive, &selected_digest, &selected_archive_size)
+            return ResultCode.MalformedMetadata if not ReleaseMetadata::match_identity_fields(metadata, root, package, selected, &selected_archive, &selected_digest, &selected_archive_size)
             return ResultCode.RollbackDetected if selected_version_below(selected, previous_version)
             signature_path: mutable darray[u8] = []
             return ResultCode.InvalidConfiguration if not sibling_path(metadata_path, "metadata.sig", &signature_path)
@@ -480,7 +481,7 @@ module Registry:
             trust_status: Trust::VerificationCode = Trust::verify_detached("ed25519", public_key, metadata, signature)
             return ResultCode.InvalidSignature if trust_status != Trust::VerificationCode.Valid
             expires: mutable u64 = 0
-            return ResultCode.MalformedMetadata if not metadata_integer(metadata, "expires", &expires)
+            return ResultCode.MalformedMetadata if not ReleaseMetadata::unsigned_field(metadata, "expires", &expires)
             now: i64 = Platform::pkg_wall_clock_seconds()
             return ResultCode.ClockUnavailable if now < 0
             expiry_status: ResultCode = metadata_expiry_status(expires, now.u64())
@@ -512,7 +513,7 @@ module Registry:
             return ResultCode.DigestMismatch if archive_bytes.count.u64() != selected_archive_size
             actual_digest_bytes: mutable darray[u8] = []
             actual_digest: mutable darray[u8] = []
-            return ResultCode.DigestMismatch if Integrity::sha256(archive_bytes, &actual_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(actual_digest_bytes, &actual_digest) or not bytes_equal(actual_digest, selected_digest)
+            return ResultCode.DigestMismatch if Integrity::sha256(archive_bytes, &actual_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(actual_digest_bytes, &actual_digest) or not RegistryBytes::equal(actual_digest, selected_digest)
             return ResultCode.MalformedMetadata if not release_archive_matches_metadata(package, selected, metadata, archive_bytes)
             for index in 0..<selected.count |version_out, selected|:
                 version_out.push(selected[index])
@@ -552,7 +553,6 @@ module Registry:
             return "unknown registry result"
 
     private:
-        const max_dependencies: usize = 4096
 
         def registry_append_decimal(out: mutable darray[u8]&, value: u64) -> void can[Memory.Allocate, Abort.Panic]:
             start: usize = out.count
@@ -585,160 +585,6 @@ module Registry:
         def registry_push_array(out: mutable darray[u8]&, value: darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
             for index in 0..<value.count |out, value|:
                 out.push(value[index])
-
-        def registry_version_seen(seen: darray[u8]&, wanted: darray[u8]&) -> bool:
-            cursor: mutable usize = 0
-            while cursor < seen.count:
-                finish: mutable usize = cursor
-                while finish < seen.count and seen[finish] != 0 |seen, finish|:
-                    finish <- finish + 1
-                return true if finish - cursor == wanted.count and registry_slice_equal(seen, cursor, finish, wanted)
-                cursor <- finish + 1
-            return false
-
-        def registry_slice_equal(value: darray[u8]&, start: usize, finish: usize, wanted: darray[u8]&) -> bool:
-            return false if finish < start or finish - start != wanted.count
-            for item in 0..<wanted.count |value, start, wanted|:
-                return false if value[start + item] != wanted[item]
-            return true
-
-        def metadata_dependencies(raw: darray[u8]&, out: mutable darray[Solver::Constraint]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            out.resize(0)
-            parsed: mutable darray[Solver::Constraint] = []
-            return false if not parse_metadata_dependencies(raw, &parsed)
-            for index in 0..<parsed.count |parsed, out|:
-                out.push(parsed[index])
-            return true
-
-        def parse_metadata_dependencies(raw: darray[u8]&, out: mutable darray[Solver::Constraint]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            out.resize(0)
-            dependency_start: usize = metadata_value_start(raw, "dependencies")
-            return true if dependency_start == raw.count
-            dependency_end: usize = Json::object_end(raw, dependency_start)
-            return false if dependency_start >= raw.count or dependency_end <= dependency_start or raw[dependency_start] != 123
-            seen: mutable darray[u8] = []
-            in_string: mutable bool = false
-            escaped: mutable bool = false
-            string_start: mutable usize = 0
-            braces: mutable i64 = 1
-            brackets: mutable i64 = 0
-            for index in (dependency_start + 1)..<dependency_end |raw, out, seen, in_string, escaped, string_start, braces, brackets|:
-                byte: u8 = raw[index]
-                if not in_string:
-                    if byte == 34:
-                        in_string <- true
-                        string_start <- index + 1
-                    elif byte == 123:
-                        braces <- braces + 1
-                    elif byte == 125:
-                        braces <- braces - 1
-                    elif byte == 91:
-                        brackets <- brackets + 1
-                    elif byte == 93:
-                        brackets <- brackets - 1
-                elif escaped:
-                    escaped <- false
-                elif byte == 92:
-                    escaped <- true
-                elif byte == 34:
-                    after: mutable usize = index + 1
-                    while after < dependency_end and is_registry_space(raw[after]) |raw, after|:
-                        after <- after + 1
-                    if braces == 1 and brackets == 0 and after < dependency_end and raw[after] == 58:
-                        alias: mutable darray[u8] = []
-                        for item in string_start..<index |raw, alias|:
-                            alias.push(raw[item])
-                        return false if not registry_valid_name(alias) or registry_version_seen(seen, alias)
-                        for item in 0..<alias.count |seen, alias|:
-                            seen.push(alias[item])
-                        seen.push(0)
-                        after <- after + 1
-                        while after < dependency_end and is_registry_space(raw[after]) |raw, after|:
-                            after <- after + 1
-                        return false if after >= dependency_end or raw[after] != 123
-                        value_end: usize = Json::object_end(raw, after)
-                        return false if value_end <= after or value_end > dependency_end
-                        return false if not dependency_allowed_fields(raw, after, value_end)
-                        requirement: mutable darray[u8] = []
-                        return false if not Json::object_string_value(raw, after, value_end, "version", &requirement)
-                        parsed: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
-                        return false if not SemVer::parse_requirement(requirement, &parsed)
-                        registry_name: mutable darray[u8] = []
-                        return false if not Json::object_string_value(raw, after, value_end, "registry", &registry_name) or not bytes_equal_text(registry_name, "primary")
-                        return false if out.count >= max_dependencies
-                        out.push(Solver::Constraint{package: alias, requirement: requirement})
-                    in_string <- false
-            return true
-
-        def metadata_optional_object_empty(raw: darray[u8]&, wanted: cstr) -> bool:
-            start: usize = metadata_value_start(raw, wanted)
-            return true if start >= raw.count
-            return false if raw[start] != 123
-            finish: usize = Json::object_end(raw, start)
-            return false if finish <= start or finish >= raw.count
-            for index in (start + 1)..<finish |raw|:
-                return false if not is_registry_space(raw[index])
-            return true
-
-        def registry_dependency_sets_equal(left: darray[Solver::Constraint]&, right: darray[Solver::Constraint]&) -> bool:
-            return false if left.count != right.count
-            for left_index in 0..<left.count |left, right|:
-                found: mutable bool = false
-                for right_index in 0..<right.count |left, right, left_index, found|:
-                    found <- true if bytes_equal(left[left_index].package, right[right_index].package) and bytes_equal(left[left_index].requirement, right[right_index].requirement)
-                return false if not found
-            return true
-
-        def metadata_value_start(raw: darray[u8]&, wanted: cstr) -> usize:
-            key_length: usize = Platform::pkg_strlen(wanted)
-            in_string: mutable bool = false
-            escaped: mutable bool = false
-            string_start: mutable usize = 0
-            braces: mutable i64 = 0
-            brackets: mutable i64 = 0
-            for index in 0..<raw.count |raw, in_string, escaped, string_start, braces, brackets|:
-                byte: u8 = raw[index]
-                if not in_string:
-                    if byte == 34:
-                        in_string <- true
-                        string_start <- index + 1
-                    elif byte == 123:
-                        braces <- braces + 1
-                    elif byte == 125:
-                        braces <- braces - 1
-                    elif byte == 91:
-                        brackets <- brackets + 1
-                    elif byte == 93:
-                        brackets <- brackets - 1
-                elif escaped:
-                    escaped <- false
-                elif byte == 92:
-                    escaped <- true
-                elif byte == 34:
-                    after: mutable usize = index + 1
-                    while after < raw.count and is_registry_space(raw[after]) |raw, after|:
-                        after <- after + 1
-                    if braces == 1 and brackets == 0 and after < raw.count and raw[after] == 58 and index - string_start == key_length:
-                        matched: mutable bool = true
-                        for item in 0..<key_length |raw, wanted, string_start, matched|:
-                            matched <- false if raw[string_start + item] != wanted[item].u8()
-                        if matched:
-                            after <- after + 1
-                            while after < raw.count and is_registry_space(raw[after]) |raw, after|:
-                                after <- after + 1
-                            return after
-                    in_string <- false
-            return raw.count
-
-        def is_registry_space(byte: u8) -> bool:
-            return byte == 32 or byte == 9 or byte == 10 or byte == 13
-
-        def bytes_equal_text(value: darray[u8]&, expected: cstr) -> bool:
-            length: usize = Platform::pkg_strlen(expected)
-            return false if value.count != length
-            for index in 0..<length |value, expected|:
-                return false if value[index] != expected[index].u8()
-            return true
 
         def registry_valid_name(value: darray[u8]&) -> bool:
             return PackageIdentity::valid_name(value)
@@ -962,10 +808,6 @@ module Registry:
         def valid_package_name(package: darray[u8]&) -> bool:
             return PackageIdentity::valid_name(package)
 
-        def valid_package_version(version: darray[u8]&) -> bool:
-            parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-            return PackageIdentity::parse_version(version, &parsed)
-
         def join_path_leaf(root: darray[u8]&, package: darray[u8]&, leaf: cstr, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
             out.resize(0)
             return false if root.count == 0 or not RegistryRoot::valid(root)
@@ -984,7 +826,7 @@ module Registry:
 
         def join_path_version(root: darray[u8]&, package: darray[u8]&, version: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
             out.resize(0)
-            return false if not valid_package_version(version)
+            return false if not PackageIdentity::valid_version(version)
             for index in 0..<root.count |out, root|:
                 out.push(root[index])
             out.push(47) if out.count == 0 or out[out.count - 1.usize()] != 47
@@ -1091,7 +933,7 @@ module Registry:
             generation: mutable u64 = 0
             expires: mutable u64 = 0
             return ResultCode.MalformedMetadata if not RegistryIndexSnapshot::parse(snapshot, &snapshot_root, &snapshot_package, &generation, &expires, &versions, &yanked_flags)
-            return ResultCode.InvalidSignature if not bytes_equal(snapshot_root, root) or not bytes_equal(snapshot_package, package)
+            return ResultCode.InvalidSignature if not RegistryBytes::equal(snapshot_root, root) or not RegistryBytes::equal(snapshot_package, package)
             now: i64 = Platform::pkg_wall_clock_seconds()
             return ResultCode.ClockUnavailable if now < 0
             expiry_status: ResultCode = metadata_expiry_status(expires, now.u64())
@@ -1200,116 +1042,6 @@ module Registry:
             registry_push_text(&generation_version, "0.0.")
             registry_append_decimal(&generation_version, generation)
             return trust_state_record(identity, generation_version, snapshot_digest, snapshot_digest, expires, key_fingerprint)
-
-        def metadata_identity(raw: darray[u8]&, root: darray[u8]&, package: darray[u8]&, version: darray[u8]&, archive_out: mutable darray[u8]&, digest_out: mutable darray[u8]&, size_out: mutable u64&) -> bool can[Memory.Allocate, Abort.Panic]:
-            archive_out.resize(0)
-            digest_out.resize(0)
-            size_out <- 0.u64()
-            return false if not valid_package_version(version)
-            schema: mutable u64 = 0
-            return false if not metadata_integer(raw, "schema-version", &schema) or schema != 1
-            registry: mutable darray[u8] = []
-            algorithm: mutable darray[u8] = []
-            package_value: mutable darray[u8] = []
-            version_value: mutable darray[u8] = []
-            return false if not metadata_string(raw, "registry", &registry) or not metadata_string(raw, "algorithm", &algorithm) or not metadata_string(raw, "package", &package_value) or not metadata_string(raw, "version", &version_value)
-            return false if not bytes_equal(registry, root) or not bytes_equal(package_value, package) or not bytes_equal(version_value, version)
-            return false if algorithm.count != 7 or algorithm[0] != 101 or algorithm[1] != 100 or algorithm[2] != 50 or algorithm[3] != 53 or algorithm[4] != 53 or algorithm[5] != 49 or algorithm[6] != 57
-            return false if not metadata_string(raw, "archive", archive_out) or not Archive::is_safe_entry(archive_out)
-            return false if not metadata_string(raw, "archive-digest", digest_out) or not Integrity::valid_sha256_hex(digest_out)
-            parsed_size: mutable u64 = 0
-            return false if not metadata_integer(raw, "archive-size", &parsed_size) or parsed_size > Archive::max_archive_bytes.u64()
-            size_out <- parsed_size
-            return true
-
-        def metadata_allowed_fields(raw: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            first: mutable usize = 0
-            last: mutable usize = raw.count
-            while first < last and is_registry_space(raw[first]) |raw, first|:
-                first <- first + 1
-            while last > first and is_registry_space(raw[last - 1]) |raw, last|:
-                last <- last - 1
-            return false if first >= last or raw[first] != 123 or raw[last - 1] != 125
-            in_string: mutable bool = false
-            escaped: mutable bool = false
-            string_start: mutable usize = 0
-            braces: mutable i64 = 1
-            brackets: mutable i64 = 0
-            for index in (first + 1)..<last |raw, in_string, escaped, string_start, braces, brackets|:
-                byte: u8 = raw[index]
-                if not in_string:
-                    if byte == 34:
-                        in_string <- true
-                        string_start <- index + 1
-                    elif byte == 123:
-                        braces <- braces + 1
-                    elif byte == 125:
-                        braces <- braces - 1
-                    elif byte == 91:
-                        brackets <- brackets + 1
-                    elif byte == 93:
-                        brackets <- brackets - 1
-                elif escaped:
-                    escaped <- false
-                elif byte == 92:
-                    escaped <- true
-                elif byte == 34:
-                    after: mutable usize = index + 1
-                    while after < last and is_registry_space(raw[after]) |raw, after|:
-                        after <- after + 1
-                    if braces == 1 and brackets == 0 and after < last and raw[after] == 58:
-                        key: mutable darray[u8] = []
-                        for item in string_start..<index |raw, key|:
-                            key.push(raw[item])
-                        allowed: bool = bytes_equal_text(key, "schema-version") or bytes_equal_text(key, "algorithm") or bytes_equal_text(key, "registry") or bytes_equal_text(key, "package") or bytes_equal_text(key, "version") or bytes_equal_text(key, "archive") or bytes_equal_text(key, "archive-size") or bytes_equal_text(key, "archive-digest") or bytes_equal_text(key, "expires") or bytes_equal_text(key, "dependencies")
-                        return false if not allowed
-                    in_string <- false
-            return not in_string and not escaped and braces == 0 and brackets == 0
-
-        def dependency_allowed_fields(raw: darray[u8]&, start: usize, finish: usize) -> bool can[Memory.Allocate, Abort.Panic]:
-            return false if start >= finish or raw[start] != 123
-            in_string: mutable bool = false
-            escaped: mutable bool = false
-            string_start: mutable usize = 0
-            braces: mutable i64 = 1
-            brackets: mutable i64 = 0
-            for index in (start + 1)..<finish |raw, in_string, escaped, string_start, braces, brackets|:
-                byte: u8 = raw[index]
-                if not in_string:
-                    if byte == 34:
-                        in_string <- true
-                        string_start <- index + 1
-                    elif byte == 123:
-                        braces <- braces + 1
-                    elif byte == 125:
-                        braces <- braces - 1
-                    elif byte == 91:
-                        brackets <- brackets + 1
-                    elif byte == 93:
-                        brackets <- brackets - 1
-                elif escaped:
-                    escaped <- false
-                elif byte == 92:
-                    escaped <- true
-                elif byte == 34:
-                    after: mutable usize = index + 1
-                    while after < finish and is_registry_space(raw[after]) |raw, after|:
-                        after <- after + 1
-                    if braces == 1 and brackets == 0 and after < finish and raw[after] == 58:
-                        key: mutable darray[u8] = []
-                        for item in string_start..<index |raw, key|:
-                            key.push(raw[item])
-                        return false if not bytes_equal_text(key, "registry") and not bytes_equal_text(key, "version")
-                    in_string <- false
-            return not in_string and not escaped and braces == 1 and brackets == 0
-
-        def metadata_string(raw: darray[u8]&, wanted: cstr, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            start: usize = Json::root_start(raw)
-            return Json::object_string_value(raw, start, Json::root_object_end(raw, start), wanted, out)
-
-        def metadata_integer(raw: darray[u8]&, wanted: cstr, out: mutable u64&) -> bool:
-            start: usize = Json::root_start(raw)
-            return Json::object_unsigned_value(raw, start, Json::root_object_end(raw, start), wanted, out)
 
         def selected_version_below(version: darray[u8]&, previous: Model::Version) -> bool:
             parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
@@ -1542,11 +1274,11 @@ module Registry:
                 return ResultCode.TrustStateMalformed if not SemVer::parse(line_version, &parsed) or parsed.prerelease
                 previous: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
                 should_copy: mutable bool = false
-                if bytes_equal(line_package, package):
+                if RegistryBytes::equal(line_package, package):
                     if found:
                         return ResultCode.TrustStateMalformed if not SemVer::parse(version_out, &previous)
                         return ResultCode.TrustStateMalformed if SemVer::compare(parsed, previous) < 0
-                        return ResultCode.TrustStateMalformed if SemVer::compare(parsed, previous) == 0 and (not bytes_equal(digest_out, line_digest) or not bytes_equal(metadata_digest_out, line_metadata_digest))
+                        return ResultCode.TrustStateMalformed if SemVer::compare(parsed, previous) == 0 and (not RegistryBytes::equal(digest_out, line_digest) or not RegistryBytes::equal(metadata_digest_out, line_metadata_digest))
                         should_copy <- SemVer::compare(parsed, previous) > 0
                     else:
                         should_copy <- true
@@ -1574,8 +1306,8 @@ module Registry:
             if pinned_version.count == 0:
                 return ResultCode.TrustStateUnavailable if require_existing or trust_state_is_v4(state) and trust_state_has_root_scoped_history(state, root_key_identity)
                 return ResultCode.Ok
-            return ResultCode.TrustStateMalformed if not bytes_equal_text(pinned_version, "0.0.0") or not bytes_equal(pinned_digest, pinned_metadata_digest)
-            return ResultCode.TrustRootChanged if compare_key and not bytes_equal(pinned_digest, key_fingerprint)
+            return ResultCode.TrustStateMalformed if not RegistryBytes::equal_text(pinned_version, "0.0.0") or not RegistryBytes::equal(pinned_digest, pinned_metadata_digest)
+            return ResultCode.TrustRootChanged if compare_key and not RegistryBytes::equal(pinned_digest, key_fingerprint)
             found_out <- true
             return ResultCode.Ok
 
@@ -1717,7 +1449,7 @@ module Registry:
             return trust_state_record_internal(package, version, digest, metadata_digest, expires, true, generation, index_digest, index_identity, key_fingerprint)
 
         def trust_state_record_internal(package: darray[u8]&, version: darray[u8]&, digest: darray[u8]&, metadata_digest: darray[u8]&, expires: u64, guard_index: bool, index_generation: u64, index_digest: darray[u8]&, index_identity: darray[u8]&, key_fingerprint: darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
-            return ResultCode.InvalidConfiguration if not trust_state_identity_valid(package) or not valid_package_version(version) or not Integrity::valid_sha256_hex(digest) or not Integrity::valid_sha256_hex(metadata_digest) or not guard_index and not Integrity::valid_sha256_hex(key_fingerprint)
+            return ResultCode.InvalidConfiguration if not trust_state_identity_valid(package) or not PackageIdentity::valid_version(version) or not Integrity::valid_sha256_hex(digest) or not Integrity::valid_sha256_hex(metadata_digest) or not guard_index and not Integrity::valid_sha256_hex(key_fingerprint)
             parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
             return ResultCode.InvalidConfiguration if not SemVer::parse(version, &parsed) or parsed.prerelease
             return ResultCode.InvalidConfiguration if guard_index and (index_generation == 0 or not Integrity::valid_sha256_hex(index_digest) or not trust_state_identity_valid(index_identity))
@@ -1726,7 +1458,7 @@ module Registry:
             if guard_index:
                 expected_index_identity: mutable darray[u8] = []
                 return ResultCode.TrustStateUnavailable if not make_index_identity(root, package, &expected_index_identity)
-                return ResultCode.InvalidConfiguration if not bytes_equal(expected_index_identity, index_identity)
+                return ResultCode.InvalidConfiguration if not RegistryBytes::equal(expected_index_identity, index_identity)
             state_path: mutable darray[u8] = trust_state_path(root)
             return ResultCode.TrustStateUnavailable if state_path.count == 0
             return ResultCode.TrustStateUnavailable if state_path.count > 4090.usize()
@@ -1757,7 +1489,7 @@ module Registry:
                 current_index_identity: mutable darray[u8] = []
                 if not make_index_identity(root_after_fingerprint, package, &current_index_identity):
                     return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable)
-                if not bytes_equal(current_index_identity, index_identity):
+                if not RegistryBytes::equal(current_index_identity, index_identity):
                     return trust_state_finish(lock_fd, ResultCode.InvalidConfiguration)
             state_identity: mutable darray[u8] = []
             if registry_valid_name(package):
@@ -1774,7 +1506,7 @@ module Registry:
             for index in 0..<state_path.count |lock_path, state_path|:
                 lock_path.push(state_path[index])
             registry_push_text(&lock_path, ".lock")
-            if not bytes_equal(lock_path, lock_path_snapshot):
+            if not RegistryBytes::equal(lock_path, lock_path_snapshot):
                 return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable)
             state: mutable darray[u8] = []
             read_status: ResultCode = trust_state_read(state_path, &state)
@@ -1798,7 +1530,7 @@ module Registry:
             return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if clock_missing and state.count > 23.usize()
             current_state_digest: mutable darray[u8] = []
             return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if not trust_state_digest(state, &current_state_digest)
-            return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if not clock_missing and not bytes_equal(observed_state_digest, current_state_digest)
+            return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if not clock_missing and not RegistryBytes::equal(observed_state_digest, current_state_digest)
             now: i64 = Platform::pkg_wall_clock_seconds()
             return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if now < 0
             return trust_state_finish(lock_fd, ResultCode.ClockRollback) if observed_clock > now.u64()
@@ -1819,7 +1551,7 @@ module Registry:
                 return trust_state_finish(lock_fd, ResultCode.TrustStateMalformed) if not SemVer::parse(expected_index_version, &expected_index_parsed) or not SemVer::parse(observed_index_version, &observed_index_parsed)
                 return trust_state_finish(lock_fd, ResultCode.RollbackDetected) if SemVer::compare(observed_index_parsed, expected_index_parsed) > 0
                 return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if SemVer::compare(observed_index_parsed, expected_index_parsed) < 0
-                return trust_state_finish(lock_fd, ResultCode.DigestMismatch) if not bytes_equal(observed_index_digest, index_digest) or not bytes_equal(observed_index_metadata_digest, index_digest)
+                return trust_state_finish(lock_fd, ResultCode.DigestMismatch) if not RegistryBytes::equal(observed_index_digest, index_digest) or not RegistryBytes::equal(observed_index_metadata_digest, index_digest)
             previous_version: mutable darray[u8] = []
             previous_digest: mutable darray[u8] = []
             previous_metadata_digest: mutable darray[u8] = []
@@ -1834,7 +1566,7 @@ module Registry:
                 previous: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
                 return trust_state_finish(lock_fd, ResultCode.TrustStateMalformed) if not SemVer::parse(previous_version, &previous)
                 return trust_state_finish(lock_fd, ResultCode.RollbackDetected) if SemVer::compare(parsed, previous) < 0
-                return trust_state_finish(lock_fd, ResultCode.DigestMismatch) if SemVer::compare(parsed, previous) == 0 and (not bytes_equal(previous_digest, digest) or not bytes_equal(previous_metadata_digest, metadata_digest))
+                return trust_state_finish(lock_fd, ResultCode.DigestMismatch) if SemVer::compare(parsed, previous) == 0 and (not RegistryBytes::equal(previous_digest, digest) or not RegistryBytes::equal(previous_metadata_digest, metadata_digest))
                 if SemVer::compare(parsed, previous) == 0:
                     if key_pin_found:
                         return trust_state_finish(lock_fd, ResultCode.Ok) if observed_clock == now.u64()
@@ -1880,7 +1612,7 @@ module Registry:
             return trust_state_finish(lock_fd, ResultCode.Ok)
 
         def trust_state_verify(package: darray[u8]&, version: darray[u8]&, digest: darray[u8]&, metadata_digest: darray[u8]&, expires: u64) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
-            return ResultCode.InvalidConfiguration if not trust_state_identity_valid(package) or not valid_package_version(version) or not Integrity::valid_sha256_hex(digest) or not Integrity::valid_sha256_hex(metadata_digest)
+            return ResultCode.InvalidConfiguration if not trust_state_identity_valid(package) or not PackageIdentity::valid_version(version) or not Integrity::valid_sha256_hex(digest) or not Integrity::valid_sha256_hex(metadata_digest)
             parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
             return ResultCode.InvalidConfiguration if not SemVer::parse(version, &parsed) or parsed.prerelease
             package_value: mutable darray[u8] = []
@@ -1943,7 +1675,7 @@ module Registry:
             registry_push_text(&lock_path, ".lock")
             if lock_path.count > 4096:
                 return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable)
-            if not bytes_equal(lock_path, lock_path_snapshot):
+            if not RegistryBytes::equal(lock_path, lock_path_snapshot):
                 return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable)
             state: mutable darray[u8] = []
             read_status: ResultCode = trust_state_read(state_path, &state)
@@ -1965,12 +1697,12 @@ module Registry:
             if not configured_root(&root_after_clock):
                 return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable)
             clock_root_key_identity: mutable darray[u8] = []
-            if not make_root_key_identity(root_after_clock, &clock_root_key_identity) or not bytes_equal(clock_root_key_identity, root_key_identity):
+            if not make_root_key_identity(root_after_clock, &clock_root_key_identity) or not RegistryBytes::equal(clock_root_key_identity, root_key_identity):
                 return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable)
             return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if clock_missing and state.count > 23.usize()
             current_state_digest: mutable darray[u8] = []
             return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if not trust_state_digest(state, &current_state_digest)
-            return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if not clock_missing and not bytes_equal(observed_state_digest, current_state_digest)
+            return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if not clock_missing and not RegistryBytes::equal(observed_state_digest, current_state_digest)
             now: i64 = Platform::pkg_wall_clock_seconds()
             return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if now < 0
             return trust_state_finish(lock_fd, ResultCode.ClockRollback) if observed_clock > now.u64()
@@ -1985,7 +1717,7 @@ module Registry:
             previous: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
             return trust_state_finish(lock_fd, ResultCode.TrustStateMalformed) if not SemVer::parse(previous_version, &previous)
             return trust_state_finish(lock_fd, ResultCode.RollbackDetected) if SemVer::compare(parsed, previous) < 0
-            if SemVer::compare(parsed, previous) == 0 and (not bytes_equal(previous_digest, digest_value) or not bytes_equal(previous_metadata_digest, metadata_digest_value)):
+            if SemVer::compare(parsed, previous) == 0 and (not RegistryBytes::equal(previous_digest, digest_value) or not RegistryBytes::equal(previous_metadata_digest, metadata_digest_value)):
                 return trust_state_finish(lock_fd, ResultCode.DigestMismatch)
             return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if SemVer::compare(parsed, previous) > 0
             if now.u64() > observed_clock:
@@ -2025,7 +1757,7 @@ module Registry:
             registry_push_array(&state_path, state_path_snapshot)
             lock_path.resize(0)
             registry_push_array(&lock_path, lock_path_snapshot)
-            return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if not bytes_equal(lock_path, lock_path_snapshot)
+            return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if not RegistryBytes::equal(lock_path, lock_path_snapshot)
             state: mutable darray[u8] = []
             read_status: ResultCode = trust_tuf_state_read(state_path, &state)
             return trust_state_finish(lock_fd, read_status) if read_status != ResultCode.Ok
@@ -2043,7 +1775,7 @@ module Registry:
             return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if clock_missing and state.count > 0.usize()
             current_state_digest: mutable darray[u8] = []
             return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if not trust_state_digest(state, &current_state_digest)
-            return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if not clock_missing and not bytes_equal(observed_state_digest, current_state_digest)
+            return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if not clock_missing and not RegistryBytes::equal(observed_state_digest, current_state_digest)
             now: i64 = Platform::pkg_wall_clock_seconds()
             return trust_state_finish(lock_fd, ResultCode.ClockUnavailable) if now < 0
             return trust_state_finish(lock_fd, ResultCode.ClockRollback) if observed_clock > now.u64()
@@ -2056,7 +1788,7 @@ module Registry:
             if not trust_tuf_state_merge(state, scoped_batch, &updated_state, &merge_status):
                 return trust_state_finish(lock_fd, merge_status)
 
-            if bytes_equal(updated_state, state):
+            if RegistryBytes::equal(updated_state, state):
                 if clock_missing or observed_clock < now.u64():
                     clock_path.resize(0)
                     registry_push_array(&clock_path, state_path_snapshot)
@@ -2129,7 +1861,7 @@ module Registry:
             return trust_state_finish(lock_fd, clock_status) if clock_status != ResultCode.Ok
             return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if clock_missing
             current_state_digest: mutable darray[u8] = []
-            return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if not trust_state_digest(state, &current_state_digest) or not bytes_equal(observed_state_digest, current_state_digest)
+            return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if not trust_state_digest(state, &current_state_digest) or not RegistryBytes::equal(observed_state_digest, current_state_digest)
             now: i64 = Platform::pkg_wall_clock_seconds()
             return trust_state_finish(lock_fd, ResultCode.ClockUnavailable) if now < 0
             return trust_state_finish(lock_fd, ResultCode.ClockRollback) if observed_clock > now.u64()
@@ -2458,18 +2190,9 @@ module Registry:
             encoded.push(10)
             return trust_state_write(path, encoded)
 
-        def metadata_root_object(raw: darray[u8]&) -> bool:
-            return Json::root_object_end(raw, Json::root_start(raw)) < raw.count
-
         const max_metadata_lifetime_seconds: u64 = 2592000
 
         def metadata_expiry_status(expires: u64, now: u64) -> ResultCode:
             return ResultCode.ExpiredMetadata if expires <= now
             return ResultCode.ExpiryHorizon if expires - now > max_metadata_lifetime_seconds
             return ResultCode.Ok
-
-        def bytes_equal(left: darray[u8]&, right: darray[u8]&) -> bool:
-            return false if left.count != right.count
-            for index in 0..<left.count |left, right|:
-                return false if left[index] != right[index]
-            return true
