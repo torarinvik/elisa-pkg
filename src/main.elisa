@@ -385,6 +385,59 @@ module Cli:
 
         # ---------- command line --------------------------------------------------------------
 
+        # Read the optional `--manifest-path PATH` before `--`. Returns false
+        # for a repeated, missing, empty, oversized, or flag-like path.
+        def read_manifest_path(argument_count: i64, slots: mutable cstr&&, manifest_path: mutable darray[u8]&, has_manifest_path: mutable bool&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            while scan_index < argument_count |scan_index: i64 = 2|:
+                scan_flag: cstr = slots[scan_index].cast[cstr]
+                break if Platform::c_string_equal(scan_flag, "--")
+                if Platform::c_string_equal(scan_flag, "--manifest-path"):
+                    return false if has_manifest_path or scan_index + 1 >= argument_count
+                    ByteText::append_bounded_text(manifest_path, slots[scan_index + 1].cast[cstr])
+                    return false if:
+                        manifest_path.count == 0.usize() or manifest_path.count > 4096.usize()
+                        manifest_path.count >= 2.usize() and manifest_path[0] == 45 and manifest_path[1] == 45
+                    has_manifest_path <- true
+                    scan_index <- scan_index + 2
+                else:
+                    scan_index <- scan_index + 1
+            return true
+
+        # Run a command that needs a recovered project transaction.
+        def dispatch_project_command(command: cstr, effective_argument_count: i64, dispatch_slots: mutable cstr&&, start: mutable darray[u8]&, options: Model::CommandOptions, publish_dry_run: bool) -> i64 can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global{Read,Write}:
+                if Platform::c_string_equal(command, "check-manifest"):
+                    return run_check(start, options)
+                if Platform::c_string_equal(command, "resolve"):
+                    return ResolutionCommand::resolve(start, options, false, true)
+                if Platform::c_string_equal(command, "tree"):
+                    return ResolutionCommand::tree(start, options)
+                if Platform::c_string_equal(command, "why"):
+                    return ResolutionCommand::why(effective_argument_count, dispatch_slots, start, options)
+                if Platform::c_string_equal(command, "metadata"):
+                    return run_metadata(start, options)
+                if Platform::c_string_equal(command, "publish"):
+                    return run_publish_dry_run(start, options) if publish_dry_run
+                    return run_publish()
+                if Platform::c_string_equal(command, "install"):
+                    return run_install(effective_argument_count, dispatch_slots, start, options)
+                if Platform::c_string_equal(command, "clean"):
+                    return MaintenanceCommand::clean()
+                if Platform::c_string_equal(command, "cache"):
+                    return MaintenanceCommand::run_cache(effective_argument_count, dispatch_slots, start)
+                if Platform::c_string_equal(command, "package"):
+                    return run_package(effective_argument_count, dispatch_slots, start)
+                if Platform::c_string_equal(command, "build") or Platform::c_string_equal(command, "run") or Platform::c_string_equal(command, "test"):
+                    return BuildCommand::run(start, options) if Platform::c_string_equal(command, "build")
+                    if Platform::c_string_equal(command, "run"):
+                        region build_status_scope:
+                            build_status: i64 = BuildCommand::run(start, options)
+                            return build_status if build_status != CliStatus::success
+                        return ProgramCommand::run(effective_argument_count, dispatch_slots, options, "bin")
+                    return run_test(effective_argument_count, dispatch_slots, start, options)
+                CliOutput::write_error("error: unknown command; run `elisapkg --help`\n")
+                return CliStatus::usage
+
         def cli_main(argument_count: i64, argument_vector: mutable void&) -> i64 can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global{Read,Write}:
                 slots: mutable cstr&& = argument_vector.cast[mutable cstr&&]
@@ -408,21 +461,7 @@ module Cli:
                     return run_initialize(initialize_argument_count, (&initialize_slots[0]).cast[mutable cstr&&] can Unsafe.PointerCast)
                 manifest_path: mutable darray[u8] = []
                 has_manifest_path: mutable bool = false
-                region scan_index_scope:
-                    scan_index: mutable i64 = 2
-                    while scan_index < argument_count |slots, manifest_path, has_manifest_path, scan_index|:
-                        scan_flag: cstr = slots[scan_index].cast[cstr]
-                        break if Platform::c_string_equal(scan_flag, "--")
-                        if Platform::c_string_equal(scan_flag, "--manifest-path"):
-                            return CliStatus::usage if has_manifest_path or scan_index + 1 >= argument_count
-                            ByteText::append_bounded_text(&manifest_path, slots[scan_index + 1].cast[cstr])
-                            return CliStatus::usage if:
-                                manifest_path.count == 0.usize() or manifest_path.count > 4096.usize()
-                                manifest_path.count >= 2.usize() and manifest_path[0] == 45 and manifest_path[1] == 45
-                            has_manifest_path <- true
-                            scan_index <- scan_index + 2
-                        else:
-                            scan_index <- scan_index + 1
+                return CliStatus::usage if not read_manifest_path(argument_count, slots, &manifest_path, &has_manifest_path)
                 effective_argument_count: mutable i64 = argument_count
                 effective_slots: mutable cstr&& = slots
                 compacted: mutable darray[cstr] = []
@@ -462,37 +501,7 @@ module Cli:
                 if Platform::c_string_equal(command, "fetch"):
                     return FetchCommand::run(effective_argument_count, dispatch_slots, &start, options)
                 return CliStatus::security_failed if not ProjectTransaction::recover()
-                if Platform::c_string_equal(command, "check-manifest"):
-                    return run_check(&start, options)
-                if Platform::c_string_equal(command, "resolve"):
-                    return ResolutionCommand::resolve(&start, options, false, true)
-                if Platform::c_string_equal(command, "tree"):
-                    return ResolutionCommand::tree(&start, options)
-                if Platform::c_string_equal(command, "why"):
-                    return ResolutionCommand::why(effective_argument_count, dispatch_slots, &start, options)
-                if Platform::c_string_equal(command, "metadata"):
-                    return run_metadata(&start, options)
-                if Platform::c_string_equal(command, "publish"):
-                    return run_publish_dry_run(start, options) if publish_dry_run
-                    return run_publish()
-                if Platform::c_string_equal(command, "install"):
-                    return run_install(effective_argument_count, dispatch_slots, &start, options)
-                if Platform::c_string_equal(command, "clean"):
-                    return MaintenanceCommand::clean()
-                if Platform::c_string_equal(command, "cache"):
-                    return MaintenanceCommand::run_cache(effective_argument_count, dispatch_slots, start)
-                if Platform::c_string_equal(command, "package"):
-                    return run_package(effective_argument_count, dispatch_slots, &start)
-                if Platform::c_string_equal(command, "build") or Platform::c_string_equal(command, "run") or Platform::c_string_equal(command, "test"):
-                    return BuildCommand::run(&start, options) if Platform::c_string_equal(command, "build")
-                    if Platform::c_string_equal(command, "run"):
-                        region build_status_scope:
-                            build_status: i64 = BuildCommand::run(&start, options)
-                            return build_status if build_status != CliStatus::success
-                        return ProgramCommand::run(effective_argument_count, dispatch_slots, options, "bin")
-                    return run_test(effective_argument_count, dispatch_slots, &start, options)
-                CliOutput::write_error("error: unknown command; run `elisapkg --help`\n")
-                return CliStatus::usage
+                return dispatch_project_command(command, effective_argument_count, dispatch_slots, &start, options, publish_dry_run)
 
     public:
         # The only public command surface. Platform, model, and trust-policy
