@@ -125,51 +125,16 @@ module Solver:
                 preferences.count > maximum_packages
             return SolveCode.Malformed if candidates.count == 0.usize()
             package_slots: mutable darray[usize] = []
-            total_dependencies: mutable usize = 0.usize()
-            for candidate_index in 0..<candidates.count |candidates, package_slots, total_dependencies|:
-                return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
-                return SolveCode.Malformed if not PackageIdentity::valid_name(candidates[candidate_index].package)
-                return SolveCode.ResourceLimit if not solver_charge_work(work, candidates[candidate_index].package.count)
-                # Version values are normalized by the provider boundary, but
-                # prereleases are outside the v1 graph identity. Reject them at
-                # this API boundary so unchecked callers cannot create an
-                # ambiguous duplicate/version ordering.
-                return SolveCode.Malformed if candidates[candidate_index].version.prerelease
-                existing: mutable bool = false
-                for slot_index in 0..<package_slots.count |candidates, package_slots, candidate_index, existing|:
-                    return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
-                    existing <- true if solver_equal(candidates[package_slots[slot_index]].package, candidates[candidate_index].package, work)
-                    return SolveCode.ResourceLimit if solver_work_exhausted(work)
-                if not existing:
-                    package_slots <- package_slots.push(candidate_index)
-                    return SolveCode.ResourceLimit if package_slots.count > maximum_packages
-                dependency_count: usize = candidates[candidate_index].dependencies.count
-                return SolveCode.ResourceLimit if dependency_count > maximum_constraints or total_dependencies > maximum_constraints - dependency_count
-                total_dependencies <- total_dependencies + dependency_count
-                for dependency_index in 0..<candidates[candidate_index].dependencies.count |candidates, candidate_index|:
-                    return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
-                    validation: SolveCode =
-                        dependency: Constraint = candidates[candidate_index].dependencies[dependency_index]
-                        validate_constraint(dependency, work)
-                    return validation if validation != SolveCode.Solved
-                for previous in 0..<candidate_index |candidates, candidate_index|:
-                    return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
-                    same_package: bool = solver_equal(candidates[previous].package, candidates[candidate_index].package, work)
-                    return SolveCode.ResourceLimit if solver_work_exhausted(work)
-                    return SolveCode.Malformed if same_package and SemVer::compare(candidates[previous].version, candidates[candidate_index].version) == 0
+            region candidate_status_scope:
+                candidate_status: SolveCode = index_candidates(candidates, &package_slots, work)
+                return candidate_status if candidate_status != SolveCode.Solved
             for root_index in 0..<roots.count |roots|:
                 return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
                 validation: SolveCode = validate_constraint(roots[root_index], work)
                 return validation if validation != SolveCode.Solved
-            for preference_index in 0..<preferences.count |preferences|:
-                return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
-                return SolveCode.Malformed if not PackageIdentity::valid_name(preferences[preference_index].package) or preferences[preference_index].version.prerelease
-                return SolveCode.ResourceLimit if not solver_charge_work(work, preferences[preference_index].package.count)
-                for previous in 0..<preference_index |preferences, preference_index|:
-                    return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
-                    duplicate_package: bool = solver_equal(preferences[previous].package, preferences[preference_index].package, work)
-                    return SolveCode.ResourceLimit if solver_work_exhausted(work)
-                    return SolveCode.Malformed if duplicate_package
+            region preference_status_scope:
+                preference_status: SolveCode = validate_preferences(preferences, work)
+                return preference_status if preference_status != SolveCode.Solved
             ordered_preferences: mutable darray[Preference] = []
             for preference_index in 0..<preferences.count |preferences, ordered_preferences|:
                 return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
@@ -203,6 +168,57 @@ module Solver:
             return SolveCode.ResourceLimit if not solver_charge_work(work, assigned.count)
             for slot in 0..<assigned.count |assigned, selected|:
                 selected.push(assigned[slot].usize()) if assigned[slot] >= 0
+            return SolveCode.Solved
+
+        # Validate every candidate and record the first candidate index of
+        # each distinct package as its slot. Same-package candidates must have
+        # distinct versions, and the total dependency count stays bounded.
+        def index_candidates(candidates: darray[Candidate]&, package_slots: mutable darray[usize]&, work: mutable WorkBudget&) -> SolveCode can[Memory.Allocate, Abort.Panic]:
+            total_dependencies: mutable usize = 0.usize()
+            for candidate_index in 0..<candidates.count |candidates, package_slots, total_dependencies|:
+                return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
+                return SolveCode.Malformed if not PackageIdentity::valid_name(candidates[candidate_index].package)
+                return SolveCode.ResourceLimit if not solver_charge_work(work, candidates[candidate_index].package.count)
+                # Version values are normalized by the provider boundary, but
+                # prereleases are outside the v1 graph identity. Reject them at
+                # this API boundary so unchecked callers cannot create an
+                # ambiguous duplicate/version ordering.
+                return SolveCode.Malformed if candidates[candidate_index].version.prerelease
+                existing: mutable bool = false
+                for slot_index in 0..<package_slots.count |candidates, package_slots, candidate_index, existing|:
+                    return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
+                    existing <- true if solver_equal(candidates[package_slots[slot_index]].package, candidates[candidate_index].package, work)
+                    return SolveCode.ResourceLimit if solver_work_exhausted(work)
+                if not existing:
+                    package_slots.push(candidate_index)
+                    return SolveCode.ResourceLimit if package_slots.count > maximum_packages
+                dependency_count: usize = candidates[candidate_index].dependencies.count
+                return SolveCode.ResourceLimit if dependency_count > maximum_constraints or total_dependencies > maximum_constraints - dependency_count
+                total_dependencies <- total_dependencies + dependency_count
+                for dependency_index in 0..<candidates[candidate_index].dependencies.count |candidates, candidate_index|:
+                    return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
+                    validation: SolveCode =
+                        dependency: Constraint = candidates[candidate_index].dependencies[dependency_index]
+                        validate_constraint(dependency, work)
+                    return validation if validation != SolveCode.Solved
+                for previous in 0..<candidate_index |candidates, candidate_index|:
+                    return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
+                    same_package: bool = solver_equal(candidates[previous].package, candidates[candidate_index].package, work)
+                    return SolveCode.ResourceLimit if solver_work_exhausted(work)
+                    return SolveCode.Malformed if same_package and SemVer::compare(candidates[previous].version, candidates[candidate_index].version) == 0
+            return SolveCode.Solved
+
+        # Preferences name valid, stable, pairwise distinct packages.
+        def validate_preferences(preferences: darray[Preference]&, work: mutable WorkBudget&) -> SolveCode:
+            for preference_index in 0..<preferences.count |preferences|:
+                return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
+                return SolveCode.Malformed if not PackageIdentity::valid_name(preferences[preference_index].package) or preferences[preference_index].version.prerelease
+                return SolveCode.ResourceLimit if not solver_charge_work(work, preferences[preference_index].package.count)
+                for previous in 0..<preference_index |preferences, preference_index|:
+                    return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
+                    duplicate_package: bool = solver_equal(preferences[previous].package, preferences[preference_index].package, work)
+                    return SolveCode.ResourceLimit if solver_work_exhausted(work)
+                    return SolveCode.Malformed if duplicate_package
             return SolveCode.Solved
 
         struct WorkBudget:
