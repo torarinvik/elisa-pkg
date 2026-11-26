@@ -1,0 +1,109 @@
+# Project file operations shared by commands and transaction recovery.
+include "../platform.elisa"
+include "../text/bytes.elisa"
+
+module ProjectFiles:
+    public:
+        def path_with_nul_into(path: darray[u8]&, out: mutable darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
+            out.resize(0)
+            for index in 0..<path.count |out, path|:
+                out.push(path[index])
+            out.push(0)
+
+        def make_directory(path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return true if path.count == 0.usize()
+            work: mutable darray[u8] = []
+            path_with_nul_into(path, &work)
+            for index in 1..<work.count |work, path|:
+                continue if work[index] != 47
+                work[index] <- 0
+                prefix: cstr = (&work[0]).cast[cstr] can Unsafe.PointerCast
+                created: i64 = Platform::pkg_mkdir(prefix, 493.u16())
+                valid: bool = Platform::pkg_fsync_parent(prefix) == 0 if created == 0 else Platform::pkg_is_directory(prefix) == 1
+                work[index] <- 47
+                return false if not valid
+            final_path: cstr = (&work[0]).cast[cstr] can Unsafe.PointerCast
+            created: i64 = Platform::pkg_mkdir(final_path, 493.u16())
+            return false if created == 0 and Platform::pkg_fsync_parent(final_path) != 0
+            return false if created != 0 and Platform::pkg_is_directory(final_path) != 1
+            return Platform::pkg_is_directory(final_path) == 1
+
+        def read_cstr_into(path_name: cstr, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            capacity: usize = out.count
+            return false if capacity == 0.usize() or capacity > 67108864.usize()
+            # Reserve one extra byte so a file exactly at the caller's bound
+            # remains distinguishable from an oversized file. Use the
+            # descriptor reader directly so bounded project reads share one
+            # implementation and do not allocate a stdio stream per call.
+            out.resize(capacity + 1.usize())
+            out_raw: mutable u8& = (&out[0]).cast[mutable u8&] can Unsafe.PointerCast
+            loaded: i64 = Platform::pkg_read_package_file(path_name, out_raw, out.count)
+            if loaded < 0 or loaded > capacity.i64():
+                out.resize(0)
+                return false
+            out.resize(loaded.usize())
+            return true
+
+        def write_fd_all(fd: i64, value: darray[u8]&) -> bool can[Unsafe.PointerCast, Console.Write]:
+            offset: mutable usize = 0.usize()
+            while offset < value.count |value, offset|:
+                value_raw: void& = (&value[offset]).cast[void&] can Unsafe.PointerCast
+                wrote: i64 = Platform::pkg_write(fd, value_raw, value.count - offset) can Console.Write
+                # A native write must never report more bytes than requested.
+                # Treat a malformed FFI result as a failed publication instead
+                # of allowing the cursor conversion below to overrun the
+                # caller's buffer or wrap an unsigned offset.
+                return false if wrote <= 0 or wrote > (value.count - offset).i64()
+                offset <- offset + wrote.usize()
+            return true
+
+        def write_cstr_file(path_name: cstr, value: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            # mkstemp provides an exclusive 0600 temporary file; fsync and rename make
+            # the lockfile transition atomic and prevent readers from seeing a prefix.
+            path_snapshot: mutable darray[u8] = []
+            ByteText::append_bounded_text(&path_snapshot, path_name)
+            template: mutable darray[u8] = []
+            ByteText::append(&template, path_snapshot)
+            ByteText::append_text(&template, ".tmp.XXXXXX")
+            template.push(0)
+            fd: i64 = Platform::pkg_mkstemp(&template)
+            return false if fd < 0
+            temp_snapshot: mutable darray[u8] = []
+            ByteText::append(&temp_snapshot, template)
+            if not write_fd_all(fd, value):
+                _ = Platform::pkg_close(fd)
+                return false
+            if Platform::pkg_fsync(fd) != 0:
+                _ = Platform::pkg_close(fd)
+                return false
+            if Platform::pkg_close(fd) != 0:
+                return false
+            temp_c: mutable darray[u8] = []
+            ByteText::append(&temp_c, temp_snapshot)
+            target_c: mutable darray[u8] = []
+            path_with_nul_into(&path_snapshot, &target_c)
+            temp_name: cstr = (&temp_c[0]).cast[cstr] can Unsafe.PointerCast
+            target_name: mutable cstr = (&target_c[0]).cast[cstr] can Unsafe.PointerCast
+            if Platform::pkg_rename(temp_name, target_name) != 0:
+                return false
+            target_c.resize(0)
+            path_with_nul_into(&path_snapshot, &target_c)
+            target_name <- (&target_c[0]).cast[cstr] can Unsafe.PointerCast
+            return Platform::pkg_fsync_parent(target_name) == 0
+
+        def cstr_file_exists(path_name: cstr) -> bool:
+            return Platform::pkg_access(path_name, 0) == 0
+
+        def remove_empty_directory(path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            path_c: mutable darray[u8] = []
+            path_with_nul_into(path, &path_c)
+            path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
+            result: i64 = Platform::pkg_rmdir(path_name)
+            return true if result == 0 or result == -2
+            return false
+
+        def remove_cstr_file(path_name: cstr) -> bool:
+            state: i64 = Platform::pkg_package_file_size(path_name)
+            return true if state == -2
+            return false if state < 0
+            return Platform::pkg_unlink(path_name) == 0

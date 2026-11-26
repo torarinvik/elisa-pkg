@@ -20,7 +20,7 @@ DIGEST = hashlib.sha256(ARTIFACT).hexdigest().encode("ascii")
 def check_install_recovery_sync_order() -> None:
     source = (ROOT / "src/main.elisa").read_text(encoding="utf-8")
     retire_start = source.find("def retire_local_install_transaction(")
-    retire_end = source.find("def remove_empty_directory(", retire_start)
+    retire_end = source.find("def remove_build_directory_if_empty(", retire_start)
     if retire_start < 0 or retire_end < 0:
         raise SystemExit("error: durable local install transaction retirement helper is missing")
     retire = source[retire_start:retire_end]
