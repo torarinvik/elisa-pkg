@@ -70,6 +70,7 @@ import os
 import sys
 
 try:
+    os.chmod(sys.argv[1], 0o755)
     os.replace(sys.argv[1], sys.argv[2])
 except OSError as error:
     raise SystemExit(f"error: unable to publish elisapkg: {error}") from error

@@ -16,7 +16,8 @@ does not prevent a merge. The attestation job runs after a successful test job
 on a push to `refs/heads/main`; it does not run on pull requests.
 
 For qualifying main-branch pushes, the test job creates a build candidate
-manifest and normalized tar archive, then uploads those files and the tested
+manifest and normalized tar archive. Bootstrap builds publish the executable
+with mode `0755` regardless of the build umask. The job then uploads those files and the tested
 executable as a 90-day Actions artifact. A separate Ubuntu job downloads and
 validates the candidate. It does not check out the repository or execute the
 candidate binary. Only this job receives `id-token: write` and
