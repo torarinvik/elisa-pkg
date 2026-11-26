@@ -4,24 +4,30 @@
 # one absolute source path and receive a single include directive only after
 # the path has been validated as safe to place inside a quoted source literal.
 
+include "./integrity.elisa"
 include "./text/bytes.elisa"
 
 module Build:
     public:
         def receipt_size(prefix_bytes: usize) -> usize:
-            # The digest record adds a 24-byte label, 64 hex digits, and LF.
-            return prefix_bytes + 89.usize()
+            return prefix_bytes + digest_label_bytes + digest_hex_bytes + 1.usize()
 
         def append_receipt_digest(receipt: mutable darray[u8]&, digest: darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
-            ByteText::append_text(receipt, "\nartifact-digest:sha256:")
+            ByteText::append_text(receipt, digest_label)
             ByteText::append(receipt, digest)
             receipt.push(10)
 
-        def receipt_matches(receipt: darray[u8]&, prefix: darray[u8]&, digest: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            return false if not ByteText::starts_with(receipt, prefix)
-            suffix: mutable darray[u8] = []
-            append_receipt_digest(&suffix, digest)
-            return ByteText::range_equals(receipt, prefix.count, receipt.count, suffix)
+        def receipt_header_matches(receipt: darray[u8]&, prefix: darray[u8]&) -> bool:
+            return false if receipt.count != receipt_size(prefix.count) or not ByteText::starts_with(receipt, prefix)
+            digest_start: usize = prefix.count + digest_label_bytes
+            digest_end: usize = receipt.count - 1.usize()
+            return receipt[digest_end] == 10 and ByteText::range_equals_text(receipt, prefix.count, digest_start, digest_label) and Integrity::valid_sha256_hex_range(receipt, digest_start, digest_end)
+
+        # Called after the receipt header has been checked.
+        def receipt_digest_matches(receipt: darray[u8]&, digest: darray[u8]&) -> bool:
+            return false if receipt.count < digest_hex_bytes + 1.usize() or digest.count != digest_hex_bytes
+            digest_end: usize = receipt.count - 1.usize()
+            return ByteText::range_equals(receipt, digest_end - digest_hex_bytes, digest_end, digest)
 
         # An empty project root means the current working directory.
         def output_directory(project_root: darray[u8]&, release: bool) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
@@ -57,6 +63,10 @@ module Build:
             return true
 
     private:
+        const digest_label: cstr = "\nartifact-digest:sha256:"
+        const digest_label_bytes: usize = 24.usize()
+        const digest_hex_bytes: usize = 64.usize()
+
         const max_include_path_bytes: usize = 4096
 
         def build_valid_include_path(path: darray[u8]&, path_length: usize) -> bool:
