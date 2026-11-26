@@ -85,6 +85,18 @@ return false if:
     finish > bytes.count
 ```
 
+Once the package manager's compiler supports `if not:`, use a negated guard list
+when every condition must hold. The guard returns at the first false condition.
+
+```elisa
+return false if not:
+    BuildReceipt::receipt_header_matches(cached_receipt, expected_prefix)
+    ProjectFiles::valid_path_bytes(artifact)
+```
+
+On toolchains that reject `if not:`, use `if:` with `not` on each condition to
+preserve the same evaluation order and short-circuit behavior.
+
 ## 2. Block expressions
 
 A binding whose initializer is an indented block; the last line is the value, and locals
