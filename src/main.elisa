@@ -35,6 +35,7 @@ include "./cli/arguments.elisa"
 include "./cli/output.elisa"
 include "./source/fingerprint.elisa"
 include "./source/snapshots.elisa"
+include "./resolution/local_build_graph.elisa"
 include "./project/transaction.elisa"
 
 module Cli:
@@ -50,22 +51,9 @@ module Cli:
         const PROGRAM_TIMEOUT_MS: i64 = 120000
         const MAX_DEPENDENCIES: usize = 4096
         const MAX_BUILD_GRAPH_EDGES: usize = 65536.usize()
-        const MAX_BUILD_AGGREGATE_BYTES: usize = 33554432.usize()
         # Package version identities share the SemVer parser's bounded length.
         # Install metadata then adds only bounded paths, names, and fixed fields.
         const MAX_INSTALL_VERSION_BYTES: usize = SemVer::max_version_bytes
-
-        struct LocalBuildPackage:
-            name: mutable darray[u8]
-            root: mutable darray[u8]
-            entry: mutable darray[u8]
-            relative_entry: mutable darray[u8]
-            source_digest: mutable darray[u8]
-            snapshot_entry: mutable darray[u8]
-            dependency_names: mutable darray[u8]
-            dependents: mutable darray[usize]
-            remaining_dependencies: mutable usize
-            emitted: mutable bool
 
         # ---------- path and file primitives --------------------------------------------------
 
@@ -3889,18 +3877,6 @@ module Cli:
                     in_string <- false
             return true
 
-        def local_build_package_index(packages: darray[LocalBuildPackage]&, wanted: darray[u8]&) -> usize:
-            lower: mutable usize = 0.usize()
-            upper: mutable usize = packages.count
-            while lower < upper |packages, wanted, lower, upper|:
-                middle: usize = lower + (upper - lower) / 2.usize()
-                return middle if ByteText::equal(packages[middle].name, wanted)
-                if ByteText::less(packages[middle].name, wanted):
-                    lower <- middle + 1.usize()
-                else:
-                    upper <- middle
-            return packages.count
-
         def select_unique_library_entry(raw: darray[u8]&, package_root: darray[u8]&, out: mutable darray[u8]&, relative_out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out.resize(0)
             relative_out.resize(0)
@@ -3915,7 +3891,7 @@ module Cli:
             ByteText::append(relative_out, selected_entry)
             return true
 
-        def build_local_dependency_aggregate[@r](lock: darray[u8]&, start: darray[u8]&, root_entry: cstr, source_byte_budget: usize, aggregate: mutable darray[u8]&, has_dependencies: mutable bool&, packages: mutable darray[LocalBuildPackage]& @r, order: mutable darray[usize]& @r) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+        def build_local_dependency_aggregate[@r](lock: darray[u8]&, start: darray[u8]&, root_entry: cstr, source_byte_budget: usize, aggregate: mutable darray[u8]&, has_dependencies: mutable bool&, packages: mutable darray[LocalBuildGraph::Package]& @r, order: mutable darray[usize]& @r) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             aggregate.resize(0)
             has_dependencies <- false
             packages.resize(0)
@@ -3994,7 +3970,7 @@ module Cli:
                 total_graph_edges <- total_graph_edges + package_edges
                 snapshot_entry: mutable darray[u8] @r = []
                 dependents: mutable darray[usize] @r = []
-                packages.push(LocalBuildPackage{name: package_name, root: canonical_root, entry: library_entry, relative_entry: relative_entry, source_digest: source_digest, snapshot_entry: snapshot_entry, dependency_names: dependency_names, dependents: dependents, remaining_dependencies: 0, emitted: false})
+                packages.push(LocalBuildGraph::Package{name: package_name, root: canonical_root, entry: library_entry, relative_entry: relative_entry, source_digest: source_digest, snapshot_entry: snapshot_entry, dependency_names: dependency_names, dependents: dependents, remaining_dependencies: 0, emitted: false})
                 cursor <- record_end + 1.usize()
                 while cursor < packages_end and (lock[cursor] == 32 or lock[cursor] == 9 or lock[cursor] == 10 or lock[cursor] == 13) |lock, cursor|:
                     cursor <- cursor + 1.usize()
@@ -4004,44 +3980,7 @@ module Cli:
             if packages.count == 0.usize():
                 return true
             has_dependencies <- true
-            for package_index in 0..<packages.count |packages|:
-                dependency_cursor: mutable usize = 0.usize()
-                while dependency_cursor < packages[package_index].dependency_names.count:
-                    dependency_end: mutable usize = dependency_cursor
-                    while dependency_end < packages[package_index].dependency_names.count and packages[package_index].dependency_names[dependency_end] != 0 |packages, dependency_end|:
-                        dependency_end <- dependency_end + 1.usize()
-                    dependency_name: mutable darray[u8] = []
-                    for byte_index in dependency_cursor..<dependency_end |dependency_name, packages|:
-                        dependency_name.push(packages[package_index].dependency_names[byte_index])
-                    dependency_index: usize = local_build_package_index(packages, dependency_name)
-                    return false if dependency_end == dependency_cursor or dependency_index >= packages.count
-                    packages[package_index].remaining_dependencies <- packages[package_index].remaining_dependencies + 1.usize()
-                    packages[dependency_index].dependents.push(package_index)
-                    dependency_cursor <- dependency_end + 1.usize()
-            completed: mutable usize = 0.usize()
-            while completed < packages.count |packages, completed, aggregate|:
-                selected: mutable usize = packages.count
-                for candidate in 0..<packages.count |packages, selected|:
-                    if not packages[candidate].emitted and packages[candidate].remaining_dependencies == 0.usize():
-                        selected <- candidate
-                        break
-                return false if selected >= packages.count
-                return false if not Build::append_include_path(packages[selected].entry, aggregate)
-                order.push(selected)
-                packages[selected].emitted <- true
-                completed <- completed + 1.usize()
-                return false if aggregate.count > MAX_BUILD_AGGREGATE_BYTES
-                for dependent_index in 0..<packages[selected].dependents.count |packages, selected, dependent_index|:
-                    dependent: usize = packages[selected].dependents[dependent_index]
-                    return false if packages[dependent].remaining_dependencies == 0.usize()
-                    packages[dependent].remaining_dependencies <- packages[dependent].remaining_dependencies - 1.usize()
-            root_entry_bytes: mutable darray[u8] = []
-            root_entry_length: usize = Platform::pkg_strlen(root_entry)
-            return false if root_entry_length == 0.usize() or root_entry_length > 4096.usize()
-            for index in 0..<root_entry_length |root_entry_bytes, root_entry|:
-                root_entry_bytes.push(root_entry[index].u8())
-            return false if not Build::append_include_path(root_entry_bytes, aggregate) or aggregate.count > MAX_BUILD_AGGREGATE_BYTES
-            return true
+            return LocalBuildGraph::write_ordered_includes(packages, order, root_entry, aggregate)
 
         def run_build(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global{Read,Write}:
@@ -4129,7 +4068,7 @@ module Cli:
                 region build_state(67108864):
                     # Retain package records and their nested buffers after the planner
                     # returns by tying allocations to the caller's output region.
-                    dependency_packages: mutable darray[LocalBuildPackage] @build_state = []
+                    dependency_packages: mutable darray[LocalBuildGraph::Package] @build_state = []
                     dependency_order: mutable darray[usize] @build_state = []
                     source_snapshot_container_storage: mutable darray[u8] @build_state = []
                     source_snapshot_container_name: mutable cstr = ""
@@ -4351,7 +4290,6 @@ module Cli:
                         if package_index >= dependency_packages.count:
                             dependency_snapshots_ok <- false
                             break
-                        dependency_packages[package_index].snapshot_entry.resize(0)
                         snapshot_status: i64 = BuildSnapshots::create_verified(source_snapshot_root, dependency_packages[package_index].root, "dependency", dependency_packages[package_index].source_digest, dependency_packages[package_index].relative_entry, &source_snapshot_roots, &snapshot_total_bytes, &snapshot_package_root, &dependency_packages[package_index].snapshot_entry)
                         if snapshot_status != 0:
                             dependency_snapshots_ok <- false
@@ -4379,7 +4317,7 @@ module Cli:
                             if package_index >= dependency_packages.count or not Build::append_include_path(dependency_packages[package_index].snapshot_entry, &compiler_dependency_aggregate):
                                 dependency_aggregate_ok <- false
                                 break
-                        if not dependency_aggregate_ok or not Build::append_include_path(root_snapshot_entry, &compiler_dependency_aggregate) or compiler_dependency_aggregate.count > MAX_BUILD_AGGREGATE_BYTES:
+                        if not dependency_aggregate_ok or not Build::append_include_path(root_snapshot_entry, &compiler_dependency_aggregate) or compiler_dependency_aggregate.count > LocalBuildGraph::maximum_aggregate_bytes:
                             _ = BuildSnapshots::remove_all(source_snapshot_container_name, source_snapshot_roots)
                             CliOutput::write_error("error: verified dependency aggregate exceeds the configured build limit\n")
                             return EXIT_BUILD
