@@ -1,0 +1,89 @@
+# Persist content-addressed registry archives, signed metadata, and receipts.
+include "../archive.elisa"
+include "../cache.elisa"
+include "../integrity.elisa"
+include "../json.elisa"
+include "../platform.elisa"
+include "../project/files.elisa"
+include "../text/bytes.elisa"
+
+module RegistryCache:
+    public:
+        def store_archive(digest: darray[u8]&, content: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            return false if not Archive::verify_ustar_archive(content)
+            return store_verified_bytes(digest, content)
+
+        # Store metadata and its detached signature after registry authentication.
+        def store_metadata(metadata_digest: darray[u8]&, metadata: darray[u8]&, signature: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            return false if metadata.count == 0.usize() or metadata.count > Json::max_document_bytes or signature.count != 64.usize()
+            return false if not store_verified_bytes(metadata_digest, metadata)
+            signature_path: mutable darray[u8] = []
+            return false if not Cache::registry_signature_path(metadata_digest, &signature_path)
+            signature_c: mutable darray[u8] = []
+            ProjectFiles::path_with_nul_into(&signature_path, &signature_c)
+            signature_name: cstr = (&signature_c[0]).cast[cstr] can Unsafe.PointerCast
+            if not ProjectFiles::cstr_file_exists(signature_name):
+                status: i64 = ProjectFiles::write_cstr_file_noclobber_status(signature_name, signature)
+                # A concurrent publication is acceptable only if the final
+                # detached signature is the same one we intended to store.
+                return false if status != 0 and status != -17
+            existing: mutable darray[u8] = []
+            return false if not Cache::read_registry_signature(metadata_digest, &existing)
+            return ByteText::equal(existing, signature)
+
+        def read_metadata(metadata_digest: darray[u8]&, metadata_out: mutable darray[u8]&, signature_out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            metadata_out.resize(0)
+            signature_out.resize(0)
+            metadata: mutable darray[u8] = []
+            return false if not Cache::read_verified_blob(metadata_digest, Json::max_document_bytes, &metadata)
+            signature: mutable darray[u8] = []
+            return false if not Cache::read_registry_signature(metadata_digest, &signature)
+            for index in 0..<metadata.count |metadata_out, metadata|:
+                metadata_out.push(metadata[index])
+            for index in 0..<signature.count |signature_out, signature|:
+                signature_out.push(signature[index])
+            return true
+
+        def store_receipt(package: darray[u8]&, version: darray[u8]&, archive: darray[u8]&, archive_size: u64, digest: darray[u8]&, metadata_digest: darray[u8]&, expires: u64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            path: mutable darray[u8] = []
+            return false if not Cache::registry_receipt_path(digest, metadata_digest, &path)
+            parent: mutable darray[u8] = []
+            return false if not Cache::shard_path(digest, &parent)
+            return false if not ProjectFiles::make_directory(&parent)
+            receipt: darray[u8] = Cache::encode_registry_receipt(package, version, archive, archive_size, digest, metadata_digest, expires)
+            return false if receipt.count == 0.usize()
+            path_c: mutable darray[u8] = []
+            ProjectFiles::path_with_nul_into(&path, &path_c)
+            path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
+            if not ProjectFiles::cstr_file_exists(path_name):
+                publication_status: i64 = ProjectFiles::write_cstr_file_noclobber_status(path_name, receipt)
+                return false if publication_status != 0 and publication_status != -17
+            existing: mutable darray[u8] = []
+            return Cache::read_registry_receipt(digest, metadata_digest, &existing) and ByteText::equal(existing, receipt)
+
+    private:
+        def store_verified_bytes(digest: darray[u8]&, content: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            # Cache publication is content-addressed and immutable. Verify the bytes
+            # before creating any cache entry, then revalidate the final pathname after
+            # the exclusive link so a concurrent writer or replacement cannot turn a
+            # successful fetch into an unverified cache hit.
+            digest_bytes: mutable darray[u8] = []
+            actual: mutable darray[u8] = []
+            return false if Integrity::sha256(content, &digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(digest_bytes, &actual) or not ByteText::equal(actual, digest)
+            blob_path: mutable darray[u8] = []
+            return false if not Cache::blob_path(digest, &blob_path)
+            cache_parent: mutable darray[u8] = []
+            return false if not Cache::shard_path(digest, &cache_parent)
+            return false if not ProjectFiles::make_directory(&cache_parent)
+            blob_name: mutable darray[u8] = []
+            ProjectFiles::path_with_nul_into(&blob_path, &blob_name)
+            blob_c: cstr = (&blob_name[0]).cast[cstr] can Unsafe.PointerCast
+            if ProjectFiles::cstr_file_exists(blob_c):
+                return true if Cache::verify_blob(digest)
+                quarantine_parent: mutable darray[u8] = []
+                ByteText::append_text(&quarantine_parent, Cache::quarantine_directory)
+                return false if not ProjectFiles::make_directory(&quarantine_parent)
+                return false if not Cache::quarantine_blob(digest)
+            publication_status: i64 = ProjectFiles::write_cstr_file_noclobber_status(blob_c, content)
+            return Cache::verify_blob(digest) if publication_status == 0 or publication_status == -17
+            return false
