@@ -62,15 +62,25 @@ module ProjectTransaction:
             return false if not ProjectFiles::remove_empty_directory(&guard)
             return ProjectFiles::remove_cstr_file(".elisapkg/transaction.state")
 
-        def published_lock_matches_stage() -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            staged_lock: mutable darray[u8] = []
-            staged_lock.resize(1048577)
-            current_lock: mutable darray[u8] = []
-            current_lock.resize(1048577)
+        def live_file_matches(expected_path: cstr, live_path: cstr) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            expected: mutable darray[u8] = []
+            expected.resize(1048577)
+            live: mutable darray[u8] = []
+            live.resize(1048577)
             return false if:
-                not ProjectFiles::read_cstr_into(".elisapkg/transaction.new-lock", &staged_lock)
-                not ProjectFiles::read_cstr_into("elisapkg.lock", &current_lock)
-            return ByteText::equal(staged_lock, current_lock)
+                not ProjectFiles::read_cstr_into(expected_path, &expected)
+                not ProjectFiles::read_cstr_into(live_path, &live)
+            return ByteText::equal(expected, live)
+
+        def published_manifest_matches_journal() -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            state: mutable darray[u8] = []
+            state.resize(128)
+            return false if not ProjectFiles::read_cstr_into(".elisapkg/transaction.state", &state)
+            if ByteText::equal_text(state, "prepared-lock\n") or ByteText::equal_text(state, "prepared-no-lock\n"):
+                return live_file_matches(".elisapkg/transaction.manifest", "elisapkg.json")
+            if ByteText::equal_text(state, "manifest-pending\n") or ByteText::equal_text(state, "manifest-replaced\n"):
+                return live_file_matches(".elisapkg/transaction.new-manifest", "elisapkg.json")
+            return false
 
         def report_recovery_error(message: cstr) -> void can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             bytes: mutable darray[u8] = []
@@ -300,7 +310,11 @@ module ProjectTransaction:
         def commit() -> bool can[Global{Read,Write}, Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             can Global{Read,Write}:
                 return false if transaction_lock_fd < 0
-                if not published_lock_matches_stage():
+                if not published_manifest_matches_journal():
+                    report_recovery_error("error: published manifest does not match the transaction journal\n")
+                    _ = restore()
+                    return false
+                if not live_file_matches(".elisapkg/transaction.new-lock", "elisapkg.lock"):
                     report_recovery_error("error: published lockfile does not match the staged transaction bytes\n")
                     _ = restore()
                     return false
