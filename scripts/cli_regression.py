@@ -58,7 +58,13 @@ with tempfile.TemporaryDirectory(prefix='cli-review-', dir=ROOT / 'build') as di
     result = subprocess.run([BIN, 'check-manifest'], cwd=blocked_project,
                             capture_output=True, timeout=120, check=False)
     assert result.returncode == 5, result
-    for arguments, expected in ((['foo'], 2), (['foo', '1.0.0', '--offline'], 3), ([], 5)):
+    for arguments, expected in (
+        (['foo'], 2),
+        (['INVALID', '1.0.0'], 2),
+        (['foo', '^1.0.0', '--offline'], 2),
+        (['foo', '1.0.0', '--offline'], 3),
+        ([], 5),
+    ):
         result = subprocess.run([BIN, 'fetch', *arguments], cwd=blocked_project,
                                 capture_output=True, timeout=120, check=False)
         assert result.returncode == expected, (arguments, result)
