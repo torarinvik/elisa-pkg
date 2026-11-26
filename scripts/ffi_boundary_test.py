@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Keep the native implementation in Elisa with one explicit FFI seam."""
 
+import os
 import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 FFI_DECLARATIONS = (ROOT / "src/platform/libc.elisa").resolve()
 NATIVE_MODULE = (ROOT / "src/platform_native.elisa").resolve()
-SOURCE_SUFFIXES = {".elisa", ".py", ".sh", ".md", ".json", ".lock", ".mk"}
+GENERATED_DIRECTORIES = {".git", ".elisapkg", ".ruff_cache", "build"}
 FORBIDDEN_NATIVE_SUFFIXES = {".c", ".h", ".cc", ".cpp", ".cxx", ".hpp"}
 FOREIGN_DECLARATION = re.compile(r"^\s*(?:@link_name\b|extern\b)")
 NATIVE_SYMBOL = re.compile(r"\bnative_[A-Za-z0-9_]+\b")
@@ -45,15 +46,15 @@ C_SSIZE_T_RETURN_SYMBOLS = {"native_fgetxattr"}
 
 
 def source_files():
-    for path in ROOT.rglob("*"):
-        if not path.is_file():
-            continue
-        relative = path.relative_to(ROOT)
-        if relative.parts[0] in {".git", "build"}:
-            continue
-        if path.name == "IMPLEMENTATION_PLAN.md":
-            continue
-        yield path
+    for directory, children, names in os.walk(ROOT, followlinks=False):
+        if Path(directory) == ROOT:
+            children[:] = sorted(set(children) - GENERATED_DIRECTORIES)
+        else:
+            children.sort()
+        for name in sorted(names):
+            path = Path(directory) / name
+            if path.is_file():
+                yield path
 
 
 def main() -> int:
@@ -82,9 +83,10 @@ def main() -> int:
             print(f"  {name}: expected i64, got {extern_returns.get(name, 'missing')}", flush=True)
         return 1
 
+    sources = list(source_files())
     native_files = [
         path.relative_to(ROOT)
-        for path in source_files()
+        for path in sources
         if path.suffix.lower() in FORBIDDEN_NATIVE_SUFFIXES
     ]
     if native_files:
@@ -94,7 +96,7 @@ def main() -> int:
         return 1
 
     violations = []
-    for path in source_files():
+    for path in sources:
         if path.suffix != ".elisa":
             continue
         text = path.read_text(encoding="utf-8")
