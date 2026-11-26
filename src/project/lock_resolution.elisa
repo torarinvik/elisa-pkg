@@ -38,6 +38,8 @@ module LockResolution:
                 return LocalLock::canonical(name, version, raw, root)
 
     private:
+        const maximum_candidate_checks: usize = 4096.usize()
+
         def provider_failure(code: Registry::ResultCode, report_failure: bool) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
             return [] if not report_failure
             return [code.u8() + 1.u8()]
@@ -126,11 +128,13 @@ module LockResolution:
                 candidate_index_identities: mutable darray[u8] = []
                 package_queue: mutable darray[u8] = []
                 package_total: mutable usize = 0
+                return provider_failure(Registry::ResultCode.ResourceLimit, persist_trust) if roots.count > LocalBuildPlan::maximum_packages
                 for index in 0..<roots.count |roots, package_queue, package_total|:
                     return [] if ByteText::contains_nul_field(package_queue, roots[index].package)
                     registry_queue_append(&package_queue, roots[index].package)
                     package_total <- package_total + 1
                 processed: mutable usize = 0
+                checked_candidates: mutable usize = 0
                 while processed < package_total:
                     package: mutable darray[u8] = []
                     return [] if not registry_queue_field_at(package_queue, processed, &package)
@@ -144,6 +148,9 @@ module LockResolution:
                     cursor: mutable usize = 0
                     version_ordinal: mutable usize = 0
                     while cursor < index_data.count:
+                        # Expired releases still cost a metadata and signature check.
+                        return provider_failure(Registry::ResultCode.ResourceLimit, persist_trust) if checked_candidates >= maximum_candidate_checks
+                        checked_candidates <- checked_candidates + 1.usize()
                         finish: mutable usize = cursor
                         while finish < index_data.count and index_data[finish] != 10 |index_data, finish|:
                             finish <- finish + 1
@@ -176,7 +183,7 @@ module LockResolution:
                             candidate_package.push(package[item])
                         for dependency_index in 0..<dependencies.count |dependencies, package_queue, package_total|:
                             if not ByteText::contains_nul_field(package_queue, dependencies[dependency_index].package):
-                                return [] if package_total >= LocalBuildPlan::maximum_packages
+                                return provider_failure(Registry::ResultCode.ResourceLimit, persist_trust) if package_total >= LocalBuildPlan::maximum_packages
                                 registry_queue_append(&package_queue, dependencies[dependency_index].package)
                                 package_total <- package_total + 1
                         candidate: Solver::Candidate = Solver::Candidate{package: candidate_package, version: parsed, dependencies: dependencies, yanked: candidate_yanked}
@@ -184,11 +191,9 @@ module LockResolution:
                         candidate_index_generations.push(index_generation)
                         registry_queue_append(&candidate_index_digests, index_digest)
                         registry_queue_append(&candidate_index_identities, index_identity)
-                        return provider_failure(Registry::ResultCode.ResourceLimit, persist_trust) if candidates.count > 4096
                         cursor <- finish + 1
                     return [] if version_ordinal != yanked_flags.count
                     processed <- processed + 1
-                    return provider_failure(Registry::ResultCode.ResourceLimit, persist_trust) if processed > 4096
 
                 selected_indexes: mutable darray[usize] = []
                 solve_constraints: mutable darray[Solver::Constraint] = []
