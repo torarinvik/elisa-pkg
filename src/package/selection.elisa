@@ -1,0 +1,133 @@
+# Bounded archive include and exclude matching and source path policy.
+
+include "../archive.elisa"
+include "../package_path_policy.elisa"
+
+module PackageSelection:
+    private:
+        def archive_glob_charge(work_remaining: mutable usize&, rows_remaining: mutable usize&, amount: usize, new_row: bool) -> bool:
+            return false if amount > work_remaining or new_row and rows_remaining == 0.usize()
+            work_remaining <- work_remaining - amount
+            rows_remaining <- rows_remaining - 1.usize() if new_row
+            return true
+
+        def archive_glob_charge_scan(work_remaining: mutable usize&, rows_remaining: mutable usize&, budget_exhausted: mutable bool&) -> bool:
+            if not archive_glob_charge(work_remaining, rows_remaining, 1.usize(), false):
+                budget_exhausted <- true
+                return false
+            return true
+
+        def archive_glob_matches(pattern: darray[u8]&, path: darray[u8]&, work_remaining: mutable usize&, rows_remaining: mutable usize&, budget_exhausted: mutable bool&) -> bool:
+            # Two boolean rows avoid recursive backtracking. Shared budgets cap
+            # both DP work and allocation count across the entire package walk.
+            current: mutable darray[bool] = []
+            if not archive_glob_charge(work_remaining, rows_remaining, path.count + 1.usize(), true):
+                budget_exhausted <- true
+                return false
+            current.resize(path.count + 1.usize())
+            current[0] <- true
+            pattern_index: mutable usize = 0.usize()
+            while pattern_index < pattern.count:
+                if pattern[pattern_index] == 42:
+                    star_start: usize = pattern_index
+                    while pattern_index < pattern.count and pattern[pattern_index] == 42:
+                        pattern_index <- pattern_index + 1.usize()
+                    crosses_separator: bool = pattern_index - star_start > 1.usize()
+                    next: mutable darray[bool] = []
+                    if not archive_glob_charge(work_remaining, rows_remaining, path.count + 1.usize(), true):
+                        budget_exhausted <- true
+                        return false
+                    next.resize(path.count + 1.usize())
+                    if crosses_separator and pattern_index < pattern.count and pattern[pattern_index] == 47:
+                        # `**/` consumes zero or more complete components. The
+                        # slash is part of this token, so the zero-component
+                        # transition skips it entirely.
+                        reachable: mutable bool = false
+                        for path_index in 0..=path.count |current, next, reachable, path|:
+                            reachable <- true if current[path_index]
+                            next[path_index] <- true if current[path_index]
+                            if path_index < path.count and path[path_index] == 47:
+                                next[path_index + 1.usize()] <- true if reachable
+                        pattern_index <- pattern_index + 1.usize()
+                    elif crosses_separator:
+                        reachable: mutable bool = false
+                        for path_index in 0..=path.count |current, next, reachable|:
+                            reachable <- true if current[path_index]
+                            next[path_index] <- reachable
+                    else:
+                        reachable: mutable bool = false
+                        for path_index in 0..=path.count |current, next, reachable|:
+                            reachable <- false if path_index > 0.usize() and path[path_index - 1.usize()] == 47
+                            reachable <- true if current[path_index]
+                            next[path_index] <- reachable
+                    current <- next
+                    continue
+                next: mutable darray[bool] = []
+                if not archive_glob_charge(work_remaining, rows_remaining, path.count + 1.usize(), true):
+                    budget_exhausted <- true
+                    return false
+                next.resize(path.count + 1.usize())
+                for path_index in 0..<path.count |current, next, pattern, pattern_index, path|:
+                    next[path_index + 1.usize()] <- current[path_index] and pattern[pattern_index] == path[path_index]
+                current <- next
+                pattern_index <- pattern_index + 1.usize()
+            return current[path.count]
+
+        def pattern_array_matches_path(raw: darray[u8]&, pattern_start: usize, pattern_end: usize, path: darray[u8]&, work_remaining: mutable usize&, rows_remaining: mutable usize&, budget_exhausted: mutable bool&) -> bool can[Memory.Allocate, Abort.Panic]:
+            return false if pattern_start >= raw.count
+            return false if pattern_end <= pattern_start or raw[pattern_start] != 91
+            cursor: mutable usize = pattern_start + 1.usize()
+            return false if not archive_glob_charge_scan(work_remaining, rows_remaining, budget_exhausted)
+            while cursor < pattern_end:
+                while cursor < pattern_end and (raw[cursor] == 32 or raw[cursor] == 9 or raw[cursor] == 10 or raw[cursor] == 13) |raw, cursor|:
+                    return false if not archive_glob_charge_scan(work_remaining, rows_remaining, budget_exhausted)
+                    cursor <- cursor + 1.usize()
+                return false if cursor >= pattern_end or raw[cursor] != 34
+                return false if not archive_glob_charge_scan(work_remaining, rows_remaining, budget_exhausted)
+                cursor <- cursor + 1.usize()
+                pattern: mutable darray[u8] = []
+                while cursor < pattern_end and raw[cursor] != 34 |raw, cursor, pattern|:
+                    return false if raw[cursor] == 92 or raw[cursor] < 32 or raw[cursor] == 127
+                    pattern.push(raw[cursor])
+                    cursor <- cursor + 1.usize()
+                return false if cursor >= pattern_end or not valid_publish_pattern(pattern)
+                pattern_scan_work: usize = pattern.count * 2.usize() + 1.usize()
+                if not archive_glob_charge(work_remaining, rows_remaining, pattern_scan_work, false):
+                    budget_exhausted <- true
+                    return false
+                return true if archive_glob_matches(pattern, path, work_remaining, rows_remaining, budget_exhausted)
+                return false if budget_exhausted
+                return false if not archive_glob_charge_scan(work_remaining, rows_remaining, budget_exhausted)
+                cursor <- cursor + 1.usize()
+                while cursor < pattern_end and (raw[cursor] == 32 or raw[cursor] == 9 or raw[cursor] == 10 or raw[cursor] == 13) |raw, cursor|:
+                    return false if not archive_glob_charge_scan(work_remaining, rows_remaining, budget_exhausted)
+                    cursor <- cursor + 1.usize()
+                return false if cursor >= pattern_end or raw[cursor] != 44
+                return false if not archive_glob_charge_scan(work_remaining, rows_remaining, budget_exhausted)
+                cursor <- cursor + 1.usize()
+            return false
+
+    public:
+        const max_work: usize = 16777216.usize()
+        const max_rows: usize = 65536.usize()
+
+        def valid_publish_pattern(pattern: darray[u8]&) -> bool:
+            return false if pattern.count == 0.usize() or pattern.count > 4096.usize() or pattern[0] == 47 or pattern[0] == 92
+            for index in 0..<pattern.count |pattern|:
+                return false if pattern[index] == 0 or pattern[index] < 32 or pattern[index] == 127 or pattern[index] == 92
+                return false if pattern[index] == 46 and index + 1.usize() < pattern.count and pattern[index + 1.usize()] == 46
+                return false if index > 0.usize() and pattern[index - 1.usize()] == 47 and pattern[index] == 47
+            return true
+
+        def include_allows_path(raw: darray[u8]&, pattern_start: usize, pattern_end: usize, path: darray[u8]&, work_remaining: mutable usize&, rows_remaining: mutable usize&, budget_exhausted: mutable bool&) -> bool can[Memory.Allocate, Abort.Panic]:
+            return true if pattern_start >= raw.count
+            return pattern_array_matches_path(raw, pattern_start, pattern_end, path, work_remaining, rows_remaining, budget_exhausted)
+
+        def exclude_allows_path(raw: darray[u8]&, pattern_start: usize, pattern_end: usize, path: darray[u8]&, work_remaining: mutable usize&, rows_remaining: mutable usize&, budget_exhausted: mutable bool&) -> bool can[Memory.Allocate, Abort.Panic]:
+            return false if pattern_start >= raw.count
+            return pattern_array_matches_path(raw, pattern_start, pattern_end, path, work_remaining, rows_remaining, budget_exhausted)
+
+        def publish_path_forbidden(path: darray[u8]&) -> bool:
+            return true if path.count == 0.usize() or not Archive::is_safe_entry(path)
+            return true if PackagePathPolicy::credential_path_forbidden(path)
+            return PackagePathPolicy::reserved_source_path_forbidden(path)
