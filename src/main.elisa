@@ -45,6 +45,7 @@ include "./project/build_receipt.elisa"
 include "./project/build_paths.elisa"
 include "./project/local_build_plan.elisa"
 include "./project/local_lock.elisa"
+include "./project/lock_resolution.elisa"
 include "./project/schema_fields.elisa"
 include "./project/manifest.elisa"
 
@@ -244,377 +245,6 @@ module Cli:
 
         def version_compare(left: Model::Version, right: Model::Version) -> i64:
             return SemVer::compare(left, right)
-
-        def registry_queue_append(queue: mutable darray[u8]&, value: darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
-            for index in 0..<value.count |queue, value|:
-                queue.push(value[index])
-            queue.push(0)
-
-        def registry_queue_contains(queue: darray[u8]&, wanted: darray[u8]&) -> bool:
-            cursor: mutable usize = 0
-            while cursor < queue.count:
-                finish: mutable usize = cursor
-                while finish < queue.count and queue[finish] != 0 |queue, finish|:
-                    finish <- finish + 1
-                return true if finish - cursor == wanted.count and ByteText::range_equals(queue, cursor, finish, wanted)
-                cursor <- finish + 1
-            return false
-
-        def registry_queue_field_at(queue: darray[u8]&, record: usize, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            cursor: mutable usize = 0
-            current: mutable usize = 0
-            while cursor < queue.count |queue, cursor, current, out|:
-                finish: mutable usize = cursor
-                while finish < queue.count and queue[finish] != 0 |queue, finish|:
-                    finish <- finish + 1
-                if current == record:
-                    out.resize(0)
-                    for index in cursor..<finish |queue, out|:
-                        out.push(queue[index])
-                    return true
-                cursor <- finish + 1
-                current <- current + 1
-            return false
-
-        def registry_evidence_field_at(values: darray[u8]&, record: usize, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            return registry_queue_field_at(values, record, out)
-
-        def registry_append_decimal(out: mutable darray[u8]&, value: u64) -> void can[Memory.Allocate, Abort.Panic]:
-            start: usize = out.count
-            out.resize(start + 20.usize())
-            number: mutable u64 = value
-            cursor: mutable usize = start
-            if number == 0:
-                out[cursor] <- 48
-                cursor <- cursor + 1.usize()
-            else:
-                while number > 0 |out, number, cursor|:
-                    out[cursor] <- 48 + (number % 10).u8()
-                    cursor <- cursor + 1.usize()
-                    number <- number / 10
-                left: mutable usize = start
-                right: mutable usize = cursor
-                while left < right and right - left > 1.usize() |out, left, right|:
-                    right <- right - 1.usize()
-                    temporary: u8 = out[left]
-                    out[left] <- out[right]
-                    out[right] <- temporary
-                    left <- left + 1.usize()
-            out.resize(cursor)
-
-        def registry_security_status(code: Registry::ResultCode) -> bool:
-            return code == Registry::ResultCode.InvalidConfiguration or code == Registry::ResultCode.MalformedMetadata or code == Registry::ResultCode.MissingSignature or code == Registry::ResultCode.MissingTrustRoot or code == Registry::ResultCode.InvalidSignature or code == Registry::ResultCode.ExpiredMetadata or code == Registry::ResultCode.RollbackDetected or code == Registry::ResultCode.DigestMismatch or code == Registry::ResultCode.ResourceLimit or code == Registry::ResultCode.TrustStateUnavailable or code == Registry::ResultCode.TrustStateMalformed or code == Registry::ResultCode.ClockRollback or code == Registry::ResultCode.ClockUnavailable or code == Registry::ResultCode.ExpiryHorizon or code == Registry::ResultCode.TrustRootChanged or code == Registry::ResultCode.TufEquivocationDetected
-
-        def registry_candidate_matches(candidates: darray[Solver::Candidate]&, package: darray[u8]&, version: Model::Version) -> bool:
-            for index in 0..<candidates.count |candidates, package, version|:
-                return true if ByteText::equal(candidates[index].package, package) and SemVer::compare(candidates[index].version, version) == 0
-            return false
-
-        # Candidate enumeration drives graph solving before the selected
-        # metadata is read a second time. Require the final signed dependency
-        # set to match that exact graph input so a concurrent metadata change
-        # cannot publish a lock for a different release graph.
-        def registry_dependency_sets_equal(left: darray[Solver::Constraint]&, right: darray[Solver::Constraint]&) -> bool:
-            return false if left.count != right.count
-            used: mutable darray[bool] = []
-            used.resize(right.count)
-            for left_index in 0..<left.count |left, right, used|:
-                found: mutable bool = false
-                for right_index in 0..<right.count |left, right, used, left_index, found|:
-                    continue if used[right_index]
-                    if ByteText::equal(left[left_index].package, right[right_index].package) and ByteText::equal(left[left_index].requirement, right[right_index].requirement):
-                        used[right_index] <- true
-                        found <- true
-                        break
-                return false if not found
-            return true
-
-        def registry_preference_present(preferences: darray[Solver::Preference]&, package: darray[u8]&) -> bool:
-            for index in 0..<preferences.count |preferences, package|:
-                return true if ByteText::equal(preferences[index].package, package)
-            return false
-
-        # A prior lock entry is an ordering hint and permits retention of only
-        # that exact soft-yanked release. It is never a constraint: the solver
-        # checks every active requirement and backtracks when another version
-        # is required by the manifest or a selected dependency.
-        def append_registry_lock_preferences(lock: darray[u8]&, unlock: darray[u8]&, candidates: darray[Solver::Candidate]&, preferences: mutable darray[Solver::Preference]&) -> void can[Memory.Allocate, Abort.Panic]:
-            return if lock.count == 0.usize() or not Json::valid_document(lock) or not Json::unique_object_keys(lock) or not Lockfile::version_is(lock, 3)
-            for index in 0..<lock.count |lock, unlock, candidates, preferences|:
-                continue if lock[index] != 123
-                object_end: usize = Json::object_end(lock, index)
-                continue if object_end <= index
-                package: mutable darray[u8] = []
-                version_text: mutable darray[u8] = []
-                continue if not Json::object_string_value(lock, index, object_end, "name", &package) or not Json::object_string_value(lock, index, object_end, "version", &version_text)
-                continue if unlock.count > 0.usize() and ByteText::equal(package, unlock)
-                parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-                continue if not SemVer::parse(version_text, &parsed) or parsed.prerelease
-                continue if not registry_candidate_matches(candidates, package, parsed) or registry_preference_present(preferences, package)
-                preferences.push(Solver::Preference{package: package, version: parsed})
-
-        def canonical_registry_lock(name: darray[u8]&, version: darray[u8]&, raw: darray[u8]&, root: darray[u8]&, roots: darray[Solver::Constraint]&, preferred_lock: darray[u8]&, unlock: darray[u8]&, persist_trust: bool) -> darray[u8] can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
-            can Global.Read:
-                out: mutable darray[u8] = []
-                root_digest_bytes: mutable darray[u8] = []
-                root_digest: mutable darray[u8] = []
-                return [] if Integrity::sha256(raw, &root_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(root_digest_bytes, &root_digest)
-                root_source_digest: mutable darray[u8] = []
-                return [] if not SourceFingerprint::at(root, &root_source_digest)
-
-                candidates: mutable darray[Solver::Candidate] = []
-                candidate_index_generations: mutable darray[u64] = []
-                candidate_index_digests: mutable darray[u8] = []
-                candidate_index_identities: mutable darray[u8] = []
-                package_queue: mutable darray[u8] = []
-                package_total: mutable usize = 0
-                for index in 0..<roots.count |roots, package_queue, package_total|:
-                    return [] if registry_queue_contains(package_queue, roots[index].package)
-                    registry_queue_append(&package_queue, roots[index].package)
-                    package_total <- package_total + 1
-                processed: mutable usize = 0
-                while processed < package_total:
-                    package: mutable darray[u8] = []
-                    return [] if not registry_queue_field_at(package_queue, processed, &package)
-                    index_data: mutable darray[u8] = []
-                    yanked_flags: mutable darray[u8] = []
-                    index_generation: mutable u64 = 0
-                    index_digest: mutable darray[u8] = []
-                    index_identity: mutable darray[u8] = []
-                    index_status: Registry::ResultCode = Registry::read_index_with_yanked(package, &index_data, &yanked_flags, &index_generation, &index_digest, &index_identity)
-                    if index_status != Registry::ResultCode.Ok and persist_trust and registry_security_status(index_status):
-                        out.push(index_status.u8() + 1.u8())
-                        return out
-                    return [] if index_status != Registry::ResultCode.Ok
-                    cursor: mutable usize = 0
-                    version_ordinal: mutable usize = 0
-                    while cursor < index_data.count:
-                        finish: mutable usize = cursor
-                        while finish < index_data.count and index_data[finish] != 10 |index_data, finish|:
-                            finish <- finish + 1
-                        line_end: mutable usize = finish
-                        line_end <- line_end - 1 if line_end > cursor and index_data[line_end - 1] == 13
-                        return [] if line_end == cursor or line_end - cursor > 128
-                        version_text: mutable darray[u8] = []
-                        for item in cursor..<line_end |index_data, version_text|:
-                            version_text.push(index_data[item])
-                        parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-                        return [] if not SemVer::parse(version_text, &parsed)
-                        return [] if version_ordinal >= yanked_flags.count or yanked_flags[version_ordinal] > 1
-                        candidate_yanked: bool = yanked_flags[version_ordinal] == 1
-                        version_ordinal <- version_ordinal + 1.usize()
-                        selected_text: mutable darray[u8] = []
-                        archive: mutable darray[u8] = []
-                        digest: mutable darray[u8] = []
-                        metadata: mutable darray[u8] = []
-                        archive_size: mutable u64 = 0
-                        candidate_status: Registry::ResultCode = Registry::resolve_candidate_metadata(package, version_text, &selected_text, &archive, &digest, &archive_size, &metadata)
-                        if candidate_status == Registry::ResultCode.ExpiredMetadata:
-                            cursor <- finish + 1
-                            continue
-                        if candidate_status != Registry::ResultCode.Ok and persist_trust and registry_security_status(candidate_status):
-                            out.push(candidate_status.u8() + 1.u8())
-                            return out
-                        return [] if candidate_status != Registry::ResultCode.Ok
-                        dependencies: mutable darray[Solver::Constraint] = []
-                        dependencies_valid: bool = Registry::read_dependencies(metadata, &dependencies)
-                        if not dependencies_valid and persist_trust:
-                            out.push(Registry::ResultCode.MalformedMetadata.u8() + 1.u8())
-                            return out
-                        return [] if not dependencies_valid
-                        candidate_package: mutable darray[u8] = []
-                        for item in 0..<package.count |candidate_package, package|:
-                            candidate_package.push(package[item])
-                        for dependency_index in 0..<dependencies.count |dependencies, package_queue, package_total|:
-                            if not registry_queue_contains(package_queue, dependencies[dependency_index].package):
-                                return [] if package_total >= LocalBuildPlan::maximum_packages
-                                registry_queue_append(&package_queue, dependencies[dependency_index].package)
-                                package_total <- package_total + 1
-                        candidate: Solver::Candidate = Solver::Candidate{package: candidate_package, version: parsed, dependencies: dependencies, yanked: candidate_yanked}
-                        candidates.push(candidate)
-                        candidate_index_generations.push(index_generation)
-                        registry_queue_append(&candidate_index_digests, index_digest)
-                        registry_queue_append(&candidate_index_identities, index_identity)
-                        return [] if candidates.count > 4096
-                        cursor <- finish + 1
-                    return [] if version_ordinal != yanked_flags.count
-                    processed <- processed + 1
-                    return [] if processed > 4096
-
-                selected_indexes: mutable darray[usize] = []
-                solve_constraints: mutable darray[Solver::Constraint] = []
-                for index in 0..<roots.count |roots, solve_constraints|:
-                    solve_constraints.push(roots[index])
-                lock_preferences: mutable darray[Solver::Preference] = []
-                append_registry_lock_preferences(preferred_lock, unlock, candidates, &lock_preferences)
-                solve_status: mutable Solver::SolveCode = Solver::SolveCode.Malformed
-                conflict: mutable Solver::Conflict = Solver::Conflict{package: [], first_requirement: [], second_requirement: []}
-                if persist_trust:
-                    solve_status <- Solver::solve_with_preferences_and_conflict(candidates, solve_constraints, lock_preferences, &selected_indexes, &conflict)
-                else:
-                    solve_status <- Solver::solve_with_preferences(candidates, solve_constraints, lock_preferences, &selected_indexes)
-                if solve_status == Solver::SolveCode.Unsatisfiable and persist_trust:
-                    # A one-byte status sentinel is reserved for ordinary provider
-                    # failures. Include three NUL-delimited, already validated
-                    # fields after the new status so `run_resolve` can report the
-                    # deterministic package/range pair without making this function
-                    # return a second mutable record.
-                    out.push(Registry::ResultCode.Unsatisfiable.u8() + 1.u8())
-                    for byte_index in 0..<conflict.package.count |out, conflict|:
-                        out.push(conflict.package[byte_index])
-                    out.push(0)
-                    for byte_index in 0..<conflict.first_requirement.count |out, conflict|:
-                        out.push(conflict.first_requirement[byte_index])
-                    out.push(0)
-                    for byte_index in 0..<conflict.second_requirement.count |out, conflict|:
-                        out.push(conflict.second_requirement[byte_index])
-                    out.push(0)
-                    return out
-                return [] if solve_status != Solver::SolveCode.Solved
-                ByteText::append_text(&out, "{\n  \"lock-version\": 3,\n  \"resolver\": \"elisapkg-registry-v1\",\n  \"package\": {\n    \"name\": \"")
-                ByteText::append(&out, name)
-                ByteText::append_text(&out, "\",\n    \"version\": \"")
-                ByteText::append(&out, version)
-                ByteText::append_text(&out, "\",\n    \"manifest-digest\": \"sha256:")
-                ByteText::append(&out, root_digest)
-                ByteText::append_text(&out, "\",\n    \"source-digest\": \"sha256:")
-                ByteText::append(&out, root_source_digest)
-                ByteText::append_text(&out, "\"\n  },\n  \"packages\": [")
-                emitted: mutable darray[u8] = []
-                first: mutable bool = true
-                for _step in 0..<selected_indexes.count |selected_indexes, candidates, emitted, out, first|:
-                    found: mutable bool = false
-                    selected_slot: mutable usize = selected_indexes.count
-                    selected_name: mutable darray[u8] = []
-                    for item in 0..<selected_indexes.count |selected_indexes, candidates, emitted, found, selected_slot, selected_name|:
-                        candidate_index: usize = selected_indexes[item]
-                        candidate_name: darray[u8] = candidates[candidate_index].package
-                        continue if registry_queue_contains(emitted, candidate_name)
-                        if not found or ByteText::less(candidate_name, selected_name):
-                            selected_slot <- item
-                            selected_name.resize(0)
-                            for byte_index in 0..<candidate_name.count |selected_name, candidate_name|:
-                                selected_name.push(candidate_name[byte_index])
-                            found <- true
-                    return [] if not found
-                    candidate_index: usize = selected_indexes[selected_slot]
-                    candidate: Solver::Candidate = candidates[candidate_index]
-                    if candidate.yanked and persist_trust:
-                        warning: mutable darray[u8] = []
-                        version_label: mutable darray[u8] = []
-                        ByteText::append_text(&warning, "warning: retaining locked yanked release ")
-                        ByteText::append(&warning, candidate.package)
-                        warning.push(64)
-                        Registry::exact_requirement(candidate.version, &version_label)
-                        ByteText::append(&warning, version_label)
-                        ByteText::append_text(&warning, "; run 'elisapkg update ")
-                        ByteText::append(&warning, candidate.package)
-                        ByteText::append_text(&warning, "' to select a non-yanked release\n")
-                        CliOutput::write_bytes(2, warning)
-                    selected_index_generation: u64 = candidate_index_generations[candidate_index]
-                    selected_index_digest: mutable darray[u8] = []
-                    selected_index_identity: mutable darray[u8] = []
-                    return [] if not registry_evidence_field_at(candidate_index_digests, candidate_index, &selected_index_digest) or not registry_evidence_field_at(candidate_index_identities, candidate_index, &selected_index_identity)
-                    exact: mutable darray[u8] = []
-                    Registry::exact_requirement(candidate.version, &exact)
-                    selected_text: mutable darray[u8] = []
-                    archive: mutable darray[u8] = []
-                    digest: mutable darray[u8] = []
-                    metadata: mutable darray[u8] = []
-                    archive_size: mutable u64 = 0
-                    verified_index_generation: mutable u64 = 0
-                    verified_index_digest: mutable darray[u8] = []
-                    verified_index_identity: mutable darray[u8] = []
-                    final_status: Registry::ResultCode = Registry::resolve_selected_with_index_evidence(candidate.package, exact, &selected_text, &archive, &digest, &archive_size, &metadata, &verified_index_generation, &verified_index_digest, &verified_index_identity)
-                    if final_status != Registry::ResultCode.Ok and persist_trust and registry_security_status(final_status):
-                        out.push(final_status.u8() + 1.u8())
-                        return out
-                    return [] if final_status != Registry::ResultCode.Ok
-                    if verified_index_generation != selected_index_generation or not ByteText::equal(verified_index_digest, selected_index_digest) or not ByteText::equal(verified_index_identity, selected_index_identity):
-                        if persist_trust:
-                            out.push(Registry::ResultCode.RollbackDetected.u8() + 1.u8())
-                            return out
-                        return []
-                    metadata_digest_bytes: mutable darray[u8] = []
-                    metadata_digest: mutable darray[u8] = []
-                    return [] if Integrity::sha256(metadata, &metadata_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(metadata_digest_bytes, &metadata_digest)
-                    metadata_signature: mutable darray[u8] = []
-                    signature_status: Registry::ResultCode = Registry::read_signature(candidate.package, selected_text, &metadata_signature)
-                    if signature_status != Registry::ResultCode.Ok:
-                        if persist_trust:
-                            out.push(signature_status.u8() + 1.u8())
-                            return out
-                        return []
-                    snapshot_archive: mutable darray[u8] = []
-                    snapshot_digest: mutable darray[u8] = []
-                    snapshot_size: mutable u64 = 0
-                    snapshot_expires: mutable u64 = 0
-                    snapshot_dependencies: mutable darray[Solver::Constraint] = []
-                    snapshot_status: Registry::ResultCode = Registry::verify_metadata_snapshot(candidate.package, selected_text, metadata_digest, metadata, metadata_signature, &snapshot_archive, &snapshot_digest, &snapshot_size, &snapshot_expires, &snapshot_dependencies)
-                    if snapshot_status != Registry::ResultCode.Ok or not ByteText::equal(snapshot_archive, archive) or not ByteText::equal(snapshot_digest, digest) or snapshot_size != archive_size or not registry_dependency_sets_equal(snapshot_dependencies, candidate.dependencies):
-                        if persist_trust:
-                            failure: Registry::ResultCode = snapshot_status if snapshot_status != Registry::ResultCode.Ok else Registry::ResultCode.DigestMismatch
-                            out.push(failure.u8() + 1.u8())
-                            return out
-                        return []
-                    if persist_trust:
-                        trust_status: Registry::ResultCode = Registry::record_trusted_at_index(candidate.package, selected_text, digest, metadata_digest, snapshot_expires, selected_index_generation, selected_index_digest, selected_index_identity)
-                        if trust_status != Registry::ResultCode.Ok:
-                            out.push(trust_status.u8() + 1.u8())
-                            return out
-                    out.push(44) if not first
-                    ByteText::append_text(&out, "\n    {\"name\":\"")
-                    ByteText::append(&out, selected_name)
-                    ByteText::append_text(&out, "\",\"version\":\"")
-                    ByteText::append(&out, selected_text)
-                    ByteText::append_text(&out, "\",\"source\":{\"type\":\"registry\",\"registry\":\"primary\",\"archive\":\"")
-                    ByteText::append(&out, archive)
-                    ByteText::append_text(&out, "\"},\"archive-size\":")
-                    registry_append_decimal(&out, archive_size)
-                    ByteText::append_text(&out, ",\"archive-digest\":\"sha256:")
-                    ByteText::append(&out, digest)
-                    ByteText::append_text(&out, "\",\"metadata-digest\":\"sha256:")
-                    ByteText::append(&out, metadata_digest)
-                    ByteText::append_text(&out, "\"}")
-                    for byte_index in 0..<selected_name.count |emitted, selected_name|:
-                        emitted.push(selected_name[byte_index])
-                    emitted.push(0)
-                    first <- false
-                ByteText::append_text(&out, "\n  ]\n}\n")
-                return out
-
-        def canonical_lock_for_manifest(name: darray[u8]&, version: darray[u8]&, raw: darray[u8]&, root: darray[u8]&) -> darray[u8] can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            can Global.Read:
-                registry_roots: mutable darray[Solver::Constraint] = []
-                has_local_dependency: mutable bool = false
-                return [] if not RegistryRoots::collect(raw, &registry_roots, &has_local_dependency)
-                if registry_roots.count > 0.usize():
-                    return [] if has_local_dependency
-                    empty_lock: mutable darray[u8] = []
-                    empty_unlock: mutable darray[u8] = []
-                    return canonical_registry_lock(name, version, raw, root, registry_roots, empty_lock, empty_unlock, false)
-                return LocalLock::canonical(name, version, raw, root)
-
-        def canonical_registry_lock_for_existing_lock(name: darray[u8]&, version: darray[u8]&, raw: darray[u8]&, root: darray[u8]&, preferred_lock: darray[u8]&) -> darray[u8] can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
-            can Global.Read:
-                registry_roots: mutable darray[Solver::Constraint] = []
-                has_local_dependency: mutable bool = false
-                return [] if not RegistryRoots::collect(raw, &registry_roots, &has_local_dependency) or has_local_dependency or registry_roots.count == 0.usize()
-                empty_unlock: mutable darray[u8] = []
-                return canonical_registry_lock(name, version, raw, root, registry_roots, preferred_lock, empty_unlock, false)
-
-        def canonical_lock_for_manifest_with_options(name: darray[u8]&, version: darray[u8]&, raw: darray[u8]&, root: darray[u8]&, options: Model::CommandOptions, preferred_lock: darray[u8]&) -> darray[u8] can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            can Global.Read:
-                registry_roots: mutable darray[Solver::Constraint] = []
-                has_local_dependency: mutable bool = false
-                return [] if not RegistryRoots::collect(raw, &registry_roots, &has_local_dependency)
-                if registry_roots.count > 0.usize():
-                    return [] if has_local_dependency
-                    unlock: mutable darray[u8] = []
-                    if Platform::pkg_strlen(options.update_name) > 0.usize():
-                        ByteText::append_bounded_text(&unlock, options.update_name)
-                    return canonical_registry_lock(name, version, raw, root, registry_roots, preferred_lock, unlock, true)
-                return LocalLock::canonical(name, version, raw, root)
 
         # ---------- project discovery and commands -------------------------------------------
 
@@ -902,7 +532,7 @@ module Cli:
                 # validate their signed identity and shape without refreshing registry
                 # metadata or changing trust state.
                 if not Lockfile::version_is(lock, 3):
-                    expected: darray[u8] = canonical_lock_for_manifest(name, version, manifest, start)
+                    expected: darray[u8] = LockResolution::canonical(name, version, manifest, start)
                     return expected.count > 0.usize() and ByteText::equal(expected, lock)
                 registry_roots: mutable darray[Solver::Constraint] = []
                 has_local_dependency: mutable bool = false
@@ -954,7 +584,7 @@ module Cli:
                     return false if has_previous_package and not ByteText::less(previous_package, package)
                     parsed_version: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
                     return false if not SemVer::parse(version_text, &parsed_version) or parsed_version.prerelease
-                    return false if registry_queue_contains(seen, package)
+                    return false if ByteText::contains_nul_field(seen, package)
                     source_start: mutable usize = 0.usize()
                     source_end: mutable usize = 0.usize()
                     return false if not Json::object_value_span(lock, cursor, record_end, "source", &source_start, &source_end) or not SchemaFields::valid(lock, source_start, source_end, SchemaFields::Kind.RegistryLockSource)
@@ -988,7 +618,7 @@ module Cli:
                 # fetch revalidates the lock; offline mode must at least reject omission
                 # of any dependency named by the manifest itself.
                 for index in 0..<registry_roots.count |registry_roots, seen|:
-                    return false if not registry_queue_contains(seen, registry_roots[index].package)
+                    return false if not ByteText::contains_nul_field(seen, registry_roots[index].package)
                 return Lockfile::registry_satisfies_roots(lock, packages_start, packages_end, registry_roots)
 
         def run_why(argc: i64, slots: mutable cstr&&, start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -1106,7 +736,7 @@ module Cli:
                         return EXIT_RESOLVE if not lock_matches_manifest(raw, preferred_lock, name, version, start)
                         write_resolved_text(resolved_name_text, resolved_version_text, options) if emit_result
                         return EXIT_OK
-                lock: darray[u8] = canonical_lock_for_manifest_with_options(name, version, raw, start, options, preferred_lock)
+                lock: darray[u8] = LockResolution::canonical_with_options(name, version, raw, start, options, preferred_lock)
                 if lock.count > 0.usize() and lock[0] > 0 and lock[0] < 32:
                     code: mutable Registry::ResultCode = Registry::ResultCode.TrustStateMalformed
                     # The sentinel stores the enum value plus one so an empty lock remains
@@ -1451,7 +1081,7 @@ module Cli:
                 # registry metadata and compare bytes before any cache mutation. This
                 # rejects duplicate, omitted, reordered, or otherwise hand-edited records
                 # that could make fetch operate on a graph different from resolution.
-                expected_lock: darray[u8] = canonical_registry_lock_for_existing_lock(root_name, root_version, manifest, start, lock)
+                expected_lock: darray[u8] = LockResolution::replay_registry(root_name, root_version, manifest, start, lock)
                 return EXIT_SECURITY if expected_lock.count == 0.usize()
                 return EXIT_RESOLVE if not ByteText::equal(expected_lock, lock)
                 lock_end: usize = Json::object_end(lock, 0)
@@ -1525,7 +1155,7 @@ module Cli:
                         CliOutput::write_error(" while verifying locked ")
                         CliOutput::write_bytes(2, &package)
                         CliOutput::write_error("\n")
-                        return EXIT_SECURITY if registry_security_status(registry_status)
+                        return EXIT_SECURITY if Registry::is_security_failure(registry_status)
                         return EXIT_SOURCE
                     if not ByteText::equal(selected, version_text):
                         CliOutput::write_error("error: locked registry version does not match signed metadata\n")
@@ -1564,7 +1194,7 @@ module Cli:
                         CliOutput::write_error(" for locked ")
                         CliOutput::write_bytes(2, &package)
                         CliOutput::write_error("\n")
-                        return EXIT_SECURITY if registry_security_status(archive_status)
+                        return EXIT_SECURITY if Registry::is_security_failure(archive_status)
                         return EXIT_SOURCE
                     trust_status: Registry::ResultCode = Registry::record_trusted_at_index(package, version_text, digest, metadata_digest, snapshot_expires, selected_index_generation, selected_index_digest, selected_index_identity)
                     if trust_status != Registry::ResultCode.Ok:
@@ -1644,7 +1274,7 @@ module Cli:
                         CliOutput::write_error("error: ")
                         CliOutput::write_error(Registry::result_message(registry_status))
                         CliOutput::write_error("\n")
-                        return EXIT_SECURITY if registry_security_status(registry_status)
+                        return EXIT_SECURITY if Registry::is_security_failure(registry_status)
                         return EXIT_RESOLVE
                     metadata_digest_bytes: mutable darray[u8] = []
                     metadata_digest: mutable darray[u8] = []
@@ -1667,7 +1297,7 @@ module Cli:
                         CliOutput::write_error("error: ")
                         CliOutput::write_error(Registry::result_message(archive_status))
                         CliOutput::write_error("\n")
-                        return EXIT_SECURITY if registry_security_status(archive_status)
+                        return EXIT_SECURITY if Registry::is_security_failure(archive_status)
                         return EXIT_SOURCE
                     trust_status: Registry::ResultCode = Registry::record_trusted_at_index(package, selected, digest, metadata_digest, snapshot_expires, selected_index_generation, selected_index_digest, selected_index_identity)
                     if trust_status != Registry::ResultCode.Ok:
@@ -1704,7 +1334,7 @@ module Cli:
                 return EXIT_RESOLVE if not ProjectFiles::read_cstr_into("elisapkg.lock", &lock)
                 if Lockfile::version_is(lock, 3):
                     return fetch_registry_lock_offline(raw, lock, name, version, start) if options.offline or options.frozen else fetch_registry_lock(raw, lock, name, version, start)
-                expected: darray[u8] = canonical_lock_for_manifest(name, version, raw, start)
+                expected: darray[u8] = LockResolution::canonical(name, version, raw, start)
                 return EXIT_RESOLVE if expected.count == 0.usize() or not ByteText::equal(expected, lock)
                 CliOutput::write_ok("verified local locked sources\n")
                 return EXIT_OK
@@ -1752,7 +1382,7 @@ module Cli:
                 return EXIT_SECURITY if Integrity::sha256(archive, &archive_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(archive_digest_bytes, &archive_digest)
                 if options.json:
                     size_text: mutable darray[u8] = []
-                    registry_append_decimal(&size_text, archive.count.u64())
+                    ByteText::append_decimal(&size_text, archive.count.u64())
                     CliOutput::write_ok("{\"schema-version\":1,\"command\":\"publish\",\"dry-run\":true,\"valid\":true,\"source-tree-digest\":\"sha256:")
                     CliOutput::write_bytes(1, &source_digest)
                     CliOutput::write_ok("\",\"archive-size\":")
