@@ -1,6 +1,6 @@
 # Collect direct registry constraints from a validated package manifest.
 include "../json.elisa"
-include "../package/package_identity.elisa"
+include "../package/dependency_entry.elisa"
 include "../text/bytes.elisa"
 include "./solver.elisa"
 
@@ -16,32 +16,20 @@ module RegistryRoots:
             cursor: mutable usize = Json::skip_whitespace(raw, dependency_start + 1.usize(), dependency_end)
             return true if cursor == dependency_end
             while cursor < dependency_end:
-                return false if raw[cursor] != 34
-                alias_start: usize = cursor + 1.usize()
-                alias_end: usize =
-                    while end < dependency_end and end - alias_start < PackageIdentity::max_name_bytes and raw[end] != 34 |end: usize = alias_start| -> end:
-                        end <- end + 1.usize()
-                return false if:
-                    alias_end >= dependency_end or raw[alias_end] != 34
-                    not PackageIdentity::valid_name_segment(raw, alias_start, alias_end)
-                separator: usize = Json::skip_whitespace(raw, alias_end + 1.usize(), dependency_end)
-                return false if separator >= dependency_end or raw[separator] != 58
-                value_start: usize = Json::skip_whitespace(raw, separator + 1.usize(), dependency_end)
-                return false if value_start >= dependency_end or raw[value_start] != 123
-                value_end: usize = Json::object_end(raw, value_start)
-                return false if value_end <= value_start or value_end >= dependency_end
-                if Json::object_has_key(raw, value_start, value_end, "path"):
+                entry: mutable DependencyEntry::Span = DependencyEntry::Span{name_start: 0, name_end: 0, object_start: 0, object_end: 0}
+                return false if not DependencyEntry::read(raw, cursor, dependency_end, &entry)
+                if Json::object_has_key(raw, entry.object_start, entry.object_end, "path"):
                     has_local <- true
                 else:
                     requirement: mutable darray[u8] @r = []
                     return false if:
-                        not Json::object_string_equals_text(raw, value_start, value_end, "registry", "primary")
-                        not Json::object_string_value(raw, value_start, value_end, "version", &requirement)
+                        not Json::object_string_equals_text(raw, entry.object_start, entry.object_end, "registry", "primary")
+                        not Json::object_string_value(raw, entry.object_start, entry.object_end, "version", &requirement)
                         out.count >= maximum_dependencies
                     alias: mutable darray[u8] @r = []
-                    ByteText::append_range(&alias, raw, alias_start, alias_end)
+                    ByteText::append_range(&alias, raw, entry.name_start, entry.name_end)
                     out.push(Solver::Constraint{package: alias, requirement: requirement})
-                cursor <- Json::skip_whitespace(raw, value_end + 1.usize(), dependency_end)
+                cursor <- Json::skip_whitespace(raw, entry.object_end + 1.usize(), dependency_end)
                 return true if cursor == dependency_end
                 return false if raw[cursor] != 44
                 cursor <- Json::skip_whitespace(raw, cursor + 1.usize(), dependency_end)
