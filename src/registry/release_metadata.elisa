@@ -80,51 +80,38 @@ module ReleaseMetadata:
             dependency_start: usize = Json::root_value_offset(raw, "dependencies")
             return true if dependency_start == raw.count
             dependency_end: usize = Json::object_end(raw, dependency_start)
-            return false if dependency_start >= raw.count or dependency_end <= dependency_start or raw[dependency_start] != 123
-            in_string: mutable bool = false
-            escaped: mutable bool = false
-            string_start: mutable usize = 0
-            braces: mutable i64 = 1
-            brackets: mutable i64 = 0
-            for index in (dependency_start + 1)..<dependency_end |raw, out, in_string, escaped, string_start, braces, brackets|:
-                byte: u8 = raw[index]
-                if not in_string:
-                    if byte == 34:
-                        in_string <- true
-                        string_start <- index + 1
-                    elif byte == 123:
-                        braces <- braces + 1
-                    elif byte == 125:
-                        braces <- braces - 1
-                    elif byte == 91:
-                        brackets <- brackets + 1
-                    elif byte == 93:
-                        brackets <- brackets - 1
-                elif escaped:
-                    escaped <- false
-                elif byte == 92:
-                    escaped <- true
-                elif byte == 34:
-                    after: mutable usize = index + 1
-                    after <- Json::skip_whitespace(raw, after, dependency_end)
-                    if braces == 1 and brackets == 0 and after < dependency_end and raw[after] == 58:
-                        return false if not append_dependency(raw, string_start, index, after, dependency_end, out)
-                    in_string <- false
-            return true
+            return false if dependency_end <= dependency_start or dependency_end >= raw.count or raw[dependency_start] != 123
+            cursor: mutable usize = Json::skip_whitespace(raw, dependency_start + 1.usize(), dependency_end)
+            return true if cursor == dependency_end
+            while cursor < dependency_end:
+                return false if raw[cursor] != 34
+                alias_start: usize = cursor + 1.usize()
+                alias_end: usize =
+                    while end < dependency_end and end - alias_start < PackageIdentity::max_name_bytes and raw[end] != 34 |end: usize = alias_start| -> end:
+                        end <- end + 1.usize()
+                return false if alias_end >= dependency_end or raw[alias_end] != 34
+                separator: usize = Json::skip_whitespace(raw, alias_end + 1.usize(), dependency_end)
+                return false if separator >= dependency_end or raw[separator] != 58
+                value_start: usize = Json::skip_whitespace(raw, separator + 1.usize(), dependency_end)
+                return false if value_start >= dependency_end or raw[value_start] != 123
+                value_end: usize = Json::object_end(raw, value_start)
+                return false if:
+                    value_end <= value_start or value_end >= dependency_end
+                    not append_dependency(raw, alias_start, alias_end, value_start, value_end, out)
+                cursor <- Json::skip_whitespace(raw, value_end + 1.usize(), dependency_end)
+                return true if cursor == dependency_end
+                return false if raw[cursor] != 44
+                cursor <- Json::skip_whitespace(raw, cursor + 1.usize(), dependency_end)
+            return false
 
-        def append_dependency(raw: darray[u8]&, alias_start: usize, alias_end: usize, separator: usize, dependency_end: usize, out: mutable darray[Solver::Constraint]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            requires alias_start <= alias_end and alias_end < separator and separator < dependency_end and dependency_end <= raw.count
+        def append_dependency(raw: darray[u8]&, alias_start: usize, alias_end: usize, value_start: usize, value_end: usize, out: mutable darray[Solver::Constraint]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            requires alias_start <= alias_end and alias_end < value_start and value_start < value_end and value_end < raw.count
             return false if not PackageIdentity::valid_name_segment(raw, alias_start, alias_end)
             for existing in 0..<out.count |out, raw, alias_start, alias_end|:
                 return false if ByteText::range_equals(raw, alias_start, alias_end, out[existing].package)
             alias: mutable darray[u8] = []
             ByteText::append_range(&alias, raw, alias_start, alias_end)
-            value_start: usize = Json::skip_whitespace(raw, separator + 1.usize(), dependency_end)
-            return false if value_start >= dependency_end or raw[value_start] != 123
-            value_end: usize = Json::object_end(raw, value_start)
-            return false if:
-                value_end <= value_start or value_end > dependency_end
-                not SchemaFields::valid(raw, value_start, value_end, SchemaFields::Kind.RegistryDependency)
+            return false if not SchemaFields::valid(raw, value_start, value_end, SchemaFields::Kind.RegistryDependency)
             requirement: mutable darray[u8] = []
             return false if not Json::object_string_value(raw, value_start, value_end, "version", &requirement)
             parsed: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
