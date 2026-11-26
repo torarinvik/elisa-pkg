@@ -126,7 +126,12 @@ PY
   export ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_GRAPH_KEY"
   export ELISAPKG_TRUST_STATE="$REGISTRY_GRAPH_STATE"
   "$BIN" fetch --locked >/dev/null
+  # Retain the configured registry identity, but make its releases unavailable.
+  mv "$REGISTRY_GRAPH_ROOT/foo" "$REGISTRY_GRAPH_CASE/unavailable-foo"
+  mv "$REGISTRY_GRAPH_ROOT/bar" "$REGISTRY_GRAPH_CASE/unavailable-bar"
   "$BIN" fetch --offline > "$REGISTRY_GRAPH_CASE/offline.stdout"
+  mv "$REGISTRY_GRAPH_CASE/unavailable-foo" "$REGISTRY_GRAPH_ROOT/foo"
+  mv "$REGISTRY_GRAPH_CASE/unavailable-bar" "$REGISTRY_GRAPH_ROOT/bar"
 )
 grep -F 'verified cached registry artifact bar 1.0.0' "$REGISTRY_GRAPH_CASE/offline.stdout" >/dev/null
 grep -F 'verified cached registry artifact foo 1.0.0' "$REGISTRY_GRAPH_CASE/offline.stdout" >/dev/null
