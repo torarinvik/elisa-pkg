@@ -73,9 +73,11 @@ module ProjectManifest:
             canonical_root: mutable darray[u8] = []
             return false if not ProjectFiles::canonical_existing_path(root, &canonical_root)
             seen: mutable darray[u8] = []
+            name_offsets: mutable darray[usize] = []
+            name_offsets.resize(2.usize() * ManifestTargets::max_targets + 1.usize())
             found: mutable usize = 0.usize()
             cursor: mutable usize = skip_space(raw, targets_start + 1.usize(), targets_end)
-            while cursor < targets_end |raw, root, canonical_root, seen, found, cursor, targets_end|:
+            while cursor < targets_end |raw, root, canonical_root, seen, name_offsets, found, cursor, targets_end|:
                 return false if found >= ManifestTargets::max_targets or raw[cursor] != 123
                 object_end: usize = Json::object_end(raw, cursor)
                 return false if:
@@ -85,7 +87,7 @@ module ProjectManifest:
                 return false if:
                     not Json::object_string_value(raw, cursor, object_end, "name", &target_name)
                     not PackageIdentity::valid_name(target_name)
-                    target_name_seen(seen, target_name)
+                    not register_target_name(target_name, &seen, &name_offsets)
                 target_kind: mutable darray[u8] = []
                 return false if:
                     not Json::object_string_value(raw, cursor, object_end, "kind", &target_kind)
@@ -95,8 +97,6 @@ module ProjectManifest:
                     not Json::object_string_value(raw, cursor, object_end, "entry", &target_entry)
                     not Manifest::is_safe_relative_entry(target_entry)
                     not target_file_is_valid(root, canonical_root, target_entry)
-                ByteText::append(&seen, target_name)
-                seen.push(0)
                 found <- found + 1.usize()
                 cursor <- skip_space(raw, object_end + 1.usize(), targets_end)
                 return true if cursor == targets_end
@@ -112,14 +112,26 @@ module ProjectManifest:
                 cursor <- cursor + 1.usize()
             return cursor
 
-        def target_name_seen(seen: darray[u8]&, alias: darray[u8]&) -> bool:
-            cursor: mutable usize = 0.usize()
-            while cursor < seen.count:
-                segment_end: mutable usize = cursor
-                while segment_end < seen.count and seen[segment_end] != 0:
-                    segment_end <- segment_end + 1.usize()
-                return true if segment_end - cursor == alias.count and ByteText::range_equals(seen, cursor, segment_end, alias)
-                cursor <- segment_end + 1.usize()
+        # Each occupied slot stores a one-based offset into the packed names.
+        # Compare the full name on collisions before rejecting a duplicate.
+        def register_target_name(name: darray[u8]&, names: mutable darray[u8]&, offsets: mutable darray[usize]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            hash: mutable u32 = 2166136261.u32()
+            for index in 0..<name.count |hash, name|:
+                hash <- (hash ^ name[index].u32()) * 16777619.u32()
+            slot: mutable usize = hash.usize() % offsets.count
+            for attempt in 0..<offsets.count |slot, offsets, names, name|:
+                stored: usize = offsets[slot]
+                if stored == 0.usize():
+                    offsets[slot] <- names.count + 1.usize()
+                    ByteText::append(names, name)
+                    names.push(0)
+                    return true
+                start: usize = stored - 1.usize()
+                finish: mutable usize = start
+                while names[finish] != 0 |names, finish|:
+                    finish <- finish + 1.usize()
+                return false if ByteText::range_equals(names, start, finish, name)
+                slot <- (slot + 1.usize()) % offsets.count
             return false
 
         def dependency_map_empty(raw: darray[u8]&, wanted: cstr) -> bool:
