@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+FFI_DECLARATIONS = (ROOT / "src/platform/libc.elisa").resolve()
 NATIVE_MODULE = (ROOT / "src/platform_native.elisa").resolve()
 SOURCE_SUFFIXES = {".elisa", ".py", ".sh", ".md", ".json", ".lock", ".mk"}
 FORBIDDEN_NATIVE_SUFFIXES = {".c", ".h", ".cc", ".cpp", ".cxx", ".hpp"}
@@ -56,7 +57,7 @@ def source_files():
 
 
 def main() -> int:
-    native_source = NATIVE_MODULE.read_text(encoding="utf-8")
+    native_source = FFI_DECLARATIONS.read_text(encoding="utf-8")
     extern_returns = dict(
         re.findall(
             r"(?m)^\s*extern\s+(native_[A-Za-z0-9_]+)\([^\n]*\)\s*->\s*([A-Za-z0-9_]+)",
@@ -97,10 +98,12 @@ def main() -> int:
         if path.suffix != ".elisa":
             continue
         text = path.read_text(encoding="utf-8")
-        if path.resolve() != NATIVE_MODULE:
-            for line_number, line in enumerate(text.splitlines(), 1):
-                if FOREIGN_DECLARATION.search(line) or NATIVE_SYMBOL.search(line):
-                    violations.append((path.relative_to(ROOT), line_number, line.strip()))
+        resolved = path.resolve()
+        for line_number, line in enumerate(text.splitlines(), 1):
+            foreign_declaration = resolved != FFI_DECLARATIONS and FOREIGN_DECLARATION.search(line)
+            foreign_call = resolved not in {FFI_DECLARATIONS, NATIVE_MODULE} and NATIVE_SYMBOL.search(line)
+            if foreign_declaration or foreign_call:
+                violations.append((path.relative_to(ROOT), line_number, line.strip()))
     if violations:
         print("error: foreign declarations or native symbols escaped the private FFI module", flush=True)
         for path, line_number, line in violations:
