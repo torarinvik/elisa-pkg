@@ -38,6 +38,10 @@ module LockResolution:
                 return LocalLock::canonical(name, version, raw, root)
 
     private:
+        def provider_failure(code: Registry::ResultCode, report_failure: bool) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
+            return [] if not report_failure
+            return [code.u8() + 1.u8()]
+
         def registry_queue_append(queue: mutable darray[u8]&, value: darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
             for index in 0..<value.count |queue, value|:
                 queue.push(value[index])
@@ -189,11 +193,11 @@ module LockResolution:
                         candidate_index_generations.push(index_generation)
                         registry_queue_append(&candidate_index_digests, index_digest)
                         registry_queue_append(&candidate_index_identities, index_identity)
-                        return [] if candidates.count > 4096
+                        return provider_failure(Registry::ResultCode.ResourceLimit, persist_trust) if candidates.count > 4096
                         cursor <- finish + 1
                     return [] if version_ordinal != yanked_flags.count
                     processed <- processed + 1
-                    return [] if processed > 4096
+                    return provider_failure(Registry::ResultCode.ResourceLimit, persist_trust) if processed > 4096
 
                 selected_indexes: mutable darray[usize] = []
                 solve_constraints: mutable darray[Solver::Constraint] = []
@@ -224,6 +228,8 @@ module LockResolution:
                         out.push(conflict.second_requirement[byte_index])
                     out.push(0)
                     return out
+                return provider_failure(Registry::ResultCode.ResourceLimit, persist_trust) if solve_status == Solver::SolveCode.ResourceLimit
+                return provider_failure(Registry::ResultCode.MalformedMetadata, persist_trust) if solve_status == Solver::SolveCode.Malformed
                 return [] if solve_status != Solver::SolveCode.Solved
                 ByteText::append_text(&out, "{\n  \"lock-version\": 3,\n  \"resolver\": \"elisapkg-registry-v1\",\n  \"package\": {\n    \"name\": \"")
                 ByteText::append(&out, name)
@@ -336,11 +342,7 @@ module LockResolution:
                     ByteText::append(&out, metadata_digest)
                     ByteText::append_text(&out, "\"}")
                     # Reserve seven bytes for the closing array, object, and line endings.
-                    if out.count > Json::max_document_bytes - 7.usize():
-                        return [] if not persist_trust
-                        out.resize(0)
-                        out.push(Registry::ResultCode.ResourceLimit.u8() + 1.u8())
-                        return out
+                    return provider_failure(Registry::ResultCode.ResourceLimit, persist_trust) if out.count > Json::max_document_bytes - 7.usize()
                     for byte_index in 0..<selected_name.count |emitted, selected_name|:
                         emitted.push(selected_name[byte_index])
                     emitted.push(0)
