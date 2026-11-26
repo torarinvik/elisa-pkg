@@ -27,6 +27,14 @@ with tempfile.TemporaryDirectory(prefix='cli-review-', dir=ROOT / 'build') as di
     assert json.loads(resolved_json.stdout) == {'schema-version': 1, 'resolved': True, 'package': {'name': 'app', 'version': '0.1.0'}}
     tree_json = subprocess.run([BIN, 'tree', '--json'], cwd=project, capture_output=True, text=True, timeout=120, check=True)
     assert json.loads(tree_json.stdout) == {'schema-version': 1, 'packages': [{'name': 'app', 'version': '0.1.0'}]}
+    run([BIN, 'fetch', '--offline'], cwd=project, stdout=subprocess.DEVNULL)
+    lockfile = project / 'elisapkg.lock'
+    local_lock = lockfile.read_bytes()
+    lockfile.write_text('{"lock-version":99}\n')
+    result = subprocess.run([BIN, 'fetch', '--offline'], cwd=project,
+                            capture_output=True, timeout=120, check=False)
+    assert result.returncode == 3 and lockfile.read_text() == '{"lock-version":99}\n', result
+    lockfile.write_bytes(local_lock)
     for command in [['resolve', 'unexpected'], ['check-manifest', 'unexpected']]:
         result = subprocess.run([BIN, *command], cwd=project, capture_output=True, timeout=120, check=False)
         assert result.returncode == 2, (command, result)
