@@ -40,6 +40,7 @@ include "./cli/arguments.elisa"
 include "./cli/output.elisa"
 include "./cli/compiler_process.elisa"
 include "./cli/build_sources.elisa"
+include "./cli/build_inputs.elisa"
 include "./cli/program.elisa"
 include "./cli/fetch.elisa"
 include "./cli/resolution.elisa"
@@ -607,32 +608,13 @@ module Cli:
                     target_entry_name <- resolved_target
                 else:
                     return EXIT_BUILD
-                lock_status: i64 = ResolutionCommand::resolve(start, options, false, false)
-                return lock_status if lock_status != EXIT_OK
                 lock_raw: mutable darray[u8] = []
-                lock_raw.resize(1048577)
-                return EXIT_BUILD if not ProjectFiles::read_cstr_into("elisapkg.lock", &lock_raw)
-                # Resolution reads the manifest again and may replace the lock. Bind
-                # both results to the exact manifest snapshot used above to select the
-                # target and compute its receipt, before trusting registry evidence or
-                # starting the compiler.
-                manifest_after_resolve: mutable darray[u8] = []
-                manifest_after_resolve.resize(1048577)
-                return EXIT_BUILD if not ProjectFiles::read_cstr_into("elisapkg.json", &manifest_after_resolve)
-                return EXIT_BUILD if not ByteText::equal(manifest_after_resolve, manifest_raw)
-                return EXIT_BUILD if not LockValidation::matches_manifest(manifest_raw, lock_raw, root_name, root_version, start)
-                if Lockfile::version_is(lock_raw, 3):
-                    CliOutput::write_error("error: builds with registry dependencies are not supported; local dependency builds require a version 2 local lock\n")
-                    return EXIT_BUILD
-                lock_digest_bytes: mutable darray[u8] = []
                 lock_digest: mutable darray[u8] = []
-                return EXIT_BUILD if Integrity::sha256(lock_raw, &lock_digest_bytes) != Integrity::DigestCode.Ok
-                return EXIT_BUILD if not Integrity::hex_digest(lock_digest_bytes, &lock_digest)
+                lock_status: i64 = BuildInputs::resolve_local_lock(start, options, manifest_raw, root_name, root_version, &lock_raw, &lock_digest)
+                return lock_status if lock_status != EXIT_OK
                 source_tree_digest: mutable darray[u8] = []
                 source_tree_bytes: mutable usize = 0.usize()
-                if not SourceFingerprint::current_bounded(&source_tree_digest, SourceFingerprint::maximum_snapshot_bytes, &source_tree_bytes):
-                    CliOutput::write_error("error: package source tree is unreadable, unsafe, or exceeds the supported source-size limits; refusing to build\n")
-                    return EXIT_BUILD
+                return EXIT_BUILD if not BuildInputs::fingerprint_source(&source_tree_digest, &source_tree_bytes)
                 dependency_aggregate: mutable darray[u8] = []
                 dependency_aggregate_digest: mutable darray[u8] = []
                 has_local_build_dependencies: mutable bool = false
@@ -652,18 +634,8 @@ module Cli:
                     if PackageSelection::publish_path_forbidden(target_entry):
                         CliOutput::write_error("error: selected target entry is not a safe package source path\n")
                         return EXIT_BUILD
-                    target_source: mutable darray[u8] = []
-                    target_source_size: i64 = Platform::pkg_package_file_size(target_entry_raw)
-                    return EXIT_BUILD if target_source_size < 0 or target_source_size > 67108864
-                    target_source.resize(target_source_size.usize() + 1.usize())
-                    target_source_raw: mutable u8& = (&target_source[0]).cast[mutable u8&] can Unsafe.PointerCast
-                    target_source_read: i64 = Platform::pkg_read_package_file(target_entry_raw, target_source_raw, target_source.count)
-                    return EXIT_BUILD if target_source_read < 0 or target_source_read != target_source_size
-                    target_source.resize(target_source_read.usize())
-                    source_digest_bytes: mutable darray[u8] = []
                     source_digest: mutable darray[u8] = []
-                    return EXIT_BUILD if Integrity::sha256(target_source, &source_digest_bytes) != Integrity::DigestCode.Ok
-                    return EXIT_BUILD if not Integrity::hex_digest(source_digest_bytes, &source_digest)
+                    return EXIT_BUILD if not BuildInputs::fingerprint_target(target_entry_raw, &source_digest)
                     build_dir: mutable darray[u8] = []
                     artifact: mutable darray[u8] = []
                     receipt_path: mutable darray[u8] = []
