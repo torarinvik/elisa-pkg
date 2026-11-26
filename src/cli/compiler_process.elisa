@@ -67,76 +67,33 @@ module CompilerProcess:
             return status == 0 or status == -2
 
         # Keep the environment buffers alive in this frame through fork and exec.
-        def spawn(invocation: Invocation, sdk_root: darray[u8]&, developer_directory: darray[u8]&, sandbox_work_directory_file_descriptor: i64, compiler_stdout_file_descriptor: i64, compiler_stderr_file_descriptor: i64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            # The compiler was resolved against the fixed child PATH above;
-            # invoking its absolute path keeps execution and sandbox policy aligned.
-            stage1_environment: mutable darray[u8] = []
-            runtime_environment: mutable darray[u8] = []
-            stale_environment: mutable darray[u8] = []
-            clang_environment: mutable darray[u8] = []
-            sdkroot_environment: mutable darray[u8] = []
-            developer_directory_environment: mutable darray[u8] = []
-            temporary_environment: mutable darray[u8] = []
-            callback_parameter: mutable darray[u8] = []
-            callback_digits_offset: usize = prepare_callback_parameter(&callback_parameter)
-            arguments: mutable darray[cstr] = []
-            arguments <- arguments.push("/usr/bin/sandbox-exec")
-            arguments <- arguments.push("-D")
-            arguments <- arguments.push((&callback_parameter[0]).cast[cstr] can Unsafe.PointerCast)
-            arguments <- arguments.push("-p")
-            arguments <- arguments.push(invocation.profile)
-            arguments <- arguments.push("/usr/bin/env")
-            arguments <- arguments.push("-i")
-            arguments <- arguments.push(Toolchain::isolated_path_environment)
-            ByteText::append_text(&temporary_environment, "TMPDIR=")
-            ByteText::append_bounded_text(&temporary_environment, invocation.scratch_directory)
-            temporary_environment <- temporary_environment.push(0)
-            arguments <- arguments.push((&temporary_environment[0]).cast[cstr] can Unsafe.PointerCast)
-            sandbox_home_environment: mutable darray[u8] = []
-            ByteText::append_text(&sandbox_home_environment, "HOME=")
-            ByteText::append_bounded_text(&sandbox_home_environment, invocation.scratch_directory)
-            sandbox_home_environment <- sandbox_home_environment.push(0)
-            arguments <- arguments.push((&sandbox_home_environment[0]).cast[cstr] can Unsafe.PointerCast)
-            fixed_home_environment: mutable darray[u8] = []
-            ByteText::append_text(&fixed_home_environment, "CFFIXED_USER_HOME=")
-            ByteText::append_bounded_text(&fixed_home_environment, invocation.scratch_directory)
-            fixed_home_environment <- fixed_home_environment.push(0)
-            arguments <- arguments.push((&fixed_home_environment[0]).cast[cstr] can Unsafe.PointerCast)
-            cache_home_environment: mutable darray[u8] = []
-            ByteText::append_text(&cache_home_environment, "XDG_CACHE_HOME=")
-            ByteText::append_bounded_text(&cache_home_environment, invocation.scratch_directory)
-            cache_home_environment <- cache_home_environment.push(0)
-            arguments <- arguments.push((&cache_home_environment[0]).cast[cstr] can Unsafe.PointerCast)
-            arguments <- arguments.push("ELISA_STAGE1_SEMANTIC_GATE=1")
-            if not Platform::c_string_equal(invocation.stage1_binary, ""):
-                ByteText::append_text(&stage1_environment, "ELISA_STAGE1_BIN=")
-                ByteText::append_bounded_text(&stage1_environment, invocation.stage1_binary)
-                stage1_environment <- stage1_environment.push(0)
-                arguments <- arguments.push((&stage1_environment[0]).cast[cstr] can Unsafe.PointerCast)
-            if not Platform::c_string_equal(invocation.runtime_object, ""):
-                ByteText::append_text(&runtime_environment, "ELISA_RUNTIME_OBJ=")
-                ByteText::append_bounded_text(&runtime_environment, invocation.runtime_object)
-                runtime_environment <- runtime_environment.push(0)
-                arguments <- arguments.push((&runtime_environment[0]).cast[cstr] can Unsafe.PointerCast)
-            if not Platform::c_string_equal(invocation.allow_stale, ""):
-                ByteText::append_text(&stale_environment, "ELISA_ALLOW_STALE_STAGE1=")
-                ByteText::append_bounded_text(&stale_environment, invocation.allow_stale)
-                stale_environment <- stale_environment.push(0)
-                arguments <- arguments.push((&stale_environment[0]).cast[cstr] can Unsafe.PointerCast)
-            if invocation.clang[0].u8() != 0:
-                ByteText::append_text(&clang_environment, "ELISA_CLANG=")
-                ByteText::append_bounded_text(&clang_environment, invocation.clang)
-                clang_environment <- clang_environment.push(0)
-                arguments <- arguments.push((&clang_environment[0]).cast[cstr] can Unsafe.PointerCast)
-            if sdk_root.count > 0.usize():
-                ByteText::append_text(&sdkroot_environment, "SDKROOT=")
-                ByteText::append(&sdkroot_environment, sdk_root)
-                sdkroot_environment <- sdkroot_environment.push(0)
-                arguments <- arguments.push((&sdkroot_environment[0]).cast[cstr] can Unsafe.PointerCast)
-                ByteText::append_text(&developer_directory_environment, "DEVELOPER_DIR=")
-                ByteText::append(&developer_directory_environment, developer_directory)
-                developer_directory_environment <- developer_directory_environment.push(0)
-                arguments <- arguments.push((&developer_directory_environment[0]).cast[cstr] can Unsafe.PointerCast)
+        # A terminated "NAME=VALUE" environment entry, or an empty array when
+        # VALUE is empty and the entry is optional.
+        def environment_entry(name: cstr, value: cstr) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
+            entry: mutable darray[u8] = []
+            ByteText::append_text(&entry, name)
+            ByteText::append_bounded_text(&entry, value)
+            entry <- entry.push(0)
+            return entry
+
+        def optional_environment_entry(name: cstr, value: cstr) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
+            return [] if value[0].u8() == 0
+            return environment_entry(name, value)
+
+        def bytes_environment_entry(name: cstr, value: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
+            entry: mutable darray[u8] = []
+            ByteText::append_text(&entry, name)
+            ByteText::append(&entry, value)
+            entry <- entry.push(0)
+            return entry
+
+        def with_entry(arguments: mutable darray[cstr], entry: darray[u8]&) -> darray[cstr] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return arguments if entry.count == 0.usize()
+            entry_text: cstr = (&entry[0]).cast[cstr] can Unsafe.PointerCast
+            arguments <- arguments.push(entry_text)
+            return arguments
+
+        def with_compiler_arguments(arguments: mutable darray[cstr], invocation: Invocation) -> darray[cstr] can[Memory.Allocate, Abort.Panic]:
             arguments <- arguments.push(invocation.executable)
             if invocation.release:
                 arguments <- arguments.push("-O2")
@@ -149,35 +106,68 @@ module CompilerProcess:
             arguments <- arguments.push(invocation.output_path)
             arguments <- arguments.push(invocation.source_path)
             arguments <- arguments.push(null)
+            return arguments
+
+        def spawn(invocation: Invocation, sdk_root: darray[u8]&, developer_directory: darray[u8]&, sandbox_work_directory_file_descriptor: i64, compiler_stdout_file_descriptor: i64, compiler_stderr_file_descriptor: i64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            # The compiler was resolved against the fixed child PATH above;
+            # invoking its absolute path keeps execution and sandbox policy aligned.
+            # Every entry buffer stays alive until the child has executed.
+            callback_parameter: mutable darray[u8] = []
+            callback_digits_offset: usize = prepare_callback_parameter(&callback_parameter)
+            temporary_environment: darray[u8] = environment_entry("TMPDIR=", invocation.scratch_directory)
+            sandbox_home_environment: darray[u8] = environment_entry("HOME=", invocation.scratch_directory)
+            fixed_home_environment: darray[u8] = environment_entry("CFFIXED_USER_HOME=", invocation.scratch_directory)
+            cache_home_environment: darray[u8] = environment_entry("XDG_CACHE_HOME=", invocation.scratch_directory)
+            stage1_environment: darray[u8] = optional_environment_entry("ELISA_STAGE1_BIN=", invocation.stage1_binary)
+            runtime_environment: darray[u8] = optional_environment_entry("ELISA_RUNTIME_OBJ=", invocation.runtime_object)
+            stale_environment: darray[u8] = optional_environment_entry("ELISA_ALLOW_STALE_STAGE1=", invocation.allow_stale)
+            clang_environment: darray[u8] = optional_environment_entry("ELISA_CLANG=", invocation.clang)
+            sdkroot_environment: darray[u8] = bytes_environment_entry("SDKROOT=", sdk_root) if sdk_root.count > 0.usize() else []
+            developer_directory_environment: darray[u8] = bytes_environment_entry("DEVELOPER_DIR=", developer_directory) if sdk_root.count > 0.usize() else []
+            callback_text: cstr = (&callback_parameter[0]).cast[cstr] can Unsafe.PointerCast
+            arguments: mutable darray[cstr] = ["/usr/bin/sandbox-exec", "-D", callback_text, "-p", invocation.profile, "/usr/bin/env", "-i", Toolchain::isolated_path_environment]
+            arguments <- with_entry(arguments, temporary_environment)
+            arguments <- with_entry(arguments, sandbox_home_environment)
+            arguments <- with_entry(arguments, fixed_home_environment)
+            arguments <- with_entry(arguments, cache_home_environment)
+            arguments <- arguments.push("ELISA_STAGE1_SEMANTIC_GATE=1")
+            arguments <- with_entry(arguments, stage1_environment)
+            arguments <- with_entry(arguments, runtime_environment)
+            arguments <- with_entry(arguments, stale_environment)
+            arguments <- with_entry(arguments, clang_environment)
+            arguments <- with_entry(arguments, sdkroot_environment)
+            arguments <- with_entry(arguments, developer_directory_environment)
+            arguments <- with_compiler_arguments(arguments, invocation)
             child_argument_vector: mutable cstr&& = (&arguments[0]).cast[mutable cstr&&] can Unsafe.PointerCast
             child_process_identifier: i64 = Platform::fork_process()
             if child_process_identifier == 0:
-                region process_identifier_scope:
-                    process_identifier: i64 = Platform::process_identifier()
-                    if not set_callback_path_process_identifier(&callback_parameter, callback_digits_offset, process_identifier):
-                        Platform::exit_process(126)
-                callback_path_offset: usize = Platform::c_string_length(callback_environment_prefix)
-                region callback_file_name_scope:
-                    callback_file_name: cstr = (&callback_parameter[callback_path_offset]).cast[cstr] can Unsafe.PointerCast
-                    if Platform::create_exclusive_file(callback_file_name) != 0:
-                        Platform::exit_process(126)
-                if Platform::set_process_group() != 0:
-                    Platform::exit_process(126)
-                if Platform::set_process_limits(1) != 0:
-                    Platform::exit_process(126)
-                if Platform::change_directory_to_descriptor(sandbox_work_directory_file_descriptor) != 0:
-                    Platform::exit_process(126)
-                region null_file_descriptor_scope:
-                    null_file_descriptor: i64 = Platform::open_null_device()
-                    if null_file_descriptor < 0 or Platform::duplicate_file_descriptor_to(null_file_descriptor, 0) != 0 or Platform::duplicate_file_descriptor_to(compiler_stdout_file_descriptor, 1) != 1 or Platform::duplicate_file_descriptor_to(compiler_stderr_file_descriptor, 2) != 2:
-                        Platform::exit_process(126)
-                    if null_file_descriptor > 2:
-                        _ = Platform::close_file_descriptor(null_file_descriptor)
-                if Platform::close_inherited_file_descriptors() != 0:
-                    Platform::exit_process(126)
-                _ = Platform::execute_program("/usr/bin/sandbox-exec", child_argument_vector)
-                Platform::exit_process(127)
+                run_child(&callback_parameter, callback_digits_offset, sandbox_work_directory_file_descriptor, compiler_stdout_file_descriptor, compiler_stderr_file_descriptor, child_argument_vector)
             return child_process_identifier
+
+        # In the forked child: claim the callback file, isolate the process,
+        # wire its standard streams, and execute the sandboxed compiler. Never returns.
+        def run_child(callback_parameter: mutable darray[u8]&, callback_digits_offset: usize, sandbox_work_directory_file_descriptor: i64, compiler_stdout_file_descriptor: i64, compiler_stderr_file_descriptor: i64, child_argument_vector: mutable cstr&&) -> void can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            region process_identifier_scope:
+                process_identifier: i64 = Platform::process_identifier()
+                if not set_callback_path_process_identifier(callback_parameter, callback_digits_offset, process_identifier):
+                    Platform::exit_process(126)
+            callback_path_offset: usize = Platform::c_string_length(callback_environment_prefix)
+            region callback_file_name_scope:
+                callback_file_name: cstr = (&callback_parameter[callback_path_offset]).cast[cstr] can Unsafe.PointerCast
+                if Platform::create_exclusive_file(callback_file_name) != 0:
+                    Platform::exit_process(126)
+            if Platform::set_process_group() != 0 or Platform::set_process_limits(1) != 0 or Platform::change_directory_to_descriptor(sandbox_work_directory_file_descriptor) != 0:
+                Platform::exit_process(126)
+            region null_file_descriptor_scope:
+                null_file_descriptor: i64 = Platform::open_null_device()
+                if null_file_descriptor < 0 or Platform::duplicate_file_descriptor_to(null_file_descriptor, 0) != 0 or Platform::duplicate_file_descriptor_to(compiler_stdout_file_descriptor, 1) != 1 or Platform::duplicate_file_descriptor_to(compiler_stderr_file_descriptor, 2) != 2:
+                    Platform::exit_process(126)
+                if null_file_descriptor > 2:
+                    _ = Platform::close_file_descriptor(null_file_descriptor)
+            if Platform::close_inherited_file_descriptors() != 0:
+                Platform::exit_process(126)
+            _ = Platform::execute_program("/usr/bin/sandbox-exec", child_argument_vector)
+            Platform::exit_process(127)
 
         struct Completion:
             wait_status: i64
