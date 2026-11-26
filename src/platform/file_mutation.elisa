@@ -144,17 +144,19 @@ module NativeFileMutation:
             return PlatformNative::close_error(directory, NativeErrors::negative_value(NativeErrors::current_errno()))
 
         def check_replaceable_destination(new_directory: i64, new_leaf: darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            destination_file_descriptor: i64 =
-                new_leaf_c: darray[u8] = byte_copy(new_leaf)
-                new_leaf_name: cstr = (&new_leaf_c[0]).cast[cstr] can Unsafe.PointerCast
-                PlatformNative::open_regular_file_at(new_directory, new_leaf_name)
-            return -21 if destination_file_descriptor == -unsupported_file_type_error
-            return 0 if destination_file_descriptor == -2
-            return destination_file_descriptor if destination_file_descriptor < 0
-            region destination_regular_scope:
-                destination_regular: bool = NativeTrustedPaths::trusted_regular_file_descriptor(destination_file_descriptor, native_geteuid().u64())
-                return -5 if native_close(destination_file_descriptor) != 0
-                return -21 if not destination_regular
+            return check_trusted_regular_leaf(new_directory, new_leaf, true)
+
+        # `leaf` in `directory` is a trusted regular file owned by this user.
+        # A missing leaf passes only when `allow_missing`. Returns 0 or a negative errno.
+        def check_trusted_regular_leaf(directory: i64, leaf: darray[u8]&, allow_missing: bool) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            file_descriptor: i64 = PlatformNative::open_regular_file_at(directory, ((&leaf[0]).cast[cstr] can Unsafe.PointerCast))
+            return -21 if file_descriptor == -unsupported_file_type_error
+            return 0 if file_descriptor == -2 and allow_missing
+            return file_descriptor if file_descriptor < 0
+            region regular_scope:
+                regular: bool = NativeTrustedPaths::trusted_regular_file_descriptor(file_descriptor, native_geteuid().u64())
+                return -5 if native_close(file_descriptor) != 0
+                return -21 if not regular
             return 0
 
         def unlink_verified_identity(path: cstr, expected_device: u64, expected_inode: u64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -236,40 +238,22 @@ module NativeFileMutation:
         # other users cannot mutate, and require the source to be a trusted
         # regular file. Returns 0 or a negative errno.
         def check_trusted_source(old_directory: i64, new_directory: i64, old_leaf: darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            expected_user_identifier: u64 = native_geteuid().u64()
-            return -13 if not NativeTrustedPaths::trusted_directory_file_descriptor(old_directory, expected_user_identifier) or not NativeTrustedPaths::trusted_directory_file_descriptor(new_directory, expected_user_identifier)
-            source_file_descriptor: i64 =
-                old_leaf_c: darray[u8] = byte_copy(old_leaf)
-                old_leaf_name: cstr = (&old_leaf_c[0]).cast[cstr] can Unsafe.PointerCast
-                PlatformNative::open_regular_file_at(old_directory, old_leaf_name)
-            return -21 if source_file_descriptor == -unsupported_file_type_error
-            return source_file_descriptor if source_file_descriptor < 0
-            region source_regular_scope:
-                source_regular: bool = NativeTrustedPaths::trusted_regular_file_descriptor(source_file_descriptor, expected_user_identifier)
-                return -5 if native_close(source_file_descriptor) != 0
-                return -21 if not source_regular
-            return 0
+            return -13 if not NativeTrustedPaths::trusted_directory_file_descriptor(old_directory, native_geteuid().u64()) or not NativeTrustedPaths::trusted_directory_file_descriptor(new_directory, native_geteuid().u64())
+            return check_trusted_regular_leaf(old_directory, old_leaf, false)
 
         # A move may replace an existing regular file but never a symlink or
         # another kind of entry; a link requires the name to be absent.
         # Returns 0 or a negative errno.
         def check_destination(new_directory: i64, new_leaf: darray[u8]&, is_move: bool) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            new_leaf_c: darray[u8] = byte_copy(new_leaf)
-            new_leaf_name: cstr = (&new_leaf_c[0]).cast[cstr] can Unsafe.PointerCast
-            new_mode: u64 =
-                new_status: mutable darray[u8] = []
-                new_status <- new_status.resize(status_buffer_bytes)
-                new_result: i64 =
-                    new_status_raw: mutable void& = (&new_status[0]).cast[mutable void&] can Unsafe.PointerCast
-                    native_fstatat(new_directory, new_leaf_name, new_status_raw, at_no_follow)
-                region new_errno_scope:
-                    new_errno: i64 = NativeErrors::error_code()
-                    return -new_errno if new_result != 0 and new_errno != 2
-                return 0 if new_result != 0
-                return -17 if not is_move
-                NativeStat::mode(new_status)
-            return -40 if (new_mode & NativeStat::file_type_mask) == NativeStat::symlink_mode
-            return -21 if (new_mode & NativeStat::file_type_mask) != NativeStat::regular_mode
+            new_status: mutable darray[u8] = []
+            new_status <- new_status.resize(status_buffer_bytes)
+            region new_errno_scope:
+                new_errno: i64 = NativeErrors::error_code() if native_fstatat(new_directory, ((&new_leaf[0]).cast[cstr] can Unsafe.PointerCast), ((&new_status[0]).cast[mutable void&] can Unsafe.PointerCast), at_no_follow) != 0 else 0
+                return 0 if new_errno == 2
+                return -new_errno if new_errno != 0
+            return -17 if not is_move
+            return -40 if (NativeStat::mode(new_status) & NativeStat::file_type_mask) == NativeStat::symlink_mode
+            return -21 if (NativeStat::mode(new_status) & NativeStat::file_type_mask) != NativeStat::regular_mode
             return 0
 
         def flags_read_write_create_exclusive() -> i64:
