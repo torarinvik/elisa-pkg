@@ -133,6 +133,23 @@ def main() -> int:
         if (state / "transaction.state").exists():
             raise SystemExit("missing-lock recovery retained its journal")
 
+        # A prepared journal declaring an original lock cannot recover without
+        # its backup, even when the staged operation removed the live lock.
+        (state / "transaction.manifest").write_bytes(original_manifest)
+        (state / "transaction.new-lock-missing").write_bytes(b"missing\n")
+        journal = state / "transaction.state"
+        journal.write_bytes(b"prepared-lock\n")
+        run("check-manifest", cwd=project, expected=5)
+        if lock.exists() or manifest.read_bytes() != original_manifest:
+            raise SystemExit("recovery changed live files without the required lock backup")
+        if journal.read_bytes() != b"prepared-lock\n":
+            raise SystemExit("recovery discarded the journal while its backup was missing")
+        (state / "transaction.lock").write_bytes(original_lock)
+        run("check-manifest", cwd=project, expected=0)
+        if lock.read_bytes() != original_lock:
+            raise SystemExit("recovery did not restore the repaired lock backup")
+        lock.unlink()
+
         # A modern guard can be recovered after a crash before journal publication.
         guard.mkdir(mode=0o700)
         (state / "transaction.manifest").write_bytes(original_manifest)
