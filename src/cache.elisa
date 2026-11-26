@@ -28,14 +28,21 @@ module Cache:
 
         const quarantine_directory: cstr = ".elisapkg/cache/quarantine"
 
-        def quarantine_path(digest: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            out.resize(0)
-            return false if not Integrity::valid_sha256_hex(digest)
-            append_literal(out, quarantine_directory)
-            out.push(47)
-            for index in 0..<digest.count |out, digest|:
-                out.push(digest[index])
-            append_literal(out, ".invalid")
+        def quarantine_blob(digest: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            active: mutable darray[u8] = []
+            evidence: mutable darray[u8] = []
+            return false if not blob_path(digest, &active) or not quarantine_path(digest, &evidence)
+            active.push(0)
+            evidence.push(0)
+            blob_name: cstr = (&active[0]).cast[cstr] can Unsafe.PointerCast
+            quarantine_name: cstr = (&evidence[0]).cast[cstr] can Unsafe.PointerCast
+            # Preserve forensic evidence: link() publishes the quarantine entry with
+            # no-clobber semantics, so an existing record cannot be replaced by a
+            # later failure. Remove the active name only after the link succeeds.
+            return false if Platform::pkg_link(blob_name, quarantine_name) != 0
+            return false if Platform::pkg_fsync_parent(quarantine_name) != 0
+            return false if Platform::pkg_unlink(blob_name) != 0
+            return false if Platform::pkg_fsync_parent(blob_name) != 0
             return true
 
         def registry_receipt_path(archive_digest: darray[u8]&, metadata_digest: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
@@ -90,6 +97,16 @@ module Cache:
             return true
 
     private:
+        def quarantine_path(digest: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            out.resize(0)
+            return false if not Integrity::valid_sha256_hex(digest)
+            append_literal(out, quarantine_directory)
+            out.push(47)
+            for index in 0..<digest.count |out, digest|:
+                out.push(digest[index])
+            append_literal(out, ".invalid")
+            return true
+
         def read_bounded_path(path: darray[u8]&, maximum_bytes: usize, content: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             path_c: mutable darray[u8] = []
             for index in 0..<path.count |path_c, path|:
