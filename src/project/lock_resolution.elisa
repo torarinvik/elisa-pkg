@@ -5,6 +5,7 @@ include "../json.elisa"
 include "../package/model.elisa"
 include "../platform.elisa"
 include "../registry.elisa"
+include "../registry/release_metadata.elisa"
 include "../resolution/registry_roots.elisa"
 include "../resolution/semver.elisa"
 include "../resolution/solver.elisa"
@@ -78,25 +79,6 @@ module LockResolution:
             for index in 0..<candidates.count |candidates, package, version|:
                 return true if ByteText::equal(candidates[index].package, package) and SemVer::compare(candidates[index].version, version) == 0
             return false
-
-        # Candidate enumeration drives graph solving before the selected
-        # metadata is read a second time. Require the final signed dependency
-        # set to match that exact graph input so a concurrent metadata change
-        # cannot publish a lock for a different release graph.
-        def registry_dependency_sets_equal(left: darray[Solver::Constraint]&, right: darray[Solver::Constraint]&) -> bool:
-            return false if left.count != right.count
-            used: mutable darray[bool] = []
-            used <- used.resize(right.count)
-            for left_index in 0..<left.count |left, right, used|:
-                found: mutable bool = false
-                for right_index in 0..<right.count |left, right, used, left_index, found|:
-                    continue if used[right_index]
-                    if ByteText::equal(left[left_index].package, right[right_index].package) and ByteText::equal(left[left_index].requirement, right[right_index].requirement):
-                        used[right_index] <- true
-                        found <- true
-                        break
-                return false if not found
-            return true
 
         def registry_preference_present(preferences: darray[Solver::Preference]&, package: darray[u8]&) -> bool:
             for index in 0..<preferences.count |preferences, package|:
@@ -304,7 +286,7 @@ module LockResolution:
                     snapshot_expires: mutable u64 = 0
                     snapshot_dependencies: mutable darray[Solver::Constraint] = []
                     snapshot_status: Registry::ResultCode = Registry::verify_metadata_snapshot(candidate.package, selected_text, metadata_digest, metadata, metadata_signature, &snapshot_archive, &snapshot_digest, &snapshot_size, &snapshot_expires, &snapshot_dependencies)
-                    if snapshot_status != Registry::ResultCode.Ok or not ByteText::equal(snapshot_archive, archive) or not ByteText::equal(snapshot_digest, digest) or snapshot_size != archive_size or not registry_dependency_sets_equal(snapshot_dependencies, candidate.dependencies):
+                    if snapshot_status != Registry::ResultCode.Ok or not ByteText::equal(snapshot_archive, archive) or not ByteText::equal(snapshot_digest, digest) or snapshot_size != archive_size or not ReleaseMetadata::dependency_sets_equal(snapshot_dependencies, candidate.dependencies):
                         failure: Registry::ResultCode = snapshot_status if snapshot_status != Registry::ResultCode.Ok else Registry::ResultCode.DigestMismatch
                         return provider_failure(failure, persist_trust)
                     if persist_trust:
