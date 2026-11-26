@@ -107,8 +107,8 @@ GitHub references: [artifact attestations](https://docs.github.com/en/actions/ho
 
 ## Strict Elisa lint
 
-The macOS workflow checks the repository layout and FFI boundary before
-fetching or rebuilding the compiler, so source policy failures surface early.
+The macOS workflow checks the repository layout, FFI boundary, and rebuild
+timeout supervisor before fetching or rebuilding the compiler.
 
 Run `make lint` to check the 600-line source limit and 20-file directory limit
 before checking Elisa semantics. The layout check also runs independently with
