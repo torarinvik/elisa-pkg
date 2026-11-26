@@ -140,10 +140,7 @@ module LockResolution:
                     index_digest: mutable darray[u8] = []
                     index_identity: mutable darray[u8] = []
                     index_status: Registry::ResultCode = Registry::read_index_with_yanked(package, &index_data, &yanked_flags, &index_generation, &index_digest, &index_identity)
-                    if index_status != Registry::ResultCode.Ok and persist_trust:
-                        out.push(index_status.u8() + 1.u8())
-                        return out
-                    return [] if index_status != Registry::ResultCode.Ok
+                    return provider_failure(index_status, persist_trust) if index_status != Registry::ResultCode.Ok
                     cursor: mutable usize = 0
                     version_ordinal: mutable usize = 0
                     while cursor < index_data.count:
@@ -170,16 +167,10 @@ module LockResolution:
                         if candidate_status == Registry::ResultCode.ExpiredMetadata:
                             cursor <- finish + 1
                             continue
-                        if candidate_status != Registry::ResultCode.Ok and persist_trust:
-                            out.push(candidate_status.u8() + 1.u8())
-                            return out
-                        return [] if candidate_status != Registry::ResultCode.Ok
+                        return provider_failure(candidate_status, persist_trust) if candidate_status != Registry::ResultCode.Ok
                         dependencies: mutable darray[Solver::Constraint] = []
                         dependencies_valid: bool = Registry::read_dependencies(metadata, &dependencies)
-                        if not dependencies_valid and persist_trust:
-                            out.push(Registry::ResultCode.MalformedMetadata.u8() + 1.u8())
-                            return out
-                        return [] if not dependencies_valid
+                        return provider_failure(Registry::ResultCode.MalformedMetadata, persist_trust) if not dependencies_valid
                         candidate_package: mutable darray[u8] = []
                         for item in 0..<package.count |candidate_package, package|:
                             candidate_package.push(package[item])
@@ -286,28 +277,16 @@ module LockResolution:
                     verified_index_digest: mutable darray[u8] = []
                     verified_index_identity: mutable darray[u8] = []
                     final_status: Registry::ResultCode = Registry::resolve_selected_with_index_evidence(candidate.package, exact, &selected_text, &archive, &digest, &archive_size, &metadata, &verified_index_generation, &verified_index_digest, &verified_index_identity)
-                    if final_status != Registry::ResultCode.Ok and persist_trust:
-                        out.resize(0)
-                        out.push(final_status.u8() + 1.u8())
-                        return out
-                    return [] if final_status != Registry::ResultCode.Ok
+                    return provider_failure(final_status, persist_trust) if final_status != Registry::ResultCode.Ok
                     if verified_index_generation != selected_index_generation or not ByteText::equal(verified_index_digest, selected_index_digest) or not ByteText::equal(verified_index_identity, selected_index_identity):
-                        if persist_trust:
-                            out.resize(0)
-                            out.push(Registry::ResultCode.RollbackDetected.u8() + 1.u8())
-                            return out
-                        return []
+                        return provider_failure(Registry::ResultCode.RollbackDetected, persist_trust)
                     metadata_digest_bytes: mutable darray[u8] = []
                     metadata_digest: mutable darray[u8] = []
                     return [] if Integrity::sha256(metadata, &metadata_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(metadata_digest_bytes, &metadata_digest)
                     metadata_signature: mutable darray[u8] = []
                     signature_status: Registry::ResultCode = Registry::read_signature(candidate.package, selected_text, &metadata_signature)
                     if signature_status != Registry::ResultCode.Ok:
-                        if persist_trust:
-                            out.resize(0)
-                            out.push(signature_status.u8() + 1.u8())
-                            return out
-                        return []
+                        return provider_failure(signature_status, persist_trust)
                     snapshot_archive: mutable darray[u8] = []
                     snapshot_digest: mutable darray[u8] = []
                     snapshot_size: mutable u64 = 0
@@ -315,18 +294,12 @@ module LockResolution:
                     snapshot_dependencies: mutable darray[Solver::Constraint] = []
                     snapshot_status: Registry::ResultCode = Registry::verify_metadata_snapshot(candidate.package, selected_text, metadata_digest, metadata, metadata_signature, &snapshot_archive, &snapshot_digest, &snapshot_size, &snapshot_expires, &snapshot_dependencies)
                     if snapshot_status != Registry::ResultCode.Ok or not ByteText::equal(snapshot_archive, archive) or not ByteText::equal(snapshot_digest, digest) or snapshot_size != archive_size or not registry_dependency_sets_equal(snapshot_dependencies, candidate.dependencies):
-                        if persist_trust:
-                            failure: Registry::ResultCode = snapshot_status if snapshot_status != Registry::ResultCode.Ok else Registry::ResultCode.DigestMismatch
-                            out.resize(0)
-                            out.push(failure.u8() + 1.u8())
-                            return out
-                        return []
+                        failure: Registry::ResultCode = snapshot_status if snapshot_status != Registry::ResultCode.Ok else Registry::ResultCode.DigestMismatch
+                        return provider_failure(failure, persist_trust)
                     if persist_trust:
                         trust_status: Registry::ResultCode = Registry::record_trusted_at_index(candidate.package, selected_text, digest, metadata_digest, snapshot_expires, selected_index_generation, selected_index_digest, selected_index_identity)
                         if trust_status != Registry::ResultCode.Ok:
-                            out.resize(0)
-                            out.push(trust_status.u8() + 1.u8())
-                            return out
+                            return provider_failure(trust_status, true)
                     out.push(44) if not first
                     ByteText::append_text(&out, "\n    {\"name\":\"")
                     ByteText::append(&out, selected_name)
