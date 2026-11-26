@@ -5,6 +5,18 @@ include "./lockfile.elisa"
 
 module BuildPaths:
     public:
+        def resolve_local_source(lock: darray[u8]&, source_start: usize, source_end: usize, project_root: darray[u8]&,
+                                 out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            out.resize(0)
+            relative: mutable darray[u8] = []
+            return false if not Json::object_string_value(lock, source_start, source_end, "path", &relative) or not Manifest::valid_dependency_path(relative)
+            relative_c: mutable darray[u8] = []
+            ProjectFiles::path_with_nul_into(&relative, &relative_c)
+            relative_name: cstr = (&relative_c[0]).cast[cstr] can Unsafe.PointerCast
+            joined: mutable darray[u8] = []
+            ProjectFiles::path_join_into(project_root, relative_name, &joined)
+            return ProjectFiles::canonical_existing_path(joined, out)
+
         def sandbox_dependency_roots(lock: darray[u8]&, start: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out.resize(0)
             return true if not Lockfile::version_is(lock, 2)
@@ -25,15 +37,8 @@ module BuildPaths:
                 return false if not Json::object_value_span(lock, cursor, record_end, "source", &source_start, &source_end)
                 source_type: mutable darray[u8] = []
                 if Json::object_string_value(lock, source_start, source_end, "type", &source_type) and ByteText::equal_text(source_type, "path"):
-                    relative: mutable darray[u8] = []
-                    return false if not Json::object_string_value(lock, source_start, source_end, "path", &relative) or not Manifest::valid_dependency_path(relative)
-                    relative_c: mutable darray[u8] = []
-                    ProjectFiles::path_with_nul_into(&relative, &relative_c)
-                    relative_name: cstr = (&relative_c[0]).cast[cstr] can Unsafe.PointerCast
-                    joined: mutable darray[u8] = []
-                    ProjectFiles::path_join_into(start, relative_name, &joined)
                     canonical_root: mutable darray[u8] = []
-                    return false if not ProjectFiles::canonical_existing_path(joined, &canonical_root)
+                    return false if not resolve_local_source(lock, source_start, source_end, start, &canonical_root)
                     ByteText::append(out, canonical_root)
                     out.push(0)
                 cursor <- record_end + 1.usize()
