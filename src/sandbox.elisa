@@ -13,35 +13,65 @@ module Sandbox:
                 return Platform::access_path("/usr/bin/sandbox-exec", 1) == 0
             return false
 
+        # Paths and permissions the compiler sandbox is built from. Every path
+        # is canonical and absolute.
+        struct ProfileInputs:
+            home: mutable darray[u8]
+            project: mutable darray[u8]
+            build: mutable darray[u8]
+            snapshot: mutable darray[u8]
+            tool_roots: mutable darray[u8]
+            dependency_roots: darray[u8]
+            tool_paths: darray[cstr]
+            executable_paths: darray[cstr]
+            output_temporary: cstr
+
+        # The Seatbelt profile of one compiler run. Rules are appended in a
+        # fixed order because later rules override earlier ones: broad
+        # read-only roots, then denials, then narrow re-allowed inputs,
+        # execution exceptions, and finally the private scratch directory.
         def darwin_build_profile(home: cstr, project_root: darray[u8]&, build_root: darray[u8]&,
                                  source_snapshot_root: darray[u8]&, dependency_roots: darray[u8]&, tool_paths: darray[cstr]&,
                                  executable_paths: darray[cstr]&, output_temporary: cstr) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             static if not ELISA_TARGET_OS_MACOS:
                 return []
-            home_real: mutable darray[u8] = []
-            project_real: mutable darray[u8] = []
-            build_real: mutable darray[u8] = []
-            snapshot_real: mutable darray[u8] = []
-            if not ProjectFiles::canonical_existing_c_string_path(home, &home_real):
-                return []
-            if not ProjectFiles::canonical_existing_path(project_root, &project_real):
-                return []
-            if not ProjectFiles::canonical_existing_path(build_root, &build_real):
-                return []
-            if not ProjectFiles::canonical_existing_path(source_snapshot_root, &snapshot_real):
-                return []
-            return [] if not absolute_path(home_real) or not absolute_path(project_real) or not absolute_path(build_real) or not absolute_path(snapshot_real)
+            inputs: mutable ProfileInputs = ProfileInputs{home: [], project: [], build: [], snapshot: [], tool_roots: [],
+                                                         dependency_roots: [dependency_roots[index] for index in 0..<dependency_roots.count], tool_paths: [tool_paths[index] for index in 0..<tool_paths.count],
+                                                         executable_paths: [executable_paths[index] for index in 0..<executable_paths.count], output_temporary: output_temporary}
+            return [] if not resolve_profile_inputs(home, project_root, build_root, source_snapshot_root, &inputs)
+            profile: mutable darray[u8] = []
+            return [] if not:
+                append_host_runtime_rules(&profile, inputs)
+                append_input_rules(&profile, inputs)
+                append_private_state_denials(&profile, inputs)
+                append_reallowed_inputs(&profile, inputs)
+                append_execution_rules(&profile, inputs)
+                append_snapshot_rules(&profile, inputs)
+                append_credential_denials(&profile)
+                append_output_rules(&profile, inputs)
+            return [] if profile.count > 65536.usize()
+            return profile
+
+    private:
+        # Canonicalize every root the profile names and collect the toolchain roots.
+        def resolve_profile_inputs(home: cstr, project_root: darray[u8]&, build_root: darray[u8]&, source_snapshot_root: darray[u8]&, inputs: mutable ProfileInputs&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return false if not:
+                ProjectFiles::canonical_existing_c_string_path(home, &inputs.home)
+                ProjectFiles::canonical_existing_path(project_root, &inputs.project)
+                ProjectFiles::canonical_existing_path(build_root, &inputs.build)
+                ProjectFiles::canonical_existing_path(source_snapshot_root, &inputs.snapshot)
+                absolute_path(inputs.home) and absolute_path(inputs.project) and absolute_path(inputs.build) and absolute_path(inputs.snapshot)
             # Source snapshots are a distinct read-only input boundary. If one
             # aliases writable compiler scratch, the later scratch exception
             # would silently turn verified inputs into mutable compiler state.
-            return [] if:
-                ProjectFiles::path_is_same_or_beneath(snapshot_real, build_real) or ProjectFiles::path_is_same_or_beneath(build_real, snapshot_real)
-                Platform::c_string_length(output_temporary) == 0.usize()
+            return false if:
+                ProjectFiles::path_is_same_or_beneath(inputs.snapshot, inputs.build) or ProjectFiles::path_is_same_or_beneath(inputs.build, inputs.snapshot)
+                Platform::c_string_length(inputs.output_temporary) == 0.usize()
+            for index in 0..<inputs.tool_paths.count:
+                return false if not add_toolchain_root(inputs.tool_paths[index], inputs.home, &inputs.tool_roots)
+            return true
 
-            tool_roots: mutable darray[u8] = []
-            for index in 0..<tool_paths.count |tool_paths, tool_roots|:
-                return [] if not add_toolchain_root(tool_paths[index], home_real, &tool_roots)
-
+        def append_host_runtime_rules(profile: mutable darray[u8]&, inputs: ProfileInputs&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             system_roots: mutable darray[u8] = []
             add_existing_root("/System", &system_roots)
             add_existing_root("/usr", &system_roots)
@@ -49,134 +79,135 @@ module Sandbox:
             add_existing_root("/sbin", &system_roots)
             add_existing_root("/Library/Developer/CommandLineTools", &system_roots)
             add_existing_root("/Applications/Xcode.app", &system_roots)
-
             extra_read_roots: mutable darray[u8] = []
             add_existing_root("/private/var/db/dyld", &extra_read_roots)
             add_existing_root("/var/select", &extra_read_roots)
-
-            profile: mutable darray[u8] = []
-            ByteText::append_text(&profile, "(version 1)\n(deny default)\n(deny network*)\n")
-            ByteText::append_text(&profile, "(allow process-fork)\n(allow process-info* (target self))\n(allow signal (target self))\n")
+            ByteText::append_text(profile, "(version 1)\n(deny default)\n(deny network*)\n")
+            ByteText::append_text(profile, "(allow process-fork)\n(allow process-info* (target self))\n(allow signal (target self))\n")
             # Some system utilities query the filesystem root as a directory
             # object during startup; granting the literal path does not expose
             # files beneath it.
-            ByteText::append_text(&profile, "(allow file-read* (literal \"/\"))\n")
-
+            ByteText::append_text(profile, "(allow file-read* (literal \"/\"))\n")
             # Host runtime and SDK files are read-only. Executable access is
             # granted later to specific compiler helpers rather than to every
             # binary below these roots.
-            return [] if not append_read_roots(&profile, system_roots)
-            return [] if not append_read_roots(&profile, extra_read_roots)
-            return [] if not append_read_alias_root(&profile, "/var/select")
-            ByteText::append_text(&profile, "(allow file-read-metadata (path-ancestors \"/dev\"))\n")
-            ByteText::append_text(&profile, "(allow file-read* (literal \"/dev/null\"))\n(allow file-read* (literal \"/dev/zero\"))\n(allow file-read* (literal \"/dev/random\"))\n(allow file-read* (literal \"/dev/urandom\"))\n(allow file-write* (literal \"/dev/null\"))\n")
+            return false if not:
+                append_read_roots(profile, system_roots)
+                append_read_roots(profile, extra_read_roots)
+                append_read_alias_root(profile, "/var/select")
+            ByteText::append_text(profile, "(allow file-read-metadata (path-ancestors \"/dev\"))\n")
+            ByteText::append_text(profile, "(allow file-read* (literal \"/dev/null\"))\n(allow file-read* (literal \"/dev/zero\"))\n(allow file-read* (literal \"/dev/random\"))\n(allow file-read* (literal \"/dev/urandom\"))\n(allow file-write* (literal \"/dev/null\"))\n")
+            return true
 
-            # Toolchain files are user-selected compiler inputs, while package
-            # sources are data. Neither grants write access. Only the latter
-            # may be read from project directories.
-            return [] if not append_read_roots(&profile, tool_roots)
+        # Toolchain files are user-selected compiler inputs, while package
+        # sources are data. Neither grants write access. Only the latter may
+        # be read from project directories.
+        def append_input_rules(profile: mutable darray[u8]&, inputs: ProfileInputs&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             # Homebrew's opt prefix is a symlink to the versioned Cellar
             # directory. dyld consults the install-name spelling, so preserve
             # the narrow LLVM library alias as well as the canonical tool root.
-            return [] if:
-                not append_selected_llvm_rules(&profile, tool_paths, home_real, "/opt/homebrew", "/opt/homebrew/opt/llvm/bin/clang", "/opt/homebrew/opt/llvm/lib")
-                not append_selected_llvm_rules(&profile, tool_paths, home_real, "/usr/local", "/usr/local/opt/llvm/bin/clang", "/usr/local/opt/llvm/lib")
-            return [] if not append_read_root(&profile, project_real)
-            return [] if not append_dependency_rules(&profile, dependency_roots, DependencyRule.AllowRead)
+            return append_read_roots(profile, inputs.tool_roots) and
+                   append_selected_llvm_rules(profile, inputs.tool_paths, inputs.home, "/opt/homebrew", "/opt/homebrew/opt/llvm/bin/clang", "/opt/homebrew/opt/llvm/lib") and
+                   append_selected_llvm_rules(profile, inputs.tool_paths, inputs.home, "/usr/local", "/usr/local/opt/llvm/bin/clang", "/usr/local/opt/llvm/lib") and
+                   append_read_root(profile, inputs.project) and
+                   append_dependency_rules(profile, inputs.dependency_roots, DependencyRule.AllowRead) and
+                   append_scratch_access(profile, inputs.build)
 
-            return [] if not append_scratch_access(&profile, build_real)
-
-            # Explicit denials are placed after broad runtime roots. Narrow
-            # project/toolchain/build exceptions are then re-added below.
-            return [] if:
-                not append_path_rule(&profile, "deny", "file-read*", "subpath", home_real)
-                not append_path_rule(&profile, "deny", "file-write*", "subpath", home_real)
-                not append_path_rule(&profile, "deny", "process-exec", "subpath", home_real)
-                not append_path_rule(&profile, "deny", "file-map-executable", "subpath", home_real)
+        # Explicit denials are placed after broad runtime roots. Narrow
+        # project/toolchain/build exceptions are then re-added afterwards.
+        def append_private_state_denials(profile: mutable darray[u8]&, inputs: ProfileInputs&) -> bool can[Memory.Allocate, Abort.Panic]:
+            return false if not:
+                append_path_rule(profile, "deny", "file-read*", "subpath", inputs.home)
+                append_path_rule(profile, "deny", "file-write*", "subpath", inputs.home)
+                append_path_rule(profile, "deny", "process-exec", "subpath", inputs.home)
+                append_path_rule(profile, "deny", "file-map-executable", "subpath", inputs.home)
             # `/usr` is a system root, but `/usr/local` is commonly writable
             # by the invoking user (including Intel Homebrew). Do not inherit
             # that entire prefix as a compiler-readable system directory.
             # Selected toolchain files and recognized LLVM roots are granted
             # back individually after this denial.
-            ByteText::append_text(&profile, "(deny file-read* (subpath \"/usr/local\"))\n")
-            ByteText::append_text(&profile, "(deny file-read* (subpath \"/private/tmp\"))\n(deny file-write* (subpath \"/private/tmp\"))\n")
+            ByteText::append_text(profile, "(deny file-read* (subpath \"/usr/local\"))\n")
+            ByteText::append_text(profile, "(deny file-read* (subpath \"/private/tmp\"))\n(deny file-write* (subpath \"/private/tmp\"))\n")
+            return true
 
-            return [] if not append_read_root(&profile, project_real)
-            return [] if not append_dependency_rules(&profile, dependency_roots, DependencyRule.AllowRead)
-            return [] if not append_read_roots(&profile, tool_roots)
-            for index in 0..<tool_paths.count |tool_paths, profile|:
-                return [] if not append_tool_file_read(&profile, tool_paths[index])
-            return [] if not append_selected_llvm_rules(&profile, tool_paths, home_real, "/usr/local", "/usr/local/opt/llvm/bin/clang", "/usr/local/opt/llvm/lib")
-            for index in 0..<tool_paths.count |tool_paths, profile|:
-                return [] if not append_toolchain_library_root(&profile, tool_paths[index], home_real)
-
+        def append_reallowed_inputs(profile: mutable darray[u8]&, inputs: ProfileInputs&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return false if not:
+                append_read_root(profile, inputs.project)
+                append_dependency_rules(profile, inputs.dependency_roots, DependencyRule.AllowRead)
+                append_read_roots(profile, inputs.tool_roots)
+            for index in 0..<inputs.tool_paths.count:
+                return false if not append_tool_file_read(profile, inputs.tool_paths[index])
+            return false if not append_selected_llvm_rules(profile, inputs.tool_paths, inputs.home, "/usr/local", "/usr/local/opt/llvm/bin/clang", "/usr/local/opt/llvm/lib")
+            for index in 0..<inputs.tool_paths.count:
+                return false if not append_toolchain_library_root(profile, inputs.tool_paths[index], inputs.home)
             # The compiler consumes only copied, verified package sources. The
             # live project and dependency trees stay unreadable for the child,
             # closing edit/restore races and absolute-include escapes back to
             # mutable checkout paths. Tool roots were allowed above; these
             # later denials still apply when a tool lives inside a source tree.
             # This keeps a selected tool exception from reopening package data.
-            return [] if not append_path_rule(&profile, "deny", "file-read*", "subpath", project_real)
-            return [] if not append_dependency_rules(&profile, dependency_roots, DependencyRule.DenyRead)
+            return append_path_rule(profile, "deny", "file-read*", "subpath", inputs.project) and
+                   append_dependency_rules(profile, inputs.dependency_roots, DependencyRule.DenyRead)
+
+        def append_execution_rules(profile: mutable darray[u8]&, inputs: ProfileInputs&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             # The compiler's controlled linker path uses these exact host
             # utilities. Allow their exact paths so it cannot execute
             # unrelated programs simply because they share /usr/bin.
-            return [] if:
-                not append_executable_path(&profile, "/usr/bin/env")
-                not append_executable_path(&profile, "/bin/sh")
-                not append_executable_path(&profile, "/bin/bash")
-                not append_executable_path(&profile, "/usr/bin/ld")
-                not append_executable_path(&profile, "/usr/bin/as")
             # Apple's linker queries the selected Xcode installation through
-            # this exact helper on macOS. Keep execution to the fixed system
-            # path; the rest of the Xcode tree is only a read-only tool root.
-            return [] if not append_executable_path(&profile, "/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild")
-
+            # the xcodebuild helper on macOS. Keep execution to the fixed
+            # system path; the rest of the Xcode tree is only a read-only root.
+            return false if not:
+                append_executable_path(profile, "/usr/bin/env")
+                append_executable_path(profile, "/bin/sh")
+                append_executable_path(profile, "/bin/bash")
+                append_executable_path(profile, "/usr/bin/ld")
+                append_executable_path(profile, "/usr/bin/as")
+                append_executable_path(profile, "/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild")
             # The selected compiler and bootstrap binary can be individual
             # files anywhere on disk. Their exact paths are the only
             # toolchain execution exceptions; toolchain roots remain read-only.
-            for index in 0..<executable_paths.count |executable_paths, profile|:
-                return [] if not append_executable_path(&profile, executable_paths[index])
+            for index in 0..<inputs.executable_paths.count:
+                return false if not append_executable_path(profile, inputs.executable_paths[index])
+            return true
 
+        def append_snapshot_rules(profile: mutable darray[u8]&, inputs: ProfileInputs&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             # These directories are excluded from the source fingerprint, so
             # they must not become compiler inputs through an include directive.
-            # The exact private scratch directory is reallowed below.
-            return [] if not append_source_state_denials(&profile, project_real)
-            return [] if not append_dependency_rules(&profile, dependency_roots, DependencyRule.DenySourceState)
-
+            # The exact private scratch directory is reallowed afterwards.
             # The snapshot root is intentionally beneath reserved build state,
             # so grant its exact read boundary after those denials. Keep this
             # exception before the credential matcher; credential-like names
             # inside a malformed snapshot remain denied.
-            return [] if:
-                not append_read_root(&profile, snapshot_real)
-                not append_source_state_denials(&profile, snapshot_real)
-                not append_path_rule(&profile, "deny", "file-write*", "subpath", snapshot_real)
+            return append_source_state_denials(profile, inputs.project) and
+                   append_dependency_rules(profile, inputs.dependency_roots, DependencyRule.DenySourceState) and
+                   append_read_root(profile, inputs.snapshot) and
+                   append_source_state_denials(profile, inputs.snapshot) and
+                   append_path_rule(profile, "deny", "file-write*", "subpath", inputs.snapshot)
 
-            # Common credentials and private build state are not source inputs.
-            # Tool and scratch exceptions stay narrow; retain
-            # these denials after those exceptions to keep obvious secret files
-            # outside the compiler's view.
-            ByteText::append_text(&profile, "(deny file-read* (regex #\"^.*/(\\.[eE][nN][vV][^/]*|[^/]*\\.[eE][nN][vV]|\\.[nN][eE][tT][rR][cC]|\\.[sS][sS][hH]|\\.[aA][wW][sS]|\\.[gG][nN][uU][pP][gG]|\\.[kK][uU][bB][eE]|\\.[dD][oO][cC][kK][eE][rR]|\\.[aA][zZ][uU][rR][eE]|\\.[tT][eE][rR][rR][aA][fF][oO][rR][mM](\\.[dD])?|\\.[cC][oO][nN][fF][iI][gG]/([gG][cC][lL][oO][uU][dD]|[gG][hH]|[rR][cC][lL][oO][nN][eE])|\\.[nN][pP][mM][rR][cC]|\\.[pP][yY][pP][iI][rR][cC]|\\.[gG][iI][tT]|\\.[hH][gG]|\\.[sS][vV][nN]|[iI][mM][pP][lL][eE][mM][eE][nN][tT][aA][tT][iI][oO][nN]_[pP][lL][aA][nN]\\.[mM][dD]|\\.[gG][iI][tT]-[cC][rR][eE][dD][eE][nN][tT][iI][aA][lL][sS]|[iI][dD]_([rR][sS][aA]|[eE][dD]25519|[eE][cC][dD][sS][aA]|[dD][sS][aA])|[cC][rR][eE][dD][eE][nN][tT][iI][aA][lL][sS][^/]*|[^/]*\\.[pP][eE][mM][^/]*|[^/]*\\.[kK][eE][yY][^/]*|[^/]*\\.[pP]12|[^/]*\\.[pP][fF][xX]|[^/]*\\.[pP]8|[^/]*\\.[jJ][kK][sS]|[^/]*\\.[kK][eE][yY][sS][tT][oO][rR][eE])($|/.*)$\"))\n")
+        # Common credentials and private build state are not source inputs.
+        # Tool and scratch exceptions stay narrow; retain these denials after
+        # those exceptions to keep obvious secret files outside the compiler's view.
+        def append_credential_denials(profile: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            ByteText::append_text(profile, "(deny file-read* (regex #\"^.*/(\\.[eE][nN][vV][^/]*|[^/]*\\.[eE][nN][vV]|\\.[nN][eE][tT][rR][cC]|\\.[sS][sS][hH]|\\.[aA][wW][sS]|\\.[gG][nN][uU][pP][gG]|\\.[kK][uU][bB][eE]|\\.[dD][oO][cC][kK][eE][rR]|\\.[aA][zZ][uU][rR][eE]|\\.[tT][eE][rR][rR][aA][fF][oO][rR][mM](\\.[dD])?|\\.[cC][oO][nN][fF][iI][gG]/([gG][cC][lL][oO][uU][dD]|[gG][hH]|[rR][cC][lL][oO][nN][eE])|\\.[nN][pP][mM][rR][cC]|\\.[pP][yY][pP][iI][rR][cC]|\\.[gG][iI][tT]|\\.[hH][gG]|\\.[sS][vV][nN]|[iI][mM][pP][lL][eE][mM][eE][nN][tT][aA][tT][iI][oO][nN]_[pP][lL][aA][nN]\\.[mM][dD]|\\.[gG][iI][tT]-[cC][rR][eE][dD][eE][nN][tT][iI][aA][lL][sS]|[iI][dD]_([rR][sS][aA]|[eE][dD]25519|[eE][cC][dD][sS][aA]|[dD][sS][aA])|[cC][rR][eE][dD][eE][nN][tT][iI][aA][lL][sS][^/]*|[^/]*\\.[pP][eE][mM][^/]*|[^/]*\\.[kK][eE][yY][^/]*|[^/]*\\.[pP]12|[^/]*\\.[pP][fF][xX]|[^/]*\\.[pP]8|[^/]*\\.[jJ][kK][sS]|[^/]*\\.[kK][eE][yY][sS][tT][oO][rR][eE])($|/.*)$\"))\n")
+            return true
 
-            return [] if not append_scratch_access(&profile, build_real)
+        def append_output_rules(profile: mutable darray[u8]&, inputs: ProfileInputs&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return false if not append_scratch_access(profile, inputs.build)
             region output_real_scope:
                 output_real: mutable darray[u8] = []
-                return [] if:
-                    not ProjectFiles::canonical_existing_c_string_path(output_temporary, &output_real) or not absolute_path(output_real)
-                    output_real.count <= build_real.count or not ProjectFiles::path_is_same_or_beneath(output_real, build_real)
+                return false if:
+                    not ProjectFiles::canonical_existing_c_string_path(inputs.output_temporary, &output_real) or not absolute_path(output_real)
+                    output_real.count <= inputs.build.count or not ProjectFiles::path_is_same_or_beneath(output_real, inputs.build)
             # The stage1 linker emits one fixed-name C fallback under /tmp.
             # The child pre-creates it with O_EXCL before entering Seatbelt. The
             # sandbox may then truncate/write that existing inode and let clang
             # read it, but cannot create, chmod, rename, or unlink the host path.
-            ByteText::append_text(&profile, "(allow file-read-metadata (path-ancestors \"/tmp\"))\n(allow file-read-metadata (literal \"/tmp\"))\n")
-            ByteText::append_text(&profile, "(allow file-read-metadata (path-ancestors (param \"CALLBACK_PATH\")))\n")
-            ByteText::append_text(&profile, "(allow file-read* (literal (param \"CALLBACK_PATH\")))\n")
-            ByteText::append_text(&profile, "(allow file-write-data (literal (param \"CALLBACK_PATH\")))\n")
-            return [] if profile.count > 65536.usize()
-            return profile
+            ByteText::append_text(profile, "(allow file-read-metadata (path-ancestors \"/tmp\"))\n(allow file-read-metadata (literal \"/tmp\"))\n")
+            ByteText::append_text(profile, "(allow file-read-metadata (path-ancestors (param \"CALLBACK_PATH\")))\n")
+            ByteText::append_text(profile, "(allow file-read* (literal (param \"CALLBACK_PATH\")))\n")
+            ByteText::append_text(profile, "(allow file-write-data (literal (param \"CALLBACK_PATH\")))\n")
+            return true
 
-    private:
         def append_read_roots(profile: mutable darray[u8]&, roots: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
             region cursor_scope:
                 cursor: mutable usize = 0
