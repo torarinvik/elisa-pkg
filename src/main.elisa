@@ -1084,58 +1084,12 @@ module Cli:
 
         # ---------- manifest and lock ---------------------------------------------------------
 
-        def key_value(raw: darray[u8]&, key: cstr, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            out.resize(0)
-            # Restrict package identity fields to the actual `package` object. A target
-            # named `name` that appears earlier in the document cannot change the package
-            # identity used in the lockfile.
-            package_start: usize = Json::root_value_offset(raw, "package")
-            package_end: usize = Json::object_end(raw, package_start)
-            return false if package_start >= raw.count or package_end <= package_start
-            in_string: mutable bool = false
-            escaped: mutable bool = false
-            string_start: mutable usize = 0.usize()
-            key_length: usize = Platform::pkg_strlen(key)
-            for index in (package_start + 1.usize())..<package_end |raw, in_string, escaped, string_start|:
-                byte: u8 = raw[index]
-                if not in_string:
-                    if byte == 34:
-                        in_string <- true
-                        string_start <- index + 1.usize()
-                elif escaped:
-                    escaped <- false
-                elif byte == 92:
-                    escaped <- true
-                elif byte == 34:
-                    after: mutable usize = index + 1.usize()
-                    while after < package_end and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
-                        after <- after + 1.usize()
-                    matched: mutable bool = after < package_end and raw[after] == 58 and index - string_start == key_length
-                    if matched:
-                        for key_index in 0..<key_length |raw, key, string_start, matched|:
-                            matched <- false if raw[string_start + key_index] != key[key_index].u8()
-                    if matched:
-                        after <- after + 1.usize()
-                        while after < package_end and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
-                            after <- after + 1.usize()
-                        return false if after >= package_end or raw[after] != 34
-                        after <- after + 1.usize()
-                        while after < package_end and raw[after] != 34 |raw, after, out|:
-                            return false if raw[after] == 92
-                            out.push(raw[after])
-                            after <- after + 1.usize()
-                        return after < package_end
-                    in_string <- false
-            return false
-
         def valid_package_name(name: darray[u8]&) -> bool:
             return PackageIdentity::valid_name(name)
 
         def validate_manifest_at(raw: darray[u8]&, root: darray[u8]&, name_out: mutable darray[u8]&, version_out: mutable darray[u8]&) -> bool:
             name_out.resize(0)
             version_out.resize(0)
-            return false if raw.count == 0.usize() or raw.count > 1048576.usize()
-            return false if not Json::valid_utf8(raw)
             return false if not Json::valid_document(raw)
             return false if not Json::unique_object_keys(raw)
             return false if not Manifest::allowed_keys(raw)
@@ -1155,7 +1109,11 @@ module Cli:
             return false if not dependency_map_empty(raw, "dev-dependencies")
             name: mutable darray[u8] = []
             version: mutable darray[u8] = []
-            return false if not key_value(raw, "name", &name) or not key_value(raw, "version", &version)
+            package_start: mutable usize = 0.usize()
+            package_end: mutable usize = 0.usize()
+            return false if not Json::object_value_span(raw, object_start, object_finish, "package", &package_start, &package_end)
+            return false if not Json::object_string_value(raw, package_start, package_end, "name", &name)
+            return false if not Json::object_string_value(raw, package_start, package_end, "version", &version)
             return false if not valid_package_name(name)
             parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
             return false if not parse_version(version, &parsed)
