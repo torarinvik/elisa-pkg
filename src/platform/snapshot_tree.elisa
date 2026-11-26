@@ -313,38 +313,49 @@ module NativeSnapshotTree:
                 NativeFileCollection::collect_files(destination, names_raw, names.count)
             return PlatformNative::close_error(root, collected) if collected < 0
             copied_paths: mutable darray[u8] = []
-            cursor: mutable usize = 0.usize()
+            region paths_status_scope:
+                paths_status: i64 = relative_snapshot_paths(destination, length, names, collected.usize(), &copied_paths)
+                return PlatformNative::close_error(root, paths_status) if paths_status != 0
+            return remove_snapshot_contents(root, copied_paths)
+
+        # Turn the collected absolute file names under `destination` into the
+        # terminated relative paths they name. Returns 0 or a negative errno.
+        def relative_snapshot_paths(destination: cstr, length: usize, names: darray[u8]&, collected: usize, copied_paths: mutable darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic]:
+            requires collected <= names.count
             entry_count: mutable usize = 0.usize()
-            while cursor < collected.usize() |names, destination, length, copied_paths, cursor, entry_count|:
+            while cursor < collected |cursor: usize = 0.usize()|:
                 path_start: usize = cursor
-                while cursor < collected.usize() and names[cursor] != 0:
+                while cursor < collected and names[cursor] != 0:
                     cursor <- cursor + 1.usize()
-                return PlatformNative::close_error(root, -22) if cursor == path_start or cursor >= collected.usize()
+                return -22 if cursor == path_start or cursor >= collected
                 path_length: usize = cursor - path_start
                 cursor <- cursor + 1.usize()
-                return PlatformNative::close_error(root, -22) if path_length <= length + 1.usize()
+                return -22 if path_length <= length + 1.usize()
                 for index in 0..<length |names, destination, path_start|:
-                    return PlatformNative::close_error(root, -22) if names[path_start + index] != destination[index].u8()
-                return PlatformNative::close_error(root, -22) if names[path_start + length] != 47
+                    return -22 if names[path_start + index] != destination[index].u8()
+                return -22 if names[path_start + length] != 47
                 relative: darray[u8] = [names[path_start + index] for index in length + 1.usize()..<path_length]
-                return PlatformNative::close_error(root, -22) if not SnapshotPaths::relative_path_safe(relative)
+                return -22 if not SnapshotPaths::relative_path_safe(relative)
                 entry_count <- entry_count + 1.usize()
-                return PlatformNative::close_error(root, -75) if entry_count > snapshot_maximum_entries
-                for index in 0..<relative.count |copied_paths, relative|:
-                    copied_paths <- copied_paths.push(relative[index])
-                copied_paths <- copied_paths.push(0)
+                return -75 if entry_count > snapshot_maximum_entries
+                ByteText::append(copied_paths, relative)
+                copied_paths.push(0)
+            return 0
 
+        # Remove the listed files, then their now-empty directories from the
+        # deepest level up, and flush and close `root`.
+        def remove_snapshot_contents(root: i64, copied_paths: darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            requires root >= 0
             return PlatformNative::close_error(root, -5) if not NativeStagingTree::remove_files(root, copied_paths)
             directory_depth: mutable usize = 64.usize()
-            while directory_depth > 0.usize() |names, copied_paths, root, directory_depth|:
+            while directory_depth > 0.usize() |copied_paths, root, directory_depth|:
                 region directories_scope:
                     directories: mutable darray[u8] = []
                     return PlatformNative::close_error(root, -22) if not directories_at_depth(copied_paths, directory_depth, &directories)
                     return PlatformNative::close_error(root, -5) if directories.count > 0.usize() and not NativeStagingTree::remove_directories(root, directories)
                 directory_depth <- directory_depth - 1.usize()
             return PlatformNative::close_error(root, -5) if not PlatformNative::directory_empty(root)
-            if native_fsync(root) != 0:
-                return PlatformNative::close_error(root, NativeErrors::negative_errno())
+            return PlatformNative::close_error(root, NativeErrors::negative_errno()) if native_fsync(root) != 0
             return PlatformNative::close_result(root, 0)
 
         # The parent directories, `depth` components deep, of each terminated
