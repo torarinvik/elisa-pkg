@@ -3555,31 +3555,19 @@ module Cli:
             bytes_push_cstr(&receipt, "\nexpires:")
             registry_append_decimal(&receipt, expires)
             receipt.push(10)
-            return false if receipt.count > 2048.usize()
+            return false if receipt.count > Cache::max_registry_receipt_bytes
             path_c: mutable darray[u8] = []
             path_with_nul_into(&path, &path_c)
             path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
-            if cstr_file_exists(path_name):
-                existing: mutable darray[u8] = []
-                return false if not read_package_file_into(&path, &existing)
-                return bytes_equal(existing, receipt)
-            publication_status: i64 = write_cstr_file_noclobber_status(path_name, receipt)
-            if publication_status != 0:
-                # Another verified fetch may have won the exclusive publication race.
-                # Accept that result only when the durable receipt bytes are identical;
-                # malformed, unreadable, or conflicting evidence still fails closed.
-                return false if publication_status != -17
-                return false if not cstr_file_exists(path_name)
-                existing: mutable darray[u8] = []
-                return false if not read_package_file_into(&path, &existing)
-                return bytes_equal(existing, receipt)
+            if not cstr_file_exists(path_name):
+                publication_status: i64 = write_cstr_file_noclobber_status(path_name, receipt)
+                return false if publication_status != 0 and publication_status != -17
             existing: mutable darray[u8] = []
-            return false if not read_package_file_into(&path, &existing)
-            return bytes_equal(existing, receipt)
+            return Cache::read_registry_receipt(digest, metadata_digest, &existing) and bytes_equal(existing, receipt)
 
         def registry_cache_receipt_matches(receipt: darray[u8]&, package: darray[u8]&, version: darray[u8]&, archive: darray[u8]&, archive_size: u64, digest: darray[u8]&, metadata_digest: darray[u8]&, expires_out: mutable u64&) -> bool can[Memory.Allocate, Abort.Panic]:
             expires_out <- 0
-            return false if receipt.count == 0.usize() or receipt.count > 2048.usize()
+            return false if receipt.count == 0.usize() or receipt.count > Cache::max_registry_receipt_bytes
             prefix: mutable darray[u8] = []
             bytes_push_view(&prefix, "elisapkg-registry-cache:1\nregistry:primary\nname:")
             bytes_push_array(&prefix, package)
@@ -3755,10 +3743,8 @@ module Cli:
                     metadata_digest.push(encoded_metadata_digest[7.usize() + index])
                 archive_size: mutable u64 = 0
                 return EXIT_RESOLVE if not object_unsigned_value(lock, cursor, record_end, "archive-size", &archive_size) or archive_size > Archive::max_archive_bytes.u64()
-                receipt_path: mutable darray[u8] = []
-                return EXIT_SECURITY if not Cache::registry_receipt_path(digest, metadata_digest, &receipt_path)
                 receipt: mutable darray[u8] = []
-                return EXIT_SECURITY if not read_package_file_into(&receipt_path, &receipt)
+                return EXIT_SECURITY if not Cache::read_registry_receipt(digest, metadata_digest, &receipt)
                 expires: mutable u64 = 0
                 return EXIT_SECURITY if not registry_cache_receipt_matches(receipt, package, version_text, archive, archive_size, digest, metadata_digest, &expires)
                 return EXIT_SECURITY if expires <= now.u64()
