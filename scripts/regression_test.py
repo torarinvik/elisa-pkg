@@ -85,6 +85,7 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
     work = Path(directory)
     lines = [f'include "{ROOT}/src/registry.elisa"',
              f'include "{ROOT}/src/package/manifest.elisa"',
+             f'include "{ROOT}/src/package/receipt.elisa"',
              f'include "{ROOT}/src/cache.elisa"',
              'def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:']
     lines.extend([
@@ -183,16 +184,16 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
     receipt_name = data('acme')
     receipt_version = data('1.2.3')
     receipt_digest = data('a' * 64)
-    lines.append(f'    receipt: mutable darray[u8] = Archive::package_receipt_bytes({receipt_name}, {receipt_version}, {receipt_digest}, {receipt_digest}, {receipt_digest})')
+    lines.append(f'    receipt: mutable darray[u8] = PackageReceipt::encode({receipt_name}, {receipt_version}, {receipt_digest}, {receipt_digest}, {receipt_digest})')
     check('receipt.count > 0.usize()')
     injected_receipt_name = data('acme\ninjected:yes')
-    lines.append(f'    injected_name_receipt: mutable darray[u8] = Archive::package_receipt_bytes({injected_receipt_name}, {receipt_version}, {receipt_digest}, {receipt_digest}, {receipt_digest})')
+    lines.append(f'    injected_name_receipt: mutable darray[u8] = PackageReceipt::encode({injected_receipt_name}, {receipt_version}, {receipt_digest}, {receipt_digest}, {receipt_digest})')
     check('injected_name_receipt.count == 0.usize()')
     injected_receipt_version = data('1.2.3\ninjected:yes')
-    lines.append(f'    injected_version_receipt: mutable darray[u8] = Archive::package_receipt_bytes({receipt_name}, {injected_receipt_version}, {receipt_digest}, {receipt_digest}, {receipt_digest})')
+    lines.append(f'    injected_version_receipt: mutable darray[u8] = PackageReceipt::encode({receipt_name}, {injected_receipt_version}, {receipt_digest}, {receipt_digest}, {receipt_digest})')
     check('injected_version_receipt.count == 0.usize()')
     bad_receipt_digest = data('bad')
-    lines.append(f'    bad_receipt: mutable darray[u8] = Archive::package_receipt_bytes({receipt_name}, {receipt_version}, {bad_receipt_digest}, {receipt_digest}, {receipt_digest})')
+    lines.append(f'    bad_receipt: mutable darray[u8] = PackageReceipt::encode({receipt_name}, {receipt_version}, {bad_receipt_digest}, {receipt_digest}, {receipt_digest})')
     check('bad_receipt.count == 0.usize()')
     namespace, package = data('acme'), data('acme/../evil')
     check(f'Trust::precheck_namespace({package}, {namespace}) == Trust::VerificationCode.UnauthorizedNamespace')
