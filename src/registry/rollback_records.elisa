@@ -75,6 +75,14 @@ module RollbackRecords:
                 cursor <- finish + 1.usize()
             return Code.Ok
 
+        # Check every record of `state` without looking up a package.
+        def validate(state: darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic]:
+            empty_identity: darray[u8] = []
+            unused_version: mutable darray[u8] = []
+            unused_digest: mutable darray[u8] = []
+            unused_metadata_digest: mutable darray[u8] = []
+            return find(state, empty_identity, &unused_version, &unused_digest, &unused_metadata_digest)
+
         # The offset of the first space in `state[start..<finish]`, or `finish`.
         def next_space(state: darray[u8]&, start: usize, finish: usize) -> usize:
             requires finish <= state.count
@@ -101,26 +109,18 @@ module RollbackRecords:
             return Code.Ok if:
                 not version_2(state)
                 not has_override
-            empty_identity: mutable darray[u8] = []
-            unused_version: mutable darray[u8] = []
-            unused_digest: mutable darray[u8] = []
-            unused_metadata_digest: mutable darray[u8] = []
             region validation_status_scope:
-                validation_status: Code = find(state, empty_identity, &unused_version, &unused_digest, &unused_metadata_digest)
+                validation_status: Code = validate(state)
                 return validation_status if validation_status != Code.Ok
             while cursor < state.count |cursor: usize = 23.usize()|:
                 finish: mutable usize = cursor
                 while finish < state.count and state[finish] != 10 |state, finish|:
                     finish <- finish + 1.usize()
                 return Code.Malformed if finish == state.count
-                separator: mutable usize = cursor
-                while separator < finish and state[separator] != 32 |state, separator|:
-                    separator <- separator + 1.usize()
+                separator: usize = next_space(state, cursor, finish)
                 return Code.Malformed if separator == cursor or separator == finish
                 region identity_scope:
-                    identity: mutable darray[u8] = []
-                    for index in cursor..<separator |identity, state|:
-                        identity <- identity.push(state[index])
+                    identity: darray[u8] = [state[index] for index in cursor..<separator]
                     return Code.Unavailable if PackageIdentity::valid_name(identity)
                 cursor <- finish + 1.usize()
             return Code.Ok
@@ -135,12 +135,8 @@ module RollbackRecords:
                     out.push(state[index])
                 return Code.Ok
             return Code.Malformed if not version_2(state) and not version_3(state)
-            empty_identity: mutable darray[u8] = []
-            unused_version: mutable darray[u8] = []
-            unused_digest: mutable darray[u8] = []
-            unused_metadata_digest: mutable darray[u8] = []
             region validation_status_scope:
-                validation_status: Code = legacy_override_status(state, true) if has_override and version_2(state) else find(state, empty_identity, &unused_version, &unused_digest, &unused_metadata_digest)
+                validation_status: Code = legacy_override_status(state, true) if has_override and version_2(state) else validate(state)
                 return validation_status if validation_status != Code.Ok
             ByteText::append_text(out, "elisapkg-trust-state:4\n")
             while cursor < state.count |cursor: usize = 23.usize()|:
@@ -148,14 +144,10 @@ module RollbackRecords:
                 while finish < state.count and state[finish] != 10 |state, finish|:
                     finish <- finish + 1.usize()
                 return Code.Malformed if finish == state.count
-                separator: mutable usize = cursor
-                while separator < finish and state[separator] != 32 |state, separator|:
-                    separator <- separator + 1.usize()
+                separator: usize = next_space(state, cursor, finish)
                 return Code.Malformed if separator == cursor or separator == finish
                 region identity_scope:
-                    identity: mutable darray[u8] = []
-                    for index in cursor..<separator |identity, state|:
-                        identity <- identity.push(state[index])
+                    identity: darray[u8] = [state[index] for index in cursor..<separator]
                     if PackageIdentity::valid_name(identity):
                         scoped_identity: mutable darray[u8] = []
                         return Code.Unavailable if not TrustIdentity::package(root, identity, &scoped_identity)
