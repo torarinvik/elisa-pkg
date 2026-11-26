@@ -47,8 +47,9 @@ module NativeSnapshotTree:
                 destination_name <- destination_name.push(destination[index].u8())
             destination_name <- destination_name.push(0)
             source_leaf: mutable darray[u8] = []
-            destination_leaf: mutable darray[u8] = []
-            return -22 if not SnapshotPaths::terminated_path_leaf(source_name, &source_leaf) or not SnapshotPaths::terminated_path_leaf(destination_name, &destination_leaf)
+            region destination_leaf_scope:
+                destination_leaf: mutable darray[u8] = []
+                return -22 if not SnapshotPaths::terminated_path_leaf(source_name, &source_leaf) or not SnapshotPaths::terminated_path_leaf(destination_name, &destination_leaf)
             return -13 if PackagePathPolicy::credential_root_forbidden(source_name) or PackagePathPolicy::reserved_source_path_forbidden(source_leaf)
 
             source_file_descriptor: mutable i64 = PlatformNative::open_package_directory_path((&source_name[0]).cast[cstr] can Unsafe.PointerCast)
@@ -66,9 +67,10 @@ module NativeSnapshotTree:
             source_status <- source_status.resize(status_buffer_bytes)
             destination_status <- destination_status.resize(status_buffer_bytes)
             source_status_raw: mutable void& = (&source_status[0]).cast[mutable void&] can Unsafe.PointerCast
-            destination_status_raw: mutable void& = (&destination_status[0]).cast[mutable void&] can Unsafe.PointerCast
-            if native_fstat(source_file_descriptor, source_status_raw) != 0 or native_fstat(destination_file_descriptor, destination_status_raw) != 0:
-                return PlatformNative::close_two_error(source_file_descriptor, destination_file_descriptor, -5)
+            region destination_status_raw_scope:
+                destination_status_raw: mutable void& = (&destination_status[0]).cast[mutable void&] can Unsafe.PointerCast
+                if native_fstat(source_file_descriptor, source_status_raw) != 0 or native_fstat(destination_file_descriptor, destination_status_raw) != 0:
+                    return PlatformNative::close_two_error(source_file_descriptor, destination_file_descriptor, -5)
             return PlatformNative::close_two_error(source_file_descriptor, destination_file_descriptor, -22) if NativeStat::same_identity(source_status, destination_status)
             if SnapshotPaths::path_is_descendant(source_name, destination_name):
                 destination_relative: mutable darray[u8] = []
@@ -100,53 +102,57 @@ module NativeSnapshotTree:
             current_source_status <- current_source_status.resize(status_buffer_bytes)
             current_source_raw: mutable void& = (&current_source_status[0]).cast[mutable void&] can Unsafe.PointerCast
             same_source: mutable bool = native_fstat(current_source_file_descriptor, current_source_raw) == 0 and NativeStat::same_identity(source_status, current_source_status)
-            current_close: i32 = native_close(current_source_file_descriptor)
-            if not same_source or current_close != 0:
-                return PlatformNative::close_two_error(source_file_descriptor, destination_file_descriptor, -13)
+            region current_close_scope:
+                current_close: i32 = native_close(current_source_file_descriptor)
+                if not same_source or current_close != 0:
+                    return PlatformNative::close_two_error(source_file_descriptor, destination_file_descriptor, -13)
 
             copied_paths: mutable darray[u8] = []
             created_directories: mutable darray[u8] = []
             cursor: mutable usize = 0.usize()
             entries: mutable usize = 0.usize()
             total_bytes: mutable usize = 0.usize()
-            copy_result: mutable i64 = 0
-            while cursor < collected.usize() |paths, source_name, source_file_descriptor, destination_file_descriptor, copied_paths, cursor, entries, total_bytes, copy_result|:
-                path_start: usize = cursor
-                while cursor < collected.usize() and paths[cursor] != 0:
+            region copy_result_scope:
+                copy_result: mutable i64 = 0
+                while cursor < collected.usize() |paths, source_name, source_file_descriptor, destination_file_descriptor, copied_paths, cursor, entries, total_bytes, copy_result|:
+                    path_start: usize = cursor
+                    while cursor < collected.usize() and paths[cursor] != 0:
+                        cursor <- cursor + 1.usize()
+                    return snapshot_copy_failure(source_file_descriptor, destination_file_descriptor, copied_paths, created_directories, -5) if cursor >= collected.usize() or cursor == path_start
+                    full_length: usize = cursor - path_start
                     cursor <- cursor + 1.usize()
-                return snapshot_copy_failure(source_file_descriptor, destination_file_descriptor, copied_paths, created_directories, -5) if cursor >= collected.usize() or cursor == path_start
-                full_length: usize = cursor - path_start
-                cursor <- cursor + 1.usize()
-                root_length: usize = source_length
-                return snapshot_copy_failure(source_file_descriptor, destination_file_descriptor, copied_paths, created_directories, -22) if full_length <= root_length + 1.usize() or full_length > SnapshotPaths::maximum_path_bytes
-                for index in 0..<root_length |paths, source_name, path_start|:
-                    return snapshot_copy_failure(source_file_descriptor, destination_file_descriptor, copied_paths, created_directories, -22) if paths[path_start + index] != source_name[index]
-                return snapshot_copy_failure(source_file_descriptor, destination_file_descriptor, copied_paths, created_directories, -22) if paths[path_start + root_length] != 47
+                    root_length: usize = source_length
+                    return snapshot_copy_failure(source_file_descriptor, destination_file_descriptor, copied_paths, created_directories, -22) if full_length <= root_length + 1.usize() or full_length > SnapshotPaths::maximum_path_bytes
+                    for index in 0..<root_length |paths, source_name, path_start|:
+                        return snapshot_copy_failure(source_file_descriptor, destination_file_descriptor, copied_paths, created_directories, -22) if paths[path_start + index] != source_name[index]
+                    return snapshot_copy_failure(source_file_descriptor, destination_file_descriptor, copied_paths, created_directories, -22) if paths[path_start + root_length] != 47
 
-                relative: mutable darray[u8] = []
-                for index in root_length + 1.usize()..<full_length |relative, paths, path_start|:
-                    relative <- relative.push(paths[path_start + index])
-                if SnapshotPaths::root_control_file(relative):
-                    continue
-                entries <- entries + 1.usize()
-                if entries > snapshot_maximum_entries or not SnapshotPaths::relative_path_safe(relative):
-                    return snapshot_copy_failure(source_file_descriptor, destination_file_descriptor, copied_paths, created_directories, -22)
-                if PackagePathPolicy::credential_path_forbidden(relative) or PackagePathPolicy::reserved_source_path_forbidden(relative):
-                    return snapshot_copy_failure(source_file_descriptor, destination_file_descriptor, copied_paths, created_directories, -13)
+                    relative: mutable darray[u8] = []
+                    for index in root_length + 1.usize()..<full_length |relative, paths, path_start|:
+                        relative <- relative.push(paths[path_start + index])
+                    if SnapshotPaths::root_control_file(relative):
+                        continue
+                    entries <- entries + 1.usize()
+                    if entries > snapshot_maximum_entries or not SnapshotPaths::relative_path_safe(relative):
+                        return snapshot_copy_failure(source_file_descriptor, destination_file_descriptor, copied_paths, created_directories, -22)
+                    if PackagePathPolicy::credential_path_forbidden(relative) or PackagePathPolicy::reserved_source_path_forbidden(relative):
+                        return snapshot_copy_failure(source_file_descriptor, destination_file_descriptor, copied_paths, created_directories, -13)
 
-                copy_result <- snapshot_copy_one(source_file_descriptor, destination_file_descriptor, relative, &copied_paths, &created_directories, &total_bytes, byte_limit)
-                if copy_result != 0:
-                    return snapshot_copy_failure(source_file_descriptor, destination_file_descriptor, copied_paths, created_directories, copy_result)
+                    copy_result <- snapshot_copy_one(source_file_descriptor, destination_file_descriptor, relative, &copied_paths, &created_directories, &total_bytes, byte_limit)
+                    if copy_result != 0:
+                        return snapshot_copy_failure(source_file_descriptor, destination_file_descriptor, copied_paths, created_directories, copy_result)
 
             if native_fsync(destination_file_descriptor) != 0:
                 return snapshot_copy_failure(source_file_descriptor, destination_file_descriptor, copied_paths, created_directories, NativeErrors::negative_errno())
-            source_close: i32 = native_close(source_file_descriptor)
-            if source_close != 0:
-                return snapshot_copy_failure(-1, destination_file_descriptor, copied_paths, created_directories, -5)
+            region source_close_scope:
+                source_close: i32 = native_close(source_file_descriptor)
+                if source_close != 0:
+                    return snapshot_copy_failure(-1, destination_file_descriptor, copied_paths, created_directories, -5)
             destination_close: i32 = native_close(destination_file_descriptor)
             if destination_close != 0:
-                cleanup_status: i64 = cleanup_package_snapshot_contents((&destination_name[0]).cast[cstr] can Unsafe.PointerCast)
-                return -5 if cleanup_status != 0
+                region cleanup_status_scope:
+                    cleanup_status: i64 = cleanup_package_snapshot_contents((&destination_name[0]).cast[cstr] can Unsafe.PointerCast)
+                    return -5 if cleanup_status != 0
                 return -5
             return total_bytes.i64()
 
@@ -159,26 +165,30 @@ module NativeSnapshotTree:
             source_leaf: cstr = (&source_parent_path[source_leaf_offset]).cast[cstr] can Unsafe.PointerCast
             source_file: i64 = PlatformNative::open_regular_file_at(source_parent, source_leaf)
             if source_file < 0:
-                close_status: i64 = native_close(source_parent)
-                return -5 if close_status != 0
+                region close_status_scope:
+                    close_status: i64 = native_close(source_parent)
+                    return -5 if close_status != 0
                 return source_file
-            regular: bool = PlatformNative::regular_file_descriptor(source_file)
-            if not regular:
-                return PlatformNative::close_two_error(source_parent, source_file, -21)
+            region regular_scope:
+                regular: bool = PlatformNative::regular_file_descriptor(source_file)
+                if not regular:
+                    return PlatformNative::close_two_error(source_parent, source_file, -21)
 
             destination_parent_path: mutable darray[u8] = []
             destination_leaf_offset: mutable usize = 0.usize()
             destination_parent: i64 = snapshot_open_parent(destination_root, relative, &destination_parent_path, &destination_leaf_offset, true, created_directories)
             if destination_parent < 0:
-                close_status: i64 = PlatformNative::close_two_error(source_parent, source_file, 0)
-                return -5 if close_status != 0
+                region close_status_scope:
+                    close_status: i64 = PlatformNative::close_two_error(source_parent, source_file, 0)
+                    return -5 if close_status != 0
                 return destination_parent
             destination_leaf: cstr = (&destination_parent_path[destination_leaf_offset]).cast[cstr] can Unsafe.PointerCast
             destination_file: i64 = native_openat(destination_parent, destination_leaf, PlatformNative::flags_write_create_exclusive(), 384)
             destination_open_errno: i64 = NativeErrors::negative_errno()
             if destination_file < 0:
-                close_status: i64 = PlatformNative::close_three_error(source_parent, source_file, destination_parent, 0)
-                return -5 if close_status != 0
+                region close_status_scope:
+                    close_status: i64 = PlatformNative::close_three_error(source_parent, source_file, destination_parent, 0)
+                    return -5 if close_status != 0
                 return destination_open_errno
 
             for index in 0..<relative.count |copied_paths, relative|:
@@ -200,34 +210,37 @@ module NativeSnapshotTree:
                 if amount > buffer.count.i64() or amount.usize() > byte_limit - total_bytes:
                     failed <- -75
                     break
-                written: mutable usize = 0.usize()
-                while written < amount.usize() |buffer_raw, destination_file, written, amount|:
-                    raw: void& = (&buffer[written]).cast[void&] can Unsafe.PointerCast
-                    wrote: i64 = native_write(destination_file, raw, amount.usize() - written)
-                    if wrote < 0:
-                        errno_value: i64 = NativeErrors::current_errno()
-                        continue if errno_value == 4
-                        failed <- NativeErrors::negative_value(errno_value)
-                        break
-                    if wrote == 0 or wrote > amount - written.i64():
-                        failed <- -5
-                        break
-                    written <- written + wrote.usize()
+                region written_scope:
+                    written: mutable usize = 0.usize()
+                    while written < amount.usize() |buffer_raw, destination_file, written, amount|:
+                        raw: void& = (&buffer[written]).cast[void&] can Unsafe.PointerCast
+                        wrote: i64 = native_write(destination_file, raw, amount.usize() - written)
+                        if wrote < 0:
+                            errno_value: i64 = NativeErrors::current_errno()
+                            continue if errno_value == 4
+                            failed <- NativeErrors::negative_value(errno_value)
+                            break
+                        if wrote == 0 or wrote > amount - written.i64():
+                            failed <- -5
+                            break
+                        written <- written + wrote.usize()
                 break if failed != 0
                 total_bytes <- total_bytes + amount.usize()
 
             if failed == 0 and native_fsync(destination_file) != 0:
                 failed <- NativeErrors::negative_errno()
             source_close: i32 = native_close(source_file)
-            destination_close: i32 = native_close(destination_file)
-            if failed == 0 and (source_close != 0 or destination_close != 0):
-                failed <- -5
+            region destination_close_scope:
+                destination_close: i32 = native_close(destination_file)
+                if failed == 0 and (source_close != 0 or destination_close != 0):
+                    failed <- -5
             if failed == 0 and native_fsync(destination_parent) != 0:
                 failed <- NativeErrors::negative_errno()
             source_parent_close: i32 = native_close(source_parent)
-            destination_parent_close: i32 = native_close(destination_parent)
-            if source_parent_close != 0 or destination_parent_close != 0:
-                failed <- -5 if failed == 0
+            region destination_parent_close_scope:
+                destination_parent_close: i32 = native_close(destination_parent)
+                if source_parent_close != 0 or destination_parent_close != 0:
+                    failed <- -5 if failed == 0
             return failed
 
         def snapshot_copy_failure(source_root: i64, destination_root: i64, copied_paths: darray[u8]&, created_directories: darray[u8]&, original_error: i64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -238,8 +251,9 @@ module NativeSnapshotTree:
                 cleanup_ok <- native_fsync(destination_root) == 0 and cleanup_ok
                 cleanup_status <- -5 if not cleanup_ok
             source_close: i32 = native_close(source_root) if source_root >= 0 else 0
-            destination_close: i32 = native_close(destination_root) if destination_root >= 0 else 0
-            return -5 if cleanup_status != 0 or source_close != 0 or destination_close != 0
+            region destination_close_scope:
+                destination_close: i32 = native_close(destination_root) if destination_root >= 0 else 0
+                return -5 if cleanup_status != 0 or source_close != 0 or destination_close != 0
             return original_error if original_error != 0 else -5
 
         def cleanup_package_snapshot_contents(destination: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -281,23 +295,24 @@ module NativeSnapshotTree:
             return PlatformNative::close_error(root, -5) if not NativeStagingTree::remove_files(root, copied_paths)
             directory_depth: mutable usize = 64.usize()
             while directory_depth > 0.usize() |names, copied_paths, root, directory_depth|:
-                directories: mutable darray[u8] = []
-                file_cursor: mutable usize = 0.usize()
-                while file_cursor < copied_paths.count |copied_paths, directories, file_cursor, directory_depth|:
-                    file_end: mutable usize = file_cursor
-                    while file_end < copied_paths.count and copied_paths[file_end] != 0:
-                        file_end <- file_end + 1.usize()
-                    return PlatformNative::close_error(root, -22) if file_end == file_cursor or file_end >= copied_paths.count
-                    component_depth: mutable usize = 0.usize()
-                    for index in file_cursor..<file_end |copied_paths, directories, component_depth, file_end, directory_depth|:
-                        if copied_paths[index] == 47:
-                            component_depth <- component_depth + 1.usize()
-                            if component_depth == directory_depth:
-                                for prefix_index in file_cursor..<index |directories, copied_paths|:
-                                    directories <- directories.push(copied_paths[prefix_index])
-                                directories <- directories.push(0)
-                    file_cursor <- file_end + 1.usize()
-                return PlatformNative::close_error(root, -5) if directories.count > 0.usize() and not NativeStagingTree::remove_directories(root, directories)
+                region directories_scope:
+                    directories: mutable darray[u8] = []
+                    file_cursor: mutable usize = 0.usize()
+                    while file_cursor < copied_paths.count |copied_paths, directories, file_cursor, directory_depth|:
+                        file_end: mutable usize = file_cursor
+                        while file_end < copied_paths.count and copied_paths[file_end] != 0:
+                            file_end <- file_end + 1.usize()
+                        return PlatformNative::close_error(root, -22) if file_end == file_cursor or file_end >= copied_paths.count
+                        component_depth: mutable usize = 0.usize()
+                        for index in file_cursor..<file_end |copied_paths, directories, component_depth, file_end, directory_depth|:
+                            if copied_paths[index] == 47:
+                                component_depth <- component_depth + 1.usize()
+                                if component_depth == directory_depth:
+                                    for prefix_index in file_cursor..<index |directories, copied_paths|:
+                                        directories <- directories.push(copied_paths[prefix_index])
+                                    directories <- directories.push(0)
+                        file_cursor <- file_end + 1.usize()
+                    return PlatformNative::close_error(root, -5) if directories.count > 0.usize() and not NativeStagingTree::remove_directories(root, directories)
                 directory_depth <- directory_depth - 1.usize()
             return PlatformNative::close_error(root, -5) if not PlatformNative::directory_empty(root)
             if native_fsync(root) != 0:
@@ -341,8 +356,9 @@ module NativeSnapshotTree:
                 if next < 0:
                     open_errno: i64 = next
                     cleanup_status: i32 = native_unlinkat(directory, component, at_remove_directory) if created else 0
-                    close_status: i32 = native_close(directory)
-                    return -5 if cleanup_status != 0 or close_status != 0
+                    region close_status_scope:
+                        close_status: i32 = native_close(directory)
+                        return -5 if cleanup_status != 0 or close_status != 0
                     return open_errno
                 if created and native_fsync(directory) != 0:
                     return PlatformNative::close_two_error(directory, next, NativeErrors::negative_errno())

@@ -87,22 +87,24 @@ module NativeArchiveExtract:
                     written <- written + amount.usize()
                 sync_status: i64 = native_fsync(file)
                 close_status: i64 = native_close(file)
-                directory_sync: i64 = native_fsync(parent) if not write_failed and sync_status == 0 and close_status == 0 else -5
-                if write_failed or sync_status != 0 or close_status != 0 or directory_sync != 0:
-                    cleanup_leaf: mutable darray[u8] = []
-                    for index in 0..<leaf_snapshot.count |cleanup_leaf, leaf_snapshot|:
-                        cleanup_leaf <- cleanup_leaf.push(leaf_snapshot[index])
-                    cleanup_name: cstr = (&cleanup_leaf[0]).cast[cstr] can Unsafe.PointerCast
-                    _ = native_unlinkat(parent, cleanup_name, 0)
-                    _ = native_close(parent)
-                    return extraction_failure(root, seen, created_directories, -5)
+                region directory_sync_scope:
+                    directory_sync: i64 = native_fsync(parent) if not write_failed and sync_status == 0 and close_status == 0 else -5
+                    if write_failed or sync_status != 0 or close_status != 0 or directory_sync != 0:
+                        cleanup_leaf: mutable darray[u8] = []
+                        for index in 0..<leaf_snapshot.count |cleanup_leaf, leaf_snapshot|:
+                            cleanup_leaf <- cleanup_leaf.push(leaf_snapshot[index])
+                        cleanup_name: cstr = (&cleanup_leaf[0]).cast[cstr] can Unsafe.PointerCast
+                        _ = native_unlinkat(parent, cleanup_name, 0)
+                        _ = native_close(parent)
+                        return extraction_failure(root, seen, created_directories, -5)
                 return extraction_failure(root, seen, created_directories, -5) if native_close(parent) != 0
                 entries <- entries + 1.usize()
                 cursor <- next_offset
             return extraction_failure(root, seen, created_directories, result) if result != 0
             return extraction_failure(root, seen, created_directories, -5) if native_fsync(root) != 0
-            close_status: i64 = native_close(root)
-            return -5 if result == 0 and close_status != 0
+            region close_status_scope:
+                close_status: i64 = native_close(root)
+                return -5 if result == 0 and close_status != 0
             return result
 
     private:
@@ -110,6 +112,7 @@ module NativeArchiveExtract:
             cleanup_ok: mutable bool = NativeStagingTree::remove_files(root, seen)
             cleanup_ok <- NativeStagingTree::remove_directories(root, created_directories) and cleanup_ok
             sync_status: i64 = native_fsync(root)
-            close_status: i64 = native_close(root)
-            return -5 if not cleanup_ok or sync_status != 0 or close_status != 0
+            region close_status_scope:
+                close_status: i64 = native_close(root)
+                return -5 if not cleanup_ok or sync_status != 0 or close_status != 0
             return errno_value

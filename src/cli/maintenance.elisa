@@ -35,14 +35,15 @@ module MaintenanceCommand:
                 ProjectFiles::path_join_into(build_directory, "receipt", &receipt)
                 ProjectFiles::path_join_into(state, "package.tar", &package_archive)
                 ProjectFiles::path_join_into(state, "package.receipt", &package_receipt)
-                manifest_raw: mutable darray[u8] = []
-                manifest_raw <- manifest_raw.resize(ProjectFiles::project_document_limit)
-                if ProjectFiles::read_c_string_into("elisapkg.json", &manifest_raw):
-                    output_leaves: mutable darray[darray[u8]] = []
-                    return CliStatus::build_failed if:
-                        not ManifestTargets::cleanup_output_leaves(manifest_raw, &output_leaves)
-                        not remove_target_outputs(output_leaves, build_directory)
-                        not remove_target_outputs(output_leaves, release_build_directory)
+                region manifest_raw_scope:
+                    manifest_raw: mutable darray[u8] = []
+                    manifest_raw <- manifest_raw.resize(ProjectFiles::project_document_limit)
+                    if ProjectFiles::read_c_string_into("elisapkg.json", &manifest_raw):
+                        output_leaves: mutable darray[darray[u8]] = []
+                        return CliStatus::build_failed if:
+                            not ManifestTargets::cleanup_output_leaves(manifest_raw, &output_leaves)
+                            not remove_target_outputs(output_leaves, build_directory)
+                            not remove_target_outputs(output_leaves, release_build_directory)
                 # Remove legacy single-target names left by older receipts as well as the
                 # manifest-declared target outputs.
                 return CliStatus::build_failed if:
@@ -90,29 +91,32 @@ module MaintenanceCommand:
                     return CliStatus::security_failed if:
                         not Integrity::sha256_hex(raw, &manifest_digest)
                         not Integrity::sha256_hex(lock, &lock_digest)
-                    archive_path: mutable darray[u8] = []
-                    ByteText::append_text(&archive_path, ".elisapkg/package.tar")
-                    return CliStatus::security_failed if:
-                        not read_package_file(&archive_path, &archive_bytes)
-                        not Archive::verify_ustar_archive(archive_bytes)
-                        not Integrity::sha256_hex(archive_bytes, &archive_digest)
+                    region archive_path_scope:
+                        archive_path: mutable darray[u8] = []
+                        ByteText::append_text(&archive_path, ".elisapkg/package.tar")
+                        return CliStatus::security_failed if:
+                            not read_package_file(&archive_path, &archive_bytes)
+                            not Archive::verify_ustar_archive(archive_bytes)
+                            not Integrity::sha256_hex(archive_bytes, &archive_digest)
                     receipt <- receipt.resize(PackageReceipt::maximum_encode + 1.usize())
                     return CliStatus::security_failed if not ProjectFiles::read_c_string_into(".elisapkg/package.receipt", &receipt)
                     expected_receipt: darray[u8] = PackageReceipt::encode(name, version, manifest_digest, lock_digest, archive_digest)
                     return CliStatus::security_failed if not ByteText::equal(receipt, expected_receipt)
                 manifest_after: mutable darray[u8] = []
                 manifest_after <- manifest_after.resize(ProjectFiles::project_document_limit)
-                lock_after: mutable darray[u8] = []
-                lock_after <- lock_after.resize(ProjectFiles::project_document_limit)
-                return CliStatus::security_failed if:
-                    not ProjectFiles::read_c_string_into("elisapkg.json", &manifest_after) or not ProjectFiles::read_c_string_into("elisapkg.lock", &lock_after)
-                    not ByteText::equal(manifest_after, raw) or not ByteText::equal(lock_after, lock)
+                region lock_after_scope:
+                    lock_after: mutable darray[u8] = []
+                    lock_after <- lock_after.resize(ProjectFiles::project_document_limit)
+                    return CliStatus::security_failed if:
+                        not ProjectFiles::read_c_string_into("elisapkg.json", &manifest_after) or not ProjectFiles::read_c_string_into("elisapkg.lock", &lock_after)
+                        not ByteText::equal(manifest_after, raw) or not ByteText::equal(lock_after, lock)
                 archive_state_after: i64 = Platform::package_file_size(".elisapkg/package.tar")
-                receipt_state_after: i64 = Platform::package_file_size(".elisapkg/package.receipt")
-                return CliStatus::security_failed if:
-                    archive_state_after < 0 and archive_state_after != -2
-                    receipt_state_after < 0 and receipt_state_after != -2
-                    archive_present != (archive_state_after >= 0) or receipt_present != (receipt_state_after >= 0)
+                region receipt_state_after_scope:
+                    receipt_state_after: i64 = Platform::package_file_size(".elisapkg/package.receipt")
+                    return CliStatus::security_failed if:
+                        archive_state_after < 0 and archive_state_after != -2
+                        receipt_state_after < 0 and receipt_state_after != -2
+                        archive_present != (archive_state_after >= 0) or receipt_present != (receipt_state_after >= 0)
                 if archive_present:
                     archive_path_after: mutable darray[u8] = []
                     ByteText::append_text(&archive_path_after, ".elisapkg/package.tar")
@@ -148,19 +152,21 @@ module MaintenanceCommand:
             path_c: mutable darray[u8] = []
             ProjectFiles::path_with_null_terminator_into(path, &path_c)
             path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
-            result: i64 = Platform::remove_directory(path_name)
-            # Keep compiler metadata and any unrecognized build files. Clean
-            # owns only the artifacts named by the manifest and their receipts.
-            return true if result == 0 or result == -2 or result == -Platform::directory_not_empty_error()
+            region result_scope:
+                result: i64 = Platform::remove_directory(path_name)
+                # Keep compiler metadata and any unrecognized build files. Clean
+                # owns only the artifacts named by the manifest and their receipts.
+                return true if result == 0 or result == -2 or result == -Platform::directory_not_empty_error()
             return false
 
         def remove_state_directory(path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             path_c: mutable darray[u8] = []
             ProjectFiles::path_with_null_terminator_into(path, &path_c)
             path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
-            result: i64 = Platform::remove_directory(path_name)
-            # A retained cache makes the state directory intentionally non-empty.
-            return true if result == 0 or result == -2 or result == -Platform::directory_not_empty_error()
+            region result_scope:
+                result: i64 = Platform::remove_directory(path_name)
+                # A retained cache makes the state directory intentionally non-empty.
+                return true if result == 0 or result == -2 or result == -Platform::directory_not_empty_error()
             return false
 
         def remove_target_outputs(leaves: darray[darray[u8]]&, build_directory: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:

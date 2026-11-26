@@ -85,8 +85,9 @@ module BuildCommand:
                     return CliStatus::build_failed
                 lock_raw: mutable darray[u8] = []
                 lock_digest: mutable darray[u8] = []
-                lock_status: i64 = BuildInputs::resolve_local_lock(start, options, manifest_raw, root_name, root_version, &lock_raw, &lock_digest)
-                return lock_status if lock_status != CliStatus::success
+                region lock_status_scope:
+                    lock_status: i64 = BuildInputs::resolve_local_lock(start, options, manifest_raw, root_name, root_version, &lock_raw, &lock_digest)
+                    return lock_status if lock_status != CliStatus::success
                 source_tree_digest: mutable darray[u8] = []
                 source_tree_bytes: mutable usize = 0.usize()
                 return CliStatus::build_failed if not BuildInputs::fingerprint_source(&source_tree_digest, &source_tree_bytes)
@@ -119,8 +120,9 @@ module BuildCommand:
                     emit_kind: cstr = "obj" if is_library else "exe"
                     artifact_access_mode: i64 = 0 if is_library else 1
                     ProjectFiles::path_join_bytes_into(build_directory, artifact_label, &artifact)
-                    receipt_label: darray[u8] = ManifestTargets::receipt_leaf(target_name)
-                    ProjectFiles::path_join_bytes_into(build_directory, receipt_label, &receipt_path)
+                    region receipt_label_scope:
+                        receipt_label: darray[u8] = ManifestTargets::receipt_leaf(target_name)
+                        ProjectFiles::path_join_bytes_into(build_directory, receipt_label, &receipt_path)
                     return CliStatus::build_failed if not ProjectFiles::make_directory(&build_directory)
                     compiler: mutable cstr = "elisac-stage1"
                     if Platform::environment_variable("ELISAPKG_COMPILER") is configured:
@@ -192,11 +194,12 @@ module BuildCommand:
                     snapshot_template: mutable darray[u8] = []
                     return CliStatus::build_failed if not BuildSources::prepare_root(build_directory, start, source_tree_digest, target_entry, &snapshot_template, &source_snapshot_root, &source_snapshot_roots, &snapshot_total_bytes, &root_snapshot_entry)
                     source_snapshot_container_name: cstr = (&snapshot_template[0]).cast[cstr] can Unsafe.PointerCast
-                    dependency_snapshots_valid: bool = BuildSnapshots::create_dependencies(&dependency_packages, dependency_order, source_snapshot_root, &source_snapshot_roots, &snapshot_total_bytes)
-                    if not dependency_snapshots_valid:
-                        _ = BuildSnapshots::remove_all(source_snapshot_container_name, source_snapshot_roots)
-                        CliOutput::write_error("error: local dependency changed or could not be copied into the verified build snapshot\n")
-                        return CliStatus::build_failed
+                    region dependency_snapshots_valid_scope:
+                        dependency_snapshots_valid: bool = BuildSnapshots::create_dependencies(&dependency_packages, dependency_order, source_snapshot_root, &source_snapshot_roots, &snapshot_total_bytes)
+                        if not dependency_snapshots_valid:
+                            _ = BuildSnapshots::remove_all(source_snapshot_container_name, source_snapshot_roots)
+                            CliOutput::write_error("error: local dependency changed or could not be copied into the verified build snapshot\n")
+                            return CliStatus::build_failed
                     if not BuildSources::target_matches(root_snapshot_entry, source_digest):
                         _ = BuildSnapshots::remove_all(source_snapshot_container_name, source_snapshot_roots)
                         return CliStatus::build_failed
@@ -215,18 +218,19 @@ module BuildCommand:
                     artifact_c: mutable darray[u8] = []
                     ProjectFiles::path_with_null_terminator_into(&artifact, &artifact_c)
                     artifact_name: cstr = (&artifact_c[0]).cast[cstr] can Unsafe.PointerCast
-                    cached_digest: mutable darray[u8] = []
-                    if toolchain_identity_ok and BuildCache::verified_digest(artifact, receipt_path, receipt, artifact_access_mode, &cached_digest):
-                        if not BuildSnapshots::remove_all(source_snapshot_container_name, source_snapshot_roots):
-                            CliOutput::write_error("error: unable to remove the verified build source snapshots\n")
-                            return CliStatus::build_failed
-                        CliOutput::write_ok("built .elisapkg/build/")
-                        CliOutput::write_bytes(1, &artifact_label)
-                        CliOutput::write_ok(" (cached)\n")
-                        for digest_index in 0..<cached_digest.count |out_artifact_digest, cached_digest|:
-                            out_artifact_digest[digest_index] <- cached_digest[digest_index]
-                        _ = options
-                        return CliStatus::success
+                    region cached_digest_scope:
+                        cached_digest: mutable darray[u8] = []
+                        if toolchain_identity_ok and BuildCache::verified_digest(artifact, receipt_path, receipt, artifact_access_mode, &cached_digest):
+                            if not BuildSnapshots::remove_all(source_snapshot_container_name, source_snapshot_roots):
+                                CliOutput::write_error("error: unable to remove the verified build source snapshots\n")
+                                return CliStatus::build_failed
+                            CliOutput::write_ok("built .elisapkg/build/")
+                            CliOutput::write_bytes(1, &artifact_label)
+                            CliOutput::write_ok(" (cached)\n")
+                            for digest_index in 0..<cached_digest.count |out_artifact_digest, cached_digest|:
+                                out_artifact_digest[digest_index] <- cached_digest[digest_index]
+                            _ = options
+                            return CliStatus::success
                     # The lock digest includes every resolved local dependency identity and
                     # source digest. Recompile whenever that graph changes instead of reusing a
                     # root-only artifact.
@@ -289,13 +293,14 @@ module BuildCommand:
                             CliOutput::write_error("error: unable to write the private dependency aggregate source\n")
                             return CliStatus::build_failed
                         aggregate_flush_status: i64 = Platform::synchronize_file(aggregate_file_descriptor)
-                        aggregate_close_status: i64 = Platform::close_file_descriptor(aggregate_file_descriptor)
-                        if aggregate_flush_status != 0 or aggregate_close_status != 0:
-                            _ = Platform::unlink_path(aggregate_source_name)
-                            aggregate_source_name <- ""
-                            CompilerProcess::discard_scratch(sandbox_work_name, "", aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
-                            CliOutput::write_error("error: unable to flush the private dependency aggregate source\n")
-                            return CliStatus::build_failed
+                        region aggregate_close_status_scope:
+                            aggregate_close_status: i64 = Platform::close_file_descriptor(aggregate_file_descriptor)
+                            if aggregate_flush_status != 0 or aggregate_close_status != 0:
+                                _ = Platform::unlink_path(aggregate_source_name)
+                                aggregate_source_name <- ""
+                                CompilerProcess::discard_scratch(sandbox_work_name, "", aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
+                                CliOutput::write_error("error: unable to flush the private dependency aggregate source\n")
+                                return CliStatus::build_failed
                         canonical_aggregate_source: mutable darray[u8] = []
                         if not ProjectFiles::canonical_existing_path(aggregate_source_path, &canonical_aggregate_source):
                             _ = Platform::unlink_path(aggregate_source_name)
@@ -370,25 +375,26 @@ module BuildCommand:
                         CompilerProcess::discard_scratch(sandbox_work_name, temporary_name, aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
                         CliOutput::write_error("error: unable to start the sandboxed compiler process\n")
                         return CliStatus::build_failed
-                    completion: CompilerProcess::Completion = CompilerProcess::await_exit(child_process_identifier, BUILD_TIMEOUT_MS)
-                    return retain_scratch_after_unconfirmed_exit(compiler_stdout_file_descriptor, compiler_stderr_file_descriptor) if not completion.group_stopped
-                    if not CompilerProcess::remove_callback_file(child_process_identifier):
-                        CompilerProcess::discard_logs(compiler_stdout_file_descriptor, compiler_stderr_file_descriptor, compiler_stdout_name, compiler_stderr_name)
-                        CompilerProcess::discard_scratch(sandbox_work_name, temporary_name, aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
-                        CliOutput::write_error("error: unable to remove the compiler callback file before output validation\n")
-                        return CliStatus::build_failed
-                    if not CompilerProcess::collect_logs(compiler_stdout_file_descriptor, compiler_stderr_file_descriptor, compiler_stdout_name, compiler_stderr_name):
-                        CompilerProcess::discard_scratch(sandbox_work_name, temporary_name, aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
-                        CliOutput::write_error("error: unable to safely collect compiler output\n")
-                        return CliStatus::build_failed
-                    if completion.wait_status == Platform::timeout_error():
-                        CompilerProcess::discard_scratch(sandbox_work_name, temporary_name, aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
-                        CliOutput::write_error("error: compiler exceeded the 10-minute execution limit\n")
-                        return CliStatus::cancelled
-                    if completion.wait_status < 0 or completion.exit_status != 0:
-                        CompilerProcess::discard_scratch(sandbox_work_name, temporary_name, aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
-                        CliOutput::write_error("error: sandboxed compiler process failed or could not be reaped\n")
-                        return CliStatus::build_failed
+                    region completion_scope:
+                        completion: CompilerProcess::Completion = CompilerProcess::await_exit(child_process_identifier, BUILD_TIMEOUT_MS)
+                        return retain_scratch_after_unconfirmed_exit(compiler_stdout_file_descriptor, compiler_stderr_file_descriptor) if not completion.group_stopped
+                        if not CompilerProcess::remove_callback_file(child_process_identifier):
+                            CompilerProcess::discard_logs(compiler_stdout_file_descriptor, compiler_stderr_file_descriptor, compiler_stdout_name, compiler_stderr_name)
+                            CompilerProcess::discard_scratch(sandbox_work_name, temporary_name, aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
+                            CliOutput::write_error("error: unable to remove the compiler callback file before output validation\n")
+                            return CliStatus::build_failed
+                        if not CompilerProcess::collect_logs(compiler_stdout_file_descriptor, compiler_stderr_file_descriptor, compiler_stdout_name, compiler_stderr_name):
+                            CompilerProcess::discard_scratch(sandbox_work_name, temporary_name, aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
+                            CliOutput::write_error("error: unable to safely collect compiler output\n")
+                            return CliStatus::build_failed
+                        if completion.wait_status == Platform::timeout_error():
+                            CompilerProcess::discard_scratch(sandbox_work_name, temporary_name, aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
+                            CliOutput::write_error("error: compiler exceeded the 10-minute execution limit\n")
+                            return CliStatus::cancelled
+                        if completion.wait_status < 0 or completion.exit_status != 0:
+                            CompilerProcess::discard_scratch(sandbox_work_name, temporary_name, aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
+                            CliOutput::write_error("error: sandboxed compiler process failed or could not be reaped\n")
+                            return CliStatus::build_failed
                     artifact_content: mutable darray[u8] = []
                     artifact_digest: mutable darray[u8] = []
                     if not capture_compiler_output(temporary_name, &artifact_content, &artifact_digest):
@@ -410,10 +416,11 @@ module BuildCommand:
                     if not project_inputs_unchanged(manifest_raw, lock_raw, root_name, root_version, start):
                         CompilerProcess::discard_scratch(sandbox_work_name, temporary_name, aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
                         return CliStatus::build_failed
-                    post_source_tree_digest: mutable darray[u8] = []
-                    if not SourceFingerprint::current(&post_source_tree_digest) or not ByteText::equal(post_source_tree_digest, source_tree_digest):
-                        CompilerProcess::discard_scratch(sandbox_work_name, temporary_name, aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
-                        return CliStatus::build_failed
+                    region post_source_tree_digest_scope:
+                        post_source_tree_digest: mutable darray[u8] = []
+                        if not SourceFingerprint::current(&post_source_tree_digest) or not ByteText::equal(post_source_tree_digest, source_tree_digest):
+                            CompilerProcess::discard_scratch(sandbox_work_name, temporary_name, aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
+                            return CliStatus::build_failed
                     if has_local_build_dependencies:
                         aggregate_after_build: mutable darray[u8] = []
                         if not read_package_file(aggregate_source_path, &aggregate_after_build) or not ByteText::equal(aggregate_after_build, compiler_dependency_aggregate):
@@ -430,10 +437,11 @@ module BuildCommand:
                         CompilerProcess::discard_scratch(sandbox_work_name, "", aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
                         CliOutput::write_error("error: compiler toolchain changed during the build; refusing to publish the artifact\n")
                         return CliStatus::build_failed
-                    cleanup_error: cstr = CompilerProcess::retire_scratch_for_publication(sandbox_work_name, temporary_name, aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
-                    if cleanup_error[0].u8() != 0:
-                        CliOutput::write_error(cleanup_error)
-                        return CliStatus::build_failed
+                    region cleanup_error_scope:
+                        cleanup_error: cstr = CompilerProcess::retire_scratch_for_publication(sandbox_work_name, temporary_name, aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
+                        if cleanup_error[0].u8() != 0:
+                            CliOutput::write_error(cleanup_error)
+                            return CliStatus::build_failed
                     return CliStatus::build_failed if not BuildPublication::publish(build_directory, artifact_label, emit_kind, artifact_access_mode, temporary_name, artifact_name, receipt_path, artifact_content, artifact_digest, &receipt)
                     CliOutput::write_ok("built .elisapkg/build/")
                     CliOutput::write_bytes(1, &artifact_label)
@@ -458,13 +466,14 @@ module BuildCommand:
         def project_inputs_unchanged(manifest: darray[u8]&, lock: darray[u8]&, root_name: darray[u8]&, root_version: darray[u8]&, start: darray[u8]&) -> bool can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             current_manifest: mutable darray[u8] = []
             current_manifest <- current_manifest.resize(ProjectFiles::project_document_limit)
-            current_lock: mutable darray[u8] = []
-            current_lock <- current_lock.resize(ProjectFiles::project_document_limit)
-            return false if not:
-                ProjectFiles::read_c_string_into("elisapkg.json", &current_manifest)
-                ProjectFiles::read_c_string_into("elisapkg.lock", &current_lock)
-                ByteText::equal(current_manifest, manifest)
-                ByteText::equal(current_lock, lock)
+            region current_lock_scope:
+                current_lock: mutable darray[u8] = []
+                current_lock <- current_lock.resize(ProjectFiles::project_document_limit)
+                return false if not:
+                    ProjectFiles::read_c_string_into("elisapkg.json", &current_manifest)
+                    ProjectFiles::read_c_string_into("elisapkg.lock", &current_lock)
+                    ByteText::equal(current_manifest, manifest)
+                    ByteText::equal(current_lock, lock)
             return LockValidation::matches_manifest(manifest, lock, root_name, root_version, start) can Global.Read
 
         def read_package_file(path: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:

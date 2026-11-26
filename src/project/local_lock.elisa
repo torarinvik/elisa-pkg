@@ -21,11 +21,12 @@ module LocalLock:
             root_digest: mutable darray[u8] = []
             return [] if:
                 not Integrity::sha256_hex(raw, &root_digest)
-            root_source_digest: mutable darray[u8] = []
-            root_source_bytes: mutable usize = 0.usize()
-            return [] if not SourceFingerprint::at_bounded(root, &root_source_digest, SourceFingerprint::maximum_snapshot_bytes, &root_source_bytes)
-            graph_source_bytes <- root_source_bytes
-            Lockfile::append_header(&out, Lockfile::Format.Local, name, version, root_digest, root_source_digest)
+            region root_source_digest_scope:
+                root_source_digest: mutable darray[u8] = []
+                root_source_bytes: mutable usize = 0.usize()
+                return [] if not SourceFingerprint::at_bounded(root, &root_source_digest, SourceFingerprint::maximum_snapshot_bytes, &root_source_bytes)
+                graph_source_bytes <- root_source_bytes
+                Lockfile::append_header(&out, Lockfile::Format.Local, name, version, root_digest, root_source_digest)
             queue: mutable darray[u8] = []
             record_starts: mutable darray[usize] = []
             sorted_records: mutable darray[usize] = []
@@ -53,14 +54,16 @@ module LocalLock:
                     not ProjectManifest::validate_at(child_raw, &package_root, &child_name, &child_version)
                     ByteText::equal(child_name, name)
                 queued_name: mutable darray[u8] = []
-                queued_version: mutable darray[u8] = []
-                return [] if:
-                    not queue_field_at(queue, record_starts, processed, 1, &queued_name) or not queue_field_at(queue, record_starts, processed, 2, &queued_version)
-                    not ByteText::equal(queued_name, child_name) or not ByteText::equal(queued_version, child_version)
-                    not append_local_dependency_records(child_raw, &package_root, &queue, &record_starts, &sorted_records, &edges, &edge_count, &total, processed)
-                digest: mutable darray[u8] = []
-                return [] if Integrity::sha256(child_raw, &digest) != Integrity::DigestCode.Ok
-                ByteText::append(&traversed_manifest_digests, digest)
+                region queued_version_scope:
+                    queued_version: mutable darray[u8] = []
+                    return [] if:
+                        not queue_field_at(queue, record_starts, processed, 1, &queued_name) or not queue_field_at(queue, record_starts, processed, 2, &queued_version)
+                        not ByteText::equal(queued_name, child_name) or not ByteText::equal(queued_version, child_version)
+                        not append_local_dependency_records(child_raw, &package_root, &queue, &record_starts, &sorted_records, &edges, &edge_count, &total, processed)
+                region digest_scope:
+                    digest: mutable darray[u8] = []
+                    return [] if Integrity::sha256(child_raw, &digest) != Integrity::DigestCode.Ok
+                    ByteText::append(&traversed_manifest_digests, digest)
                 processed <- processed + 1.usize()
                 edge_offsets <- edge_offsets.push(edges.count)
             return [] if not DependencyGraph::is_acyclic(total, edges, edge_offsets)
@@ -128,35 +131,37 @@ module LocalLock:
         def queue_field_at(queue: darray[u8]&, record_starts: darray[usize]&, record: usize, field: usize, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
             out.resize(0)
             return false if record >= record_starts.count or field >= 3.usize()
-            cursor: mutable usize = record_starts[record]
-            for current_field in 0..<3 |queue, record_starts, record, field, current_field, cursor, out|:
-                return false if cursor >= queue.count
-                end: mutable usize = cursor
-                while end < queue.count and queue[end] != 0 |queue, end|:
-                    end <- end + 1.usize()
-                return false if end >= queue.count
-                if current_field == field:
-                    ByteText::append_range(out, queue, cursor, end)
-                    return true
-                cursor <- end + 1.usize()
+            region cursor_scope:
+                cursor: mutable usize = record_starts[record]
+                for current_field in 0..<3 |queue, record_starts, record, field, current_field, cursor, out|:
+                    return false if cursor >= queue.count
+                    end: mutable usize = cursor
+                    while end < queue.count and queue[end] != 0 |queue, end|:
+                        end <- end + 1.usize()
+                    return false if end >= queue.count
+                    if current_field == field:
+                        ByteText::append_range(out, queue, cursor, end)
+                        return true
+                    cursor <- end + 1.usize()
             return false
 
         def queue_name_record(queue: darray[u8]&, record_starts: darray[usize]&, sorted_records: darray[usize]&, total: usize, wanted: darray[u8]&, insertion_out: mutable usize&) -> usize can[Memory.Allocate, Abort.Panic]:
             insertion_out <- total + 1.usize()
             return total if sorted_records.count != total
             lower: mutable usize = 0.usize()
-            upper: mutable usize = sorted_records.count
-            while lower < upper |queue, record_starts, sorted_records, wanted, lower, upper|:
-                middle: usize = lower + (upper - lower) / 2.usize()
-                record: usize = sorted_records[middle]
-                return total if record >= record_starts.count
-                candidate: mutable darray[u8] = []
-                if not queue_field_at(queue, record_starts, record, 1, &candidate):
-                    return total
-                if ByteText::less(candidate, wanted):
-                    lower <- middle + 1.usize()
-                else:
-                    upper <- middle
+            region upper_scope:
+                upper: mutable usize = sorted_records.count
+                while lower < upper |queue, record_starts, sorted_records, wanted, lower, upper|:
+                    middle: usize = lower + (upper - lower) / 2.usize()
+                    record: usize = sorted_records[middle]
+                    return total if record >= record_starts.count
+                    candidate: mutable darray[u8] = []
+                    if not queue_field_at(queue, record_starts, record, 1, &candidate):
+                        return total
+                    if ByteText::less(candidate, wanted):
+                        lower <- middle + 1.usize()
+                    else:
+                        upper <- middle
             insertion_out <- lower
             return total if lower >= sorted_records.count
             record: usize = sorted_records[lower]
@@ -174,10 +179,11 @@ module LocalLock:
             return false if insertion > sorted_records.count
             previous_count: usize = sorted_records.count
             sorted_records.resize(previous_count + 1.usize())
-            cursor: mutable usize = previous_count
-            while cursor > insertion |sorted_records, cursor|:
-                sorted_records[cursor] <- sorted_records[cursor - 1.usize()]
-                cursor <- cursor - 1.usize()
+            region cursor_scope:
+                cursor: mutable usize = previous_count
+                while cursor > insertion |sorted_records, cursor|:
+                    sorted_records[cursor] <- sorted_records[cursor - 1.usize()]
+                    cursor <- cursor - 1.usize()
             sorted_records[insertion] <- record
             return true
 
@@ -221,12 +227,13 @@ module LocalLock:
                 return false if insertion > sorted_records.count
                 if existing < total:
                     existing_path: mutable darray[u8] = []
-                    existing_version: mutable darray[u8] = []
-                    return false if not:
-                        queue_field_at(queue, record_starts, existing, 0, &existing_path)
-                        queue_field_at(queue, record_starts, existing, 2, &existing_version)
-                        ByteText::equal(existing_path, child_root)
-                        ByteText::equal(existing_version, child_version)
+                    region existing_version_scope:
+                        existing_version: mutable darray[u8] = []
+                        return false if not:
+                            queue_field_at(queue, record_starts, existing, 0, &existing_path)
+                            queue_field_at(queue, record_starts, existing, 2, &existing_version)
+                            ByteText::equal(existing_path, child_root)
+                            ByteText::equal(existing_version, child_version)
                     edges.push(existing) if parent < total
                     continue
                 return false if total >= 4096.usize()

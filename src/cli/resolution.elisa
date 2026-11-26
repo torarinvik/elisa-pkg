@@ -24,8 +24,9 @@ module ResolutionCommand:
         def add(argument_count: i64, slots: mutable cstr&&) -> i64 can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global{Read,Write}:
                 local_form: bool = argument_count == 5 and Platform::c_string_equal(slots[3].cast[cstr], "--path")
-                registry_form: bool = argument_count == 7 and Platform::c_string_equal(slots[3].cast[cstr], "--version") and Platform::c_string_equal(slots[5].cast[cstr], "--registry") and Platform::c_string_equal(slots[6].cast[cstr], "primary")
-                return CliStatus::usage if not local_form and not registry_form
+                region registry_form_scope:
+                    registry_form: bool = argument_count == 7 and Platform::c_string_equal(slots[3].cast[cstr], "--version") and Platform::c_string_equal(slots[5].cast[cstr], "--registry") and Platform::c_string_equal(slots[6].cast[cstr], "primary")
+                    return CliStatus::usage if not local_form and not registry_form
                 alias: mutable darray[u8] = []
                 ByteText::append_bounded_text(&alias, slots[2].cast[cstr])
                 return CliStatus::usage if not PackageIdentity::valid_name(alias)
@@ -56,21 +57,23 @@ module ResolutionCommand:
                         not ByteText::equal(alias, dependency_name) or ByteText::equal(alias, root_name)
                 else:
                     return CliStatus::resolution_failed if ByteText::equal(alias, root_name)
-                updated: darray[u8] = ManifestEdits::append_path(raw, alias, dependency_path) if local_form else ManifestEdits::append_registry(raw, alias, requirement)
-                if updated.count == 0.usize():
-                    CliOutput::write_error("error: could not add the dependency; check for a duplicate name or a manifest limit\n")
-                    return CliStatus::resolution_failed
-                return CliStatus::security_failed if not ProjectTransaction::begin(raw)
-                if not ProjectTransaction::publish_manifest(updated):
-                    _ = ProjectTransaction::restore()
-                    return CliStatus::source_failed
+                region updated_scope:
+                    updated: darray[u8] = ManifestEdits::append_path(raw, alias, dependency_path) if local_form else ManifestEdits::append_registry(raw, alias, requirement)
+                    if updated.count == 0.usize():
+                        CliOutput::write_error("error: could not add the dependency; check for a duplicate name or a manifest limit\n")
+                        return CliStatus::resolution_failed
+                    return CliStatus::security_failed if not ProjectTransaction::begin(raw)
+                    if not ProjectTransaction::publish_manifest(updated):
+                        _ = ProjectTransaction::restore()
+                        return CliStatus::source_failed
                 options: Model::CommandOptions = Model::CommandOptions{locked: false, offline: false, frozen: false, json: false, verbose: false, profile: "debug", target_name: "", target_kind: "", update_name: ""}
                 resolved: i64 = resolve(&root, options, true, false)
                 if resolved != CliStatus::success:
-                    restored: bool = ProjectTransaction::restore()
-                    if not restored:
-                        CliOutput::write_error("error: dependency edit failed and the original manifest could not be restored\n")
-                        return CliStatus::security_failed
+                    region restored_scope:
+                        restored: bool = ProjectTransaction::restore()
+                        if not restored:
+                            CliOutput::write_error("error: dependency edit failed and the original manifest could not be restored\n")
+                            return CliStatus::security_failed
                     return resolved
                 return CliStatus::security_failed if not ProjectTransaction::commit()
                 CliOutput::write_ok("added ")
@@ -110,10 +113,11 @@ module ResolutionCommand:
                 # would misreport `root -> transitive` as a direct dependency.
                 return CliStatus::resolution_failed if ByteText::equal(wanted, root_name)
                 dependency_start: mutable usize = 0.usize()
-                dependency_end: mutable usize = 0.usize()
-                return CliStatus::resolution_failed if:
-                    not Manifest::find_dependency_span(raw, wanted, &dependency_start, &dependency_end)
-                    not Lockfile::contains_package(lock, wanted)
+                region dependency_end_scope:
+                    dependency_end: mutable usize = 0.usize()
+                    return CliStatus::resolution_failed if:
+                        not Manifest::find_dependency_span(raw, wanted, &dependency_start, &dependency_end)
+                        not Lockfile::contains_package(lock, wanted)
                 if options.json:
                     CliOutput::write_ok("{\"schema-version\":1,\"root\":\"")
                     CliOutput::write_bytes(1, &root_name)
@@ -184,8 +188,9 @@ module ResolutionCommand:
                 # same canonical byte comparison as locked mode.
                 if options.offline:
                     offline_registry_roots: mutable darray[Solver::Constraint] = []
-                    offline_has_local_dependency: mutable bool = false
-                    return CliStatus::resolution_failed if not RegistryRoots::collect(raw, &offline_registry_roots, &offline_has_local_dependency)
+                    region offline_has_local_dependency_scope:
+                        offline_has_local_dependency: mutable bool = false
+                        return CliStatus::resolution_failed if not RegistryRoots::collect(raw, &offline_registry_roots, &offline_has_local_dependency)
                     if offline_registry_roots.count > 0.usize():
                         return CliStatus::resolution_failed if:
                             lock_state == -2
@@ -195,30 +200,31 @@ module ResolutionCommand:
                 lock: darray[u8] = LockResolution::canonical_with_options(name, version, raw, start, options, preferred_lock)
                 if lock.count > 0.usize() and lock[0] > 0 and lock[0] < 32:
                     code: mutable Registry::ResultCode = Registry::ResultCode.TrustStateMalformed
-                    encoded_code: u8 = lock[0] - 1.u8()
-                    # The sentinel stores the enum value plus one so an empty lock remains
-                    # reserved for ordinary resolution failure.
-                    code <- Registry::ResultCode.NotConfigured if encoded_code == Registry::ResultCode.NotConfigured.u8()
-                    code <- Registry::ResultCode.InvalidConfiguration if encoded_code == Registry::ResultCode.InvalidConfiguration.u8()
-                    code <- Registry::ResultCode.MissingIndex if encoded_code == Registry::ResultCode.MissingIndex.u8()
-                    code <- Registry::ResultCode.NoMatchingVersion if encoded_code == Registry::ResultCode.NoMatchingVersion.u8()
-                    code <- Registry::ResultCode.MalformedMetadata if encoded_code == Registry::ResultCode.MalformedMetadata.u8()
-                    code <- Registry::ResultCode.MissingSignature if encoded_code == Registry::ResultCode.MissingSignature.u8()
-                    code <- Registry::ResultCode.MissingTrustRoot if encoded_code == Registry::ResultCode.MissingTrustRoot.u8()
-                    code <- Registry::ResultCode.InvalidSignature if encoded_code == Registry::ResultCode.InvalidSignature.u8()
-                    code <- Registry::ResultCode.ExpiredMetadata if encoded_code == Registry::ResultCode.ExpiredMetadata.u8()
-                    code <- Registry::ResultCode.RollbackDetected if encoded_code == Registry::ResultCode.RollbackDetected.u8()
-                    code <- Registry::ResultCode.DigestMismatch if encoded_code == Registry::ResultCode.DigestMismatch.u8()
-                    code <- Registry::ResultCode.ArchiveMissing if encoded_code == Registry::ResultCode.ArchiveMissing.u8()
-                    code <- Registry::ResultCode.ResourceLimit if encoded_code == Registry::ResultCode.ResourceLimit.u8()
-                    code <- Registry::ResultCode.TrustStateUnavailable if encoded_code == Registry::ResultCode.TrustStateUnavailable.u8()
-                    code <- Registry::ResultCode.TrustStateMalformed if encoded_code == Registry::ResultCode.TrustStateMalformed.u8()
-                    code <- Registry::ResultCode.ClockRollback if encoded_code == Registry::ResultCode.ClockRollback.u8()
-                    code <- Registry::ResultCode.Unsatisfiable if encoded_code == Registry::ResultCode.Unsatisfiable.u8()
-                    code <- Registry::ResultCode.ClockUnavailable if encoded_code == Registry::ResultCode.ClockUnavailable.u8()
-                    code <- Registry::ResultCode.ExpiryHorizon if encoded_code == Registry::ResultCode.ExpiryHorizon.u8()
-                    code <- Registry::ResultCode.TrustRootChanged if encoded_code == Registry::ResultCode.TrustRootChanged.u8()
-                    code <- Registry::ResultCode.TufEquivocationDetected if encoded_code == Registry::ResultCode.TufEquivocationDetected.u8()
+                    region encoded_code_scope:
+                        encoded_code: u8 = lock[0] - 1.u8()
+                        # The sentinel stores the enum value plus one so an empty lock remains
+                        # reserved for ordinary resolution failure.
+                        code <- Registry::ResultCode.NotConfigured if encoded_code == Registry::ResultCode.NotConfigured.u8()
+                        code <- Registry::ResultCode.InvalidConfiguration if encoded_code == Registry::ResultCode.InvalidConfiguration.u8()
+                        code <- Registry::ResultCode.MissingIndex if encoded_code == Registry::ResultCode.MissingIndex.u8()
+                        code <- Registry::ResultCode.NoMatchingVersion if encoded_code == Registry::ResultCode.NoMatchingVersion.u8()
+                        code <- Registry::ResultCode.MalformedMetadata if encoded_code == Registry::ResultCode.MalformedMetadata.u8()
+                        code <- Registry::ResultCode.MissingSignature if encoded_code == Registry::ResultCode.MissingSignature.u8()
+                        code <- Registry::ResultCode.MissingTrustRoot if encoded_code == Registry::ResultCode.MissingTrustRoot.u8()
+                        code <- Registry::ResultCode.InvalidSignature if encoded_code == Registry::ResultCode.InvalidSignature.u8()
+                        code <- Registry::ResultCode.ExpiredMetadata if encoded_code == Registry::ResultCode.ExpiredMetadata.u8()
+                        code <- Registry::ResultCode.RollbackDetected if encoded_code == Registry::ResultCode.RollbackDetected.u8()
+                        code <- Registry::ResultCode.DigestMismatch if encoded_code == Registry::ResultCode.DigestMismatch.u8()
+                        code <- Registry::ResultCode.ArchiveMissing if encoded_code == Registry::ResultCode.ArchiveMissing.u8()
+                        code <- Registry::ResultCode.ResourceLimit if encoded_code == Registry::ResultCode.ResourceLimit.u8()
+                        code <- Registry::ResultCode.TrustStateUnavailable if encoded_code == Registry::ResultCode.TrustStateUnavailable.u8()
+                        code <- Registry::ResultCode.TrustStateMalformed if encoded_code == Registry::ResultCode.TrustStateMalformed.u8()
+                        code <- Registry::ResultCode.ClockRollback if encoded_code == Registry::ResultCode.ClockRollback.u8()
+                        code <- Registry::ResultCode.Unsatisfiable if encoded_code == Registry::ResultCode.Unsatisfiable.u8()
+                        code <- Registry::ResultCode.ClockUnavailable if encoded_code == Registry::ResultCode.ClockUnavailable.u8()
+                        code <- Registry::ResultCode.ExpiryHorizon if encoded_code == Registry::ResultCode.ExpiryHorizon.u8()
+                        code <- Registry::ResultCode.TrustRootChanged if encoded_code == Registry::ResultCode.TrustRootChanged.u8()
+                        code <- Registry::ResultCode.TufEquivocationDetected if encoded_code == Registry::ResultCode.TufEquivocationDetected.u8()
                     CliOutput::write_error("error: ")
                     CliOutput::write_error(Registry::result_message(code))
                     if code == Registry::ResultCode.Unsatisfiable:
@@ -236,11 +242,12 @@ module ResolutionCommand:
                     if not ProjectTransaction::begin_with_lock(raw, lock_state, preferred_lock):
                         CliOutput::write_error("error: could not claim the package transaction; another edit may be active or the manifest or lockfile may have changed\n")
                         return CliStatus::security_failed
-                publication: ProjectTransaction::LockPublication = ProjectTransaction::publish_lock(&lock)
-                if publication != ProjectTransaction::LockPublication.Published:
-                    if not transaction_owned:
-                        _ = ProjectTransaction::restore()
-                    return CliStatus::resolution_failed if publication == ProjectTransaction::LockPublication.WriteFailed else CliStatus::security_failed
+                region publication_scope:
+                    publication: ProjectTransaction::LockPublication = ProjectTransaction::publish_lock(&lock)
+                    if publication != ProjectTransaction::LockPublication.Published:
+                        if not transaction_owned:
+                            _ = ProjectTransaction::restore()
+                        return CliStatus::resolution_failed if publication == ProjectTransaction::LockPublication.WriteFailed else CliStatus::security_failed
                 if not transaction_owned:
                     return CliStatus::security_failed if not ProjectTransaction::commit()
                 write_resolved_text(resolved_name_text, resolved_version_text, options) if emit_result
@@ -259,15 +266,16 @@ module ResolutionCommand:
                 return CliStatus::resolution_failed if:
                     not ProjectManifest::validate(raw, &name, &version)
                     not ProjectFiles::c_string_file_exists("elisapkg.lock")
-                lock: mutable darray[u8] = []
-                lock <- lock.resize(ProjectFiles::project_document_limit)
-                return CliStatus::resolution_failed if:
-                    not ProjectFiles::read_c_string_into("elisapkg.lock", &lock)
-                    not LockValidation::matches_manifest(raw, lock, name, version, start)
-                if options.json:
-                    return CliStatus::success if print_lock_packages_json(lock)
-                    return CliStatus::resolution_failed
-                return CliStatus::resolution_failed if not print_lock_packages(lock)
+                region lock_scope:
+                    lock: mutable darray[u8] = []
+                    lock <- lock.resize(ProjectFiles::project_document_limit)
+                    return CliStatus::resolution_failed if:
+                        not ProjectFiles::read_c_string_into("elisapkg.lock", &lock)
+                        not LockValidation::matches_manifest(raw, lock, name, version, start)
+                    if options.json:
+                        return CliStatus::success if print_lock_packages_json(lock)
+                        return CliStatus::resolution_failed
+                    return CliStatus::resolution_failed if not print_lock_packages(lock)
                 return CliStatus::success
 
         def remove(argument_count: i64, slots: mutable cstr&&) -> i64 can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -287,21 +295,23 @@ module ResolutionCommand:
                 return CliStatus::usage if:
                     not ProjectFiles::read_c_string_into("elisapkg.json", &raw)
                     not ProjectManifest::validate_at(raw, &root, &root_name, &root_version)
-                updated: darray[u8] = ManifestEdits::remove(raw, alias)
-                if updated.count == 0.usize():
-                    CliOutput::write_error("error: dependency is not declared; no manifest or lockfile mutation was performed\n")
-                    return CliStatus::resolution_failed
-                return CliStatus::security_failed if not ProjectTransaction::begin(raw)
-                if not ProjectTransaction::publish_manifest(updated):
-                    _ = ProjectTransaction::restore()
-                    return CliStatus::source_failed
+                region updated_scope:
+                    updated: darray[u8] = ManifestEdits::remove(raw, alias)
+                    if updated.count == 0.usize():
+                        CliOutput::write_error("error: dependency is not declared; no manifest or lockfile mutation was performed\n")
+                        return CliStatus::resolution_failed
+                    return CliStatus::security_failed if not ProjectTransaction::begin(raw)
+                    if not ProjectTransaction::publish_manifest(updated):
+                        _ = ProjectTransaction::restore()
+                        return CliStatus::source_failed
                 options: Model::CommandOptions = Model::CommandOptions{locked: false, offline: false, frozen: false, json: false, verbose: false, profile: "debug", target_name: "", target_kind: "", update_name: ""}
                 resolved: i64 = resolve(&root, options, true, false)
                 if resolved != CliStatus::success:
-                    restored: bool = ProjectTransaction::restore()
-                    if not restored:
-                        CliOutput::write_error("error: dependency removal failed and the original manifest could not be restored\n")
-                        return CliStatus::security_failed
+                    region restored_scope:
+                        restored: bool = ProjectTransaction::restore()
+                        if not restored:
+                            CliOutput::write_error("error: dependency removal failed and the original manifest could not be restored\n")
+                            return CliStatus::security_failed
                     return resolved
                 return CliStatus::security_failed if not ProjectTransaction::commit()
                 CliOutput::write_ok("removed dependency ")
@@ -323,20 +333,22 @@ module ResolutionCommand:
                 raw <- raw.resize(ProjectFiles::project_document_limit)
                 return CliStatus::usage if not ProjectFiles::read_c_string_into("elisapkg.json", &raw)
                 root_name: mutable darray[u8] = []
-                root_version: mutable darray[u8] = []
-                return CliStatus::usage if:
-                    not ProjectManifest::validate_at(raw, &root, &root_name, &root_version)
-                    wanted.count > 0.usize() and ByteText::equal(wanted, root_name)
+                region root_version_scope:
+                    root_version: mutable darray[u8] = []
+                    return CliStatus::usage if:
+                        not ProjectManifest::validate_at(raw, &root, &root_name, &root_version)
+                        wanted.count > 0.usize() and ByteText::equal(wanted, root_name)
                 return CliStatus::security_failed if not ProjectTransaction::begin(raw)
                 options: Model::CommandOptions = Model::CommandOptions{locked: false, offline: false, frozen: false, json: false, verbose: false, profile: "debug", target_name: "", target_kind: "", update_name: ""}
                 if wanted.count > 0.usize():
                     options.update_name <- slots[2].cast[cstr]
                 resolved: i64 = resolve(&root, options, true, false)
                 if resolved != CliStatus::success:
-                    restored: bool = ProjectTransaction::restore()
-                    if not restored:
-                        CliOutput::write_error("error: update failed and the original manifest or lockfile could not be restored\n")
-                        return CliStatus::security_failed
+                    region restored_scope:
+                        restored: bool = ProjectTransaction::restore()
+                        if not restored:
+                            CliOutput::write_error("error: update failed and the original manifest or lockfile could not be restored\n")
+                            return CliStatus::security_failed
                     return resolved
                 if wanted.count > 0.usize():
                     lock: mutable darray[u8] = []
@@ -368,23 +380,24 @@ module ResolutionCommand:
 
         def print_lock_packages_json(raw: darray[u8]&) -> bool can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic]:
             can Global.Read:
-                found: mutable usize = 0.usize()
-                CliOutput::write_ok("{\"schema-version\":1,\"packages\":[")
-                for index in 0..<raw.count |raw, found|:
-                    continue if raw[index] != 123
-                    object_end: usize = Json::object_end(raw, index)
-                    continue if object_end <= index
-                    package_name: mutable darray[u8] = []
-                    package_version: mutable darray[u8] = []
-                    if Json::object_string_value(raw, index, object_end, "name", &package_name) and Json::object_string_value(raw, index, object_end, "version", &package_version):
-                        CliOutput::write_ok(",") if found > 0.usize()
-                        CliOutput::write_ok("{\"name\":\"")
-                        CliOutput::write_bytes(1, &package_name)
-                        CliOutput::write_ok("\",\"version\":\"")
-                        CliOutput::write_bytes(1, &package_version)
-                        CliOutput::write_ok("\"}")
-                        found <- found + 1.usize()
-                return false if found == 0.usize()
+                region found_scope:
+                    found: mutable usize = 0.usize()
+                    CliOutput::write_ok("{\"schema-version\":1,\"packages\":[")
+                    for index in 0..<raw.count |raw, found|:
+                        continue if raw[index] != 123
+                        object_end: usize = Json::object_end(raw, index)
+                        continue if object_end <= index
+                        package_name: mutable darray[u8] = []
+                        package_version: mutable darray[u8] = []
+                        if Json::object_string_value(raw, index, object_end, "name", &package_name) and Json::object_string_value(raw, index, object_end, "version", &package_version):
+                            CliOutput::write_ok(",") if found > 0.usize()
+                            CliOutput::write_ok("{\"name\":\"")
+                            CliOutput::write_bytes(1, &package_name)
+                            CliOutput::write_ok("\",\"version\":\"")
+                            CliOutput::write_bytes(1, &package_version)
+                            CliOutput::write_ok("\"}")
+                            found <- found + 1.usize()
+                    return false if found == 0.usize()
                 CliOutput::write_ok("]}\n")
                 return true
 
@@ -424,14 +437,15 @@ module ResolutionCommand:
             can Global.Read:
                 package: mutable darray[u8] = []
                 first_requirement: mutable darray[u8] = []
-                second_requirement: mutable darray[u8] = []
-                return if:
-                    not registry_conflict_field(raw, 0, &package) or not registry_conflict_field(raw, 1, &first_requirement) or not registry_conflict_field(raw, 2, &second_requirement)
-                    package.count == 0.usize() or first_requirement.count == 0.usize() or second_requirement.count == 0.usize()
-                CliOutput::write_error(" (package ")
-                CliOutput::write_bytes(2, &package)
-                CliOutput::write_error("; requirements ")
-                CliOutput::write_bytes(2, &first_requirement)
-                CliOutput::write_error(" and ")
-                CliOutput::write_bytes(2, &second_requirement)
+                region second_requirement_scope:
+                    second_requirement: mutable darray[u8] = []
+                    return if:
+                        not registry_conflict_field(raw, 0, &package) or not registry_conflict_field(raw, 1, &first_requirement) or not registry_conflict_field(raw, 2, &second_requirement)
+                        package.count == 0.usize() or first_requirement.count == 0.usize() or second_requirement.count == 0.usize()
+                    CliOutput::write_error(" (package ")
+                    CliOutput::write_bytes(2, &package)
+                    CliOutput::write_error("; requirements ")
+                    CliOutput::write_bytes(2, &first_requirement)
+                    CliOutput::write_error(" and ")
+                    CliOutput::write_bytes(2, &second_requirement)
                 CliOutput::write_error(")")

@@ -39,13 +39,15 @@ module PackageAssembly:
             can Global.Read:
                 package_source_digest: mutable darray[u8] = []
                 return Code.SecurityFailure if not SourceFingerprint::current(&package_source_digest)
-                state_root: mutable darray[u8] = []
-                ByteText::append_text(&state_root, ".elisapkg")
-                return Code.OutputFailure if not ProjectFiles::make_directory(&state_root)
+                region state_root_scope:
+                    state_root: mutable darray[u8] = []
+                    ByteText::append_text(&state_root, ".elisapkg")
+                    return Code.OutputFailure if not ProjectFiles::make_directory(&state_root)
                 archive: mutable darray[u8] = []
                 return Code.OutputFailure if not archive_bytes(raw, entry, &archive)
-                package_source_digest_after: mutable darray[u8] = []
-                return Code.OutputFailure if not SourceFingerprint::current(&package_source_digest_after) or not ByteText::equal(package_source_digest_after, package_source_digest)
+                region package_source_digest_after_scope:
+                    package_source_digest_after: mutable darray[u8] = []
+                    return Code.OutputFailure if not SourceFingerprint::current(&package_source_digest_after) or not ByteText::equal(package_source_digest_after, package_source_digest)
                 # Manifest and lock bytes are excluded from the source-tree digest
                 # because their dedicated receipt fields would otherwise be
                 # self-referential. Re-read both inputs after archive creation so a
@@ -53,10 +55,11 @@ module PackageAssembly:
                 # identity.
                 manifest_after: mutable darray[u8] = []
                 manifest_after <- manifest_after.resize(ProjectFiles::project_document_limit)
-                lock_after: mutable darray[u8] = []
-                lock_after <- lock_after.resize(ProjectFiles::project_document_limit)
-                return Code.OutputFailure if not ProjectFiles::read_c_string_into("elisapkg.json", &manifest_after) or not ProjectFiles::read_c_string_into("elisapkg.lock", &lock_after)
-                return Code.SecurityFailure if not ByteText::equal(manifest_after, raw) or not ByteText::equal(lock_after, lock_raw)
+                region lock_after_scope:
+                    lock_after: mutable darray[u8] = []
+                    lock_after <- lock_after.resize(ProjectFiles::project_document_limit)
+                    return Code.OutputFailure if not ProjectFiles::read_c_string_into("elisapkg.json", &manifest_after) or not ProjectFiles::read_c_string_into("elisapkg.lock", &lock_after)
+                    return Code.SecurityFailure if not ByteText::equal(manifest_after, raw) or not ByteText::equal(lock_after, lock_raw)
                 return Code.OutputFailure if not Archive::verify_ustar_archive(archive)
                 archive_path: mutable darray[u8] = []
                 ProjectFiles::path_join_into(start, ".elisapkg/package.tar", &archive_path)
@@ -74,10 +77,11 @@ module PackageAssembly:
                 return Code.OutputFailure if not Integrity::sha256_hex(persisted_archive, &digest)
                 blob_path: mutable darray[u8] = []
                 return Code.OutputFailure if not Cache::blob_path(digest, &blob_path)
-                cache_parent: mutable darray[u8] = []
-                return Code.OutputFailure if:
-                    not Cache::shard_path(digest, &cache_parent)
-                    not ProjectFiles::make_directory(&cache_parent)
+                region cache_parent_scope:
+                    cache_parent: mutable darray[u8] = []
+                    return Code.OutputFailure if:
+                        not Cache::shard_path(digest, &cache_parent)
+                        not ProjectFiles::make_directory(&cache_parent)
                 blob_name_c: mutable darray[u8] = []
                 archive_source_c: mutable darray[u8] = []
                 quarantine_parent: mutable darray[u8] = []
@@ -85,15 +89,16 @@ module PackageAssembly:
                 ProjectFiles::path_with_null_terminator_into(&archive_path, &archive_source_c)
                 ByteText::append_text(&quarantine_parent, Cache::quarantine_directory)
                 blob_name: cstr = (&blob_name_c[0]).cast[cstr] can Unsafe.PointerCast
-                archive_source_name: cstr = (&archive_source_c[0]).cast[cstr] can Unsafe.PointerCast
-                if ProjectFiles::c_string_file_exists(blob_name):
-                    if not Cache::verify_blob(digest):
-                        return Code.OutputFailure if:
-                            not ProjectFiles::make_directory(&quarantine_parent)
-                            not Cache::quarantine_blob(digest)
-                            Platform::create_hard_link(archive_source_name, blob_name) != 0
-                elif Platform::create_hard_link(archive_source_name, blob_name) != 0:
-                    return Code.OutputFailure if not ProjectFiles::c_string_file_exists(blob_name) or not Cache::verify_blob(digest)
+                region archive_source_name_scope:
+                    archive_source_name: cstr = (&archive_source_c[0]).cast[cstr] can Unsafe.PointerCast
+                    if ProjectFiles::c_string_file_exists(blob_name):
+                        if not Cache::verify_blob(digest):
+                            return Code.OutputFailure if:
+                                not ProjectFiles::make_directory(&quarantine_parent)
+                                not Cache::quarantine_blob(digest)
+                                Platform::create_hard_link(archive_source_name, blob_name) != 0
+                    elif Platform::create_hard_link(archive_source_name, blob_name) != 0:
+                        return Code.OutputFailure if not ProjectFiles::c_string_file_exists(blob_name) or not Cache::verify_blob(digest)
                 # Revalidate after every publication path. A concurrent rename can change
                 # a pathname after the initial existence check; the receipt is written only
                 # once the final cache bytes still match the in-memory archive digest. The
@@ -101,9 +106,10 @@ module PackageAssembly:
                 return Code.OutputFailure if:
                     Platform::synchronize_parent_directory(blob_name) != 0
                     not Cache::verify_blob(digest)
-                receipt: darray[u8] = PackageReceipt::encode(package_name, package_version, manifest_digest, lock_digest, digest)
-                return Code.OutputFailure if receipt.count == 0.usize()
-                return Code.OutputFailure if not ProjectFiles::replace_file(receipt_path, receipt)
+                region receipt_scope:
+                    receipt: darray[u8] = PackageReceipt::encode(package_name, package_version, manifest_digest, lock_digest, digest)
+                    return Code.OutputFailure if receipt.count == 0.usize()
+                    return Code.OutputFailure if not ProjectFiles::replace_file(receipt_path, receipt)
                 CliOutput::write_ok("packaged ")
                 CliOutput::write_bytes(1, package_name)
                 CliOutput::write_ok(" ")
@@ -125,10 +131,11 @@ module PackageAssembly:
                     root_real_name <- canonical_root
                 else:
                     return false
-                root_policy_path: mutable darray[u8] = []
-                ByteText::append_bounded_text(&root_policy_path, root_real_name)
-                root_policy_path <- root_policy_path.push(0)
-                return false if PackagePathPolicy::credential_root_forbidden(root_policy_path)
+                region root_policy_path_scope:
+                    root_policy_path: mutable darray[u8] = []
+                    ByteText::append_bounded_text(&root_policy_path, root_real_name)
+                    root_policy_path <- root_policy_path.push(0)
+                    return false if PackagePathPolicy::credential_root_forbidden(root_policy_path)
                 buffer: mutable darray[u8] = []
                 buffer <- buffer.resize(8388608)
                 buffer_raw: mutable u8& = (&buffer[0]).cast[mutable u8&] can Unsafe.PointerCast

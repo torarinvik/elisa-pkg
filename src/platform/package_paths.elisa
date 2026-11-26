@@ -21,13 +21,15 @@ extend PlatformNative:
             return NativeErrors::negative_errno() if pinned < 0
             pinned_status: mutable darray[u8] = []
             pinned_status <- pinned_status.resize(status_buffer_bytes)
-            pinned_raw: mutable void& = (&pinned_status[0]).cast[mutable void&] can Unsafe.PointerCast
-            if native_fstat(pinned, pinned_raw) != 0:
-                errno_value: i64 = NativeErrors::negative_errno()
-                return close_error(pinned, errno_value)
-            pinned_mode: u64 = NativeStat::file_type(pinned_status)
-            if pinned_mode != NativeStat::regular_mode:
-                return close_error(pinned, package_nonregular_file_error(pinned_mode))
+            region pinned_raw_scope:
+                pinned_raw: mutable void& = (&pinned_status[0]).cast[mutable void&] can Unsafe.PointerCast
+                if native_fstat(pinned, pinned_raw) != 0:
+                    errno_value: i64 = NativeErrors::negative_errno()
+                    return close_error(pinned, errno_value)
+            region pinned_mode_scope:
+                pinned_mode: u64 = NativeStat::file_type(pinned_status)
+                if pinned_mode != NativeStat::regular_mode:
+                    return close_error(pinned, package_nonregular_file_error(pinned_mode))
             if not NativeStat::same_identity(before, pinned_status):
                 return close_error(pinned, -13)
 
@@ -48,20 +50,23 @@ extend PlatformNative:
             reopened: i64 = native_open(descriptor_name, flag_read_only + flag_nonblock + flag_close_on_exec)
             reopen_errno: i64 = NativeErrors::current_errno()
             if reopened < 0:
-                close_status: i32 = native_close(pinned)
-                return -5 if close_status != 0
+                region close_status_scope:
+                    close_status: i32 = native_close(pinned)
+                    return -5 if close_status != 0
                 return NativeErrors::negative_value(reopen_errno)
             reopened_status: mutable darray[u8] = []
             reopened_status <- reopened_status.resize(status_buffer_bytes)
-            reopened_raw: mutable void& = (&reopened_status[0]).cast[mutable void&] can Unsafe.PointerCast
-            if native_fstat(reopened, reopened_raw) != 0:
-                errno_value: i64 = NativeErrors::negative_errno()
-                return close_two_error(pinned, reopened, errno_value)
+            region reopened_raw_scope:
+                reopened_raw: mutable void& = (&reopened_status[0]).cast[mutable void&] can Unsafe.PointerCast
+                if native_fstat(reopened, reopened_raw) != 0:
+                    errno_value: i64 = NativeErrors::negative_errno()
+                    return close_two_error(pinned, reopened, errno_value)
             same: bool = (NativeStat::file_type(reopened_status)) == NativeStat::regular_mode and NativeStat::same_identity(pinned_status, reopened_status)
-            close_status: i32 = native_close(pinned)
-            if not same or close_status != 0:
-                _ = native_close(reopened)
-                return -5 if close_status != 0 else -13
+            region close_status_scope:
+                close_status: i32 = native_close(pinned)
+                if not same or close_status != 0:
+                    _ = native_close(reopened)
+                    return -5 if close_status != 0 else -13
             return reopened
 
     public:
@@ -70,10 +75,11 @@ extend PlatformNative:
         # ordinary component so callers cannot smuggle traversal through a
         # supposedly descriptor-relative leaf.
         def package_leaf_component_safe(name: cstr) -> bool:
-            length: usize = native_strlen(name)
-            return false if length == 0 or length > 4096 or c_string_equal(name, ".") or c_string_equal(name, "..")
-            for index in 0..<length |name|:
-                return false if name[index].u8() == 47
+            region length_scope:
+                length: usize = native_strlen(name)
+                return false if length == 0 or length > 4096 or c_string_equal(name, ".") or c_string_equal(name, "..")
+                for index in 0..<length |name|:
+                    return false if name[index].u8() == 47
             return true
 
         # Pin a candidate without invoking a device driver's open operation.
@@ -85,11 +91,13 @@ extend PlatformNative:
             return -22 if not package_leaf_component_safe(leaf_name)
             before: mutable darray[u8] = []
             before <- before.resize(status_buffer_bytes)
-            before_raw: mutable void& = (&before[0]).cast[mutable void&] can Unsafe.PointerCast
-            if native_fstatat(directory, leaf_name, before_raw, at_no_follow) != 0:
-                return NativeErrors::negative_errno()
-            before_mode: u64 = NativeStat::file_type(before)
-            return package_nonregular_file_error(before_mode) if before_mode != NativeStat::regular_mode
+            region before_raw_scope:
+                before_raw: mutable void& = (&before[0]).cast[mutable void&] can Unsafe.PointerCast
+                if native_fstatat(directory, leaf_name, before_raw, at_no_follow) != 0:
+                    return NativeErrors::negative_errno()
+            region before_mode_scope:
+                before_mode: u64 = NativeStat::file_type(before)
+                return package_nonregular_file_error(before_mode) if before_mode != NativeStat::regular_mode
             if platform_is_linux:
                 how: mutable darray[u8] = []
                 how <- how.resize(24)
@@ -102,29 +110,33 @@ extend PlatformNative:
                 if opened >= 0:
                     after: mutable darray[u8] = []
                     after <- after.resize(status_buffer_bytes)
-                    after_raw: mutable void& = (&after[0]).cast[mutable void&] can Unsafe.PointerCast
-                    if native_fstat(opened, after_raw) != 0:
-                        errno_value: i64 = NativeErrors::negative_errno()
-                        return close_error(opened, errno_value)
+                    region after_raw_scope:
+                        after_raw: mutable void& = (&after[0]).cast[mutable void&] can Unsafe.PointerCast
+                        if native_fstat(opened, after_raw) != 0:
+                            errno_value: i64 = NativeErrors::negative_errno()
+                            return close_error(opened, errno_value)
                     if (NativeStat::file_type(after)) != NativeStat::regular_mode or not NativeStat::same_identity(before, after):
                         return close_error(opened, -13)
                     return opened
-                open_errno: i64 = NativeErrors::current_errno()
-                if open_errno != 38 and open_errno != 22:
-                    return NativeErrors::negative_value(open_errno)
+                region open_errno_scope:
+                    open_errno: i64 = NativeErrors::current_errno()
+                    if open_errno != 38 and open_errno != 22:
+                        return NativeErrors::negative_value(open_errno)
                 return open_regular_file_at_pinned(directory, leaf_name, before)
             else:
                 opened: i64 = native_openat(directory, leaf_name, regular_file_read_flags())
                 return NativeErrors::negative_errno() if opened < 0
                 after: mutable darray[u8] = []
                 after <- after.resize(status_buffer_bytes)
-                after_raw: mutable void& = (&after[0]).cast[mutable void&] can Unsafe.PointerCast
-                if native_fstat(opened, after_raw) != 0:
-                    errno_value: i64 = NativeErrors::negative_errno()
-                    return close_error(opened, errno_value)
-                after_mode: u64 = NativeStat::file_type(after)
-                if after_mode != NativeStat::regular_mode:
-                    return close_error(opened, package_nonregular_file_error(after_mode))
+                region after_raw_scope:
+                    after_raw: mutable void& = (&after[0]).cast[mutable void&] can Unsafe.PointerCast
+                    if native_fstat(opened, after_raw) != 0:
+                        errno_value: i64 = NativeErrors::negative_errno()
+                        return close_error(opened, errno_value)
+                region after_mode_scope:
+                    after_mode: u64 = NativeStat::file_type(after)
+                    if after_mode != NativeStat::regular_mode:
+                        return close_error(opened, package_nonregular_file_error(after_mode))
                 if not NativeStat::same_identity(before, after):
                     return close_error(opened, -13)
                 return opened
@@ -133,18 +145,20 @@ extend PlatformNative:
         def package_source_directory_file_descriptor(file_descriptor: i64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             stat: mutable darray[u8] = []
             stat <- stat.resize(status_buffer_bytes)
-            raw: mutable void& = (&stat[0]).cast[mutable void&] can Unsafe.PointerCast
-            return false if native_fstat(file_descriptor, raw) != 0
+            region raw_scope:
+                raw: mutable void& = (&stat[0]).cast[mutable void&] can Unsafe.PointerCast
+                return false if native_fstat(file_descriptor, raw) != 0
             mode: u64 = NativeStat::mode(stat)
-            owner: u64 = NativeStat::owner(stat)
-            return false if (mode & NativeStat::file_type_mask) != NativeStat::directory_mode
-            if (mode & NativeStat::group_or_other_write_mask) != 0.u64():
-                # The only writable shared directory accepted for source
-                # traversal is a root-owned sticky directory (for example,
-                # /tmp). The sticky bit limits replacement to the owner of
-                # each entry; O_NOFOLLOW/nonblocking checks handle symlinks
-                # and FIFOs at the leaf.
-                return false if owner != 0.u64() or (mode & 512.u64()) == 0.u64()
+            region owner_scope:
+                owner: u64 = NativeStat::owner(stat)
+                return false if (mode & NativeStat::file_type_mask) != NativeStat::directory_mode
+                if (mode & NativeStat::group_or_other_write_mask) != 0.u64():
+                    # The only writable shared directory accepted for source
+                    # traversal is a root-owned sticky directory (for example,
+                    # /tmp). The sticky bit limits replacement to the owner of
+                    # each entry; O_NOFOLLOW/nonblocking checks handle symlinks
+                    # and FIFOs at the leaf.
+                    return false if owner != 0.u64() or (mode & 512.u64()) == 0.u64()
             return NativeTrustedAcl::trusted_acl_file_descriptor(file_descriptor, true)
 
     private:
@@ -177,8 +191,9 @@ extend PlatformNative:
             for index in leaf_start..<length |path, leaf|:
                 leaf.push(path[index].u8())
             leaf.push(0)
-            leaf_name: cstr = (&leaf[0]).cast[cstr] can Unsafe.PointerCast
-            return false if leaf.count <= 1.usize() or c_string_equal(leaf_name, ".") or c_string_equal(leaf_name, "..")
+            region leaf_name_scope:
+                leaf_name: cstr = (&leaf[0]).cast[cstr] can Unsafe.PointerCast
+                return false if leaf.count <= 1.usize() or c_string_equal(leaf_name, ".") or c_string_equal(leaf_name, "..")
             if slash == 0:
                 parent.push(46)
             elif slash == 1 and path[0].u8() == 47:
@@ -208,13 +223,14 @@ extend PlatformNative:
                 while finish < length and path_copy[finish] != 47 |path_copy, finish|:
                     finish <- finish + 1.usize()
                 path_copy[finish] <- 0
-                part: cstr = (&path_copy[start]).cast[cstr] can Unsafe.PointerCast
-                if not c_string_equal(part, "."):
-                    return close_error(directory, -22) if c_string_equal(part, "..")
-                    next: i64 = native_openat(directory, part, flags_directory() + flag_no_follow)
-                    return close_error(directory, -NativeErrors::error_code()) if next < 0
-                    return close_error(next, -5) if native_close(directory) != 0
-                    directory <- next
+                region part_scope:
+                    part: cstr = (&path_copy[start]).cast[cstr] can Unsafe.PointerCast
+                    if not c_string_equal(part, "."):
+                        return close_error(directory, -22) if c_string_equal(part, "..")
+                        next: i64 = native_openat(directory, part, flags_directory() + flag_no_follow)
+                        return close_error(directory, -NativeErrors::error_code()) if next < 0
+                        return close_error(next, -5) if native_close(directory) != 0
+                        directory <- next
                 start <- finish + 1.usize()
                 while start < length and path_copy[start] == 47 |path_copy, start|:
                     start <- start + 1.usize()
@@ -225,21 +241,24 @@ extend PlatformNative:
             return -22 if not package_leaf_component_safe(component)
             before: mutable darray[u8] = []
             before <- before.resize(status_buffer_bytes)
-            before_raw: mutable void& = (&before[0]).cast[mutable void&] can Unsafe.PointerCast
-            if native_fstatat(directory, component, before_raw, at_no_follow) != 0:
-                return NativeErrors::negative_errno()
-            before_mode: u64 = NativeStat::file_type(before)
-            if before_mode != NativeStat::directory_mode:
-                return -symlink_error if before_mode == NativeStat::symlink_mode
-                return -20
+            region before_raw_scope:
+                before_raw: mutable void& = (&before[0]).cast[mutable void&] can Unsafe.PointerCast
+                if native_fstatat(directory, component, before_raw, at_no_follow) != 0:
+                    return NativeErrors::negative_errno()
+            region before_mode_scope:
+                before_mode: u64 = NativeStat::file_type(before)
+                if before_mode != NativeStat::directory_mode:
+                    return -symlink_error if before_mode == NativeStat::symlink_mode
+                    return -20
             next: i64 = native_openat(directory, component, flags_directory() + flag_no_follow)
             return NativeErrors::negative_errno() if next < 0
             after: mutable darray[u8] = []
             after <- after.resize(status_buffer_bytes)
-            after_raw: mutable void& = (&after[0]).cast[mutable void&] can Unsafe.PointerCast
-            if native_fstat(next, after_raw) != 0:
-                errno_value: i64 = NativeErrors::negative_errno()
-                return close_error(next, errno_value)
+            region after_raw_scope:
+                after_raw: mutable void& = (&after[0]).cast[mutable void&] can Unsafe.PointerCast
+                if native_fstat(next, after_raw) != 0:
+                    errno_value: i64 = NativeErrors::negative_errno()
+                    return close_error(next, errno_value)
             if (NativeStat::file_type(after)) != NativeStat::directory_mode or not NativeStat::same_identity(before, after) or not package_source_directory_file_descriptor(next):
                 return close_error(next, -13)
             return next
@@ -264,12 +283,13 @@ extend PlatformNative:
                 while finish < length and path_copy[finish] != 47 |path_copy, start, finish|:
                     finish <- finish + 1.usize()
                 path_copy[finish] <- 0
-                component: cstr = (&path_copy[start]).cast[cstr] can Unsafe.PointerCast
-                if not c_string_equal(component, "."):
-                    next: i64 = open_package_directory_component(directory, component)
-                    return close_error(directory, next) if next < 0
-                    return close_error(next, -5) if native_close(directory) != 0
-                    directory <- next
+                region component_scope:
+                    component: cstr = (&path_copy[start]).cast[cstr] can Unsafe.PointerCast
+                    if not c_string_equal(component, "."):
+                        next: i64 = open_package_directory_component(directory, component)
+                        return close_error(directory, next) if next < 0
+                        return close_error(next, -5) if native_close(directory) != 0
+                        directory <- next
                 start <- finish + 1.usize()
                 while start < length and path_copy[start] == 47 |path_copy, start|:
                     start <- start + 1.usize()
@@ -308,10 +328,11 @@ extend PlatformNative:
                     return close_result(directory, -21) if c_string_equal(part, ".")
                     result: i64 = open_regular_file_at(directory, part)
                     return close_error(directory, result) if result < 0
-                    close_status: i32 = native_close(directory)
-                    if close_status != 0:
-                        _ = native_close(result)
-                        return -5
+                    region close_status_scope:
+                        close_status: i32 = native_close(directory)
+                        if close_status != 0:
+                            _ = native_close(result)
+                            return -5
                     return result
                 start <- finish + 1.usize()
                 while start < length and path_copy[start] == 47 |path_copy, start|:

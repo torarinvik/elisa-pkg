@@ -22,11 +22,12 @@ module Lockfile:
 
         def append_header(out: mutable darray[u8]&, format: Format, name: darray[u8]&, version: darray[u8]&, manifest_digest: darray[u8]&, source_digest: darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
             document_version: u64 = local_version if format == Format.Local else registry_version
-            resolver: cstr = "elisapkg-v2" if format == Format.Local else registry_resolver
-            ByteText::append_text(out, "{\n  \"lock-version\": ")
-            ByteText::append_decimal(out, document_version)
-            ByteText::append_text(out, ",\n  \"resolver\": \"")
-            ByteText::append_text(out, resolver)
+            region resolver_scope:
+                resolver: cstr = "elisapkg-v2" if format == Format.Local else registry_resolver
+                ByteText::append_text(out, "{\n  \"lock-version\": ")
+                ByteText::append_decimal(out, document_version)
+                ByteText::append_text(out, ",\n  \"resolver\": \"")
+                ByteText::append_text(out, resolver)
             ByteText::append_text(out, "\",\n  \"package\": {\n    \"name\": \"")
             ByteText::append(out, name)
             ByteText::append_text(out, "\",\n    \"version\": \"")
@@ -53,20 +54,22 @@ module Lockfile:
 
         def read_registry_archive(raw: darray[u8]&, record_start: usize, record_end: usize, archive: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
             source_start: mutable usize = 0
-            source_end: mutable usize = 0
-            return false if not:
-                Json::object_value_span(raw, record_start, record_end, "source", &source_start, &source_end)
-                SchemaFields::valid(raw, source_start, source_end, SchemaFields::Kind.RegistryLockSource)
-                Json::object_string_equals_text(raw, source_start, source_end, "type", "registry")
-                Json::object_string_equals_text(raw, source_start, source_end, "registry", "primary")
-                Json::object_string_value(raw, source_start, source_end, "archive", archive)
+            region source_end_scope:
+                source_end: mutable usize = 0
+                return false if not:
+                    Json::object_value_span(raw, record_start, record_end, "source", &source_start, &source_end)
+                    SchemaFields::valid(raw, source_start, source_end, SchemaFields::Kind.RegistryLockSource)
+                    Json::object_string_equals_text(raw, source_start, source_end, "type", "registry")
+                    Json::object_string_equals_text(raw, source_start, source_end, "registry", "primary")
+                    Json::object_string_value(raw, source_start, source_end, "archive", archive)
             return Archive::is_safe_entry(archive)
 
         def read_sha256_field(raw: darray[u8]&, object_start: usize, object_end: usize, field: cstr, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
             out.resize(0)
-            start: usize = sha256_field_start(raw, object_start, object_end, field)
-            return false if start >= raw.count
-            ByteText::append_range(out, raw, start, start + 64.usize())
+            region start_scope:
+                start: usize = sha256_field_start(raw, object_start, object_end, field)
+                return false if start >= raw.count
+                ByteText::append_range(out, raw, start, start + 64.usize())
             return true
 
         def has_sha256_field(raw: darray[u8]&, object_start: usize, object_end: usize, field: cstr) -> bool:
@@ -81,10 +84,11 @@ module Lockfile:
             requires right_start <= right_end and right_end <= lock.count
             left_length: usize = left_end - left_start
             right_length: usize = right_end - right_start
-            shared_length: usize = left_length if left_length < right_length else right_length
-            for offset in 0..<shared_length |lock, left_start, right_start|:
-                return true if lock[left_start + offset] < lock[right_start + offset]
-                return false if lock[left_start + offset] > lock[right_start + offset]
+            region shared_length_scope:
+                shared_length: usize = left_length if left_length < right_length else right_length
+                for offset in 0..<shared_length |lock, left_start, right_start|:
+                    return true if lock[left_start + offset] < lock[right_start + offset]
+                    return false if lock[left_start + offset] > lock[right_start + offset]
             return left_length < right_length
 
         def registry_record_starts(lock: darray[u8]&, packages_start: usize, packages_end: usize, out: mutable darray[usize]&) -> bool can[Memory.Allocate, Abort.Panic]:
@@ -143,8 +147,9 @@ module Lockfile:
             return -1 if record_end <= record_start or record_end >= lock.count
             version: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
             return -1 if not read_registry_version(lock, record_start, record_end, &version)
-            requirement: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
-            return -1 if not SemVer::parse_requirement(wanted.requirement, &requirement) or not SemVer::matches(requirement, version)
+            region requirement_scope:
+                requirement: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
+                return -1 if not SemVer::parse_requirement(wanted.requirement, &requirement) or not SemVer::matches(requirement, version)
             return record_index.i64()
 
         # Match only direct records in the packages array.
@@ -154,17 +159,18 @@ module Lockfile:
                 return false
             finish: usize = Json::array_end(raw, start)
             return false if finish <= start or finish >= raw.count
-            cursor: mutable usize = start + 1.usize()
-            while cursor < finish |raw, finish, cursor, wanted|:
-                cursor <- Json::skip_whitespace(raw, cursor, finish)
-                return false if cursor >= finish or raw[cursor] != 123
-                record_end: usize = Json::object_end(raw, cursor)
-                return false if record_end <= cursor or record_end >= finish
-                return true if Json::object_string_equals(raw, cursor, record_end, "name", wanted)
-                cursor <- record_end + 1.usize()
-                cursor <- Json::skip_whitespace(raw, cursor, finish)
-                return false if cursor >= finish or raw[cursor] != 44
-                cursor <- cursor + 1.usize()
+            region cursor_scope:
+                cursor: mutable usize = start + 1.usize()
+                while cursor < finish |raw, finish, cursor, wanted|:
+                    cursor <- Json::skip_whitespace(raw, cursor, finish)
+                    return false if cursor >= finish or raw[cursor] != 123
+                    record_end: usize = Json::object_end(raw, cursor)
+                    return false if record_end <= cursor or record_end >= finish
+                    return true if Json::object_string_equals(raw, cursor, record_end, "name", wanted)
+                    cursor <- record_end + 1.usize()
+                    cursor <- Json::skip_whitespace(raw, cursor, finish)
+                    return false if cursor >= finish or raw[cursor] != 44
+                    cursor <- cursor + 1.usize()
             return false
 
         # The caller supplies record offsets in strictly increasing package-name order.
@@ -184,10 +190,11 @@ module Lockfile:
                 record_end <= record_start or record_end >= lock.count
                 not Json::object_string_span(lock, record_start, record_end, "name", &start, &finish)
             length: usize = finish - start
-            shared_length: usize = length if length < wanted.count else wanted.count
-            for offset in 0..<shared_length |lock, start, wanted|:
-                return -1 if lock[start + offset] < wanted[offset]
-                return 1 if lock[start + offset] > wanted[offset]
+            region shared_length_scope:
+                shared_length: usize = length if length < wanted.count else wanted.count
+                for offset in 0..<shared_length |lock, start, wanted|:
+                    return -1 if lock[start + offset] < wanted[offset]
+                    return 1 if lock[start + offset] > wanted[offset]
             return -1 if length < wanted.count
             return 1 if length > wanted.count
             return 0
@@ -195,12 +202,13 @@ module Lockfile:
         # Return the validated hex span's start, or the input length on failure.
         def sha256_field_start(raw: darray[u8]&, object_start: usize, object_end: usize, field: cstr) -> usize:
             start: mutable usize = 0
-            finish: mutable usize = 0
-            return raw.count if:
-                not Json::object_string_span(raw, object_start, object_end, field, &start, &finish)
-                finish - start != 71.usize()
-                not ByteText::range_equals_text(raw, start, start + 7.usize(), "sha256:")
-                not Integrity::valid_sha256_hex_range(raw, start + 7.usize(), finish)
+            region finish_scope:
+                finish: mutable usize = 0
+                return raw.count if:
+                    not Json::object_string_span(raw, object_start, object_end, field, &start, &finish)
+                    finish - start != 71.usize()
+                    not ByteText::range_equals_text(raw, start, start + 7.usize(), "sha256:")
+                    not Integrity::valid_sha256_hex_range(raw, start + 7.usize(), finish)
             return start + 7.usize()
 
         const maximum_registry_records: usize = 4096.usize()

@@ -42,23 +42,26 @@ module SignedRegistryIndex:
             index_path: mutable darray[u8] = []
             return Code.InvalidConfiguration if not RegistryFiles::join_path_leaf(root, package, "index", &index_path)
             snapshot: mutable darray[u8] = []
-            loaded: i64 = RegistryFiles::read_trusted_file(index_path, 1048576.usize(), &snapshot)
-            return Code.MissingIndex if loaded == -2
-            return Code.ResourceLimit if loaded == -27
-            return Code.InvalidConfiguration if loaded < 0
-            return Code.MalformedMetadata if loaded == 0 or snapshot.count > 1048576
+            region loaded_scope:
+                loaded: i64 = RegistryFiles::read_trusted_file(index_path, 1048576.usize(), &snapshot)
+                return Code.MissingIndex if loaded == -2
+                return Code.ResourceLimit if loaded == -27
+                return Code.InvalidConfiguration if loaded < 0
+                return Code.MalformedMetadata if loaded == 0 or snapshot.count > 1048576
 
             signature_path: mutable darray[u8] = []
             return Code.InvalidConfiguration if not RegistryFiles::join_path_leaf(root, package, "index.sig", &signature_path)
             signature: mutable darray[u8] = []
-            signature_size: i64 = RegistryFiles::read_trusted_file(signature_path, Trust::ed25519_signature_bytes, &signature)
-            return Code.MissingSignature if signature_size < 0 or signature_size != Trust::ed25519_signature_bytes.i64()
+            region signature_size_scope:
+                signature_size: i64 = RegistryFiles::read_trusted_file(signature_path, Trust::ed25519_signature_bytes, &signature)
+                return Code.MissingSignature if signature_size < 0 or signature_size != Trust::ed25519_signature_bytes.i64()
             public_key: mutable darray[u8] = []
             return Code.MissingTrustRoot if RegistryFiles::read_trusted_file(key_path, Trust::ed25519_public_key_bytes, &public_key) != Trust::ed25519_public_key_bytes.i64()
             key_fingerprint_hex: mutable darray[u8] = []
             return Code.TrustStateUnavailable if not Integrity::sha256_hex(public_key, &key_fingerprint_hex)
-            trust_status: Trust::VerificationCode = Trust::verify_detached("ed25519", public_key, snapshot, signature)
-            return Code.InvalidSignature if trust_status != Trust::VerificationCode.Valid
+            region trust_status_scope:
+                trust_status: Trust::VerificationCode = Trust::verify_detached("ed25519", public_key, snapshot, signature)
+                return Code.InvalidSignature if trust_status != Trust::VerificationCode.Valid
 
             versions: mutable darray[u8] = []
             yanked_flags: mutable darray[u8] = []
@@ -70,15 +73,17 @@ module SignedRegistryIndex:
             return Code.InvalidSignature if not ByteText::equal(snapshot_root, root) or not ByteText::equal(snapshot_package, package)
             now: i64 = Platform::wall_clock_seconds()
             return Code.ClockUnavailable if now < 0
-            expiry_status: Code = rollback_result(RollbackStore::metadata_expiry_status(expires, now.u64()))
-            return expiry_status if expiry_status != Code.Ok
+            region expiry_status_scope:
+                expiry_status: Code = rollback_result(RollbackStore::metadata_expiry_status(expires, now.u64()))
+                return expiry_status if expiry_status != Code.Ok
 
             snapshot_digest: mutable darray[u8] = []
             return Code.TrustStateUnavailable if not Integrity::sha256_hex(snapshot, &snapshot_digest)
             index_identity: mutable darray[u8] = []
             return Code.TrustStateUnavailable if not TrustIdentity::index(root, package, &index_identity)
-            state_status: Code = record_index_generation(index_identity, generation, snapshot_digest, expires, key_fingerprint_hex)
-            return state_status if state_status != Code.Ok
+            region state_status_scope:
+                state_status: Code = record_index_generation(index_identity, generation, snapshot_digest, expires, key_fingerprint_hex)
+                return state_status if state_status != Code.Ok
             for index in 0..<versions.count |out, versions|:
                 out.push(versions[index])
             for index in 0..<yanked_flags.count |yanked_flags_out, yanked_flags|:
@@ -93,14 +98,15 @@ module SignedRegistryIndex:
             return Code.Ok
 
         def contains_version(versions: darray[u8]&, version: darray[u8]&) -> bool:
-            cursor: mutable usize = 0
-            while cursor < versions.count |versions, version, cursor|:
-                finish: mutable usize = cursor
-                while finish < versions.count and versions[finish] != 10 |versions, finish|:
-                    finish <- finish + 1
-                return false if finish == versions.count
-                return true if ByteText::range_equals(versions, cursor, finish, version)
-                cursor <- finish + 1
+            region cursor_scope:
+                cursor: mutable usize = 0
+                while cursor < versions.count |versions, version, cursor|:
+                    finish: mutable usize = cursor
+                    while finish < versions.count and versions[finish] != 10 |versions, finish|:
+                        finish <- finish + 1
+                    return false if finish == versions.count
+                    return true if ByteText::range_equals(versions, cursor, finish, version)
+                    cursor <- finish + 1
             return false
 
         def filter_yanked_versions(index: darray[u8]&, yanked_flags: darray[u8]&, eligible_out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:

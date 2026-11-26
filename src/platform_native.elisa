@@ -21,8 +21,9 @@ module PlatformNative:
             return native_strlen(value)
         def c_string_equal(left: cstr, right: cstr) -> bool:
             left_length: usize = native_strlen(left)
-            right_length: usize = native_strlen(right)
-            return false if left_length != right_length
+            region right_length_scope:
+                right_length: usize = native_strlen(right)
+                return false if left_length != right_length
             for index in 0..<left_length |left, right|:
                 return false if left[index].u8() != right[index].u8()
             return true
@@ -38,9 +39,10 @@ module PlatformNative:
             return -22 if file_descriptor < 0
             raw: mutable void& = buffer.cast[mutable void&] can Unsafe.PointerCast
             while true |file_descriptor, raw, capacity|:
-                result: i64 = native_read(file_descriptor, raw, capacity)
-                continue if result < 0 and NativeErrors::current_errno() == 4
-                return result if result >= 0
+                region result_scope:
+                    result: i64 = native_read(file_descriptor, raw, capacity)
+                    continue if result < 0 and NativeErrors::current_errno() == 4
+                    return result if result >= 0
                 return NativeErrors::negative_errno()
             return -5
         def seek_file_descriptor(file_descriptor: i64, offset: i64, origin: i64) -> i64:
@@ -58,8 +60,9 @@ module PlatformNative:
         def close_inherited_file_descriptors() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             static if ELISA_TARGET_OS_LINUX:
                 while true:
-                    close_status: i64 = native_syscall(linux_close_range_syscall, 3, 4294967295, 0)
-                    return 0 if close_status == 0
+                    region close_status_scope:
+                        close_status: i64 = native_syscall(linux_close_range_syscall, 3, 4294967295, 0)
+                        return 0 if close_status == 0
                     errno_value: i64 = NativeErrors::current_errno()
                     continue if errno_value == 4
                     return NativeErrors::negative_value(errno_value)
@@ -108,8 +111,9 @@ module PlatformNative:
             return file_descriptor if file_descriptor < 0
             return close_error(file_descriptor, -21) if not regular_file_descriptor(file_descriptor)
             size: i64 = native_lseek(file_descriptor, 0, 2)
-            close_status: i64 = native_close(file_descriptor)
-            return -5 if close_status != 0
+            region close_status_scope:
+                close_status: i64 = native_close(file_descriptor)
+                return -5 if close_status != 0
             return -5 if size < 0
             return size
 
@@ -119,10 +123,11 @@ module PlatformNative:
         # platform module so its filesystem trust policy can be regression
         # tested directly; application code should use verify_ed25519.
         def is_directory(path: cstr) -> i64:
-            file_descriptor: i64 = open_directory_path(path)
-            return 0 if:
-                file_descriptor < 0
-                native_close(file_descriptor) != 0
+            region file_descriptor_scope:
+                file_descriptor: i64 = open_directory_path(path)
+                return 0 if:
+                    file_descriptor < 0
+                    native_close(file_descriptor) != 0
             return 1
 
         def open_directory_for_process(path: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -137,8 +142,9 @@ module PlatformNative:
             return close_error(directory, NativeErrors::negative_value(errno_value))
 
         def fchdir(file_descriptor: i64) -> i64:
-            result: i64 = native_fchdir(file_descriptor)
-            return 0 if result == 0
+            region result_scope:
+                result: i64 = native_fchdir(file_descriptor)
+                return 0 if result == 0
             return -NativeErrors::error_code()
 
         def realpath(path: cstr, resolved: mutable darray[u8]&) -> cstr? can[Unsafe.PointerCast]:
@@ -150,9 +156,10 @@ module PlatformNative:
             if found is canonical:
                 length: usize = native_strlen(canonical.cast[cstr] can Unsafe.PointerCast)
                 if length + 1.usize() <= resolved.count:
-                    source: cstr = canonical.cast[cstr] can Unsafe.PointerCast
-                    for index in 0..<length |resolved, source|:
-                        resolved[index] <- source[index].u8()
+                    region source_scope:
+                        source: cstr = canonical.cast[cstr] can Unsafe.PointerCast
+                        for index in 0..<length |resolved, source|:
+                            resolved[index] <- source[index].u8()
                     resolved[length] <- 0
                     native_free(canonical.cast[void&] can Unsafe.PointerCast)
                     return (&resolved[0]).cast[cstr] can Unsafe.PointerCast
@@ -171,15 +178,16 @@ module PlatformNative:
                 entries <- entries.resize(capacity.usize())
                 buffer: mutable void& = (&entries[0]).cast[mutable void&] can Unsafe.PointerCast
                 native_errno()[0] <- 0
-                received: i32 = native_proc_pidinfo(process, descriptor_list_flavor, 0.u64(), buffer, capacity)
-                return -5 if received < 0 or received >= capacity or received % 8 != 0
-                return NativeErrors::negative_errno() if received == 0 and NativeErrors::current_errno() != 0
-                for index in 0..<(received.usize() / entry_bytes) |entries, entry_bytes|:
-                    offset: usize = index * entry_bytes
-                    descriptor: i64 = NativeProcessValues::descriptor_number(entries, offset)
-                    return -5 if descriptor < 0
-                    if descriptor >= 3 and native_close(descriptor) != 0:
-                        return NativeErrors::negative_errno()
+                region received_scope:
+                    received: i32 = native_proc_pidinfo(process, descriptor_list_flavor, 0.u64(), buffer, capacity)
+                    return -5 if received < 0 or received >= capacity or received % 8 != 0
+                    return NativeErrors::negative_errno() if received == 0 and NativeErrors::current_errno() != 0
+                    for index in 0..<(received.usize() / entry_bytes) |entries, entry_bytes|:
+                        offset: usize = index * entry_bytes
+                        descriptor: i64 = NativeProcessValues::descriptor_number(entries, offset)
+                        return -5 if descriptor < 0
+                        if descriptor >= 3 and native_close(descriptor) != 0:
+                            return NativeErrors::negative_errno()
                 return 0
 
     public:
@@ -219,11 +227,12 @@ module PlatformNative:
                     entry: mutable heap void&? = native_readdir(opened)
                     if entry is record:
                         raw: mutable u8& = record.cast[mutable u8&] can Unsafe.PointerCast
-                        name_length: usize = dirent_name_length(raw)
-                        if name_length == 0.usize():
-                            _ = native_closedir(opened)
-                            return false
-                        continue if name_is_dot(raw, dirent_name_offset, name_length)
+                        region name_length_scope:
+                            name_length: usize = dirent_name_length(raw)
+                            if name_length == 0.usize():
+                                _ = native_closedir(opened)
+                                return false
+                            continue if name_is_dot(raw, dirent_name_offset, name_length)
                         _ = native_closedir(opened)
                         return false
                     failed <- NativeErrors::current_errno() != 0
@@ -252,23 +261,26 @@ module PlatformNative:
     public:
         def close_two_error(left: i64, right: i64, errno_value: i64) -> i64:
             left_status: i64 = native_close(left)
-            right_status: i64 = native_close(right)
-            return -5 if left_status != 0 or right_status != 0
+            region right_status_scope:
+                right_status: i64 = native_close(right)
+                return -5 if left_status != 0 or right_status != 0
             return errno_value
 
     public:
         def close_three_error(first: i64, second: i64, third: i64, errno_value: i64) -> i64:
             first_status: i32 = native_close(first)
             second_status: i32 = native_close(second)
-            third_status: i32 = native_close(third)
-            return -5 if first_status != 0 or second_status != 0 or third_status != 0
+            region third_status_scope:
+                third_status: i32 = native_close(third)
+                return -5 if first_status != 0 or second_status != 0 or third_status != 0
             return errno_value
 
     public:
         def close_two_result(left: i64, right: i64, result: i64) -> i64:
             left_status: i64 = native_close(left)
-            right_status: i64 = native_close(right)
-            return -5 if left_status != 0 or right_status != 0
+            region right_status_scope:
+                right_status: i64 = native_close(right)
+                return -5 if left_status != 0 or right_status != 0
             return result
 
     public:

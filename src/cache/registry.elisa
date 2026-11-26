@@ -25,12 +25,13 @@ module RegistryCache:
             return false if not Cache::registry_signature_path(metadata_digest, &signature_path)
             signature_c: mutable darray[u8] = []
             ProjectFiles::path_with_null_terminator_into(&signature_path, &signature_c)
-            signature_name: cstr = (&signature_c[0]).cast[cstr] can Unsafe.PointerCast
-            if not ProjectFiles::c_string_file_exists(signature_name):
-                status: i64 = ProjectFiles::publish_file_exclusively(signature_path, signature)
-                # A concurrent publication is acceptable only if the final
-                # detached signature is the same one we intended to store.
-                return false if status != 0 and status != -17
+            region signature_name_scope:
+                signature_name: cstr = (&signature_c[0]).cast[cstr] can Unsafe.PointerCast
+                if not ProjectFiles::c_string_file_exists(signature_name):
+                    status: i64 = ProjectFiles::publish_file_exclusively(signature_path, signature)
+                    # A concurrent publication is acceptable only if the final
+                    # detached signature is the same one we intended to store.
+                    return false if status != 0 and status != -17
             existing: mutable darray[u8] = []
             return false if not Cache::read_registry_signature(metadata_digest, &existing)
             return ByteText::equal(existing, signature)
@@ -45,18 +46,20 @@ module RegistryCache:
         def store_receipt(package: darray[u8]&, version: darray[u8]&, archive: darray[u8]&, archive_size: u64, digest: darray[u8]&, metadata_digest: darray[u8]&, expires: u64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             path: mutable darray[u8] = []
             return false if not Cache::registry_receipt_path(digest, metadata_digest, &path)
-            parent: mutable darray[u8] = []
-            return false if not:
-                Cache::shard_path(digest, &parent)
-                ProjectFiles::make_directory(&parent)
+            region parent_scope:
+                parent: mutable darray[u8] = []
+                return false if not:
+                    Cache::shard_path(digest, &parent)
+                    ProjectFiles::make_directory(&parent)
             receipt: darray[u8] = Cache::encode_registry_receipt(package, version, archive, archive_size, digest, metadata_digest, expires)
             return false if receipt.count == 0.usize()
             path_c: mutable darray[u8] = []
             ProjectFiles::path_with_null_terminator_into(&path, &path_c)
-            path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
-            if not ProjectFiles::c_string_file_exists(path_name):
-                publication_status: i64 = ProjectFiles::publish_file_exclusively(path, receipt)
-                return false if publication_status != 0 and publication_status != -17
+            region path_name_scope:
+                path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
+                if not ProjectFiles::c_string_file_exists(path_name):
+                    publication_status: i64 = ProjectFiles::publish_file_exclusively(path, receipt)
+                    return false if publication_status != 0 and publication_status != -17
             existing: mutable darray[u8] = []
             return Cache::read_registry_receipt(digest, metadata_digest, &existing) and ByteText::equal(existing, receipt)
 
@@ -66,24 +69,28 @@ module RegistryCache:
             # before creating any cache entry, then revalidate the final pathname after
             # the exclusive link so a concurrent writer or replacement cannot turn a
             # successful fetch into an unverified cache hit.
-            actual: mutable darray[u8] = []
-            return false if not Integrity::sha256_hex(content, &actual) or not ByteText::equal(actual, digest)
+            region actual_scope:
+                actual: mutable darray[u8] = []
+                return false if not Integrity::sha256_hex(content, &actual) or not ByteText::equal(actual, digest)
             blob_path: mutable darray[u8] = []
             return false if not Cache::blob_path(digest, &blob_path)
-            cache_parent: mutable darray[u8] = []
-            return false if not:
-                Cache::shard_path(digest, &cache_parent)
-                ProjectFiles::make_directory(&cache_parent)
+            region cache_parent_scope:
+                cache_parent: mutable darray[u8] = []
+                return false if not:
+                    Cache::shard_path(digest, &cache_parent)
+                    ProjectFiles::make_directory(&cache_parent)
             blob_name: mutable darray[u8] = []
             ProjectFiles::path_with_null_terminator_into(&blob_path, &blob_name)
-            blob_c: cstr = (&blob_name[0]).cast[cstr] can Unsafe.PointerCast
-            if ProjectFiles::c_string_file_exists(blob_c):
-                return true if Cache::verify_blob(digest)
-                quarantine_parent: mutable darray[u8] = []
-                ByteText::append_text(&quarantine_parent, Cache::quarantine_directory)
-                return false if not:
-                    ProjectFiles::make_directory(&quarantine_parent)
-                    Cache::quarantine_blob(digest)
-            publication_status: i64 = ProjectFiles::publish_file_exclusively(blob_path, content)
-            return Cache::verify_blob(digest) if publication_status == 0 or publication_status == -17
+            region blob_c_scope:
+                blob_c: cstr = (&blob_name[0]).cast[cstr] can Unsafe.PointerCast
+                if ProjectFiles::c_string_file_exists(blob_c):
+                    return true if Cache::verify_blob(digest)
+                    quarantine_parent: mutable darray[u8] = []
+                    ByteText::append_text(&quarantine_parent, Cache::quarantine_directory)
+                    return false if not:
+                        ProjectFiles::make_directory(&quarantine_parent)
+                        Cache::quarantine_blob(digest)
+            region publication_status_scope:
+                publication_status: i64 = ProjectFiles::publish_file_exclusively(blob_path, content)
+                return Cache::verify_blob(digest) if publication_status == 0 or publication_status == -17
             return false
