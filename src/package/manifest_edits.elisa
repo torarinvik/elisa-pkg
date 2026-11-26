@@ -65,28 +65,39 @@ module ManifestEdits:
 
         def append_entry(raw: darray[u8]&, alias: darray[u8]&, entry: dstr&) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
             dependency_start: usize = Json::root_value_offset(raw, "dependencies")
-            dependency_end: usize = Json::object_end(raw, dependency_start)
-            return [] if dependency_start >= dependency_end or dependency_end >= raw.count
+            if dependency_start >= raw.count:
+                return append_object_member(raw, Json::root_start(raw), entry, true)
             previous_start: mutable usize = 0.usize()
             previous_end: mutable usize = 0.usize()
             return [] if Manifest::find_dependency_span(raw, alias, &previous_start, &previous_end)
+            out: darray[u8] = append_object_member(raw, dependency_start, entry, false)
+            return [] if not Manifest::valid_dependency_map(out, "dependencies")
+            return out
+
+        def append_object_member(raw: darray[u8]&, object_start: usize, entry: dstr&, create_dependencies: bool) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
+            object_end: usize = Json::object_end(raw, object_start)
+            return [] if object_start >= object_end or object_end >= raw.count
             has_existing: mutable bool = false
-            for index in (dependency_start + 1.usize())..<dependency_end |raw, has_existing|:
+            for index in (object_start + 1.usize())..<object_end |raw, has_existing|:
                 byte: u8 = raw[index]
                 if byte != 32 and byte != 9 and byte != 10 and byte != 13:
                     has_existing <- true
                     break
             separator_bytes: usize = 2.usize() if has_existing else 0.usize()
+            wrapper_bytes: usize = 18.usize() if create_dependencies else 0.usize()
             return [] if raw.count > Json::max_document_bytes
             remaining: usize = Json::max_document_bytes - raw.count
-            return [] if separator_bytes > remaining or entry.count > remaining - separator_bytes
+            return [] if separator_bytes + wrapper_bytes > remaining or entry.count > remaining - separator_bytes - wrapper_bytes
             out: mutable darray[u8] = []
-            for index in 0..<dependency_end |out, raw|:
+            for index in 0..<object_end |out, raw|:
                 out.push(raw[index])
             if has_existing:
                 ByteText::append_text(&out, ", ")
+            if create_dependencies:
+                ByteText::append_text(&out, "\"dependencies\": {")
             append_text(&out, entry)
-            for index in dependency_end..<raw.count |out, raw|:
+            if create_dependencies:
+                out.push(125)
+            for index in object_end..<raw.count |out, raw|:
                 out.push(raw[index])
-            return [] if not Manifest::valid_dependency_map(out, "dependencies")
             return out
