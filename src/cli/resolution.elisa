@@ -70,39 +70,21 @@ module ResolutionCommand:
                 ByteText::append_bounded_text(&wanted, slots[2].cast[cstr])
                 return CliStatus::usage if not PackageIdentity::valid_name(wanted)
                 raw: mutable darray[u8] = []
-                raw <- raw.resize(ProjectFiles::project_document_limit)
-                return CliStatus::resolution_failed if not ProjectFiles::read_c_string_into("elisapkg.json", &raw)
-                root_name: mutable darray[u8] = []
-                root_version: mutable darray[u8] = []
-                return CliStatus::resolution_failed if:
-                    not ProjectManifest::validate_at(raw, start, &root_name, &root_version)
-                    not ProjectFiles::c_string_file_exists("elisapkg.lock")
                 lock: mutable darray[u8] = []
-                lock <- lock.resize(ProjectFiles::project_document_limit)
-                return CliStatus::resolution_failed if:
-                    not ProjectFiles::read_c_string_into("elisapkg.lock", &lock)
-                    not LockValidation::matches_manifest(raw, lock, root_name, root_version, start)
+                root_name: mutable darray[u8] = []
                 # `why` reports the root edge. A lockfile also contains transitive
                 # records, so merely finding a name in the lock is insufficient and
                 # would misreport `root -> transitive` as a direct dependency.
-                return CliStatus::resolution_failed if ByteText::equal(wanted, root_name)
-                dependency_start: mutable usize = 0.usize()
-                region dependency_end_scope:
+                return CliStatus::resolution_failed if:
+                    not read_locked_project(start, &raw, &lock, &root_name)
+                    ByteText::equal(wanted, root_name)
+                region dependency_span_scope:
+                    dependency_start: mutable usize = 0.usize()
                     dependency_end: mutable usize = 0.usize()
                     return CliStatus::resolution_failed if:
                         not Manifest::find_dependency_span(raw, wanted, &dependency_start, &dependency_end)
                         not Lockfile::contains_package(lock, wanted)
-                if options.json:
-                    CliOutput::write_ok("{\"schema-version\":1,\"root\":\"")
-                    CliOutput::write_bytes(1, &root_name)
-                    CliOutput::write_ok("\",\"package\":\"")
-                    CliOutput::write_bytes(1, &wanted)
-                    CliOutput::write_ok("\"}\n")
-                    return CliStatus::success
-                CliOutput::write_bytes(1, &root_name)
-                CliOutput::write_ok(" -> ")
-                CliOutput::write_bytes(1, &wanted)
-                CliOutput::write_ok("\n")
+                write_root_edge(root_name, wanted, options.json)
                 return CliStatus::success
 
         def resolve(start: darray[u8]&, options: Model::CommandOptions, transaction_owned: bool, emit_result: bool) -> CliStatus::ExitStatus can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -245,6 +227,29 @@ module ResolutionCommand:
                 raw.resize(ProjectFiles::project_document_limit)
                 root_version: mutable darray[u8] = []
                 return ProjectFiles::read_c_string_into("elisapkg.json", raw) and ProjectManifest::validate_at(raw, root, root_name, &root_version)
+
+        # Read the manifest at `start` and its lockfile, and check that the
+        # lock still matches the manifest.
+        def read_locked_project(start: darray[u8]&, raw: mutable darray[u8]&, lock: mutable darray[u8]&, root_name: mutable darray[u8]&) -> bool can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                raw.resize(ProjectFiles::project_document_limit)
+                lock.resize(ProjectFiles::project_document_limit)
+                root_version: mutable darray[u8] = []
+                return ProjectFiles::read_c_string_into("elisapkg.json", raw) and ProjectManifest::validate_at(raw, start, root_name, &root_version) and ProjectFiles::c_string_file_exists("elisapkg.lock") and ProjectFiles::read_c_string_into("elisapkg.lock", lock) and LockValidation::matches_manifest(raw, lock, root_name, root_version, start)
+
+        def write_root_edge(root_name: darray[u8]&, wanted: darray[u8]&, json: bool) -> void can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                if json:
+                    CliOutput::write_ok("{\"schema-version\":1,\"root\":\"")
+                    CliOutput::write_bytes(1, root_name)
+                    CliOutput::write_ok("\",\"package\":\"")
+                    CliOutput::write_bytes(1, wanted)
+                    CliOutput::write_ok("\"}\n")
+                    return
+                CliOutput::write_bytes(1, root_name)
+                CliOutput::write_ok(" -> ")
+                CliOutput::write_bytes(1, wanted)
+                CliOutput::write_ok("\n")
 
         def edit_options() -> Model::CommandOptions:
             return Model::CommandOptions{locked: false, offline: false, frozen: false, json: false, verbose: false, profile: "debug", target_name: "", target_kind: "", update_name: ""}
