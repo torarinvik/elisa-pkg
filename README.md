@@ -1,186 +1,114 @@
-# elisapkg
+# Elisa Packaging System
 
-`elisapkg` is the Elisa Packaging System, implemented in Elisa. The repository currently contains the first local vertical slice: strict manifest checks, deterministic lockfiles, frozen builds, local project scaffolding, toolchain invocation, and fail-closed remote-source policy.
+**elisapkg** manages Elisa projects. Use it to create a project, declare dependencies, record the exact inputs in a lockfile, and build or package the result. The package manager itself is written in Elisa.
 
-The source uses explicit Elisa modules. `Cli::run` is the public command boundary; `Platform` wraps the minimal FFI seam and byte-wise C-string helpers; `Model` contains value contracts; `Json` rejects duplicate keys and invalid UTF-8 before schema lookup; `Integrity` computes SHA-256 digests; `Trust` defines signed-metadata verification results and the fail-closed production policy; and `Security` owns remote-operation decisions. See [`docs/architecture.md`](docs/architecture.md) for the visibility and namespace rules.
+**Project status:** Local projects and local path dependencies are supported. Building projects requires Apple Silicon macOS with a working Seatbelt sandbox. Linux x86-64 and arm64 can run supported commands that don't build projects. The registry implementation is a signed, file-backed fixture for development. Network downloads, remote installation, and publication are disabled.
 
-## Bootstrap
+## Quick start
 
-The package manager is compiled by the self-hosted Elisa compiler. Set `ELISA_COMPILER_ROOT` to an Elisa compiler checkout, then run:
+### 1. Build elisapkg
 
-```sh
-scripts/build.sh
-build/elisapkg --help
-```
-
-`ELISA_COMPILER_ROOT` is required; the script does not guess a sibling checkout or download a compiler. `ELISA_RUNTIME_OBJ` may point to the compiler's runtime object. `ELISAPKG_COMPILER` selects the compiler executable used by `elisapkg build`; it is passed as an argv element, never through a shell command string.
-
-## Local workflow
+Start in the root of this repository. You'll need Bash and a separate Elisa compiler checkout with an executable Stage1 compiler, its wrapper script, and a built runtime object. Set the first path below to your actual compiler checkout. See [compiler compatibility](docs/compatibility.md) for the supported toolchain layout.
 
 ```sh
-build/elisapkg init path/to/app
-(cd path/to/app && ../../build/elisapkg check-manifest)
-(cd path/to/app && ../../build/elisapkg resolve)
-(cd path/to/app && ../../build/elisapkg build)
-(cd path/to/app && ../../build/elisapkg build --bin app)
-(cd path/to/app && ../../build/elisapkg run --bin app --)
-(cd path/to/app && ../../build/elisapkg test --test app-tests)
-(cd path/to/app && ELISAPKG_INSTALL_PREFIX="$HOME/.local" ../../build/elisapkg install --local)
+export ELISA_COMPILER_ROOT="/absolute/path/to/elisa-compiler"
+export ELISA_STAGE1_BIN="$ELISA_COMPILER_ROOT/bin/elisac-stage1"
+export ELISA_RUNTIME_OBJ="$ELISA_COMPILER_ROOT/build/runtime/elisacore_runtime.o"
+
+./scripts/build.sh
+export ELISAPKG="$(pwd)/build/elisapkg"
+"$ELISAPKG" --help
+"$ELISAPKG" doctor
 ```
 
-The manifest and lockfile are JSON schema-versioned. `resolve --frozen` verifies the existing lockfile byte-for-byte and refuses to edit it. Dependency edits journal the original manifest/lock pair and recover it after an interrupted process. `tree` and `why NAME` read the verified lock and show the selected local graph. `--offline`, `--locked`, `--frozen`, and `--quiet` are accepted by the CLI; `--color auto|always|never` is validated for forward-compatible output policy (the current renderer emits no ANSI escapes). Quiet mode suppresses human success/progress text but never hides errors or explicitly requested JSON. `fetch` verifies local path sources against the committed lockfile without network access. With `ELISAPKG_REGISTRY_DIR`, `fetch PACKAGE REQUIREMENT` verifies one file-backed registry artifact with detached Ed25519 metadata, while no-argument `fetch` verifies and caches every exact registry record in lock v3; network acquisition remains disabled.
+A successful build creates `build/elisapkg`. The example saves its absolute path so it still works after you change directories. If your checkout uses a different wrapper location, set `ELISA_COMPILER_WRAPPER` to that executable before running the script. The script uses your existing compiler checkout and does not download a toolchain.
 
-`cache verify` performs the same canonical-lock and local manifest-digest check
-and, when a package archive exists, verifies its deterministic archive receipt.
-The receipt binds the archive bytes to the exact manifest and lockfile digests,
-and a partial archive/receipt pair is rejected. It then reports that no shared
-remote cache is configured. Package archives also receive a local
-content-addressed hard-link under `.elisapkg/cache/sha256/`; verification
-rehashes that blob and rejects corruption. Successful builds
-publish an exclusive compiler output by atomic rename and retain a receipt of
-the target source, manifest, resolved-lock, and artifact digests plus selected
-compiler inputs. A matching receipt and artifact are reused; changing the
-root, dependency graph, or target source forces a fresh compiler invocation.
-Compiler, stage1, and runtime content identities are included in the receipt;
-if any identity cannot be captured, that build does not reuse an existing
-artifact. The receipt also includes a deterministic digest of every sanitized
-source-tree file, so additions, removals, renames, and changes to non-target
-sources invalidate reuse.
-`cache gc --dry-run` is likewise read-only and reports that there is no shared
-cache to sweep; destructive garbage collection stays disabled until leases and
-concurrent-reader rules are implemented for the local blob store. A new package
-operation quarantines a corrupted active blob before republishing its verified
-replacement. Quarantine publication is exclusive; if the deterministic evidence
-name already exists, the operation fails closed instead of replacing prior evidence.
+### 2. Create and inspect a project
 
-Project commands accept `--manifest-path PATH`; PATH may name the project directory or its `elisapkg.json`, including dependency mutations such as `add`, `remove`, and `update`. Local path resolution walks the dependency graph transitively, sorts package records by canonical name, normalizes relative paths, records SHA-256 manifest and complete sanitized source-tree digests, and rejects conflicting duplicate package identities. Target paths are resolved with `realpath` and must remain below their package root, including when a symlink is present. `build` selects the first target by default or a named target with `--bin NAME`, `--lib NAME`, or `--test NAME`; executable and test artifacts use the target name under `.elisapkg/build/`, while libraries use the same name with an `.o` suffix. A local v2 build includes each transitive dependency's sole `lib` target in a bounded, deterministic dependency-first aggregate. The build receipt binds the lock, source digests, and ordered logical dependency target paths; the private aggregate compiled from verified snapshots is checked unchanged before publication. Registry dependency builds remain disabled until authenticated source acquisition and graph compilation are integrated. Build receipts and cache validation bind the target kind and artifact name, while `run --bin NAME` and `install --local --bin NAME` reject library targets before attempting execution or publication. `test --test NAME` selects a named test target. `clean` removes known build artifacts plus `.elisapkg/package.tar`, `.elisapkg/package.receipt`, and empty build directories. Registry dependency declarations are syntax-checked locally, including exact, caret, tilde, and comparison SemVer ranges. Registry-only graphs use the local test fixture described in [`docs/registry.md`](docs/registry.md), produce lockfile version 3, and can be authenticated and cached with `fetch PACKAGE VERSION`; mixed local/registry graphs and network transport remain fail-closed. Production registry trust is selected as TUF v1.0.36 but is not implemented; see [`docs/tuf-profile.md`](docs/tuf-profile.md).
-
-The local test fixture's version index is a byte-for-byte Ed25519-signed snapshot
-that binds the registry, package, generation, expiry, and complete declared
-version list. The list is bounded, sorted, unique stable SemVer. The client
-persists each package's generation in rollback-protected trust state and rejects
-lower generations or changed bytes at the same generation. Owner, mode, no-follow,
-and supported ACL checks still protect every path component. A trusted publisher
-signature asserts completeness; a first-use client cannot know about a newer
-unseen snapshot, so the bounded expiry limits that replay window. This format
-is not TUF and cannot be used by a network provider.
-
-Fetched registry blobs have immutable receipts beside their content-addressed cache
-objects. The exact signed metadata bytes and detached signature are cached by metadata
-digest, while the receipt binds the lock selection to the archive and authenticated
-metadata digests, size, and expiry. Offline or frozen `fetch` re-verifies cached
-metadata and dependency edges, then validates the receipt, archive, and persisted
-trust record without contacting a provider or changing the lockfile. Registry
-evidence can be fetched and cached, but builds with registry dependencies remain
-disabled until authenticated package acquisition and dependency compilation are
-integrated. Missing or forged evidence fails closed.
-
-After archive verification, each signed registry selection is recorded in a
-user-owned trust-state file outside the project. The default location is
-`$HOME/.local/share/elisapkg/trust/<sha256-of-registry-root>.state`; set
-`ELISAPKG_TRUST_STATE` to an absolute path for an isolated location. Updates
-use an exclusive lock and durable atomic replacement. Trust-state format v4
-keys package history by registry-root hash and package name, and binds each
-package/version to both its archive and signed metadata digests; a lower
-version or same-version change to either digest is rejected even if the
-project lockfile is deleted or restored. It also pins each registry path to
-the SHA-256 fingerprint of its configured Ed25519 key, so later key changes
-fail closed. Default per-registry paths migrate v2/v3 history on the next state
-update; because those formats contain no key fingerprint, the first v4 pin is
-trust-on-first-use. Preserve and verify the expected key out of band when
-migrating deployments that require signer continuity. A v2 override containing
-unscoped package rows fails closed because those rows do not identify their
-registry; v1 records without metadata identity remain rejected. The adjacent
-`.clock` sidecar durably records the greatest wall-clock value observed for the
-registry; malformed values and clock rollback are
-rejected before a signed selection can update trust state. Removing it after a
-record exists fails closed rather than resetting that floor. The sidecar also
-stores the SHA-256 of the exact state bytes; a restored or missing state file
-with the newer sidecar fails closed during recording and verification. After
-offline signed metadata and archive checks pass, verification rechecks expiry
-under the state lock and advances that bound clock. Restoring both user-owned files together is outside this local
-rollback check's protection.
-The derived `HOME` path is accepted only when it is absolute and contains no
-control bytes or backslashes; trailing separators are normalized, and malformed
-environment input fails closed before any trust-state directory is created.
-
-`package --list` previews the validated file set. `package` writes a bounded,
-deterministic ustar archive to `.elisapkg/package.tar`, with sorted regular
-files (at most 512 entries), normalized metadata, and a fixed timestamp. Source
-reads refuse symlinks at every path component. PAX/GNU long-name
-extensions and compression are intentionally deferred. The generated bytes are
-verified again for headers, checksums, case-folded duplicate names, bounds, and
-end blocks. Packaging revalidates the lock and compares complete source-tree
-digests before and after reading the selected files, then re-reads the manifest
-and lockfile, so an in-flight input mutation aborts instead of producing a mixed
-archive. The archive digest is recorded in `.elisapkg/package.receipt` together
-with the manifest and lock digests;
-signing is still required before any remote publication.
-
-`publish --dry-run` performs the release preflight without writing an archive
-or contacting a registry: it requires a valid frozen lockfile, rechecks the
-complete source-tree digest, and validates the selected package file set.
-Successful preflight does not publish bytes or bypass signing and publisher
-authorization requirements.
-
-`install --local [--bin NAME]` is the deliberately narrow local deployment
-path. It resolves the local graph and builds the first binary target by default,
-or the named binary target with `--bin NAME`, then writes it to
-`$ELISAPKG_INSTALL_PREFIX/bin/<package-name>` (or `$HOME/.local/bin` when the
-override is absent). The destination and its receipt are created through an
-exclusive hard-link publication, so an existing file cannot be replaced. A
-receipt under `share/elisapkg/receipts` binds the package name, destination, and
-SHA-256 artifact digest. A durable per-prefix transaction journal is written
-before either file changes. The next install or uninstall recovers under the
-prefix lock only when the executable digest and exact receipt match the
-journal; malformed or ambiguous state is preserved and blocks further changes.
-`uninstall --local NAME` removes only a matching, unchanged receipt-owned
-binary; modified files and malformed receipts are refused. Before installation
-or removal, the prefix and its existing directory
-chain must contain only real directories owned by root or the effective user,
-with no group or other write bits; shared writable locations such as `/tmp` are
-refused. On macOS, the check permits deny-only extended ACLs but rejects allow
-ACEs and unknown ACL entries even when mode bits look safe. Linux checks POSIX
-ACLs on opened descriptors and rejects named user/group access entries,
-malformed or unreadable ACLs, and default ACLs on trusted directories. No
-platform check prevents pathname races by another process running as the same
-user. Remote `install NAME` remains trust-gated
-with the other network operations.
-
-## Security posture
-
-Remote packages are not accepted unsigned. `fetch` and remote `install NAME`
-currently exit with the security status and explain that no trusted source
-provider is configured. This is deliberate: checksums, TLS, and a registry URL
-alone do not authenticate a publisher. Remote support requires a conformant
-implementation of the selected TUF profile, trusted-root bootstrap, publisher
-delegation, expiry and rollback protection, safe archive extraction, credential
-redaction, key rotation/revocation, adversarial fixtures, and independent
-security review before it can be enabled. Tracked details are in
-[`docs/security.md`](docs/security.md) and
-[`docs/tuf-profile.md`](docs/tuf-profile.md).
-
-On macOS, compiler children run under a deny-by-default Seatbelt profile with network access denied and a per-build scratch directory. The compiler reads private, read-only snapshots of the project and locked local dependencies; the parent verifies each copied tree against its locked source digest before launch, and the live source roots stay unreadable to the child. Compiler output, including stage1's intermediate object, stays in scratch; the child can write there, to `/dev/null`, and to the already-created callback C file through its existing inode. It cannot create, chmod, or unlink that callback path, or write into source snapshots. The parent validates and copies the output to a new inode before publishing it. Compiler stdin is `/dev/null`; stdout and stderr go to private scratch files and are forwarded by the parent only after the compiler process group has stopped. Builds fail closed when Seatbelt is absent or rejects the profile. Selected compiler/toolchain directories remain readable, and ordinary secrets placed in source files that pass the shared path filters are visible in the snapshots, so this is constrained build isolation rather than a complete credential boundary. `run` and `test` execute the resulting artifact as the invoking user. Arbitrary dependency build scripts, plugins, and automatic native dependency installation remain disabled. `doctor` reports whether `sandbox-exec` is present; an actual build validates profile application.
-
-Build subprocesses receive a minimal environment through an `env -i` argv invocation, with only the selected compiler bootstrap values, Clang path, validated macOS `SDKROOT`/`DEVELOPER_DIR`, and isolated HOME/TMPDIR/cache paths. The SDK and developer directory must resolve under the supported Xcode or Command Line Tools locations. Build receipts include these paths and the selected linker/assembler identities when the filesystem policy can verify them; if a toolchain identity is unavailable, the existing build cache is not reused. When `ELISAPKG_COMPILER` and `ELISA_STAGE1_BIN` resolve to the expected `scripts/elisac_stage1.sh` and sibling `bin/elisac-stage1` layout, elisapkg invokes stage1 directly because macOS blocks the wrapper's setuid `ps` memory poll in a sandbox. That path skips the wrapper's source-freshness and RSS-polling checks; the binary digest is recorded. Registry credentials and unrelated variables are excluded. Compiler and application children use private process groups, deadlines, CPU/file-size limits, and disabled core dumps. Memory use is not capped: macOS rejects the attempted data-segment/address-space limits for ordinary compiler processes, and its resident-size limit is not reliable. Before publication, compiler output bytes are copied to a fresh parent-owned file so a detached process holding the compiler's old output descriptor cannot modify the cached artifact. Seatbelt does not stop every possible detached descendant, so complete process cleanup remains an isolation requirement. Application processes launched by `run` and `test` do not use the build sandbox.
-
-The `run` and `test` parent terminates and checks remaining members of that
-private process group after the direct child exits or reaches its deadline. A
-descendant that creates a new session can leave the group and escape this
-cleanup.
-
-Builds also force `ELISA_STAGE1_SEMANTIC_GATE=1`; a semantic-check failure is a
-build failure and cannot be replaced by successful object emission. Build
-receipts include SHA-256 identities for the selected compiler, stage1 binary,
-and runtime object. If any identity cannot be captured reliably, cache reuse is
-disabled for that build.
-
-## Development
-
-Run the deterministic smoke suite with:
+Pick an unused directory name. Run these commands from a directory where you want to create the project.
 
 ```sh
-scripts/test.sh
+"$ELISAPKG" init hello-elisa
+cd hello-elisa
+"$ELISAPKG" check-manifest
+"$ELISAPKG" resolve
+"$ELISAPKG" resolve --frozen
+"$ELISAPKG" tree
 ```
 
-The suite compiles the source, checks help/version/doctor, creates an isolated package, resolves and freezes its lockfile, builds and runs it, and verifies invalid-manifest, local-fetch, and unsigned-remote-operation failures. Generated state is ignored by Git.
+- `src/main.elisa` is the starter program. It exits successfully without printing anything.
+- `elisapkg.json` is the **manifest**. It describes the package, targets, and dependencies you want.
+- `elisapkg.lock` is the **lockfile**. It records the resolved inputs. Commit it alongside the manifest. After an intentional input change, run `resolve` and review the lockfile diff.
+- `.elisapkg/` holds generated state and artifacts. Add it to your project's Git ignore rules.
+
+The generated package and binary target are named `app`, even though the example directory is named `hello-elisa`. The manifest controls those names.
+
+### 3. Build and run on Apple Silicon macOS
+
+Use a trusted compiler and keep the toolchain settings from step 1 in the same shell. macOS also needs the Xcode Command Line Tools or a supported Xcode installation.
+
+```sh
+export ELISAPKG_COMPILER="${ELISA_COMPILER_WRAPPER:-$ELISA_COMPILER_ROOT/scripts/elisac_stage1.sh}"
+"$ELISAPKG" build --bin app
+"$ELISAPKG" run --bin app --
+```
+
+The default build produces `.elisapkg/build/app`. Put program arguments after `--`. On Linux, you can still validate, resolve, and package this project, but `build`, `run`, and `test` require the macOS build sandbox.
+
+### 4. Preview and create a package archive
+
+```sh
+"$ELISAPKG" package --list
+"$ELISAPKG" package
+"$ELISAPKG" cache verify
+```
+
+The preview shows which source files will ship. Packaging writes `.elisapkg/package.tar` and a verification receipt. Creating the archive does not compile or upload it.
+
+## Command reference
+
+Run project commands from the project directory. Where supported, `--manifest-path PATH` selects a different project directory or its `elisapkg.json`. Use `elisapkg --help` for the full command list.
+
+| I want to… | Command | What it does |
+| --- | --- | --- |
+| Add a sibling library | `add my-lib --path ../my-lib` | Adds a local dependency whose manifest name is `my-lib`. Local dependency builds require exactly one library target per dependency. |
+| Review dependency selections | `tree` or `why my-lib` | Displays the locked graph or explains why a package is present. |
+| Check a committed lockfile | `resolve --frozen` | Verifies the lockfile without rewriting it. |
+| Inspect normalized metadata | `metadata --json` | Prints machine-readable package metadata. |
+| Build a release binary | `build --bin app --profile release` | Places the binary under `.elisapkg/build/release/`. |
+| Run a test target | `test --test app-tests` | Builds and runs a test target you have declared in the manifest. |
+| Install a local binary | `install --local --bin app` | Installs under `$HOME/.local/bin` by default. The destination uses the package name. |
+| Remove that installation | `uninstall --local app` | Removes the binary only if it matches its installation receipt. |
+| Remove generated build outputs | `clean` | Removes known local build and package outputs. |
+| Check release inputs | `publish --dry-run` | Validates release inputs and deterministic archive contents without uploading. |
+
+## Troubleshooting
+
+- **Missing compiler, wrapper, or runtime:** Check the three paths in step 1 against your Elisa compiler checkout. Bootstrap the compiler in that checkout first if its Stage1 or runtime artifacts are missing.
+- **Cannot find the build compiler:** Set `ELISAPKG_COMPILER` to the absolute path of the trusted compiler wrapper, then run `doctor`.
+- **Manifest or target not found:** Check your working directory and the target's `name` and `kind` in `elisapkg.json`. Use [the manifest reference](docs/manifest.md) when defining a new target.
+- **Frozen lock is stale:** Review the source or dependency changes. If they're intentional, run `resolve` and review the updated `elisapkg.lock`.
+- **Sandbox unavailable:** Project builds require macOS and successful Seatbelt profile application. An installed `sandbox-exec` alone does not prove a profile can run.
+- **Local install refused:** Check for an existing destination and use a private, trusted prefix. You can choose another absolute directory with `ELISAPKG_INSTALL_PREFIX`. The installer will not replace an existing binary.
+
+## How it works
+
+Local resolution records dependencies in a deterministic lockfile with SHA-256 identities for manifests and source trees. Local library targets are compiled in dependency order. Builds compile verified source snapshots and require the Stage1 semantic gate. They reuse a previous artifact only when its receipt and verified inputs match, including the source, lockfile, and selected toolchain identities. Packaging writes a bounded, deterministic ustar archive with normalized metadata.
+
+The build sandbox restricts compiler file access and denies network access. **`run` and `test` execute package code with your user account's permissions.** Only run code you trust. The [security model](docs/security.md) describes the sandbox's limits.
+
+The local registry fixture verifies detached Ed25519 signatures, expiry, cached evidence, and persisted rollback state. It can resolve and cache fixture packages, but those dependencies cannot be built. The production TUF profile is documented separately and is not implemented. See [the registry guide](docs/registry.md), [threat model](docs/threat-model.md), and [security reporting policy](SECURITY.md).
+
+## Documentation and development
+
+| Reference | Covers |
+| --- | --- |
+| [Manifest](docs/manifest.md) and [lockfile](docs/lockfile.md) | JSON schemas, targets, dependencies, and lockfile formats |
+| [Architecture](docs/architecture.md) and [decisions](docs/decisions.md) | Elisa modules, public interfaces, and the private POSIX FFI boundary |
+| [Compiler compatibility](docs/compatibility.md) | Bootstrap paths, host support, and toolchain constraints |
+| [CI and regression checks](docs/ci.md) | Development checks and host requirements |
+| [TUF profile](docs/tuf-profile.md) | Requirements for future production registry support |
+
+Source lives in `src/`, build and regression tooling in `scripts/`, and experimental work in `spikes/`. With the toolchain configured, `make build` builds the CLI and `make test` runs the smoke suite on a supported build host.
+
+See [LICENSE](LICENSE) for license terms.
