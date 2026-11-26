@@ -3098,7 +3098,7 @@ module Cli:
             starts: mutable darray[usize] = []
             return false if not registry_lock_record_starts(lock, packages_start, packages_end, &starts)
             for root_index in 0..<roots.count |lock, starts, roots|:
-                return false if not indexed_registry_constraint_matches(lock, starts, roots[root_index])
+                return false if matching_registry_record(lock, starts, roots[root_index]) < 0
             return true
 
         def lock_matches_manifest(manifest: darray[u8]&, lock: darray[u8]&, name: darray[u8]&, version: darray[u8]&, start: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -3552,40 +3552,41 @@ module Cli:
             out <- lower
             return true
 
-        def indexed_registry_constraint_matches(lock: darray[u8]&, starts: darray[usize]&, wanted: Solver::Constraint) -> bool can[Memory.Allocate, Abort.Panic]:
+        def matching_registry_record(lock: darray[u8]&, starts: darray[usize]&, wanted: Solver::Constraint) -> i64 can[Memory.Allocate, Abort.Panic]:
             record_index: mutable usize = 0.usize()
-            return false if not registry_lock_record_index(lock, starts, wanted.package, &record_index)
+            return -1 if not registry_lock_record_index(lock, starts, wanted.package, &record_index)
             record_start: usize = starts[record_index]
             record_end: usize = json_object_end(lock, record_start)
-            return false if record_end <= record_start or record_end >= lock.count
+            return -1 if record_end <= record_start or record_end >= lock.count
             version_text: mutable darray[u8] = []
-            return false if not object_string_value(lock, record_start, record_end, "version", &version_text)
+            return -1 if not object_string_value(lock, record_start, record_end, "version", &version_text)
             version: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-            return false if not SemVer::parse(version_text, &version) or version.prerelease
+            return -1 if not SemVer::parse(version_text, &version) or version.prerelease
             requirement: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
-            return SemVer::parse_requirement(wanted.requirement, &requirement) and SemVer::matches(requirement, version)
+            return -1 if not SemVer::parse_requirement(wanted.requirement, &requirement) or not SemVer::matches(requirement, version)
+            return record_index.i64()
 
         def registry_offline_graph_closure(manifest: darray[u8]&, lock: darray[u8]&, starts: darray[usize]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             roots: mutable darray[Solver::Constraint] = []
             has_local: mutable bool = false
             return EXIT_RESOLVE if not collect_registry_roots(manifest, &roots, &has_local) or has_local or roots.count == 0.usize()
-            reachable: mutable darray[u8] = []
-            reachable_count: mutable usize = 0.usize()
-            for index in 0..<roots.count |roots, reachable, reachable_count|:
-                if not registry_queue_contains(reachable, roots[index].package):
-                    return EXIT_RESOLVE if reachable_count >= MAX_DEPENDENCIES
-                    registry_queue_append(&reachable, roots[index].package)
-                    reachable_count <- reachable_count + 1.usize()
+            queued: mutable darray[bool] = []
+            queued.resize(starts.count)
+            pending: mutable darray[usize] = []
+            for index in 0..<roots.count |lock, starts, roots, queued, pending|:
+                matched_record: i64 = matching_registry_record(lock, starts, roots[index])
+                return EXIT_SECURITY if matched_record < 0
+                record_index: usize = matched_record.usize()
+                if not queued[record_index]:
+                    queued[record_index] <- true
+                    pending.push(record_index)
             processed: mutable usize = 0.usize()
-            while processed < reachable_count:
-                package: mutable darray[u8] = []
-                return EXIT_RESOLVE if not registry_queue_field_at(reachable, processed, &package)
-                record_index: mutable usize = 0.usize()
-                return EXIT_SECURITY if not registry_lock_record_index(lock, starts, package, &record_index)
-                record_start: usize = starts[record_index]
+            while processed < pending.count:
+                record_start: usize = starts[pending[processed]]
                 record_end: usize = json_object_end(lock, record_start)
+                package: mutable darray[u8] = []
                 version_text: mutable darray[u8] = []
-                return EXIT_SECURITY if not object_string_value(lock, record_start, record_end, "version", &version_text)
+                return EXIT_SECURITY if not object_string_value(lock, record_start, record_end, "name", &package) or not object_string_value(lock, record_start, record_end, "version", &version_text)
                 source_start: mutable usize = 0.usize()
                 source_end: mutable usize = 0.usize()
                 return EXIT_SECURITY if not object_object_value_span(lock, record_start, record_end, "source", &source_start, &source_end)
@@ -3611,18 +3612,16 @@ module Cli:
                 dependencies: mutable darray[Solver::Constraint] = []
                 status: Registry::ResultCode = Registry::verify_metadata_snapshot(package, version_text, metadata_digest, cached_metadata, cached_signature, &resolved_archive, &resolved_digest, &resolved_size, &expires, &dependencies)
                 return EXIT_SECURITY if status != Registry::ResultCode.Ok or not bytes_equal(resolved_archive, archive) or not bytes_equal(resolved_digest, digest) or resolved_size != archive_size
-                for dependency_index in 0..<dependencies.count |lock, starts, dependencies, reachable, reachable_count, dependency_index|:
-                    dependency: Solver::Constraint = dependencies[dependency_index]
-                    return EXIT_SECURITY if not indexed_registry_constraint_matches(lock, starts, dependency)
-                    if not registry_queue_contains(reachable, dependency.package):
-                        return EXIT_RESOLVE if reachable_count >= MAX_DEPENDENCIES
-                        registry_queue_append(&reachable, dependency.package)
-                        reachable_count <- reachable_count + 1.usize()
+                for dependency_index in 0..<dependencies.count |lock, starts, dependencies, queued, pending|:
+                    matched_record: i64 = matching_registry_record(lock, starts, dependencies[dependency_index])
+                    return EXIT_SECURITY if matched_record < 0
+                    record_index: usize = matched_record.usize()
+                    if not queued[record_index]:
+                        queued[record_index] <- true
+                        pending.push(record_index)
                 processed <- processed + 1.usize()
-            # Every locked record must be in the authenticated closure. All
-            # reachable names were looked up above, so matching the unique
-            # record and closure counts proves exact set equality.
-            return EXIT_RESOLVE if starts.count != reachable_count
+            # Only distinct authenticated records enter the queue.
+            return EXIT_RESOLVE if starts.count != pending.count
             return EXIT_OK
 
         def fetch_registry_lock_offline(manifest: darray[u8]&, lock: darray[u8]&, root_name: darray[u8]&, root_version: darray[u8]&, start: darray[u8]&) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -3685,7 +3684,7 @@ module Cli:
                 metadata_status: Registry::ResultCode = Registry::verify_metadata_snapshot(package, version_text, metadata_digest, cached_metadata, cached_signature, &resolved_archive, &resolved_digest, &resolved_size, &metadata_expires, &metadata_dependencies)
                 return EXIT_SECURITY if metadata_status != Registry::ResultCode.Ok or not bytes_equal(resolved_archive, archive) or not bytes_equal(resolved_digest, digest) or resolved_size != archive_size or metadata_expires != expires
                 for dependency_index in 0..<metadata_dependencies.count |lock, starts, metadata_dependencies, dependency_index|:
-                    return EXIT_SECURITY if not indexed_registry_constraint_matches(lock, starts, metadata_dependencies[dependency_index])
+                    return EXIT_SECURITY if matching_registry_record(lock, starts, metadata_dependencies[dependency_index]) < 0
                 archive_bytes: mutable darray[u8] = []
                 return EXIT_SECURITY if not Cache::read_verified_blob(digest, archive_size.usize(), &archive_bytes) or archive_bytes.count.u64() != archive_size or not Registry::release_archive_matches_metadata(package, version_text, cached_metadata, archive_bytes)
                 # Only authenticated cache content may advance the durable
