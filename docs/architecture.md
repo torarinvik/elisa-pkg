@@ -30,6 +30,25 @@ The current source units are:
 | `Cache` | Digest-addressed paths, verified byte reads, quarantine, and registry receipt codecs | Bounded file reads, path construction, and receipt fields | Blob reads return the bytes that passed SHA-256 verification. The CLI coordinates publication. |
 | `Cli` | `run(argc, argv)` | None | The public command surface delegates to private command helpers. |
 
+## Command modules
+
+`Cli::run` dispatches to command modules in `src/cli/`. Each command keeps its
+orchestration short and delegates each phase to a focused module:
+
+| Module | Responsibility |
+| --- | --- |
+| `CliArguments`, `CliOutput`, `CliStatus`, `ProjectContext` | Argument grammar, output policy and help text, exit statuses, and project discovery |
+| `BuildCommand` | Orders a build: read the project, prepare inputs, reuse a cached artifact, or compile |
+| `BuildTarget` | Reads the manifest and selects the compiled target |
+| `BuildInputs`, `BuildSources` | Fingerprints the inputs bound to a build receipt and prepares the private source tree |
+| `BuildToolchainSetup` | Resolves the compiler toolchain and fingerprints every component |
+| `BuildWorkspace` | Owns the private scratch files of one build and removes them on every path |
+| `BuildExecution`, `CompilerProcess` | Runs the sandboxed compiler and verifies and publishes its output |
+| `FetchCommand`, `FetchRelease`, `FetchOffline` | Fetches registry releases online, or verifies a registry lock against the authenticated offline cache |
+| `ResolutionCommand` | Resolves, edits, and presents dependency locks |
+| `LocalInstallCommand` | Publishes and removes verified local installations under a per-prefix lock |
+| `MaintenanceCommand`, `ProgramCommand` | Cleans outputs, verifies the package cache, and runs built programs |
+
 The current compiler backend requires foreign declarations at compilation-unit scope, so the declarations live in `src/platform/libc.elisa`. Target constants and directory entry layouts live in `src/platform/abi.elisa`. Only `PlatformNative` calls the foreign functions to implement descriptor-relative operating-system policy. `Platform` exposes only the reviewed wrapper surface. Callers use qualified names such as `Platform::read_package_file`, `Model::Version`, and `Security::remote_fetch_status`; `using` imports are deliberately avoided.
 
 The current CLI also has a local deployment path. `install --local` stays in

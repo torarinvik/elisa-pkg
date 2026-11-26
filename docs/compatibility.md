@@ -24,9 +24,12 @@ private FFI boundary. The errno accessor is selected at compile time for the
 target (`__error` on Apple and `__errno_location` on Linux), so a Linux build
 does not depend on the Darwin symbol. The wrapper and stage1
 executable must be explicitly present and executable.
-Build the Stage1 executable from an Elisa compiler revision that supports
-`if not:` guard lists (introduced in `6aba26bcd03f`). A newer compiler checkout
-with an older Stage1 executable will still reject this syntax.
+Build the Stage1 executable from Elisa compiler `f33011410` or later, with
+Elisa core `46dff6b3` or later as stage0. The source uses `if not:` guard
+lists (introduced in `6aba26bcd03f`) and optional borrow parameters
+(`T&?`, introduced in `f33011410`). Earlier Stage1 executables accept optional
+borrows but drop writes made through them, so a newer compiler checkout with
+an older Stage1 executable is not supported.
 
 ## Capability matrix
 
