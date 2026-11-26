@@ -44,7 +44,41 @@ module PackageAssembly:
                     ByteText::append_text(&state_root, ".elisapkg")
                     return Code.OutputFailure if not ProjectFiles::make_directory(&state_root)
                 archive: mutable darray[u8] = []
-                return Code.OutputFailure if not archive_bytes(raw, entry, &archive)
+                region build_status_scope:
+                    build_status: Code = build_verified_archive(raw, lock_raw, entry, package_source_digest, &archive)
+                    return build_status if build_status != Code.Ok
+                archive_path: mutable darray[u8] = []
+                ProjectFiles::path_join_into(start, ".elisapkg/package.tar", &archive_path)
+                receipt_path: mutable darray[u8] = []
+                ProjectFiles::path_join_into(start, ".elisapkg/package.receipt", &receipt_path)
+                return Code.OutputFailure if not ProjectFiles::replace_file(archive_path, &archive)
+                persisted_archive: mutable darray[u8] = []
+                return Code.OutputFailure if not Platform::read_bounded_file(archive_path, Integrity::maximum_input, &persisted_archive)
+                # The receipt and cache identify the bytes that remain at the
+                # published path. Refuse a pathname replacement between the
+                # atomic write and this read unless it still matches the exact tar
+                # that passed the in-memory archive verifier.
+                return Code.OutputFailure if not ByteText::equal(persisted_archive, archive)
+                digest: mutable darray[u8] = []
+                return Code.OutputFailure if not Integrity::sha256_hex(persisted_archive, &digest)
+                return Code.OutputFailure if not publish_to_cache(archive_path, digest)
+                region receipt_scope:
+                    receipt: darray[u8] = PackageReceipt::encode(package_name, package_version, manifest_digest, lock_digest, digest)
+                    return Code.OutputFailure if receipt.count == 0.usize()
+                    return Code.OutputFailure if not ProjectFiles::replace_file(receipt_path, receipt)
+                report_packaged(package_name, package_version, archive_path, digest)
+                return Code.Ok
+
+    private:
+        # Build the package archive, then confirm the source tree, manifest,
+        # and lock did not change while it was built. Manifest and lock bytes
+        # are excluded from the source-tree digest because their dedicated
+        # receipt fields would otherwise be self-referential, so both are
+        # re-read to keep a concurrent edit from publishing a mixed archive
+        # under the earlier identity.
+        def build_verified_archive(raw: darray[u8]&, lock_raw: darray[u8]&, entry: darray[u8]&, package_source_digest: darray[u8]&, archive: mutable darray[u8]&) -> Code can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                return Code.OutputFailure if not archive_bytes(raw, entry, archive)
                 region package_source_digest_after_scope:
                     package_source_digest_after: mutable darray[u8] = []
                     return Code.OutputFailure if not SourceFingerprint::current(&package_source_digest_after) or not ByteText::equal(package_source_digest_after, package_source_digest)
@@ -61,67 +95,56 @@ module PackageAssembly:
                     return Code.OutputFailure if not ProjectFiles::read_c_string_into("elisapkg.json", &manifest_after) or not ProjectFiles::read_c_string_into("elisapkg.lock", &lock_after)
                     return Code.SecurityFailure if not ByteText::equal(manifest_after, raw) or not ByteText::equal(lock_after, lock_raw)
                 return Code.OutputFailure if not Archive::verify_ustar_archive(archive)
-                archive_path: mutable darray[u8] = []
-                ProjectFiles::path_join_into(start, ".elisapkg/package.tar", &archive_path)
-                receipt_path: mutable darray[u8] = []
-                ProjectFiles::path_join_into(start, ".elisapkg/package.receipt", &receipt_path)
-                return Code.OutputFailure if not ProjectFiles::replace_file(archive_path, &archive)
-                persisted_archive: mutable darray[u8] = []
-                return Code.OutputFailure if not Platform::read_bounded_file(archive_path, Integrity::maximum_input, &persisted_archive)
-                # The receipt and cache identify the bytes that remain at the
-                # published path. Refuse a pathname replacement between the
-                # atomic write and this read unless it still matches the exact tar
-                # that passed the in-memory archive verifier.
-                return Code.OutputFailure if not ByteText::equal(persisted_archive, archive)
-                digest: mutable darray[u8] = []
-                return Code.OutputFailure if not Integrity::sha256_hex(persisted_archive, &digest)
-                blob_path: mutable darray[u8] = []
-                return Code.OutputFailure if not Cache::blob_path(digest, &blob_path)
-                region cache_parent_scope:
-                    cache_parent: mutable darray[u8] = []
-                    return Code.OutputFailure if:
-                        not Cache::shard_path(digest, &cache_parent)
-                        not ProjectFiles::make_directory(&cache_parent)
-                blob_name_c: mutable darray[u8] = []
-                archive_source_c: mutable darray[u8] = []
-                quarantine_parent: mutable darray[u8] = []
-                ProjectFiles::path_with_null_terminator_into(&blob_path, &blob_name_c)
-                ProjectFiles::path_with_null_terminator_into(&archive_path, &archive_source_c)
-                ByteText::append_text(&quarantine_parent, Cache::quarantine_directory)
-                blob_name: cstr = (&blob_name_c[0]).cast[cstr] can Unsafe.PointerCast
-                region archive_source_name_scope:
-                    archive_source_name: cstr = (&archive_source_c[0]).cast[cstr] can Unsafe.PointerCast
-                    if ProjectFiles::c_string_file_exists(blob_name):
-                        if not Cache::verify_blob(digest):
-                            return Code.OutputFailure if:
-                                not ProjectFiles::make_directory(&quarantine_parent)
-                                not Cache::quarantine_blob(digest)
-                                Platform::create_hard_link(archive_source_name, blob_name) != 0
-                    elif Platform::create_hard_link(archive_source_name, blob_name) != 0:
-                        return Code.OutputFailure if not ProjectFiles::c_string_file_exists(blob_name) or not Cache::verify_blob(digest)
-                # Revalidate after every publication path. A concurrent rename can change
-                # a pathname after the initial existence check; the receipt is written only
-                # once the final cache bytes still match the in-memory archive digest. The
-                # parent flush makes the hard-link durable before the receipt can claim it.
-                return Code.OutputFailure if:
-                    Platform::synchronize_parent_directory(blob_name) != 0
-                    not Cache::verify_blob(digest)
-                region receipt_scope:
-                    receipt: darray[u8] = PackageReceipt::encode(package_name, package_version, manifest_digest, lock_digest, digest)
-                    return Code.OutputFailure if receipt.count == 0.usize()
-                    return Code.OutputFailure if not ProjectFiles::replace_file(receipt_path, receipt)
+                return Code.Ok
+
+        # Link the published archive into the content-addressed cache,
+        # quarantining a corrupt existing blob, and make the link durable.
+        def publish_to_cache(archive_path: darray[u8]&, digest: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            blob_path: mutable darray[u8] = []
+            return false if not Cache::blob_path(digest, &blob_path)
+            region cache_parent_scope:
+                cache_parent: mutable darray[u8] = []
+                return false if:
+                    not Cache::shard_path(digest, &cache_parent)
+                    not ProjectFiles::make_directory(&cache_parent)
+            blob_name_c: mutable darray[u8] = []
+            archive_source_c: mutable darray[u8] = []
+            quarantine_parent: mutable darray[u8] = []
+            ProjectFiles::path_with_null_terminator_into(&blob_path, &blob_name_c)
+            ProjectFiles::path_with_null_terminator_into(archive_path, &archive_source_c)
+            ByteText::append_text(&quarantine_parent, Cache::quarantine_directory)
+            blob_name: cstr = (&blob_name_c[0]).cast[cstr] can Unsafe.PointerCast
+            region archive_source_name_scope:
+                archive_source_name: cstr = (&archive_source_c[0]).cast[cstr] can Unsafe.PointerCast
+                if ProjectFiles::c_string_file_exists(blob_name):
+                    if not Cache::verify_blob(digest):
+                        return false if:
+                            not ProjectFiles::make_directory(&quarantine_parent)
+                            not Cache::quarantine_blob(digest)
+                            Platform::create_hard_link(archive_source_name, blob_name) != 0
+                elif Platform::create_hard_link(archive_source_name, blob_name) != 0:
+                    return false if not ProjectFiles::c_string_file_exists(blob_name) or not Cache::verify_blob(digest)
+            # Revalidate after every publication path. A concurrent rename can change
+            # a pathname after the initial existence check; the receipt is written only
+            # once the final cache bytes still match the in-memory archive digest. The
+            # parent flush makes the hard-link durable before the receipt can claim it.
+            return false if:
+                Platform::synchronize_parent_directory(blob_name) != 0
+                not Cache::verify_blob(digest)
+            return true
+
+        def report_packaged(package_name: darray[u8]&, package_version: darray[u8]&, archive_path: darray[u8]&, digest: darray[u8]&) -> void can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
                 CliOutput::write_ok("packaged ")
                 CliOutput::write_bytes(1, package_name)
                 CliOutput::write_ok(" ")
                 CliOutput::write_bytes(1, package_version)
                 CliOutput::write_ok(" -> ")
-                CliOutput::write_bytes(1, &archive_path)
+                CliOutput::write_bytes(1, archive_path)
                 CliOutput::write_ok(" sha256:")
-                CliOutput::write_bytes(1, &digest)
+                CliOutput::write_bytes(1, digest)
                 CliOutput::write_ok("\n")
-                return Code.Ok
 
-    private:
         def select_paths(raw: darray[u8]&, target: darray[u8]&, out: mutable darray[u8]&) -> bool can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             can Global.Read:
                 resolved_root: mutable darray[u8] = []
