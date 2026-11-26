@@ -21,6 +21,7 @@ include "./registry/index_snapshot.elisa"
 include "./registry/release_metadata.elisa"
 include "./registry/checkpoint_records.elisa"
 include "./registry/trust_clock_record.elisa"
+include "./registry/trust_identity.elisa"
 
 module Registry:
     public:
@@ -559,60 +560,6 @@ module Registry:
         def registry_valid_name(value: darray[u8]&) -> bool:
             return PackageIdentity::valid_name(value)
 
-        def trust_state_identity_valid(value: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            return true if registry_valid_name(value)
-            root_key_prefix: cstr = "@root-key:"
-            root_key_prefix_length: usize = Platform::pkg_strlen(root_key_prefix)
-            if value.count == root_key_prefix_length + 64.usize():
-                for index in 0..<root_key_prefix_length |value, root_key_prefix|:
-                    return false if value[index] != root_key_prefix[index].u8()
-                for index in 0..<64.usize() |value, root_key_prefix_length|:
-                    byte: u8 = value[root_key_prefix_length + index]
-                    return false if (byte < 48 or byte > 57) and (byte < 97 or byte > 102)
-                return true
-            package_prefix: cstr = "@package:"
-            package_prefix_length: usize = Platform::pkg_strlen(package_prefix)
-            if value.count > package_prefix_length + 65.usize():
-                package_identity: mutable bool = true
-                for index in 0..<package_prefix_length |value, package_prefix, package_identity|:
-                    package_identity <- false if value[index] != package_prefix[index].u8()
-                if package_identity:
-                    for index in 0..<64.usize() |value, package_prefix_length|:
-                        byte: u8 = value[package_prefix_length + index]
-                        package_identity <- false if (byte < 48 or byte > 57) and (byte < 97 or byte > 102)
-                    separator: usize = package_prefix_length + 64.usize()
-                    package_identity <- false if value[separator] != 58
-                    package: mutable darray[u8] = []
-                    for index in (separator + 1.usize())..<value.count |package, value|:
-                        package.push(value[index])
-                    return true if package_identity and registry_valid_name(package)
-            prefix: cstr = "@index:"
-            prefix_length: usize = Platform::pkg_strlen(prefix)
-            return false if value.count <= prefix_length + 64.usize() + 1.usize()
-            for index in 0..<prefix_length |value, prefix|:
-                return false if value[index] != prefix[index].u8()
-            for index in 0..<64.usize() |value|:
-                byte: u8 = value[prefix_length + index]
-                return false if (byte < 48 or byte > 57) and (byte < 97 or byte > 102)
-            separator: usize = prefix_length + 64.usize()
-            return false if value[separator] != 58
-            package: mutable darray[u8] = []
-            for index in (separator + 1.usize())..<value.count |package, value|:
-                package.push(value[index])
-            return valid_package_name(package)
-
-        def make_package_identity(root: darray[u8]&, package: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            root_digest_bytes: mutable darray[u8] = []
-            root_digest: mutable darray[u8] = []
-            out.resize(0)
-            return false if not registry_valid_name(package)
-            return false if Integrity::sha256(root, &root_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(root_digest_bytes, &root_digest)
-            ByteText::append_text(out, "@package:")
-            ByteText::append(out, root_digest)
-            out.push(58)
-            ByteText::append(out, package)
-            return true
-
         def trust_state_has_override() -> bool:
             override: u8&? = Platform::pkg_getenv("ELISAPKG_TRUST_STATE")
             return true if override is configured
@@ -678,7 +625,7 @@ module Registry:
                     identity.push(state[index])
                 if registry_valid_name(identity):
                     scoped_identity: mutable darray[u8] = []
-                    return ResultCode.TrustStateUnavailable if not make_package_identity(root, identity, &scoped_identity)
+                    return ResultCode.TrustStateUnavailable if not TrustIdentity::package(root, identity, &scoped_identity)
                     ByteText::append(out, scoped_identity)
                 else:
                     ByteText::append(out, identity)
@@ -913,7 +860,7 @@ module Registry:
             snapshot_digest: mutable darray[u8] = []
             return ResultCode.TrustStateUnavailable if Integrity::sha256(snapshot, &snapshot_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(snapshot_digest_bytes, &snapshot_digest)
             index_identity: mutable darray[u8] = []
-            return ResultCode.TrustStateUnavailable if not make_index_identity(root, package, &index_identity)
+            return ResultCode.TrustStateUnavailable if not TrustIdentity::index(root, package, &index_identity)
             state_status: ResultCode = record_index_generation(index_identity, generation, snapshot_digest, expires, key_fingerprint_hex)
             return state_status if state_status != ResultCode.Ok
             for index in 0..<versions.count |out, versions|:
@@ -928,52 +875,6 @@ module Registry:
             for index in 0..<key_fingerprint_hex.count |key_fingerprint_out, key_fingerprint_hex|:
                 key_fingerprint_out.push(key_fingerprint_hex[index])
             return ResultCode.Ok
-
-        def make_index_identity(root: darray[u8]&, package: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            root_digest_bytes: mutable darray[u8] = []
-            root_digest: mutable darray[u8] = []
-            out.resize(0)
-            return false if Integrity::sha256(root, &root_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(root_digest_bytes, &root_digest)
-            ByteText::append_text(out, "@index:")
-            ByteText::append(out, root_digest)
-            out.push(58)
-            ByteText::append(out, package)
-            return true
-
-        # Bind one signing-key fingerprint to each stable registry path. The
-        # key must not become part of package/index history identities because
-        # that would silently clear rollback protection on key replacement.
-        def make_root_key_identity(root: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            root_digest_bytes: mutable darray[u8] = []
-            root_digest: mutable darray[u8] = []
-            out.resize(0)
-            return false if Integrity::sha256(root, &root_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(root_digest_bytes, &root_digest)
-            ByteText::append_text(out, "@root-key:")
-            ByteText::append(out, root_digest)
-            return true
-
-        def make_root_key_identity_from_history(history_identity: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            out.resize(0)
-            package_prefix: cstr = "@package:"
-            index_prefix: cstr = "@index:"
-            package_prefix_length: usize = Platform::pkg_strlen(package_prefix)
-            index_prefix_length: usize = Platform::pkg_strlen(index_prefix)
-            prefix_length: mutable usize = 0
-            if ByteText::starts_with_text(history_identity, package_prefix):
-                prefix_length <- package_prefix_length
-            elif ByteText::starts_with_text(history_identity, index_prefix):
-                prefix_length <- index_prefix_length
-            else:
-                return false
-            return false if history_identity.count <= prefix_length + 65.usize()
-            for index in 0..<64.usize() |history_identity, prefix_length|:
-                byte: u8 = history_identity[prefix_length + index]
-                return false if (byte < 48 or byte > 57) and (byte < 97 or byte > 102)
-            return false if history_identity[prefix_length + 64.usize()] != 58
-            ByteText::append_text(out, "@root-key:")
-            for index in 0..<64.usize() |out, history_identity, prefix_length|:
-                out.push(history_identity[prefix_length + index])
-            return true
 
         def configured_trust_key_fingerprint(registry_root: darray[u8]&, out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out.resize(0)
@@ -1239,7 +1140,7 @@ module Registry:
                     line_digest.push(state[index])
                 for index in (third_separator + 1.usize())..<finish |line_metadata_digest, state|:
                     line_metadata_digest.push(state[index])
-                return ResultCode.TrustStateMalformed if not trust_state_identity_valid(line_package) or not Integrity::valid_sha256_hex(line_digest) or not Integrity::valid_sha256_hex(line_metadata_digest)
+                return ResultCode.TrustStateMalformed if not TrustIdentity::valid(line_package) or not Integrity::valid_sha256_hex(line_digest) or not Integrity::valid_sha256_hex(line_metadata_digest)
                 parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
                 return ResultCode.TrustStateMalformed if not SemVer::parse(line_version, &parsed) or parsed.prerelease
                 previous: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
@@ -1328,7 +1229,7 @@ module Registry:
             digest_out.resize(0)
             metadata_digest_out.resize(0)
             scoped_identity: mutable darray[u8] = []
-            return ResultCode.TrustStateUnavailable if not make_package_identity(root, package, &scoped_identity)
+            return ResultCode.TrustStateUnavailable if not TrustIdentity::package(root, package, &scoped_identity)
             scoped_status: ResultCode = trust_state_find(state, scoped_identity, version_out, digest_out, metadata_digest_out) if state.count > 0 else ResultCode.Ok
             return scoped_status if scoped_status != ResultCode.Ok or version_out.count > 0
             # V3 rows are exclusively scoped identities, so a missing scoped
@@ -1412,15 +1313,15 @@ module Registry:
             return trust_state_record_internal(package, version, digest, metadata_digest, expires, true, generation, index_digest, index_identity, key_fingerprint)
 
         def trust_state_record_internal(package: darray[u8]&, version: darray[u8]&, digest: darray[u8]&, metadata_digest: darray[u8]&, expires: u64, guard_index: bool, index_generation: u64, index_digest: darray[u8]&, index_identity: darray[u8]&, key_fingerprint: darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
-            return ResultCode.InvalidConfiguration if not trust_state_identity_valid(package) or not PackageIdentity::valid_version(version) or not Integrity::valid_sha256_hex(digest) or not Integrity::valid_sha256_hex(metadata_digest) or not guard_index and not Integrity::valid_sha256_hex(key_fingerprint)
+            return ResultCode.InvalidConfiguration if not TrustIdentity::valid(package) or not PackageIdentity::valid_version(version) or not Integrity::valid_sha256_hex(digest) or not Integrity::valid_sha256_hex(metadata_digest) or not guard_index and not Integrity::valid_sha256_hex(key_fingerprint)
             parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
             return ResultCode.InvalidConfiguration if not SemVer::parse(version, &parsed) or parsed.prerelease
-            return ResultCode.InvalidConfiguration if guard_index and (index_generation == 0 or not Integrity::valid_sha256_hex(index_digest) or not trust_state_identity_valid(index_identity))
+            return ResultCode.InvalidConfiguration if guard_index and (index_generation == 0 or not Integrity::valid_sha256_hex(index_digest) or not TrustIdentity::valid(index_identity))
             root: mutable darray[u8] = []
             return ResultCode.NotConfigured if not configured_root(&root)
             if guard_index:
                 expected_index_identity: mutable darray[u8] = []
-                return ResultCode.TrustStateUnavailable if not make_index_identity(root, package, &expected_index_identity)
+                return ResultCode.TrustStateUnavailable if not TrustIdentity::index(root, package, &expected_index_identity)
                 return ResultCode.InvalidConfiguration if not ByteText::equal(expected_index_identity, index_identity)
             state_path: mutable darray[u8] = trust_state_path(root)
             return ResultCode.TrustStateUnavailable if state_path.count == 0
@@ -1450,18 +1351,18 @@ module Registry:
                 return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable)
             if guard_index:
                 current_index_identity: mutable darray[u8] = []
-                if not make_index_identity(root_after_fingerprint, package, &current_index_identity):
+                if not TrustIdentity::index(root_after_fingerprint, package, &current_index_identity):
                     return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable)
                 if not ByteText::equal(current_index_identity, index_identity):
                     return trust_state_finish(lock_fd, ResultCode.InvalidConfiguration)
             state_identity: mutable darray[u8] = []
             if registry_valid_name(package):
-                if not make_package_identity(root_after_fingerprint, package, &state_identity):
+                if not TrustIdentity::package(root_after_fingerprint, package, &state_identity):
                     return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable)
             else:
                 ByteText::append(&state_identity, package)
             root_key_identity: mutable darray[u8] = []
-            return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if not make_root_key_identity_from_history(state_identity, &root_key_identity)
+            return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if not TrustIdentity::root_key_from_history(state_identity, &root_key_identity)
             state_path <- trust_state_path(root_after_fingerprint)
             if state_path.count == 0 or state_path.count > 4090.usize():
                 return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable)
@@ -1543,7 +1444,7 @@ module Registry:
             return trust_state_finish(lock_fd, upgrade_status) if upgrade_status != ResultCode.Ok
             state <- upgraded_state
             if not key_pin_found:
-                return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if not trust_state_identity_valid(root_key_identity) or not ByteText::starts_with_text(root_key_identity, "@root-key:")
+                return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if not TrustIdentity::valid_root_key(root_key_identity)
                 pin_record_size: usize = root_key_identity.count + 9.usize() + key_fingerprint.count * 2.usize()
                 return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if pin_record_size > 1048576.usize() or state.count > 1048576.usize() - pin_record_size
                 ByteText::append(&state, root_key_identity)
@@ -1575,7 +1476,7 @@ module Registry:
             return trust_state_finish(lock_fd, ResultCode.Ok)
 
         def trust_state_verify(package: darray[u8]&, version: darray[u8]&, digest: darray[u8]&, metadata_digest: darray[u8]&, expires: u64) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
-            return ResultCode.InvalidConfiguration if not trust_state_identity_valid(package) or not PackageIdentity::valid_version(version) or not Integrity::valid_sha256_hex(digest) or not Integrity::valid_sha256_hex(metadata_digest)
+            return ResultCode.InvalidConfiguration if not TrustIdentity::valid(package) or not PackageIdentity::valid_version(version) or not Integrity::valid_sha256_hex(digest) or not Integrity::valid_sha256_hex(metadata_digest)
             parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
             return ResultCode.InvalidConfiguration if not SemVer::parse(version, &parsed) or parsed.prerelease
             package_value: mutable darray[u8] = []
@@ -1628,7 +1529,7 @@ module Registry:
             if not configured_root(&root_after_key):
                 return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable)
             root_key_identity: mutable darray[u8] = []
-            if not make_root_key_identity(root_after_key, &root_key_identity):
+            if not TrustIdentity::root_key(root_after_key, &root_key_identity):
                 return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable)
             state_path <- trust_state_path_readonly(root_after_key)
             if state_path.count == 0 or state_path.count > 4090.usize():
@@ -1660,7 +1561,7 @@ module Registry:
             if not configured_root(&root_after_clock):
                 return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable)
             clock_root_key_identity: mutable darray[u8] = []
-            if not make_root_key_identity(root_after_clock, &clock_root_key_identity) or not ByteText::equal(clock_root_key_identity, root_key_identity):
+            if not TrustIdentity::root_key(root_after_clock, &clock_root_key_identity) or not ByteText::equal(clock_root_key_identity, root_key_identity):
                 return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable)
             return trust_state_finish(lock_fd, ResultCode.TrustStateUnavailable) if clock_missing and state.count > 23.usize()
             current_state_digest: mutable darray[u8] = []
