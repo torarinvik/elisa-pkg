@@ -137,19 +137,22 @@ import json, subprocess, sys
 lock = json.loads(Path("elisapkg.lock").read_text())
 first = lock["packages"][0]
 assert first["name"] == "bar"
-digest = first["archive-digest"].removeprefix("sha256:")
-blob = Path(".elisapkg/cache/sha256") / digest[:2] / digest
 clock = Path(sys.argv[2])
 clock_before = (clock.stat().st_ino, clock.read_bytes())
-hidden = blob.with_suffix(".temporarily-unavailable")
-blob.rename(hidden)
-try:
-    result = subprocess.run([sys.argv[1], "fetch", "--offline"], capture_output=True, timeout=30)
-    assert result.returncode == 5, result
-    assert b"could not verify cached archive for bar 1.0.0" in result.stderr, result
-    assert (clock.stat().st_ino, clock.read_bytes()) == clock_before
-finally:
-    hidden.rename(blob)
+for field, message in (
+    ("archive-digest", b"could not verify cached archive for bar 1.0.0"),
+    ("metadata-digest", b"could not read cached signed metadata for bar 1.0.0"),
+):
+    digest = first[field].removeprefix("sha256:")
+    blob = Path(".elisapkg/cache/sha256") / digest[:2] / digest
+    hidden = blob.with_suffix(".temporarily-unavailable")
+    blob.rename(hidden)
+    try:
+        result = subprocess.run([sys.argv[1], "fetch", "--offline"], capture_output=True, timeout=30)
+        assert result.returncode == 5 and message in result.stderr, result
+        assert (clock.stat().st_ino, clock.read_bytes()) == clock_before
+    finally:
+        hidden.rename(blob)
 PY
   mv "$REGISTRY_GRAPH_CASE/unavailable-foo" "$REGISTRY_GRAPH_ROOT/foo"
   mv "$REGISTRY_GRAPH_CASE/unavailable-bar" "$REGISTRY_GRAPH_ROOT/bar"

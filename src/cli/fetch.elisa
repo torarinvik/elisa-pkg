@@ -147,6 +147,14 @@ module FetchCommand:
                 return CliStatus::success
 
     private:
+        def report_cached_release_error(message: cstr, package: darray[u8]&, version: darray[u8]&) -> void can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                CliOutput::write_error(message)
+                CliOutput::write_bytes(2, package)
+                CliOutput::write_error(" ")
+                CliOutput::write_bytes(2, version)
+                CliOutput::write_error("\n")
+
         def registry_offline_graph_closure(manifest: darray[u8]&, lock: darray[u8]&, starts: darray[usize]&) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             roots: mutable darray[Solver::Constraint] = []
             has_local: mutable bool = false
@@ -189,7 +197,10 @@ module FetchCommand:
                 return CliStatus::security_failed if not Json::object_unsigned_value(lock, record_start, record_end, "archive-size", &archive_size)
                 cached_metadata: mutable darray[u8] = []
                 cached_signature: mutable darray[u8] = []
-                return CliStatus::security_failed if not RegistryCache::read_metadata(metadata_digest, &cached_metadata, &cached_signature)
+                if not RegistryCache::read_metadata(metadata_digest, &cached_metadata, &cached_signature):
+                    can Global.Read:
+                        report_cached_release_error("error: could not read cached signed metadata for ", package, version_text)
+                    return CliStatus::security_failed
                 resolved_archive: mutable darray[u8] = []
                 resolved_digest: mutable darray[u8] = []
                 resolved_size: mutable u64 = 0
@@ -262,7 +273,9 @@ module FetchCommand:
                     return CliStatus::security_failed if expires <= now.u64()
                     cached_metadata: mutable darray[u8] = []
                     cached_signature: mutable darray[u8] = []
-                    return CliStatus::security_failed if not RegistryCache::read_metadata(metadata_digest, &cached_metadata, &cached_signature)
+                    if not RegistryCache::read_metadata(metadata_digest, &cached_metadata, &cached_signature):
+                        report_cached_release_error("error: could not read cached signed metadata for ", package, version_text)
+                        return CliStatus::security_failed
                     resolved_archive: mutable darray[u8] = []
                     resolved_digest: mutable darray[u8] = []
                     resolved_size: mutable u64 = 0
@@ -275,11 +288,7 @@ module FetchCommand:
                     archive_bytes: mutable darray[u8] = []
                     archive_verified: bool = Cache::read_verified_blob(digest, archive_size.usize(), &archive_bytes) and archive_bytes.count.u64() == archive_size and Registry::release_archive_matches_metadata(package, version_text, cached_metadata, archive_bytes)
                     if not archive_verified:
-                        CliOutput::write_error("error: could not verify cached archive for ")
-                        CliOutput::write_bytes(2, &package)
-                        CliOutput::write_error(" ")
-                        CliOutput::write_bytes(2, &version_text)
-                        CliOutput::write_error("\n")
+                        report_cached_release_error("error: could not verify cached archive for ", package, version_text)
                         return CliStatus::security_failed
                     # Only authenticated cache content may advance the durable
                     # trust clock. Do this after snapshot, dependency, expiry, and
