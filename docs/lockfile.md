@@ -2,6 +2,10 @@
 
 The lockfile records the exact resolution policy and selected package bytes. It is generated but intended to be committed. `--locked` and `--frozen` never edit it; a missing or byte-different lock is an error. Normal `resolve` writes the file only after validation succeeds. `fetch` validates the root manifest fingerprint first; for registry lock v3 it then checks every exact record against freshly authenticated metadata before caching the archive.
 
+Use `fetch --locked` without package arguments to select releases from
+`elisapkg.lock`. A named `fetch PACKAGE VERSION` selects a release independently
+and cannot be combined with `--locked`, `--frozen`, or `--offline`.
+
 Package version strings in both local and registry lock records use the same
 128-byte SemVer limit as package manifests. Lock records are still untrusted
 input and are rejected when their version text is malformed or exceeds that

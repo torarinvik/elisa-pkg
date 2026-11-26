@@ -63,6 +63,7 @@ with tempfile.TemporaryDirectory(prefix='cli-review-', dir=ROOT / 'build') as di
         (['INVALID', '1.0.0'], 2),
         (['foo', '^1.0.0', '--offline'], 2),
         (['foo', '1.0.0', '--offline'], 3),
+        (['foo', '1.0.0', '--locked'], 3),
         ([], 5),
     ):
         result = subprocess.run([BIN, 'fetch', *arguments], cwd=blocked_project,
