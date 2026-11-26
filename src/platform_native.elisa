@@ -690,12 +690,11 @@ module PlatformNative:
             signature_path: mutable darray[u8] = []
             return -38 if not write_temp_blob(crypto_key_template, encoded_key, &public_path)
             if not write_temp_blob(crypto_message_template, message, &message_path):
-                _ = remove_temp_blob(public_path)
-                return -38
+                return -38 if remove_temp_blob(public_path) == 0 else -5
             if not write_temp_blob(crypto_signature_template, signature, &signature_path):
-                _ = remove_temp_blob(public_path)
-                _ = remove_temp_blob(message_path)
-                return -38
+                key_cleanup: i64 = remove_temp_blob(public_path)
+                message_cleanup: i64 = remove_temp_blob(message_path)
+                return -38 if key_cleanup == 0 and message_cleanup == 0 else -5
             public_name: cstr = (&public_path[0]).cast[cstr] can Unsafe.PointerCast
             message_name: cstr = (&message_path[0]).cast[cstr] can Unsafe.PointerCast
             signature_name: cstr = (&signature_path[0]).cast[cstr] can Unsafe.PointerCast
@@ -723,7 +722,7 @@ module PlatformNative:
             raw_child_argv: void& = child_argv.cast[void&] can Unsafe.PointerCast
             raw_child_environment: void& = child_environment.cast[void&] can Unsafe.PointerCast
             pid: i64 = native_fork()
-            result: mutable i64 = -1
+            result: mutable i64 = negative_errno() if pid < 0 else -1
             if pid == 0:
                 if set_process_group() != 0:
                     native_exit(126)
@@ -732,8 +731,8 @@ module PlatformNative:
                 # OpenSSL writes a success sentence to stdout and diagnostics
                 # to stderr. Keep helper output from corrupting CLI JSON or
                 # exposing provider details; callers receive only this status.
-                null_fd: i64 = open_null()
-                if null_fd < 0 or duplicate_fd(null_fd, 1) != 1 or duplicate_fd(null_fd, 2) != 2:
+                null_fd: i64 = native_open("/dev/null", flag_read_write)
+                if null_fd < 0 or duplicate_fd(null_fd, 0) != 0 or duplicate_fd(null_fd, 1) != 1 or duplicate_fd(null_fd, 2) != 2:
                     native_exit(126)
                 if close_inherited_fds() != 0:
                     native_exit(126)
@@ -742,10 +741,9 @@ module PlatformNative:
             elif pid > 0:
                 status: mutable i32 = 0
                 waited: i64 = waitpid_group_timeout(pid, &status, 10000)
-                result <- -110 if waited == -110
-                result <- waited if waited < 0 and waited != -110
+                result <- waited if waited < 0
                 result <- 0 if waited == 0 and status == 0
-                result <- -38 if waited == 0 and status / 256 == 127
+                result <- -38 if waited == 0 and (status == 126 * 256 or status == 127 * 256)
             remove_status: i64 = remove_temp_blob(public_path)
             message_remove_status: i64 = remove_temp_blob(message_path)
             signature_remove_status: i64 = remove_temp_blob(signature_path)
