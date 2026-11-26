@@ -44,8 +44,9 @@ module LocalLock:
                 return out
             edge_offsets: mutable darray[usize] = []
             edge_offsets.push(0.usize())
+            traversed_manifest_digests: mutable darray[u8] = []
             processed: mutable usize = 0.usize()
-            while processed < total |queue, record_starts, sorted_records, edges, edge_count, edge_offsets, processed, total, root|:
+            while processed < total |queue, record_starts, sorted_records, edges, edge_count, edge_offsets, traversed_manifest_digests, processed, total, root|:
                 package_root: mutable darray[u8] = []
                 return [] if not queue_field_at(queue, record_starts, processed, 0, &package_root)
                 manifest_path: mutable darray[u8] = []
@@ -61,12 +62,15 @@ module LocalLock:
                 return [] if not queue_field_at(queue, record_starts, processed, 1, &queued_name) or not queue_field_at(queue, record_starts, processed, 2, &queued_version)
                 return [] if not ByteText::equal(queued_name, child_name) or not ByteText::equal(queued_version, child_version)
                 return [] if not append_local_dependency_records(child_raw, &package_root, &queue, &record_starts, &sorted_records, &edges, &edge_count, &total, processed)
+                digest: mutable darray[u8] = []
+                return [] if Integrity::sha256(child_raw, &digest) != Integrity::DigestCode.Ok
+                ByteText::append(&traversed_manifest_digests, digest)
                 processed <- processed + 1.usize()
                 edge_offsets.push(edges.count)
             return [] if not local_dependency_graph_is_acyclic(total, edges, edge_offsets)
             first: mutable bool = true
             return [] if sorted_records.count != total
-            for sorted_position in 0..<total |queue, record_starts, sorted_records, out, first|:
+            for sorted_position in 0..<total |queue, record_starts, sorted_records, traversed_manifest_digests, out, first|:
                 selected: usize = sorted_records[sorted_position]
                 return [] if selected >= record_starts.count
                 selected_name: mutable darray[u8] = []
@@ -76,14 +80,17 @@ module LocalLock:
                 selected_manifest_path: mutable darray[u8] = []
                 ProjectFiles::path_join_into(&selected_path, "elisapkg.json", &selected_manifest_path)
                 selected_manifest: mutable darray[u8] = []
-                return [] if not Platform::pkg_read_bounded_file(selected_manifest_path, Json::max_document_bytes, &selected_manifest)
                 selected_source_digest: mutable darray[u8] = []
                 selected_source_bytes: mutable usize = 0.usize()
                 return [] if graph_source_bytes > SourceFingerprint::maximum_snapshot_bytes or not SourceFingerprint::at_bounded(selected_path, &selected_source_digest, SourceFingerprint::maximum_snapshot_bytes - graph_source_bytes, &selected_source_bytes)
                 graph_source_bytes <- graph_source_bytes + selected_source_bytes
+                return [] if not Platform::pkg_read_bounded_file(selected_manifest_path, Json::max_document_bytes, &selected_manifest)
                 selected_digest: mutable darray[u8] = []
                 selected_digest_bytes: mutable darray[u8] = []
                 return [] if Integrity::sha256(selected_manifest, &selected_digest_bytes) != Integrity::DigestCode.Ok
+                # Bind the emitted digest to the manifest used to traverse edges.
+                digest_start: usize = selected * 32.usize()
+                return [] if not ByteText::range_equals(traversed_manifest_digests, digest_start, digest_start + 32.usize(), selected_digest_bytes)
                 return [] if not Integrity::hex_digest(selected_digest_bytes, &selected_digest)
                 out.push(44) if not first
                 ByteText::append_text(&out, "\n    {\"name\":\"")
