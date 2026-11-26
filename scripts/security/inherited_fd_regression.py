@@ -22,7 +22,7 @@ def main() -> int:
         if not path.exists():
             raise SystemExit(f"error: {label} is missing: {path}")
 
-    source = (ROOT / "src/main.elisa").read_text(encoding="utf-8")
+    source = (ROOT / "src/cli/compiler_process.elisa").read_text(encoding="utf-8")
     stdio_setup = source.find("if null_fd < 0 or Platform::pkg_dup2(null_fd, 0)")
     child_setup = source.find("if null_fd > 2:")
     descriptor_close = source.find("Platform::pkg_close_inherited_fds()", child_setup)
@@ -30,11 +30,7 @@ def main() -> int:
     if stdio_setup < 0 or not stdio_setup < child_setup < descriptor_close < compiler_exec:
         raise SystemExit("error: compiler launch must close inherited descriptors after stdio setup and before exec")
 
-    program_start = source.find("def run_program(")
-    program_end = source.find("def cli_main(", program_start)
-    if program_start < 0 or program_end < 0:
-        raise SystemExit("error: could not locate the shared run/test program launcher")
-    program_launcher = source[program_start:program_end]
+    program_launcher = (ROOT / "src/cli/program.elisa").read_text(encoding="utf-8")
     program_child = program_launcher.find("if pid == 0:")
     program_group = program_launcher.find("Platform::pkg_set_process_group()", program_child)
     program_limits = program_launcher.find("Platform::pkg_set_process_limits(2)", program_child)
@@ -46,6 +42,7 @@ def main() -> int:
         0 <= program_child < program_group < program_limits < program_close
         and program_close_guard > program_limits
         and program_close > program_close_guard
+        and program_close < program_close_exit
         and program_close_exit < program_exec
     ):
         raise SystemExit(
@@ -58,9 +55,9 @@ def main() -> int:
         probe = work / "fd_probe.elisa"
         binary = work / "fd_probe"
         probe.write_text(
-            f'include "{ROOT / "src/platform_native.elisa"}"\n\n'
+            f'include "{ROOT / "src/platform.elisa"}"\n\n'
             'def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:\n'
-            '    inherited_fd: i64 = PlatformNative::open_null()\n'
+            '    inherited_fd: i64 = Platform::pkg_open_null()\n'
             '    return 1 if inherited_fd < 3\n'
             '    fd_path: mutable darray[u8] = [47, 100, 101, 118, 47, 102, 100, 47]\n'
             '    digits: mutable darray[u8] = []\n'
@@ -83,17 +80,17 @@ def main() -> int:
             '    args.push(fd_name)\n'
             '    args.push(null)\n'
             '    child_argv: mutable cstr&& = (&args[0]).cast[mutable cstr&&] can Unsafe.PointerCast\n'
-            '    pid: i64 = PlatformNative::fork()\n'
+            '    pid: i64 = Platform::pkg_fork()\n'
             '    if pid == 0:\n'
-            '        return 126 if PlatformNative::duplicate_fd(inherited_fd, 1) != 1\n'
-            '        return 126 if PlatformNative::close_inherited_fds() != 0\n'
-            '        _ = PlatformNative::execvp("/bin/sh", child_argv)\n'
-            '        PlatformNative::process_exit(127)\n'
+            '        return 126 if Platform::pkg_dup2(inherited_fd, 1) != 1\n'
+            '        return 126 if Platform::pkg_close_inherited_fds() != 0\n'
+            '        _ = Platform::pkg_execvp("/bin/sh", child_argv)\n'
+            '        Platform::pkg_process_exit(127)\n'
             '    return 2 if pid < 0\n'
             '    status: mutable i32 = 0\n'
-            '    waited: i64 = PlatformNative::waitpid(pid, &status, 0)\n'
-            '    _ = PlatformNative::close(inherited_fd)\n'
-            '    return 3 if waited != pid\n'
+            '    waited: i64 = Platform::pkg_waitpid_timeout(pid, &status, 1000)\n'
+            '    _ = Platform::pkg_close(inherited_fd)\n'
+            '    return 3 if waited != 0\n'
             '    return 4 if status != 0\n'
             '    return 0\n',
             encoding="utf-8",
@@ -103,7 +100,7 @@ def main() -> int:
         environment["ELISA_RUNTIME_OBJ"] = str(RUNTIME)
         environment.setdefault("ELISA_ALLOW_STALE_STAGE1", "0")
         subprocess.run(
-            [str(WRAPPER), "-emit", "exe", "-o", str(binary), str(probe)],
+            [str(WRAPPER), "-Wnever-leak=strict", "-emit", "exe", "-o", str(binary), str(probe)],
             cwd=work,
             env=environment,
             check=True,
