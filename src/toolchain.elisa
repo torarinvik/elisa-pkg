@@ -4,6 +4,14 @@ include "./platform.elisa"
 
 module Toolchain:
     private:
+        def executable_path(path: cstr, canonical: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return false if not canonical_path_bytes(path, canonical)
+            canonical.push(0)
+            name: cstr = (&canonical[0]).cast[cstr] can Unsafe.PointerCast
+            executable: bool = Platform::pkg_access(name, 1) == 0
+            canonical.resize(canonical.count - 1.usize())
+            return executable
+
         def path_without_suffix(path: darray[u8]&, suffix: cstr, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
             out.resize(0)
             suffix_length: usize = Platform::pkg_strlen(suffix)
@@ -23,6 +31,44 @@ module Toolchain:
             return true
 
     public:
+        # Use the same search order for lookup and for the child environment.
+        const isolated_path_environment: cstr = "PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"
+
+        def resolve_build_compiler(path: cstr, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            out.resize(0)
+            return false if not valid_compiler_argument(path)
+            length: usize = Platform::pkg_strlen(path)
+            for index in 0..<length |path, length, out|:
+                if path[index].u8() == 47:
+                    canonical: mutable darray[u8] = []
+                    return false if not executable_path(path, &canonical)
+                    # Keep an explicit absolute spelling for wrapper recognition.
+                    if path[0].u8() == 47:
+                        for offset in 0..<length |out, path|:
+                            out.push(path[offset].u8())
+                    else:
+                        out <- canonical
+                    return true
+            search_end: usize = Platform::pkg_strlen(isolated_path_environment)
+            directory_start: mutable usize = 5.usize()
+            for directory_end in directory_start..=search_end |directory_start, search_end, path, length, out|:
+                if directory_end == search_end or isolated_path_environment[directory_end].u8() == 58:
+                    candidate: mutable darray[u8] = []
+                    for index in directory_start..<directory_end |candidate|:
+                        candidate.push(isolated_path_environment[index].u8())
+                    candidate.push(47)
+                    for index in 0..<length |candidate, path|:
+                        candidate.push(path[index].u8())
+                    candidate.push(0)
+                    candidate_name: cstr = (&candidate[0]).cast[cstr] can Unsafe.PointerCast
+                    canonical: mutable darray[u8] = []
+                    if executable_path(candidate_name, &canonical):
+                        candidate.resize(candidate.count - 1.usize())
+                        out <- candidate
+                        return true
+                    directory_start <- directory_end + 1.usize()
+            return false
+
         def valid_compiler_argument(value: cstr) -> bool:
             length: usize = Platform::pkg_strlen(value)
             # The compiler is the first utility argument after `env -i`. Reject forms

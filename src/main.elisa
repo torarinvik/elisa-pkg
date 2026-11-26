@@ -195,53 +195,6 @@ module Cli:
                 out.push(path[index])
             out.push(0)
 
-        def resolve_build_compiler(path: cstr, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            # Resolve bare names against exactly the PATH supplied to the
-            # isolated child. The sandbox and receipt need a concrete path for
-            # the same executable that the compiler invocation will use.
-            out.resize(0)
-            length: usize = Platform::pkg_strlen(path)
-            has_slash: mutable bool = false
-            for index in 0..<length |path, has_slash|:
-                has_slash <- true if path[index].u8() == 47
-            if has_slash:
-                canonical: mutable darray[u8] = []
-                return false if not Toolchain::canonical_path_bytes(path, &canonical)
-                canonical_c: mutable darray[u8] = []
-                path_with_nul_into(canonical, &canonical_c)
-                canonical_name: cstr = (&canonical_c[0]).cast[cstr] can Unsafe.PointerCast
-                return false if Platform::pkg_access(canonical_name, 1) != 0
-                if path[0].u8() == 47:
-                    for index in 0..<length |out, path|:
-                        out.push(path[index].u8())
-                else:
-                    out <- canonical
-                return true
-            for directory_index in 0..<4 |out|:
-                candidate: mutable darray[u8] = []
-                if directory_index == 0:
-                    bytes_push_view(&candidate, "/usr/bin/")
-                elif directory_index == 1:
-                    bytes_push_view(&candidate, "/bin/")
-                elif directory_index == 2:
-                    bytes_push_view(&candidate, "/usr/local/bin/")
-                else:
-                    bytes_push_view(&candidate, "/opt/homebrew/bin/")
-                bytes_push_cstr(&candidate, path)
-                candidate_length: usize = candidate.count
-                candidate.push(0)
-                candidate_name: cstr = (&candidate[0]).cast[cstr] can Unsafe.PointerCast
-                canonical_candidate: mutable darray[u8] = []
-                if Toolchain::canonical_path_bytes(candidate_name, &canonical_candidate):
-                    canonical_candidate_c: mutable darray[u8] = []
-                    path_with_nul_into(canonical_candidate, &canonical_candidate_c)
-                    canonical_candidate_name: cstr = (&canonical_candidate_c[0]).cast[cstr] can Unsafe.PointerCast
-                    if Platform::pkg_access(canonical_candidate_name, 1) == 0:
-                        for index in 0..<candidate_length |out, candidate|:
-                            out.push(candidate[index])
-                        return true
-            return false
-
         def make_directory(path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return true if path.count == 0.usize()
             work: mutable darray[u8] = []
@@ -6138,7 +6091,7 @@ module Cli:
                     compiler <- configured.cast[cstr]
                 return EXIT_BUILD if not Toolchain::valid_compiler_argument(compiler)
                 resolved_compiler_path: mutable darray[u8] = []
-                if not resolve_build_compiler(compiler, &resolved_compiler_path):
+                if not Toolchain::resolve_build_compiler(compiler, &resolved_compiler_path):
                     write_error("error: selected compiler was not found as an executable on the isolated build PATH\n")
                     return EXIT_BUILD
                 resolved_compiler_storage: mutable darray[u8] = []
@@ -6579,7 +6532,7 @@ module Cli:
                 args.push(sandbox_profile_name)
                 args.push("/usr/bin/env")
                 args.push("-i")
-                args.push("PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin")
+                args.push(Toolchain::isolated_path_environment)
                 bytes_push_view(&temporary_env, "TMPDIR=")
                 bytes_push_cstr(&temporary_env, canonical_sandbox_work_name)
                 temporary_env.push(0)
@@ -7049,7 +7002,7 @@ module Cli:
             args: mutable darray[cstr] = []
             args.push("/usr/bin/env")
             args.push("-i")
-            args.push("PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin")
+            args.push(Toolchain::isolated_path_environment)
             args.push(artifact_name)
             index: mutable i64 = 2
             while index < argc and not cstr_equal(slots[index].cast[cstr], "--") |slots, index|:
