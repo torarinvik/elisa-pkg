@@ -7,7 +7,7 @@ REGISTRY_GRAPH_CASE="$TEST_TMP/registry-graph-preference-regression"
 REGISTRY_GRAPH_ROOT="$REGISTRY_GRAPH_CASE/registry"
 REGISTRY_GRAPH_KEY="$REGISTRY_GRAPH_CASE/trust/key"
 REGISTRY_GRAPH_PRIVATE="$REGISTRY_GRAPH_CASE/test-private.pem"
-REGISTRY_GRAPH_SOURCE="$REGISTRY_EXPIRY_SOURCE/.elisapkg/package.tar"
+REGISTRY_GRAPH_SOURCE="$REGISTRY_EXPIRY_ROOT/foo/1.1.0/archive.tar"
 REGISTRY_GRAPH_APP="$REGISTRY_GRAPH_CASE/app"
 REGISTRY_GRAPH_STATE="$REGISTRY_GRAPH_CASE/trust/state"
 mkdir -m 700 -p "$REGISTRY_GRAPH_ROOT" "$REGISTRY_GRAPH_CASE/trust"
@@ -16,14 +16,29 @@ cp "$REGISTRY_EXPIRY_KEY" "$REGISTRY_GRAPH_KEY"
 chmod 600 "$REGISTRY_GRAPH_PRIVATE" "$REGISTRY_GRAPH_KEY"
 python3 - "$REGISTRY_GRAPH_ROOT" "$REGISTRY_GRAPH_SOURCE" "$REGISTRY_GRAPH_PRIVATE" "$OPENSSL_BIN" <<'PY'
 from pathlib import Path
-import hashlib, json, os, subprocess, sys, time
+import hashlib, io, json, subprocess, sys, tarfile, time
 
 root = Path(sys.argv[1])
-archive = Path(sys.argv[2]).read_bytes()
+archive_template = Path(sys.argv[2]).read_bytes()
 private_key = sys.argv[3]
 openssl = sys.argv[4]
-digest = hashlib.sha256(archive).hexdigest()
 expires = int(time.time()) + 3600
+
+def release_archive(package, version, dependencies):
+    output = io.BytesIO()
+    with tarfile.open(fileobj=io.BytesIO(archive_template)) as original:
+        with tarfile.open(fileobj=output, mode="w", format=tarfile.USTAR_FORMAT) as updated:
+            for entry in original:
+                content = original.extractfile(entry).read()
+                if entry.name == "elisapkg.json":
+                    manifest = json.loads(content)
+                    manifest["package"].update(name=package, version=version)
+                    manifest["dependencies"] = dependencies
+                    content = (json.dumps(manifest) + "\n").encode()
+                    entry.size = len(content)
+                updated.addfile(entry, io.BytesIO(content))
+            end = updated.offset
+    return output.getvalue()[:end + 1024]
 
 def write_signed(path, data):
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -42,6 +57,7 @@ for package, version, dependencies in (
     version_dir = root / package / version
     version_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     version_dir.chmod(0o700)
+    archive = release_archive(package, version, dependencies)
     (version_dir / "archive.tar").write_bytes(archive)
     (version_dir / "archive.tar").chmod(0o600)
     metadata = {
@@ -52,7 +68,7 @@ for package, version, dependencies in (
         "version": version,
         "archive": "archive.tar",
         "archive-size": len(archive),
-        "archive-digest": digest,
+        "archive-digest": hashlib.sha256(archive).hexdigest(),
         "expires": expires,
     }
     if dependencies:
