@@ -90,7 +90,7 @@ module Sandbox:
                     not append_homebrew_llvm_dependency(&profile, "/usr/local", "z3", home_real)
                     not append_homebrew_llvm_dependency(&profile, "/usr/local", "zstd", home_real)
             return [] if not append_read_root(&profile, project_real)
-            return [] if not append_dependency_read_roots(&profile, dependency_roots)
+            return [] if not append_dependency_rules(&profile, dependency_roots, DependencyRule.AllowRead)
 
             return [] if:
                 not append_subpath_rule(&profile, "allow", "file-read*", "subpath", build_real)
@@ -116,7 +116,7 @@ module Sandbox:
             ByteText::append_text(&profile, "(deny file-read* (subpath \"/private/tmp\"))\n(deny file-write* (subpath \"/private/tmp\"))\n")
 
             return [] if not append_read_root(&profile, project_real)
-            return [] if not append_dependency_read_roots(&profile, dependency_roots)
+            return [] if not append_dependency_rules(&profile, dependency_roots, DependencyRule.AllowRead)
             return [] if not append_read_roots(&profile, tool_roots)
             for index in 0..<tool_paths.count |tool_paths, profile|:
                 return [] if not append_tool_file_read(&profile, tool_paths[index])
@@ -136,14 +136,7 @@ module Sandbox:
             # later denials still apply when a tool lives inside a source tree.
             # This keeps a selected tool exception from reopening package data.
             return [] if not append_subpath_rule(&profile, "deny", "file-read*", "subpath", project_real)
-            root_cursor: mutable usize = 0.usize()
-            while root_cursor < dependency_roots.count |dependency_roots, root_cursor, profile|:
-                dependency_path: mutable darray[u8] = []
-                return [] if not next_root(dependency_roots, &root_cursor, &dependency_path)
-                dependency_real: mutable darray[u8] = []
-                return [] if:
-                    not canonical_path_array(dependency_path, &dependency_real)
-                    not append_subpath_rule(&profile, "deny", "file-read*", "subpath", dependency_real)
+            return [] if not append_dependency_rules(&profile, dependency_roots, DependencyRule.DenyRead)
             # The compiler's controlled linker path uses these exact host
             # utilities. Allow their exact paths so it cannot execute
             # unrelated programs simply because they share /usr/bin.
@@ -168,14 +161,7 @@ module Sandbox:
             # they must not become compiler inputs through an include directive.
             # The exact private scratch directory is reallowed below.
             return [] if not append_source_state_denials(&profile, project_real)
-            root_cursor <- 0.usize()
-            while root_cursor < dependency_roots.count |dependency_roots, root_cursor, profile|:
-                dependency_path: mutable darray[u8] = []
-                return [] if not next_root(dependency_roots, &root_cursor, &dependency_path)
-                dependency_real: mutable darray[u8] = []
-                return [] if:
-                    not canonical_path_array(dependency_path, &dependency_real)
-                    not append_source_state_denials(&profile, dependency_real)
+            return [] if not append_dependency_rules(&profile, dependency_roots, DependencyRule.DenySourceState)
 
             # The snapshot root is intentionally beneath reserved build state,
             # so grant its exact read boundary after those denials. Keep this
@@ -220,15 +206,25 @@ module Sandbox:
                     not append_read_root(profile, root)
             return true
 
-        def append_dependency_read_roots(profile: mutable darray[u8]&, dependency_roots: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+        const enum DependencyRule of u8:
+            AllowRead
+            DenyRead
+            DenySourceState
+
+        def append_dependency_rules(profile: mutable darray[u8]&, dependency_roots: darray[u8]&, rule: DependencyRule) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             cursor: mutable usize = 0
-            while cursor < dependency_roots.count |dependency_roots, cursor, profile|:
+            while cursor < dependency_roots.count |dependency_roots, cursor, profile, rule|:
                 dependency_path: mutable darray[u8] = []
                 dependency_real: mutable darray[u8] = []
                 return false if:
                     not next_root(dependency_roots, &cursor, &dependency_path)
                     not canonical_path_array(dependency_path, &dependency_real)
-                    not append_read_root(profile, dependency_real)
+                if rule == DependencyRule.AllowRead:
+                    return false if not append_read_root(profile, dependency_real)
+                elif rule == DependencyRule.DenyRead:
+                    return false if not append_subpath_rule(profile, "deny", "file-read*", "subpath", dependency_real)
+                else:
+                    return false if not append_source_state_denials(profile, dependency_real)
             return true
 
         def append_source_state_denials(out: mutable darray[u8]&, root: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
