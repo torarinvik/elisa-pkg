@@ -2284,15 +2284,18 @@ module PlatformNative:
                 part: cstr = (&part_storage[0]).cast[cstr] can Unsafe.PointerCast
                 return close_error(directory, -22) if cstr_equal(part, ".") or cstr_equal(part, "..")
                 next: mutable i64 = native_openat(directory, part, flags_directory() + flag_no_follow)
-                if next < 0 and create_missing and current_errno() == 2:
+                needs_parent_sync: bool = next < 0 and create_missing and current_errno() == 2
+                if needs_parent_sync:
                     created: i32 = native_mkdirat(directory, part, 493)
                     return close_error(directory, negative_errno()) if created != 0 and current_errno() != 17
-                    if created == 0 and native_fsync(directory) != 0:
-                        return close_error(directory, negative_errno())
                     next <- native_openat(directory, part, flags_directory() + flag_no_follow)
                 return close_error(directory, negative_errno()) if next < 0
                 if not trusted_directory_fd(next, expected_uid):
                     return close_two_error(directory, next, -13)
+                # An EEXIST result may come from another installer that
+                # created the directory but has not synced the parent yet.
+                if needs_parent_sync and native_fsync(directory) != 0:
+                    return close_two_error(directory, next, negative_errno())
                 return close_error(next, -5) if native_close(directory) != 0
                 directory <- next
                 break if finish == effective_length
