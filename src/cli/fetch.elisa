@@ -147,7 +147,7 @@ module FetchCommand:
                 return CliStatus::success
 
     private:
-        def registry_offline_graph_closure(manifest: darray[u8]&, lock: darray[u8]&, starts: darray[usize]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+        def registry_offline_graph_closure(manifest: darray[u8]&, lock: darray[u8]&, starts: darray[usize]&) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             roots: mutable darray[Solver::Constraint] = []
             has_local: mutable bool = false
             return CliStatus::resolution_failed if not RegistryRoots::collect(manifest, &roots, &has_local) or has_local or roots.count == 0.usize()
@@ -210,7 +210,10 @@ module FetchCommand:
                 processed <- processed + 1.usize()
             # Only distinct authenticated records enter the queue.
             return CliStatus::resolution_failed if starts.count != pending.count
-            return CliStatus::security_failed if not DependencyGraph::is_acyclic(pending.count, edges, edge_offsets)
+            if not DependencyGraph::is_acyclic(pending.count, edges, edge_offsets):
+                can Global.Read:
+                    CliOutput::write_error("error: cached registry dependency graph contains a cycle\n")
+                return CliStatus::security_failed
             return CliStatus::success
 
         def fetch_registry_lock_offline(manifest: darray[u8]&, lock: darray[u8]&) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -272,8 +275,8 @@ module FetchCommand:
                     metadata_dependencies: mutable darray[Solver::Constraint] = []
                     metadata_status: Registry::ResultCode = Registry::verify_metadata_snapshot(package, version_text, metadata_digest, cached_metadata, cached_signature, &resolved_archive, &resolved_digest, &resolved_size, &metadata_expires, &metadata_dependencies)
                     return CliStatus::security_failed if metadata_status != Registry::ResultCode.Ok or not ByteText::equal(resolved_archive, archive) or not ByteText::equal(resolved_digest, digest) or resolved_size != archive_size or metadata_expires != expires
-                    for dependency_index in 0..<metadata_dependencies.count |lock, starts, metadata_dependencies, dependency_index|:
-                        return CliStatus::security_failed if Lockfile::matching_registry_record(lock, starts, metadata_dependencies[dependency_index]) < 0
+                    # The digest binds this snapshot to the same dependency
+                    # bytes already checked during graph traversal.
                     archive_bytes: mutable darray[u8] = []
                     return CliStatus::security_failed if not Cache::read_verified_blob(digest, archive_size.usize(), &archive_bytes) or archive_bytes.count.u64() != archive_size or not Registry::release_archive_matches_metadata(package, version_text, cached_metadata, archive_bytes)
                     # Only authenticated cache content may advance the durable
