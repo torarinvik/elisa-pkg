@@ -16,51 +16,60 @@ module Manifest:
         # policy check, not a JSON parser: callers must first run
         # Json::valid_document and Json::unique_object_keys.
         def allowed_keys(raw: darray[u8]&) -> bool:
-            in_string: mutable bool = false
-            escaped: mutable bool = false
-            string_start: mutable usize = 0.usize()
-            braces: mutable i64 = 0
-            brackets: mutable i64 = 0
-            dependency_depth: mutable i64 = 0
-            pending_dependency_object: mutable bool = false
-            for index in 0..<raw.count |raw, in_string, escaped, string_start, braces, brackets, dependency_depth, pending_dependency_object|:
-                byte: u8 = raw[index]
-                if not in_string:
-                    if byte == 34:
-                        in_string <- true
-                        string_start <- index + 1.usize()
-                    elif byte == 123:
-                        braces <- braces + 1
-                        dependency_depth <- braces if pending_dependency_object
-                        pending_dependency_object <- false
-                    elif byte == 125:
-                        dependency_depth <- 0 if dependency_depth == braces
-                        braces <- braces - 1
-                    elif byte == 91:
-                        brackets <- brackets + 1
-                    elif byte == 93:
-                        brackets <- brackets - 1
-                    elif pending_dependency_object:
-                        pending_dependency_object <- false if not Json::is_whitespace(byte) and byte != 58
-                elif escaped:
-                    escaped <- false
-                elif byte == 92:
-                    escaped <- true
-                elif byte == 34:
-                    after: usize = Json::skip_whitespace(raw, index + 1.usize(), raw.count)
-                    if after < raw.count and raw[after] == 58:
-                        region known_scope:
-                            known: mutable bool = ByteText::range_equals_text(raw, string_start, index, "schema-version") or ByteText::range_equals_text(raw, string_start, index, "package") or ByteText::range_equals_text(raw, string_start, index, "targets") or ByteText::range_equals_text(raw, string_start, index, "dependencies") or ByteText::range_equals_text(raw, string_start, index, "dev-dependencies") or ByteText::range_equals_text(raw, string_start, index, "include") or ByteText::range_equals_text(raw, string_start, index, "exclude") or ByteText::range_equals_text(raw, string_start, index, "name") or ByteText::range_equals_text(raw, string_start, index, "version") or ByteText::range_equals_text(raw, string_start, index, "description") or ByteText::range_equals_text(raw, string_start, index, "license") or ByteText::range_equals_text(raw, string_start, index, "elisa") or ByteText::range_equals_text(raw, string_start, index, "kind") or ByteText::range_equals_text(raw, string_start, index, "entry") or ByteText::range_equals_text(raw, string_start, index, "registry") or ByteText::range_equals_text(raw, string_start, index, "path") or ByteText::range_equals_text(raw, string_start, index, "git") or ByteText::range_equals_text(raw, string_start, index, "rev")
-                            if braces == 1 and brackets == 0:
-                                top_level_known: bool = ByteText::range_equals_text(raw, string_start, index, "schema-version") or ByteText::range_equals_text(raw, string_start, index, "package") or ByteText::range_equals_text(raw, string_start, index, "targets") or ByteText::range_equals_text(raw, string_start, index, "dependencies") or ByteText::range_equals_text(raw, string_start, index, "dev-dependencies") or ByteText::range_equals_text(raw, string_start, index, "include") or ByteText::range_equals_text(raw, string_start, index, "exclude")
-                                return false if not top_level_known
-                            known <- true if dependency_depth > 0 and braces == dependency_depth and PackageIdentity::valid_name_segment(raw, string_start, index)
-                            return false if not known
-                        if braces == 1 and (ByteText::range_equals_text(raw, string_start, index, "dependencies") or ByteText::range_equals_text(raw, string_start, index, "dev-dependencies")):
-                            probe: usize = Json::skip_whitespace(raw, after + 1.usize(), raw.count)
-                            pending_dependency_object <- probe < raw.count and raw[probe] == 123
-                    in_string <- false
+            region scanner_scope:
+                in_string: mutable bool = false
+                escaped: mutable bool = false
+                string_start: mutable usize = 0.usize()
+                braces: mutable i64 = 0
+                brackets: mutable i64 = 0
+                dependency_depth: mutable i64 = 0
+                pending_dependency_object: mutable bool = false
+                for index in 0..<raw.count |raw, in_string, escaped, string_start, braces, brackets, dependency_depth, pending_dependency_object|:
+                    byte: u8 = raw[index]
+                    if not in_string:
+                        if byte == 34:
+                            in_string <- true
+                            string_start <- index + 1.usize()
+                        elif byte == 123:
+                            braces <- braces + 1
+                            dependency_depth <- braces if pending_dependency_object
+                            pending_dependency_object <- false
+                        elif byte == 125:
+                            dependency_depth <- 0 if dependency_depth == braces
+                            braces <- braces - 1
+                        elif byte == 91:
+                            brackets <- brackets + 1
+                        elif byte == 93:
+                            brackets <- brackets - 1
+                        elif pending_dependency_object:
+                            pending_dependency_object <- false if not Json::is_whitespace(byte) and byte != 58
+                    elif escaped:
+                        escaped <- false
+                    elif byte == 92:
+                        escaped <- true
+                    elif byte == 34:
+                        after: usize = Json::skip_whitespace(raw, index + 1.usize(), raw.count)
+                        if after < raw.count and raw[after] == 58:
+                            region known_scope:
+                                known: mutable bool = top_level_key(raw, string_start, index) or nested_key(raw, string_start, index)
+                                if braces == 1 and brackets == 0:
+                                    top_level_known: bool = top_level_key(raw, string_start, index)
+                                    return false if not top_level_known
+                                known <- true if dependency_depth > 0 and braces == dependency_depth and PackageIdentity::valid_name_segment(raw, string_start, index)
+                                return false if not known
+                            if braces == 1 and (ByteText::range_equals_text(raw, string_start, index, "dependencies") or ByteText::range_equals_text(raw, string_start, index, "dev-dependencies")):
+                                probe: usize = Json::skip_whitespace(raw, after + 1.usize(), raw.count)
+                                pending_dependency_object <- probe < raw.count and raw[probe] == 123
+                        in_string <- false
             return true
+
+        # A field name allowed at the top level of a manifest.
+        def top_level_key(raw: darray[u8]&, start: usize, finish: usize) -> bool:
+            return ByteText::range_equals_text(raw, start, finish, "schema-version") or ByteText::range_equals_text(raw, start, finish, "package") or ByteText::range_equals_text(raw, start, finish, "targets") or ByteText::range_equals_text(raw, start, finish, "dependencies") or ByteText::range_equals_text(raw, start, finish, "dev-dependencies") or ByteText::range_equals_text(raw, start, finish, "include") or ByteText::range_equals_text(raw, start, finish, "exclude")
+
+        # A field name allowed inside package, target, or dependency objects.
+        def nested_key(raw: darray[u8]&, start: usize, finish: usize) -> bool:
+            return ByteText::range_equals_text(raw, start, finish, "name") or ByteText::range_equals_text(raw, start, finish, "version") or ByteText::range_equals_text(raw, start, finish, "description") or ByteText::range_equals_text(raw, start, finish, "license") or ByteText::range_equals_text(raw, start, finish, "elisa") or ByteText::range_equals_text(raw, start, finish, "kind") or ByteText::range_equals_text(raw, start, finish, "entry") or ByteText::range_equals_text(raw, start, finish, "registry") or ByteText::range_equals_text(raw, start, finish, "path") or ByteText::range_equals_text(raw, start, finish, "git") or ByteText::range_equals_text(raw, start, finish, "rev")
 
         def is_safe_relative_entry(entry: darray[u8]&) -> bool:
             return false if not Archive::is_safe_entry(entry)
