@@ -5,6 +5,7 @@
 # manager policy is implemented in C.
 
 include "./package_path_policy.elisa"
+include "./package/ustar_fields.elisa"
 
 # The pinned compiler requires FFI declarations at compilation-unit scope.
 # Keep their names `native_*`; policy callers use the PlatformNative wrappers.
@@ -467,26 +468,26 @@ module PlatformNative:
             entries: mutable usize = 0.usize()
             result: mutable i64 = -22
             while cursor + 512.usize() <= archive.count |archive, cursor, entries, seen, root, result|:
-                if archive_block_zero(archive, cursor):
-                    if cursor + 1024.usize() == archive.count and entries > 0.usize() and archive_block_zero(archive, cursor + 512.usize()):
+                if UstarFields::archive_block_zero(archive, cursor):
+                    if cursor + 1024.usize() == archive.count and entries > 0.usize() and UstarFields::archive_block_zero(archive, cursor + 512.usize()):
                         result <- 0
                     break
                 return extraction_failure(root, seen, created_directories, -22) if entries >= PackagePathPolicy::max_package_archive_entries
                 return extraction_failure(root, seen, created_directories, -22) if cursor + 1024.usize() > archive.count
-                return extraction_failure(root, seen, created_directories, -22) if not archive_header_shape(archive, cursor)
+                return extraction_failure(root, seen, created_directories, -22) if not UstarFields::archive_header_shape(archive, cursor)
                 name: mutable darray[u8] = []
                 for index in 0..<100 |archive, cursor, name|:
                     break if archive[cursor + index] == 0
                     name.push(archive[cursor + index])
-                return extraction_failure(root, seen, created_directories, -22) if name.count == 0 or name.count >= 100 or not archive_entry_safe(name) or archive_name_seen(seen, name)
-                return extraction_failure(root, seen, created_directories, -22) if not archive_metadata_zero(archive, cursor, name.count)
+                return extraction_failure(root, seen, created_directories, -22) if name.count == 0 or name.count >= 100 or not UstarFields::archive_entry_safe(name) or UstarFields::archive_name_seen(seen, name)
+                return extraction_failure(root, seen, created_directories, -22) if not UstarFields::archive_metadata_zero(archive, cursor, name.count)
                 mode: mutable usize = 0.usize()
                 uid: mutable usize = 0.usize()
                 gid: mutable usize = 0.usize()
                 size: mutable usize = 0.usize()
                 mtime: mutable usize = 0.usize()
                 stored_checksum: mutable usize = 0.usize()
-                return extraction_failure(root, seen, created_directories, -22) if not parse_octal_raw(archive, cursor + 100.usize(), 8.usize(), &mode) or not parse_octal_raw(archive, cursor + 108.usize(), 8.usize(), &uid) or not parse_octal_raw(archive, cursor + 116.usize(), 8.usize(), &gid) or not parse_octal_raw(archive, cursor + 124.usize(), 12.usize(), &size) or not parse_octal_raw(archive, cursor + 136.usize(), 12.usize(), &mtime) or not parse_octal_raw(archive, cursor + 148.usize(), 8.usize(), &stored_checksum)
+                return extraction_failure(root, seen, created_directories, -22) if not UstarFields::parse_octal_raw(archive, cursor + 100.usize(), 8.usize(), &mode) or not UstarFields::parse_octal_raw(archive, cursor + 108.usize(), 8.usize(), &uid) or not UstarFields::parse_octal_raw(archive, cursor + 116.usize(), 8.usize(), &gid) or not UstarFields::parse_octal_raw(archive, cursor + 124.usize(), 12.usize(), &size) or not UstarFields::parse_octal_raw(archive, cursor + 136.usize(), 12.usize(), &mtime) or not UstarFields::parse_octal_raw(archive, cursor + 148.usize(), 8.usize(), &stored_checksum)
                 return extraction_failure(root, seen, created_directories, -22) if mode != 420.usize() or uid != 0.usize() or gid != 0.usize() or mtime != 0.usize() or size > 67108864.usize() - 1024.usize()
                 checksum: mutable usize = 0.usize()
                 for index in 0..<512 |archive, cursor, checksum|:
@@ -496,7 +497,7 @@ module PlatformNative:
                 return extraction_failure(root, seen, created_directories, -22) if size > archive.count - data_start
                 data_end: usize = data_start + size
                 padding: usize = (512.usize() - (size % 512.usize())) % 512.usize()
-                return extraction_failure(root, seen, created_directories, -22) if padding > archive.count - data_end or not archive_range_zero(archive, data_end, padding)
+                return extraction_failure(root, seen, created_directories, -22) if padding > archive.count - data_end or not UstarFields::archive_range_zero(archive, data_end, padding)
                 parent_copy: mutable darray[u8] = []
                 leaf_offset: mutable usize = 0.usize()
                 parent: i64 = archive_open_parent(root, name, &parent_copy, &leaf_offset, true, &created_directories, &extracted_nodes)
@@ -1330,81 +1331,6 @@ module PlatformNative:
                 close_status: i32 = native_closedir(opened)
                 return not failed and close_status == 0
             _ = native_close(independent)
-            return false
-
-        def archive_block_zero(archive: darray[u8]&, offset: usize) -> bool:
-            return false if offset + 512.usize() > archive.count
-            for index in 0..<512 |archive, offset|:
-                return false if archive[offset + index] != 0
-            return true
-
-        def archive_range_zero(archive: darray[u8]&, offset: usize, length: usize) -> bool:
-            return false if offset + length > archive.count
-            for index in 0..<length |archive, offset|:
-                return false if archive[offset + index] != 0
-            return true
-
-        def archive_header_shape(archive: darray[u8]&, offset: usize) -> bool:
-            return archive[offset + 257] == 117 and archive[offset + 258] == 115 and archive[offset + 259] == 116 and archive[offset + 260] == 97 and archive[offset + 261] == 114 and archive[offset + 262] == 0 and archive[offset + 263] == 48 and archive[offset + 264] == 48 and archive[offset + 156] == 48
-
-        def archive_metadata_zero(archive: darray[u8]&, offset: usize, name_length: usize) -> bool:
-            return false if not archive_range_zero(archive, offset + name_length + 1.usize(), 100.usize() - name_length - 1.usize())
-            return false if not archive_range_zero(archive, offset + 157.usize(), 100.usize())
-            return false if not archive_range_zero(archive, offset + 265.usize(), 80.usize())
-            return false if not archive_range_zero(archive, offset + 345.usize(), 155.usize())
-            return archive_range_zero(archive, offset + 500.usize(), 12.usize())
-
-        def parse_octal_raw(value: darray[u8]&, offset: usize, width: usize, out: mutable usize&) -> bool:
-            out <- 0.usize()
-            return false if width < 2.usize() or offset + width > value.count
-            cursor: mutable usize = offset
-            finish: usize = offset + width
-            parsed: mutable usize = 0.usize()
-            digits: mutable usize = 0.usize()
-            while cursor < finish and value[cursor] >= 48 and value[cursor] <= 55:
-                digit: usize = (value[cursor] - 48).usize()
-                return false if parsed > (18446744073709551615.usize() - digit) / 8.usize()
-                parsed <- parsed * 8.usize() + digit
-                digits <- digits + 1.usize()
-                cursor <- cursor + 1.usize()
-            return false if digits == 0.usize() or cursor >= finish or (value[cursor] != 0 and value[cursor] != 32)
-            cursor <- cursor + 1.usize()
-            while cursor < finish:
-                return false if value[cursor] != 0 and value[cursor] != 32
-                cursor <- cursor + 1.usize()
-            out <- parsed
-            return true
-
-        def archive_entry_safe(name: darray[u8]&) -> bool:
-            return false if name.count == 0.usize() or name.count >= 100.usize() or name[0] == 47 or name[0] == 92 or name[name.count - 1.usize()] == 47 or name[name.count - 1.usize()] == 92
-            return false if name.count >= 2.usize() and name[1] == 58
-            segment_start: mutable usize = 0.usize()
-            for index in 0..=name.count |name, segment_start|:
-                if index < name.count and name[index] != 47:
-                    return false if name[index] < 32 or name[index] >= 127 or name[index] == 92 or name[index] == 58
-                    continue
-                segment_length: usize = index - segment_start
-                return false if segment_length == 0.usize() or segment_length == 1.usize() and name[segment_start] == 46 or segment_length == 2.usize() and name[segment_start] == 46 and name[segment_start + 1.usize()] == 46
-                segment_start <- index + 1.usize()
-            return true
-
-        def archive_name_seen(seen: darray[u8]&, wanted: darray[u8]&) -> bool:
-            cursor: mutable usize = 0.usize()
-            while cursor < seen.count:
-                end: mutable usize = cursor
-                while end < seen.count and seen[end] != 0:
-                    end <- end + 1.usize()
-                common: usize = end - cursor if end - cursor < wanted.count else wanted.count
-                matches: mutable bool = true
-                for index in 0..<common |seen, wanted, cursor, matches|:
-                    left: mutable u8 = seen[cursor + index]
-                    right: mutable u8 = wanted[index]
-                    left <- left + 32 if left >= 65 and left <= 90
-                    right <- right + 32 if right >= 65 and right <= 90
-                    matches <- false if left != right
-                if matches:
-                    return true if end - cursor == wanted.count or common < wanted.count and wanted[common] == 47 or common < end - cursor and seen[cursor + common] == 47
-                cursor <- end + 1.usize()
             return false
 
         def archive_open_parent(root: i64, name: darray[u8]&, copy_out: mutable darray[u8]&, leaf_offset: mutable usize&, create_missing: bool, created_directories: mutable darray[u8]&, extracted_nodes: mutable usize&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
