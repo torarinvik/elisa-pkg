@@ -146,6 +146,7 @@ blob.rename(hidden)
 try:
     result = subprocess.run([sys.argv[1], "fetch", "--offline"], capture_output=True, timeout=30)
     assert result.returncode == 5, result
+    assert b"could not verify cached archive for bar 1.0.0" in result.stderr, result
     assert (clock.stat().st_ino, clock.read_bytes()) == clock_before
 finally:
     hidden.rename(blob)
