@@ -1,0 +1,83 @@
+# Private source snapshots used by the build sandbox.
+include "../archive.elisa"
+include "../package/selection.elisa"
+include "../project/files.elisa"
+include "./fingerprint.elisa"
+
+module BuildSnapshots:
+    public:
+        def remove_aggregate(path_name: cstr) -> bool can[Unsafe.PointerCast]:
+            return true if path_name[0].u8() == 0
+            status: i64 = Platform::pkg_unlink(path_name)
+            return status == 0 or status == -2
+
+        def remove_all(container_name: cstr, package_roots: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return true if container_name[0].u8() == 0
+            cleanup_ok: mutable bool = true
+            cursor: mutable usize = 0.usize()
+            while cursor < package_roots.count |package_roots, cursor, cleanup_ok|:
+                end: mutable usize = cursor
+                while end < package_roots.count and package_roots[end] != 0 |package_roots, end|:
+                    end <- end + 1.usize()
+                if end == cursor or end >= package_roots.count:
+                    cleanup_ok <- false
+                    break
+                path: mutable darray[u8] = []
+                for index in cursor..<end |package_roots, path|:
+                    path.push(package_roots[index])
+                path.push(0)
+                path_name: cstr = (&path[0]).cast[cstr] can Unsafe.PointerCast
+                cleanup_status: i64 = Platform::pkg_cleanup_package_snapshot(path_name)
+                cleanup_ok <- false if cleanup_status != 0
+                remove_status: i64 = Platform::pkg_rmdir(path_name)
+                cleanup_ok <- false if remove_status != 0 and remove_status != -2
+                cursor <- end + 1.usize()
+            container_status: i64 = Platform::pkg_rmdir(container_name)
+            cleanup_ok <- false if container_status != 0 and container_status != -2
+            return cleanup_ok
+
+        def create_verified(container: darray[u8]&, source_root: darray[u8]&, label: cstr,
+                                           expected_digest: darray[u8]&, relative_entry: darray[u8]&,
+                                           package_roots: mutable darray[u8]&, total_bytes: mutable usize&,
+                                           out_root: mutable darray[u8]&, out_entry: mutable darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            out_root.resize(0)
+            out_entry.resize(0)
+            return -75 if total_bytes > SourceFingerprint::maximum_snapshot_bytes
+            return -84 if not Archive::is_safe_entry(relative_entry) or PackageSelection::publish_path_forbidden(relative_entry)
+            template: mutable darray[u8] = []
+            ByteText::append(&template, container)
+            if template.count == 0.usize() or template[template.count - 1.usize()] != 47:
+                template.push(47)
+            ByteText::append_bounded_text(&template, label)
+            ByteText::append_text(&template, "-XXXXXX")
+            template.push(0)
+            mkdtemp_status: i64 = Platform::pkg_mkdtemp(&template)
+            return mkdtemp_status if mkdtemp_status != 0
+            snapshot_length: usize = Platform::pkg_strlen((&template[0]).cast[cstr] can Unsafe.PointerCast)
+            if snapshot_length == 0.usize() or snapshot_length >= 4096.usize():
+                cleanup_status: i64 = Platform::pkg_rmdir((&template[0]).cast[cstr] can Unsafe.PointerCast)
+                return -5 if cleanup_status != 0
+                return -36
+            for index in 0..<snapshot_length |out_root, template|:
+                out_root.push(template[index])
+            for index in 0..<out_root.count |package_roots, out_root|:
+                package_roots.push(out_root[index])
+            package_roots.push(0)
+            source_c: mutable darray[u8] = []
+            ProjectFiles::path_with_nul_into(source_root, &source_c)
+            source_name: cstr = (&source_c[0]).cast[cstr] can Unsafe.PointerCast
+            destination_name: cstr = (&template[0]).cast[cstr] can Unsafe.PointerCast
+            copied_bytes: i64 = Platform::pkg_snapshot_package_tree(source_name, destination_name)
+            return copied_bytes if copied_bytes < 0
+            return -75 if copied_bytes.usize() > SourceFingerprint::maximum_snapshot_bytes - total_bytes
+            total_bytes <- total_bytes + copied_bytes.usize()
+            copied_digest: mutable darray[u8] = []
+            return -86 if not SourceFingerprint::at(out_root, &copied_digest)
+            return -87 if not ByteText::equal(copied_digest, expected_digest)
+            relative_c: mutable darray[u8] = []
+            ProjectFiles::path_with_nul_into(relative_entry, &relative_c)
+            relative_name: cstr = (&relative_c[0]).cast[cstr] can Unsafe.PointerCast
+            entry_path: mutable darray[u8] = []
+            ProjectFiles::path_join_into(out_root, relative_name, &entry_path)
+            return -88 if not ProjectFiles::canonical_existing_path(entry_path, out_entry)
+            return 0
