@@ -137,61 +137,15 @@ module CheckpointStore:
             region read_status_scope:
                 read_status: Code = trust_tuf_state_read(state_path, &state)
                 return finish(lock_file_descriptor, read_status) if read_status != Code.Ok
-            if state.count == 0.usize():
-                clock_path: mutable darray[u8] = []
-                ByteText::append(&clock_path, state_path_snapshot)
-                ByteText::append_text(&clock_path, ".clock")
-                unused_clock: mutable u64 = 0.u64()
-                unused_clock_digest: mutable darray[u8] = []
-                no_clock: mutable bool = false
-                region clock_status_scope:
-                    clock_status: Code = read_clock(clock_path, &unused_clock, &unused_clock_digest, &no_clock)
-                    return finish(lock_file_descriptor, clock_status) if clock_status != Code.Ok
-                return finish(lock_file_descriptor, Code.TrustStateUnavailable) if not no_clock
-                return finish(lock_file_descriptor, Code.Ok)
-
-            state_path <- state_path.resize(0)
-            ByteText::append(&state_path, state_path_snapshot)
             clock_path: mutable darray[u8] = []
             ByteText::append(&clock_path, state_path_snapshot)
             ByteText::append_text(&clock_path, ".clock")
-            observed_clock: mutable u64 = 0.u64()
-            clock_missing: mutable bool = false
-            observed_state_digest: mutable darray[u8] = []
             region clock_status_scope:
-                clock_status: Code = read_clock(clock_path, &observed_clock, &observed_state_digest, &clock_missing)
+                clock_status: Code = verify_clock(clock_path, state)
                 return finish(lock_file_descriptor, clock_status) if clock_status != Code.Ok
-            return finish(lock_file_descriptor, Code.TrustStateUnavailable) if clock_missing
-            region current_state_digest_scope:
-                current_state_digest: mutable darray[u8] = []
-                return finish(lock_file_descriptor, Code.TrustStateUnavailable) if not Integrity::sha256_hex(state, &current_state_digest) or not ByteText::equal(observed_state_digest, current_state_digest)
-            region now_scope:
-                now: i64 = Platform::wall_clock_seconds()
-                return finish(lock_file_descriptor, Code.ClockUnavailable) if now < 0
-                return finish(lock_file_descriptor, Code.ClockRollback) if observed_clock > now.u64()
-
-            prefix: mutable darray[u8] = []
-            ByteText::append(&prefix, scope_digest)
-            prefix <- prefix.push(58)
+            return finish(lock_file_descriptor, Code.Ok) if state.count == 0.usize()
             batch: mutable darray[u8] = []
-            cursor: mutable usize = CheckpointRecords::header_length()
-            while cursor < state.count |state, cursor, prefix, batch|:
-                key: mutable darray[u8] = []
-                version: mutable darray[u8] = []
-                digest: mutable darray[u8] = []
-                next_cursor: mutable usize = 0.usize()
-                return finish(lock_file_descriptor, Code.TrustStateMalformed) if not CheckpointRecords::parse_row(state, cursor, &key, &version, &digest, &next_cursor)
-                if key.count > prefix.count and ByteText::starts_with(key, prefix):
-                    if batch.count == 0.usize():
-                        ByteText::append_text(&batch, "elisapkg-tuf-batch:1\n")
-                    for index in prefix.count..<key.count |batch, key|:
-                        batch <- batch.push(key[index])
-                    batch <- batch.push(32)
-                    ByteText::append(&batch, version)
-                    batch <- batch.push(32)
-                    ByteText::append(&batch, digest)
-                    batch <- batch.push(10)
-                cursor <- next_cursor
+            return finish(lock_file_descriptor, Code.TrustStateMalformed) if not scoped_batch(state, scope_digest, &batch)
             region close_status_scope:
                 close_status: Code = finish(lock_file_descriptor, Code.ResourceLimit if batch.count > Tuf::maximum_metadata_file_bytes else Code.Ok)
                 return close_status if close_status != Code.Ok
@@ -211,6 +165,49 @@ module CheckpointStore:
             for index in 0..<loaded.count |out, loaded|:
                 out.push(loaded[index])
             return Code.Ok
+
+        # An empty state must have no clock. A non-empty state must have a
+        # clock that records its digest and does not lie in the future.
+        def verify_clock(clock_path: darray[u8]&, state: darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            observed_clock: mutable u64 = 0.u64()
+            clock_missing: mutable bool = false
+            observed_state_digest: mutable darray[u8] = []
+            region clock_status_scope:
+                clock_status: Code = read_clock(clock_path, &observed_clock, &observed_state_digest, &clock_missing)
+                return clock_status if clock_status != Code.Ok
+            return Code.Ok if state.count == 0.usize() and clock_missing
+            return Code.TrustStateUnavailable if state.count == 0.usize() or clock_missing
+            region current_state_digest_scope:
+                current_state_digest: mutable darray[u8] = []
+                return Code.TrustStateUnavailable if not Integrity::sha256_hex(state, &current_state_digest) or not ByteText::equal(observed_state_digest, current_state_digest)
+            now: i64 = Platform::wall_clock_seconds()
+            return Code.ClockUnavailable if now < 0
+            return Code.ClockRollback if observed_clock > now.u64()
+            return Code.Ok
+
+        # Collect the rows scoped to one registry as a TUF batch, with the
+        # "SCOPE_DIGEST:" key prefix removed. Returns false for a malformed row.
+        def scoped_batch(state: darray[u8]&, scope_digest: darray[u8]&, batch: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            prefix: mutable darray[u8] = [scope_digest[index] for index in 0..<scope_digest.count]
+            prefix <- prefix.push(58)
+            cursor: mutable usize = CheckpointRecords::header_length()
+            while cursor < state.count |state, cursor, prefix, batch|:
+                key: mutable darray[u8] = []
+                version: mutable darray[u8] = []
+                digest: mutable darray[u8] = []
+                next_cursor: mutable usize = 0.usize()
+                return false if not CheckpointRecords::parse_row(state, cursor, &key, &version, &digest, &next_cursor)
+                if key.count > prefix.count and ByteText::starts_with(key, prefix):
+                    if batch.count == 0.usize():
+                        ByteText::append_text(batch, "elisapkg-tuf-batch:1\n")
+                    ByteText::append_range(batch, key, prefix.count, key.count)
+                    batch.push(32)
+                    ByteText::append(batch, version)
+                    batch.push(32)
+                    ByteText::append(batch, digest)
+                    batch.push(10)
+                cursor <- next_cursor
+            return true
 
         def checkpoint_result(status: CheckpointRecords::Code) -> Code:
             return Code.MalformedMetadata if status == CheckpointRecords::Code.MalformedBatch
