@@ -145,24 +145,12 @@ module ResolutionCommand:
                 name: mutable darray[u8] = []
                 version: mutable darray[u8] = []
                 return CliStatus::usage if not ProjectManifest::validate(raw, &name, &version)
-                # Keep output identity in owned buffers. The resolver walks and
-                # normalizes graph records; preserving these copies prevents an
-                # implementation detail of that traversal from emptying the
-                # caller's manifest fields before the success envelope is emitted.
-                resolved_name: mutable darray[u8] = []
-                resolved_version: mutable darray[u8] = []
-                for index in 0..<name.count |resolved_name, name|:
-                    resolved_name <- resolved_name.push(name[index])
-                for index in 0..<version.count |resolved_version, version|:
-                    resolved_version <- resolved_version.push(version[index])
-                resolved_name_storage: mutable darray[u8] = []
-                resolved_version_storage: mutable darray[u8] = []
-                for index in 0..<resolved_name.count |resolved_name_storage, resolved_name|:
-                    resolved_name_storage <- resolved_name_storage.push(resolved_name[index])
-                for index in 0..<resolved_version.count |resolved_version_storage, resolved_version|:
-                    resolved_version_storage <- resolved_version_storage.push(resolved_version[index])
-                resolved_name_storage <- resolved_name_storage.push(0)
-                resolved_version_storage <- resolved_version_storage.push(0)
+                # Keep output identity in owned, terminated buffers. The resolver
+                # walks and normalizes graph records; these copies keep that
+                # traversal from emptying the manifest fields before the success
+                # envelope is emitted.
+                resolved_name_storage: darray[u8] = terminated_copy(name)
+                resolved_version_storage: darray[u8] = terminated_copy(version)
                 resolved_name_text: cstr = (&resolved_name_storage[0]).cast[cstr] can Unsafe.PointerCast
                 resolved_version_text: cstr = (&resolved_version_storage[0]).cast[cstr] can Unsafe.PointerCast
                 preferred_lock: mutable darray[u8] = []
@@ -176,81 +164,20 @@ module ResolutionCommand:
                     # to investigate permissions, corruption, or a hostile filesystem.
                     CliOutput::write_error("error: existing elisapkg.lock is unreadable; refusing to replace it\n")
                     return CliStatus::resolution_failed
-                # Validate existing locks without consulting a registry provider.
-                if options.locked or options.frozen:
+                replay: mutable bool = false
+                return CliStatus::resolution_failed if not replays_existing_lock(raw, options, &replay)
+                if replay:
                     return CliStatus::resolution_failed if:
                         lock_state == -2
                         not LockValidation::matches_manifest(raw, preferred_lock, name, version, start)
                     write_resolved_text(resolved_name_text, resolved_version_text, options) if emit_result
                     return CliStatus::success
-                # Offline resolution may validate and replay an existing lock, but it must
-                # never consult a provider or refresh signed metadata. A registry graph
-                # without a lock is therefore unavailable offline; local graphs use the
-                # same canonical byte comparison as locked mode.
-                if options.offline:
-                    offline_registry_roots: mutable darray[Solver::Constraint] = []
-                    region offline_has_local_dependency_scope:
-                        offline_has_local_dependency: mutable bool = false
-                        return CliStatus::resolution_failed if not RegistryRoots::collect(raw, &offline_registry_roots, &offline_has_local_dependency)
-                    if offline_registry_roots.count > 0.usize():
-                        return CliStatus::resolution_failed if:
-                            lock_state == -2
-                            not LockValidation::matches_manifest(raw, preferred_lock, name, version, start)
-                        write_resolved_text(resolved_name_text, resolved_version_text, options) if emit_result
-                        return CliStatus::success
                 lock: darray[u8] = LockResolution::canonical_with_options(name, version, raw, start, options, preferred_lock)
-                if lock.count > 0.usize() and lock[0] > 0 and lock[0] < 32:
-                    code: mutable Registry::ResultCode = Registry::ResultCode.TrustStateMalformed
-                    region encoded_code_scope:
-                        encoded_code: u8 = lock[0] - 1.u8()
-                        # The sentinel stores the enum value plus one so an empty lock remains
-                        # reserved for ordinary resolution failure.
-                        code <- Registry::ResultCode.NotConfigured if encoded_code == Registry::ResultCode.NotConfigured.u8()
-                        code <- Registry::ResultCode.InvalidConfiguration if encoded_code == Registry::ResultCode.InvalidConfiguration.u8()
-                        code <- Registry::ResultCode.MissingIndex if encoded_code == Registry::ResultCode.MissingIndex.u8()
-                        code <- Registry::ResultCode.NoMatchingVersion if encoded_code == Registry::ResultCode.NoMatchingVersion.u8()
-                        code <- Registry::ResultCode.MalformedMetadata if encoded_code == Registry::ResultCode.MalformedMetadata.u8()
-                        code <- Registry::ResultCode.MissingSignature if encoded_code == Registry::ResultCode.MissingSignature.u8()
-                        code <- Registry::ResultCode.MissingTrustRoot if encoded_code == Registry::ResultCode.MissingTrustRoot.u8()
-                        code <- Registry::ResultCode.InvalidSignature if encoded_code == Registry::ResultCode.InvalidSignature.u8()
-                        code <- Registry::ResultCode.ExpiredMetadata if encoded_code == Registry::ResultCode.ExpiredMetadata.u8()
-                        code <- Registry::ResultCode.RollbackDetected if encoded_code == Registry::ResultCode.RollbackDetected.u8()
-                        code <- Registry::ResultCode.DigestMismatch if encoded_code == Registry::ResultCode.DigestMismatch.u8()
-                        code <- Registry::ResultCode.ArchiveMissing if encoded_code == Registry::ResultCode.ArchiveMissing.u8()
-                        code <- Registry::ResultCode.ResourceLimit if encoded_code == Registry::ResultCode.ResourceLimit.u8()
-                        code <- Registry::ResultCode.TrustStateUnavailable if encoded_code == Registry::ResultCode.TrustStateUnavailable.u8()
-                        code <- Registry::ResultCode.TrustStateMalformed if encoded_code == Registry::ResultCode.TrustStateMalformed.u8()
-                        code <- Registry::ResultCode.ClockRollback if encoded_code == Registry::ResultCode.ClockRollback.u8()
-                        code <- Registry::ResultCode.Unsatisfiable if encoded_code == Registry::ResultCode.Unsatisfiable.u8()
-                        code <- Registry::ResultCode.ClockUnavailable if encoded_code == Registry::ResultCode.ClockUnavailable.u8()
-                        code <- Registry::ResultCode.ExpiryHorizon if encoded_code == Registry::ResultCode.ExpiryHorizon.u8()
-                        code <- Registry::ResultCode.TrustRootChanged if encoded_code == Registry::ResultCode.TrustRootChanged.u8()
-                        code <- Registry::ResultCode.TufEquivocationDetected if encoded_code == Registry::ResultCode.TufEquivocationDetected.u8()
-                    CliOutput::write_error("error: ")
-                    CliOutput::write_error(Registry::result_message(code))
-                    if code == Registry::ResultCode.Unsatisfiable:
-                        write_registry_conflict(lock)
-                        CliOutput::write_error("\n")
-                        return CliStatus::resolution_failed
-                    if code == Registry::ResultCode.TrustStateUnavailable or code == Registry::ResultCode.TrustStateMalformed or code == Registry::ResultCode.ClockRollback:
-                        CliOutput::write_error(" while recording registry trust state\n")
-                    else:
-                        CliOutput::write_error("\n")
-                    return CliStatus::security_failed if Registry::is_security_failure(code) else CliStatus::resolution_failed
-
+                return report_resolution_failure(lock) if lock.count > 0.usize() and lock[0] > 0 and lock[0] < 32
                 return CliStatus::resolution_failed if lock.count == 0.usize()
-                if not transaction_owned:
-                    if not ProjectTransaction::begin_with_lock(raw, lock_state, preferred_lock):
-                        CliOutput::write_error("error: could not claim the package transaction; another edit may be active or the manifest or lockfile may have changed\n")
-                        return CliStatus::security_failed
-                region publication_scope:
-                    publication: ProjectTransaction::LockPublication = ProjectTransaction::publish_lock(&lock)
-                    if publication != ProjectTransaction::LockPublication.Published:
-                        if not transaction_owned:
-                            _ = ProjectTransaction::restore()
-                        return CliStatus::resolution_failed if publication == ProjectTransaction::LockPublication.WriteFailed else CliStatus::security_failed
-                if not transaction_owned:
-                    return CliStatus::security_failed if not ProjectTransaction::commit()
+                region publication_status_scope:
+                    publication_status: i64 = publish_resolved_lock(lock, raw, lock_state, preferred_lock, transaction_owned)
+                    return publication_status if publication_status != CliStatus::success
                 write_resolved_text(resolved_name_text, resolved_version_text, options) if emit_result
                 return CliStatus::success
 
@@ -364,6 +291,74 @@ module ResolutionCommand:
                 return CliStatus::success
 
     private:
+        def terminated_copy(bytes: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
+            copy: mutable darray[u8] = [bytes[index] for index in 0..<bytes.count]
+            copy <- copy.push(0)
+            return copy
+
+        # Locked and frozen modes validate an existing lock without consulting
+        # a registry provider. Offline mode may replay an existing lock but
+        # never consults a provider or refreshes signed metadata, so a registry
+        # graph without a lock is unavailable offline; local graphs resolve
+        # normally and use the same canonical byte comparison.
+        # Returns false when the manifest's registry roots cannot be read.
+        def replays_existing_lock(raw: darray[u8]&, options: Model::CommandOptions, replay: mutable bool&) -> bool can[Memory.Allocate, Abort.Panic]:
+            replay <- options.locked or options.frozen
+            return true if replay or not options.offline
+            registry_roots: mutable darray[Solver::Constraint] = []
+            has_local_dependency: mutable bool = false
+            return false if not RegistryRoots::collect(raw, &registry_roots, &has_local_dependency)
+            replay <- registry_roots.count > 0.usize()
+            return true
+
+        # Claim the project transaction unless the caller owns it, publish the
+        # lock, and commit. A failed publication restores the project.
+        def publish_resolved_lock(lock: darray[u8]&, raw: darray[u8]&, lock_state: i64, preferred_lock: darray[u8]&, transaction_owned: bool) -> i64 can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global{Read,Write}:
+                if not transaction_owned and not ProjectTransaction::begin_with_lock(raw, lock_state, preferred_lock):
+                    CliOutput::write_error("error: could not claim the package transaction; another edit may be active or the manifest or lockfile may have changed\n")
+                    return CliStatus::security_failed
+                owned_lock: mutable darray[u8] = [lock[index] for index in 0..<lock.count]
+                publication: ProjectTransaction::LockPublication = ProjectTransaction::publish_lock(&owned_lock)
+                if publication != ProjectTransaction::LockPublication.Published:
+                    if not transaction_owned:
+                        _ = ProjectTransaction::restore()
+                    return CliStatus::resolution_failed if publication == ProjectTransaction::LockPublication.WriteFailed else CliStatus::security_failed
+                return CliStatus::security_failed if not transaction_owned and not ProjectTransaction::commit()
+                return CliStatus::success
+
+        # The resolver reports a registry failure as a one-byte lock holding
+        # the result code plus one, so an empty lock stays reserved for an
+        # ordinary resolution failure.
+        def report_resolution_failure(lock: darray[u8]&) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                code: Registry::ResultCode = decoded_result_code(lock[0] - 1.u8())
+                CliOutput::write_error("error: ")
+                CliOutput::write_error(Registry::result_message(code))
+                if code == Registry::ResultCode.Unsatisfiable:
+                    write_registry_conflict(lock)
+                    CliOutput::write_error("\n")
+                    return CliStatus::resolution_failed
+                if code == Registry::ResultCode.TrustStateUnavailable or code == Registry::ResultCode.TrustStateMalformed or code == Registry::ResultCode.ClockRollback:
+                    CliOutput::write_error(" while recording registry trust state\n")
+                else:
+                    CliOutput::write_error("\n")
+                return CliStatus::security_failed if Registry::is_security_failure(code) else CliStatus::resolution_failed
+
+        # Unknown codes decode as a malformed trust state.
+        def decoded_result_code(encoded: u8) -> Registry::ResultCode:
+            codes: darray[Registry::ResultCode] = [
+                Registry::ResultCode.NotConfigured, Registry::ResultCode.InvalidConfiguration, Registry::ResultCode.MissingIndex,
+                Registry::ResultCode.NoMatchingVersion, Registry::ResultCode.MalformedMetadata, Registry::ResultCode.MissingSignature,
+                Registry::ResultCode.MissingTrustRoot, Registry::ResultCode.InvalidSignature, Registry::ResultCode.ExpiredMetadata,
+                Registry::ResultCode.RollbackDetected, Registry::ResultCode.DigestMismatch, Registry::ResultCode.ArchiveMissing,
+                Registry::ResultCode.ResourceLimit, Registry::ResultCode.TrustStateUnavailable, Registry::ResultCode.TrustStateMalformed,
+                Registry::ResultCode.ClockRollback, Registry::ResultCode.Unsatisfiable, Registry::ResultCode.ClockUnavailable,
+                Registry::ResultCode.ExpiryHorizon, Registry::ResultCode.TrustRootChanged, Registry::ResultCode.TufEquivocationDetected]
+            for index in 0..<codes.count:
+                return codes[index] if codes[index].u8() == encoded
+            return Registry::ResultCode.TrustStateMalformed
+
         def print_lock_packages(raw: darray[u8]&) -> bool can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic]:
             can Global.Read:
                 found: mutable usize = 0.usize()
