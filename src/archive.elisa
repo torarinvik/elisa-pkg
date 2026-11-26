@@ -82,10 +82,7 @@ module Archive:
         def read_ustar_entry(archive: darray[u8]&, wanted: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
             out.resize(0)
             return false if not is_safe_entry(wanted)
-            if not scan_ustar_archive(archive, wanted, out, true):
-                out.resize(0)
-                return false
-            return true
+            return scan_ustar_archive(archive, wanted, out, true)
 
     private:
         const max_embedded_manifest_size: usize = 1048576
@@ -97,13 +94,17 @@ module Archive:
             cursor: mutable usize = 0.usize()
             entries: mutable usize = 0.usize()
             seen: mutable darray[u8] = []
-            found: mutable bool = false
+            selected_payload_start: mutable usize = 0.usize()
+            selected_payload_size: mutable usize = 0.usize()
             while cursor + 512.usize() <= archive.count:
                 if UstarFields::archive_block_zero(archive, cursor):
                     valid_end: bool = UstarFields::archive_block_zero(archive, cursor + 512.usize()) and cursor + 1024.usize() == archive.count and entries > 0.usize()
-                    if extract:
-                        return valid_end and found
-                    return valid_end
+                    return valid_end if not extract
+                    return false if not valid_end or selected_payload_start == 0.usize()
+                    out.resize(selected_payload_size)
+                    for index in 0..<selected_payload_size |archive, selected_payload_start, out|:
+                        out[index] <- archive[selected_payload_start + index]
+                    return true
                 return false if entries >= PackagePathPolicy::max_package_archive_entries
                 return false if cursor + 512.usize() > archive.count
                 name: mutable darray[u8] = []
@@ -121,13 +122,10 @@ module Archive:
                 size: usize = payload_size.usize()
                 next_offset: usize = UstarFields::next_entry_offset(archive, cursor, size)
                 return false if next_offset == 0.usize()
-                data_start: usize = cursor + 512.usize()
                 if extract and archive_entry_equal(name, wanted):
-                    return false if found or size > max_embedded_manifest_size
-                    out.resize(size)
-                    for index in 0..<size |archive, data_start, out|:
-                        out[index] <- archive[data_start + index]
-                    found <- true
+                    return false if selected_payload_start != 0.usize() or size > max_embedded_manifest_size
+                    selected_payload_start <- cursor + 512.usize()
+                    selected_payload_size <- size
                 cursor <- next_offset
                 entries <- entries + 1.usize()
             return false
