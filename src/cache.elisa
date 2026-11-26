@@ -12,7 +12,7 @@ module Cache:
         def shard_path(digest: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
             out.resize(0)
             return false if not Integrity::valid_sha256_hex(digest)
-            append_literal(out, ".elisapkg/cache/sha256/")
+            ByteText::append_text(out, ".elisapkg/cache/sha256/")
             out.push(digest[0])
             out.push(digest[1])
             return true
@@ -52,12 +52,12 @@ module Cache:
             out.push(46)
             for index in 0..<metadata_digest.count |out, metadata_digest|:
                 out.push(metadata_digest[index])
-            append_literal(out, ".receipt")
+            ByteText::append_text(out, ".receipt")
             return true
 
         def registry_signature_path(metadata_digest: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
             return false if not blob_path(metadata_digest, out)
-            append_literal(out, ".sig")
+            ByteText::append_text(out, ".sig")
             return true
 
         def verify_blob(digest: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -95,7 +95,7 @@ module Cache:
         def encode_registry_receipt(package: darray[u8]&, version: darray[u8]&, archive: darray[u8]&, archive_size: u64, digest: darray[u8]&, metadata_digest: darray[u8]&, expires: u64) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
             receipt: mutable darray[u8] = []
             append_registry_receipt_prefix(package, version, archive, archive_size, digest, metadata_digest, &receipt)
-            registry_append_decimal(&receipt, expires)
+            ByteText::append_decimal(&receipt, expires)
             receipt <- receipt.push(10)
             return [] if receipt.count > max_registry_receipt_bytes
             return receipt
@@ -105,82 +105,42 @@ module Cache:
             return false if receipt.count == 0.usize() or receipt.count > max_registry_receipt_bytes
             prefix: mutable darray[u8] = []
             append_registry_receipt_prefix(package, version, archive, archive_size, digest, metadata_digest, &prefix)
-            return false if not bytes_starts_with(receipt, prefix)
+            return false if not ByteText::starts_with(receipt, prefix)
             # The writer emits one to twenty decimal digits and one LF.
             return false if receipt.count - prefix.count < 2.usize() or receipt[receipt.count - 1.usize()] != 10
             finish: usize = receipt.count - 1.usize()
             digit_count: usize = finish - prefix.count
             return false if digit_count > 20.usize() or (digit_count > 1.usize() and receipt[prefix.count] == 48)
             expires: mutable u64 = 0
-            for index in prefix.count..<finish |receipt, expires|:
-                byte: u8 = receipt[index]
-                return false if byte < 48 or byte > 57
-                digit: u64 = (byte - 48).u64()
-                return false if expires > (18446744073709551615.u64() - digit) / 10.u64()
-                expires <- expires * 10.u64() + digit
+            end: mutable usize = prefix.count
+            return false if:
+                not ByteText::scan_unsigned_decimal(receipt, prefix.count, finish, &end, &expires)
+                end != finish
             expires_out <- expires
             return true
 
     private:
         def append_registry_receipt_prefix(package: darray[u8]&, version: darray[u8]&, archive: darray[u8]&, archive_size: u64, digest: darray[u8]&, metadata_digest: darray[u8]&, out: mutable darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
-            append_literal(out, "elisapkg-registry-cache:1\nregistry:primary\nname:")
-            bytes_push_array(out, package)
-            append_literal(out, "\nversion:")
-            bytes_push_array(out, version)
-            append_literal(out, "\narchive:")
-            bytes_push_array(out, archive)
-            append_literal(out, "\narchive-size:")
-            registry_append_decimal(out, archive_size)
-            append_literal(out, "\narchive-digest:sha256:")
-            bytes_push_array(out, digest)
-            append_literal(out, "\nmetadata-digest:sha256:")
-            bytes_push_array(out, metadata_digest)
-            append_literal(out, "\nexpires:")
-
-        def bytes_push_array(out: mutable darray[u8]&, value: darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
-            for index in 0..<value.count |out, value|:
-                out.push(value[index])
-
-        def bytes_starts_with(value: darray[u8]&, prefix: darray[u8]&) -> bool:
-            return false if prefix.count > value.count
-            for index in 0..<prefix.count |value, prefix|:
-                return false if value[index] != prefix[index]
-            return true
-
-        def registry_append_decimal(out: mutable darray[u8]&, value: u64) -> void can[Memory.Allocate, Abort.Panic]:
-            start: usize = out.count
-            out.resize(start + 20.usize())
-            number: mutable u64 = value
-            cursor: mutable usize = start
-            if number == 0:
-                out[cursor] <- 48
-                cursor <- cursor + 1.usize()
-            else:
-                while number > 0 |out, number, cursor|:
-                    out[cursor] <- 48 + (number % 10).u8()
-                    cursor <- cursor + 1.usize()
-                    number <- number / 10
-                left: mutable usize = start
-                right: mutable usize = cursor
-                while left < right and right - left > 1.usize() |out, left, right|:
-                    right <- right - 1.usize()
-                    temporary: u8 = out[left]
-                    out[left] <- out[right]
-                    out[right] <- temporary
-                    left <- left + 1.usize()
-            out.resize(cursor)
+            ByteText::append_text(out, "elisapkg-registry-cache:1\nregistry:primary\nname:")
+            ByteText::append(out, package)
+            ByteText::append_text(out, "\nversion:")
+            ByteText::append(out, version)
+            ByteText::append_text(out, "\narchive:")
+            ByteText::append(out, archive)
+            ByteText::append_text(out, "\narchive-size:")
+            ByteText::append_decimal(out, archive_size)
+            ByteText::append_text(out, "\narchive-digest:sha256:")
+            ByteText::append(out, digest)
+            ByteText::append_text(out, "\nmetadata-digest:sha256:")
+            ByteText::append(out, metadata_digest)
+            ByteText::append_text(out, "\nexpires:")
 
         def quarantine_path(digest: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
             out.resize(0)
             return false if not Integrity::valid_sha256_hex(digest)
-            append_literal(out, quarantine_directory)
+            ByteText::append_text(out, quarantine_directory)
             out.push(47)
             for index in 0..<digest.count |out, digest|:
                 out.push(digest[index])
-            append_literal(out, ".invalid")
+            ByteText::append_text(out, ".invalid")
             return true
-
-        def append_literal(out: mutable darray[u8]&, suffix: cstr) -> void can[Memory.Allocate, Abort.Panic]:
-            length: usize = Platform::pkg_strlen(suffix)
-            for index in 0..<length |out, suffix|:
-                out.push(suffix[index].u8())
