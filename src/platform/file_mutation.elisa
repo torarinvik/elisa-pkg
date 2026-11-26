@@ -46,53 +46,8 @@ module NativeFileMutation:
         def rename(old_path: cstr, new_path: cstr) -> i64:
             return rename_secure(old_path, new_path)
 
-        def mkstemp(template_path: mutable darray[u8]&) -> i64 can[Memory.Allocate, Unsafe.PointerCast]:
-            return -22 if template_path.count == 0 or template_path.count > 4096.usize() or template_path[template_path.count - 1.usize()] != 0
-            path_length: usize = native_strlen((&template_path[0]).cast[cstr] can Unsafe.PointerCast)
-            path: cstr = (&template_path[0]).cast[cstr] can Unsafe.PointerCast
-            parent: mutable darray[u8] = []
-            leaf: mutable darray[u8] = []
-            return -22 if not PlatformNative::split_parent_leaf(path, &parent, &leaf)
-            return -22 if leaf.count < 7.usize()
-            suffix: usize = leaf.count - 7.usize()
-            for index in 0..<6 |leaf|:
-                return -22 if leaf[suffix + index] != 88
-            directory: i64 =
-                parent_name: cstr = (&parent[0]).cast[cstr] can Unsafe.PointerCast
-                PlatformNative::open_directory_path(parent_name)
-            return directory if directory < 0
-            alphabet: cstr = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-            entropy: mutable darray[u8] = []
-            entropy <- entropy.resize(6)
-            entropy_raw: mutable void& = (&entropy[0]).cast[mutable void&] can Unsafe.PointerCast
-            for attempt in 0..<256 |leaf, alphabet, directory, template_path, path_length, entropy_raw|:
-                native_arc4random_buf(entropy_raw, 6)
-                for index in 0..<6 |leaf, alphabet, entropy, attempt|:
-                    leaf[suffix + index] <- alphabet[((entropy[index].u64() + attempt.u64() * 17.u64() + index.u64()) % 62.u64()).usize()].u8()
-                file_descriptor: i64 =
-                    leaf_name: cstr = (&leaf[0]).cast[cstr] can Unsafe.PointerCast
-                    native_openat(directory, leaf_name, flags_read_write_create_exclusive(), 384)
-                if file_descriptor >= 0:
-                    region start_scope:
-                        start: usize = path_length - leaf.count + 1.usize()
-                        for index in 0..<leaf.count |template_path, leaf, start|:
-                            template_path[start + index] <- leaf[index]
-                    if native_close(directory) != 0:
-                        _ = native_close(file_descriptor)
-                        # The descriptor close failure means the caller must
-                        # treat creation as failed. Remove the newly-created
-                        # name so an unreported temporary cannot accumulate
-                        # in the package cache.
-                        _ =
-                            cleanup_path: mutable darray[u8] = []
-                            for index in 0..<template_path.count |cleanup_path, template_path|:
-                                cleanup_path <- cleanup_path.push(template_path[index])
-                            cleanup_name: cstr = (&cleanup_path[0]).cast[cstr] can Unsafe.PointerCast
-                            unlink_kind(cleanup_name, 0)
-                        return -5
-                    return file_descriptor
-                return PlatformNative::close_error(directory, NativeErrors::negative_errno()) if NativeErrors::current_errno() != 17
-            return PlatformNative::close_error(directory, -17)
+        def mkstemp(template_path: mutable darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return create_temporary(template_path, false)
 
         # Reserve a caller-selected name without following a pre-planted symlink.
         # This is used only for the legacy stage1 callback filename, which is
@@ -108,48 +63,61 @@ module NativeFileMutation:
         # All path traversal uses openat with O_NOFOLLOW; the random leaf is
         # reserved atomically with mkdirat rather than checked before creation.
         def mkdtemp(template_path: mutable darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            return -22 if template_path.count == 0 or template_path.count > 4096.usize() or template_path[template_path.count - 1.usize()] != 0
-            path_length: usize = native_strlen((&template_path[0]).cast[cstr] can Unsafe.PointerCast)
-            path: cstr = (&template_path[0]).cast[cstr] can Unsafe.PointerCast
-            parent: mutable darray[u8] = []
-            leaf: mutable darray[u8] = []
-            return -22 if not PlatformNative::split_parent_leaf(path, &parent, &leaf) or leaf.count < 7.usize()
-            suffix: usize = leaf.count - 7.usize()
-            for index in 0..<6 |leaf|:
-                return -22 if leaf[suffix + index] != 88
-            directory: i64 =
-                parent_name: cstr = (&parent[0]).cast[cstr] can Unsafe.PointerCast
-                PlatformNative::open_directory_path(parent_name)
-            return directory if directory < 0
-            alphabet: cstr = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-            entropy: mutable darray[u8] = []
-            entropy <- entropy.resize(6)
-            entropy_raw: mutable void& = (&entropy[0]).cast[mutable void&] can Unsafe.PointerCast
-            for attempt in 0..<256 |leaf, alphabet, entropy, entropy_raw, directory, template_path, path_length|:
-                native_arc4random_buf(entropy_raw, 6)
-                for index in 0..<6 |leaf, alphabet, entropy, attempt|:
-                    leaf[suffix + index] <- alphabet[((entropy[index].u64() + attempt.u64() * 17.u64() + index.u64()) % 62.u64()).usize()].u8()
-                result: i64 =
-                    leaf_name: cstr = (&leaf[0]).cast[cstr] can Unsafe.PointerCast
-                    native_mkdirat(directory, leaf_name, 448)
-                if result == 0:
-                    region start_scope:
-                        start: usize = path_length - leaf.count + 1.usize()
-                        for index in 0..<leaf.count |template_path, leaf, start|:
-                            template_path[start + index] <- leaf[index]
-                    if native_close(directory) != 0:
-                        _ =
-                            cleanup_path: mutable darray[u8] = []
-                            for index in 0..<template_path.count |cleanup_path, template_path|:
-                                cleanup_path <- cleanup_path.push(template_path[index])
-                            cleanup_name: cstr = (&cleanup_path[0]).cast[cstr] can Unsafe.PointerCast
-                            unlink_kind(cleanup_name, at_remove_directory)
-                        return -5
-                    return 0
-                return PlatformNative::close_error(directory, NativeErrors::negative_value(NativeErrors::current_errno())) if NativeErrors::current_errno() != 17
-            return PlatformNative::close_error(directory, -17)
+            return create_temporary(template_path, true)
 
     private:
+        # Replace the trailing `XXXXXX` of the null-terminated `template_path`
+        # with random characters and atomically create that name as a file
+        # (returning its descriptor) or as a directory (returning 0).
+        def create_temporary(template_path: mutable darray[u8]&, directory_kind: bool) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return -22 if template_path.count == 0 or template_path.count > 4096.usize() or template_path[template_path.count - 1.usize()] != 0
+            leaf: mutable darray[u8] = []
+            directory: i64 = open_parent_directory(((&template_path[0]).cast[cstr] can Unsafe.PointerCast), false, &leaf)
+            return directory if directory < 0
+            return PlatformNative::close_error(directory, -22) if not valid_template_leaf(leaf)
+            return reserve_random_leaf(directory, template_path, &leaf, directory_kind)
+
+        # A template leaf ends in six `X` characters before its terminator.
+        def valid_template_leaf(leaf: darray[u8]&) -> bool:
+            return false if leaf.count < 7.usize()
+            for index in 0..<6 |leaf|:
+                return false if leaf[leaf.count - 7.usize() + index] != 88
+            return true
+
+        def reserve_random_leaf(directory: i64, template_path: mutable darray[u8]&, leaf: mutable darray[u8]&, directory_kind: bool) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            requires directory >= 0
+            entropy: mutable darray[u8] = []
+            entropy <- entropy.resize(6)
+            for attempt in 0..<256 |leaf, entropy, directory, template_path|:
+                fill_random_suffix(leaf, &entropy, attempt)
+                region created_scope:
+                    created: i64 = native_mkdirat(directory, ((&leaf[0]).cast[cstr] can Unsafe.PointerCast), 448) if directory_kind else native_openat(directory, ((&leaf[0]).cast[cstr] can Unsafe.PointerCast), flags_read_write_create_exclusive(), 384)
+                    return finish_reservation(directory, template_path, leaf, created, directory_kind) if created >= 0
+                return PlatformNative::close_error(directory, NativeErrors::negative_errno()) if NativeErrors::current_errno() != 17
+            return PlatformNative::close_error(directory, -17)
+
+        def fill_random_suffix(leaf: mutable darray[u8]&, entropy: mutable darray[u8]&, attempt: usize) -> void can[Unsafe.PointerCast]:
+            requires leaf.count >= 7.usize() and entropy.count == 6.usize()
+            native_arc4random_buf(((&entropy[0]).cast[mutable void&] can Unsafe.PointerCast), 6)
+            alphabet: cstr = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+            for index in 0..<6 |leaf, alphabet, entropy, attempt|:
+                leaf[leaf.count - 7.usize() + index] <- alphabet[((entropy[index].u64() + attempt.u64() * 17.u64() + index.u64()) % 62.u64()).usize()].u8()
+
+        # Copy the reserved leaf back into `template_path` and close the parent.
+        # A failed close means creation failed, so the new name is removed
+        # and no unreported temporary can accumulate in the package cache.
+        def finish_reservation(directory: i64, template_path: mutable darray[u8]&, leaf: darray[u8]&, created: i64, directory_kind: bool) -> i64 can[Unsafe.PointerCast]:
+            requires directory >= 0 and created >= 0
+            region start_scope:
+                start: usize = native_strlen((&template_path[0]).cast[cstr] can Unsafe.PointerCast) - leaf.count + 1.usize()
+                for index in 0..<leaf.count |template_path, leaf, start|:
+                    template_path[start + index] <- leaf[index]
+            return (0 if directory_kind else created) if native_close(directory) == 0
+            if not directory_kind:
+                _ = native_close(created)
+            _ = unlink_kind(((&template_path[0]).cast[cstr] can Unsafe.PointerCast), at_remove_directory if directory_kind else 0)
+            return -5
+
         # Split `path` into its parent directory and null-terminated leaf, and
         # open the parent. Returns the directory descriptor or a negative errno.
         def open_parent_directory(path: cstr, package_directory: bool, leaf: mutable darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
