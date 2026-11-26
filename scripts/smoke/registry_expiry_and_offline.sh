@@ -147,7 +147,6 @@ subprocess.run([openssl, "pkeyutl", "-sign", "-rawin", "-inkey", private_key,
                 "-in", str(unused_metadata_path), "-out", str(unused_dir / "metadata.sig")],
                check=True)
 PY
-write_registry_index foo 1 1.0.0,1.1.0
 write_registry_index unused 1 1.0.0
 
 write_registry_dependency() {
