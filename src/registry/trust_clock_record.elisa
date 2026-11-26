@@ -1,0 +1,51 @@
+# Clock floor and state digest recorded alongside registry trust state.
+include "../integrity.elisa"
+include "./bytes.elisa"
+
+module TrustClockRecord:
+    public:
+        def decode(encoded: darray[u8]&, out: mutable u64&, state_digest: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            out <- 0
+            state_digest.resize(0)
+            return false if encoded.count < 86.usize() or encoded.count > 105.usize()
+            return false if not RegistryBytes::starts_with_text(encoded, clock_prefix)
+            value: mutable u64 = 0
+            cursor: mutable usize = clock_prefix_bytes
+            while cursor < encoded.count and encoded[cursor] != 10:
+                return false if encoded[cursor] < 48 or encoded[cursor] > 57
+                digit: u64 = (encoded[cursor] - 48).u64()
+                return false if value > (18446744073709551615.u64() - digit) / 10.u64()
+                value <- value * 10.u64() + digit
+                cursor <- cursor + 1.usize()
+            return false if cursor == clock_prefix_bytes or cursor >= encoded.count
+            cursor <- cursor + 1.usize()
+            return false if encoded.count != cursor + digest_prefix_bytes + 65.usize()
+            for index in 0..<digest_prefix_bytes |encoded, cursor|:
+                return false if encoded[cursor + index] != digest_prefix[index].u8()
+            cursor <- cursor + digest_prefix_bytes
+            return false if encoded[encoded.count - 1.usize()] != 10
+            digest: mutable darray[u8] = []
+            for index in 0..<64.usize() |encoded, digest, cursor|:
+                byte: u8 = encoded[cursor + index]
+                return false if (byte < 48 or byte > 57) and (byte < 97 or byte > 102)
+                digest <- digest.push(byte)
+            RegistryBytes::append(state_digest, digest)
+            out <- value
+            return true
+
+        def encode(value: u64, state_digest: darray[u8]&, encoded: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            encoded.resize(0)
+            return false if not Integrity::valid_sha256_hex(state_digest)
+            RegistryBytes::append_text(encoded, clock_prefix)
+            RegistryBytes::append_decimal(encoded, value)
+            encoded.push(10)
+            RegistryBytes::append_text(encoded, digest_prefix)
+            RegistryBytes::append(encoded, state_digest)
+            encoded.push(10)
+            return true
+
+    private:
+        const clock_prefix_bytes: usize = 6.usize()
+        const digest_prefix_bytes: usize = 13.usize()
+        const clock_prefix: cstr = "clock:"
+        const digest_prefix: cstr = "state-sha256:"

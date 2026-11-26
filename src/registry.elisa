@@ -20,6 +20,7 @@ include "./tuf.elisa"
 include "./registry/index_snapshot.elisa"
 include "./registry/release_metadata.elisa"
 include "./registry/checkpoint_records.elisa"
+include "./registry/trust_clock_record.elisa"
 
 module Registry:
     public:
@@ -53,11 +54,11 @@ module Registry:
         # helpers from leaking into resolver constraints.
         def exact_requirement(version: Model::Version, out: mutable darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
             out.resize(0)
-            registry_append_decimal(out, version.major)
+            RegistryBytes::append_decimal(out, version.major)
             out.push(46)
-            registry_append_decimal(out, version.minor)
+            RegistryBytes::append_decimal(out, version.minor)
             out.push(46)
-            registry_append_decimal(out, version.patch)
+            RegistryBytes::append_decimal(out, version.patch)
 
         # Decode dependency constraints from already authenticated metadata.
         # The output is kept separate from metadata records because the current
@@ -555,29 +556,6 @@ module Registry:
 
     private:
 
-        def registry_append_decimal(out: mutable darray[u8]&, value: u64) -> void can[Memory.Allocate, Abort.Panic]:
-            start: usize = out.count
-            out.resize(start + 20.usize())
-            number: mutable u64 = value
-            cursor: mutable usize = start
-            if number == 0:
-                out[cursor] <- 48
-                cursor <- cursor + 1.usize()
-            else:
-                while number > 0 |out, number, cursor|:
-                    out[cursor] <- 48 + (number % 10).u8()
-                    cursor <- cursor + 1.usize()
-                    number <- number / 10
-                left: mutable usize = start
-                right: mutable usize = cursor
-                while left < right and right - left > 1.usize() |out, left, right|:
-                    right <- right - 1.usize()
-                    temporary: u8 = out[left]
-                    out[left] <- out[right]
-                    out[right] <- temporary
-                    left <- left + 1.usize()
-            out.resize(cursor)
-
         def registry_valid_name(value: darray[u8]&) -> bool:
             return PackageIdentity::valid_name(value)
 
@@ -1032,7 +1010,7 @@ module Registry:
         def record_index_generation(identity: darray[u8]&, generation: u64, snapshot_digest: darray[u8]&, expires: u64, key_fingerprint: darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             generation_version: mutable darray[u8] = []
             RegistryBytes::append_text(&generation_version, "0.0.")
-            registry_append_decimal(&generation_version, generation)
+            RegistryBytes::append_decimal(&generation_version, generation)
             return trust_state_record(identity, generation_version, snapshot_digest, snapshot_digest, expires, key_fingerprint)
 
         def selected_version_below(version: darray[u8]&, previous: Model::Version) -> bool:
@@ -1524,7 +1502,7 @@ module Registry:
             if guard_index:
                 expected_index_version: mutable darray[u8] = []
                 RegistryBytes::append_text(&expected_index_version, "0.0.")
-                registry_append_decimal(&expected_index_version, index_generation)
+                RegistryBytes::append_decimal(&expected_index_version, index_generation)
                 observed_index_version: mutable darray[u8] = []
                 observed_index_digest: mutable darray[u8] = []
                 observed_index_metadata_digest: mutable darray[u8] = []
@@ -1909,34 +1887,7 @@ module Registry:
                     missing <- true
                     return ResultCode.Ok
                 return ResultCode.TrustStateUnavailable
-            return ResultCode.TrustStateMalformed if loaded.count < 86.usize() or loaded.count > 105.usize()
-            prefix: cstr = "clock:"
-            prefix_length: usize = Platform::pkg_strlen(prefix)
-            return ResultCode.TrustStateMalformed if loaded.count <= prefix_length + 1.usize()
-            for index in 0..<prefix_length |loaded, prefix|:
-                return ResultCode.TrustStateMalformed if loaded[index] != prefix[index].u8()
-            value: mutable u64 = 0
-            cursor: mutable usize = prefix_length
-            while cursor < loaded.count and loaded[cursor] != 10:
-                return ResultCode.TrustStateMalformed if loaded[cursor] < 48 or loaded[cursor] > 57
-                digit: u64 = (loaded[cursor] - 48).u64()
-                return ResultCode.TrustStateMalformed if value > (18446744073709551615.u64() - digit) / 10.u64()
-                value <- value * 10.u64() + digit
-                cursor <- cursor + 1.usize()
-            return ResultCode.TrustStateMalformed if cursor == prefix_length or cursor >= loaded.count
-            cursor <- cursor + 1.usize()
-            hash_prefix: cstr = "state-sha256:"
-            hash_prefix_length: usize = Platform::pkg_strlen(hash_prefix)
-            return ResultCode.TrustStateMalformed if loaded.count != cursor + hash_prefix_length + 65.usize()
-            for index in 0..<hash_prefix_length |loaded, hash_prefix|:
-                return ResultCode.TrustStateMalformed if loaded[cursor + index] != hash_prefix[index].u8()
-            cursor <- cursor + hash_prefix_length
-            for index in 0..<64.usize() |loaded, state_digest, cursor|:
-                byte: u8 = loaded[cursor + index]
-                return ResultCode.TrustStateMalformed if (byte < 48 or byte > 57) and (byte < 97 or byte > 102)
-                state_digest.push(byte)
-            return ResultCode.TrustStateMalformed if loaded[loaded.count - 1.usize()] != 10
-            out <- value
+            return ResultCode.TrustStateMalformed if not TrustClockRecord::decode(loaded, out, state_digest)
             return ResultCode.Ok
 
         def trust_state_digest(state: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
@@ -1945,38 +1896,9 @@ module Registry:
             return false if Integrity::sha256(state, &digest_bytes) != Integrity::DigestCode.Ok
             return Integrity::hex_digest(digest_bytes, out)
 
-        def trust_clock_append_decimal(out: mutable darray[u8]&, value: u64) -> void can[Memory.Allocate, Abort.Panic]:
-            start: usize = out.count
-            out.resize(start + 20.usize())
-            number: mutable u64 = value
-            cursor: mutable usize = start
-            if number == 0:
-                out[cursor] <- 48
-                cursor <- cursor + 1.usize()
-            else:
-                while number > 0 |out, number, cursor|:
-                    out[cursor] <- 48 + (number % 10).u8()
-                    cursor <- cursor + 1.usize()
-                    number <- number / 10
-                left: mutable usize = start
-                right: mutable usize = cursor
-                while left < right and right - left > 1.usize() |out, left, right|:
-                    right <- right - 1.usize()
-                    temporary: u8 = out[left]
-                    out[left] <- out[right]
-                    out[right] <- temporary
-                    left <- left + 1.usize()
-            out.resize(cursor)
-
         def trust_clock_write(path: darray[u8]&, value: u64, state_digest: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
-            return false if not Integrity::valid_sha256_hex(state_digest)
             encoded: mutable darray[u8] = []
-            RegistryBytes::append_text(&encoded, "clock:")
-            trust_clock_append_decimal(&encoded, value)
-            encoded.push(10)
-            RegistryBytes::append_text(&encoded, "state-sha256:")
-            RegistryBytes::append(&encoded, state_digest)
-            encoded.push(10)
+            return false if not TrustClockRecord::encode(value, state_digest, &encoded)
             return trust_state_write(path, encoded)
 
         const max_metadata_lifetime_seconds: u64 = 2592000
