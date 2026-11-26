@@ -92,8 +92,24 @@ EOF
   else
     test "$?" -eq 2
   fi
+  python3 - <<'PY'
+import json
+from pathlib import Path
+
+path = Path("elisapkg.json")
+manifest = json.loads(path.read_text())
+del manifest["dependencies"]
+path.write_text(json.dumps(manifest, indent=2) + "\n")
+PY
   add_quiet_output="$("$BIN" add local-util --path local-util --quiet 2>/dev/null)"
   test -z "$add_quiet_output"
+  python3 - <<'PY'
+import json
+from pathlib import Path
+
+manifest = json.loads(Path("elisapkg.json").read_text())
+assert manifest["dependencies"] == {"local-util": {"path": "local-util"}}
+PY
   "$BIN" check-manifest >/dev/null
   "$BIN" resolve >/dev/null
   grep -F '"name":"nested-util"' elisapkg.lock >/dev/null

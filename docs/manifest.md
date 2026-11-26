@@ -13,7 +13,7 @@ The optional `package.elisa` field must use the stable requirement grammar
 described below. It is currently syntax-checked only; builds do not compare it
 with the selected compiler's version or capabilities.
 
-The minimum package is:
+An example package manifest is:
 
 ```json
 {
@@ -33,6 +33,9 @@ The minimum package is:
   "include": ["src/**", "elisapkg.json", "elisapkg.lock", "README.md", "LICENSE"]
 }
 ```
+
+The `dependencies` and `dev-dependencies` objects can be omitted when empty.
+`elisapkg add` creates `dependencies` on the first successful add.
 
 Package names are 1–64 bytes, start with a lowercase ASCII letter, and contain lowercase ASCII letters, digits, and single interior hyphens. Versions use `major.minor.patch` with an optional prerelease suffix and are limited to 128 bytes. Build metadata is not currently accepted as an identity field. Targets require unique package-style names, their kinds are limited to `bin`, `lib`, or `test`, and their entries must be existing regular files below the package root. Entries reject absolute, parent, dot-prefixed, backslash, and symlink path forms; target-specific compiler flags are not inherited from dependencies. `build` selects the first target by default, or a named target with `--bin NAME`, `--lib NAME`, or `--test NAME`. Executable and test targets are emitted as `.elisapkg/build/NAME`; library targets are emitted as `.elisapkg/build/NAME.o` regular object files. `run --bin NAME` and local installation require an executable target, and `test --test NAME` selects a test target. If present, `include` and `exclude` are JSON arrays containing unescaped strings; the current archive writer accepts bounded glob patterns where `*` matches within one path component and consecutive `**` matches across path separators. An excluded path is omitted even when it also matches `include`; the manifest and lockfile remain required release entries, and VCS/state directories plus common credential stores and files (including `.ssh`, `.aws`, `.kube`, `.docker`, `.config/gcloud`, `.config/gh`, `.npmrc`, `.pypirc`, `.env*`, and private-key formats) are always excluded. Credential rules apply to every path component, including directory names; a package root named as a credential store or credential file is rejected.
 
