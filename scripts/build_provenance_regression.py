@@ -181,6 +181,21 @@ def main() -> int:
         if checksum_path.read_text(encoding="ascii") != expected_checksum:
             raise SystemExit("error: release candidate checksum does not match the archive")
 
+        invalid_archive = archive_path.parent / "invalid.tar.gz"
+        for manifest_mode, extra_member in ((0o600, False), (0o644, True)):
+            with tarfile.open(invalid_archive, "w:gz", format=tarfile.USTAR_FORMAT) as archive:
+                provenance.add_tar_file(archive, binary, "elisapkg", 0o755)
+                provenance.add_tar_file(archive, manifest_path, "elisapkg.provenance.json", manifest_mode)
+                if extra_member:
+                    provenance.add_tar_file(archive, manifest_path, "unexpected.json", 0o644)
+            try:
+                provenance.verify_archive(invalid_archive, artifact_digest, binary.stat().st_size, manifest_bytes)
+            except provenance.ProvenanceError:
+                pass
+            else:
+                raise SystemExit("error: release archive verifier accepted a noncanonical archive")
+        invalid_archive.unlink()
+
         provenance.generate_candidate(**inputs)
         if manifest_path.read_bytes() != manifest_bytes or archive_path.read_bytes() != archive_bytes:
             raise SystemExit("error: identical release candidate inputs produced different archive bytes")

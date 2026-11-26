@@ -233,19 +233,36 @@ def verify_archive(
 ) -> None:
     # Check the bytes actually written. The build path may have been replaced
     # between recording its digest and opening it for packaging.
-    with tarfile.open(path, mode="r:gz") as archive:
-        binary_entry = archive.getmember("elisapkg")
-        if not binary_entry.isfile() or binary_entry.mode != 0o755 or binary_entry.size != expected_binary_size:
-            raise ProvenanceError("release archive executable metadata differs from provenance")
-        with archive.extractfile(binary_entry) as binary:
-            digest = hashlib.sha256()
-            for chunk in iter(lambda: binary.read(1024 * 1024), b""):
-                digest.update(chunk)
-        with archive.extractfile("elisapkg.provenance.json") as manifest:
-            if digest.hexdigest() != expected_binary_digest or (
-                manifest.read(MAX_MANIFEST_BYTES + 1) != expected_manifest
-            ):
-                raise ProvenanceError("release archive inputs changed during packaging")
+    try:
+        with tarfile.open(path, mode="r|gz") as archive:
+            binary_entry = require_archive_entry(archive, "elisapkg", expected_binary_size, 0o755)
+            with archive.extractfile(binary_entry) as binary:
+                digest = hashlib.sha256()
+                for chunk in iter(lambda: binary.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            manifest_entry = require_archive_entry(
+                archive, "elisapkg.provenance.json", len(expected_manifest), 0o644
+            )
+            with archive.extractfile(manifest_entry) as manifest:
+                if digest.hexdigest() != expected_binary_digest or (
+                    manifest.read(MAX_MANIFEST_BYTES + 1) != expected_manifest
+                ):
+                    raise ProvenanceError("release archive inputs changed during packaging")
+            if archive.next() is not None:
+                raise ProvenanceError("release archive contains unexpected trailing members")
+    except (tarfile.TarError, EOFError) as error:
+        raise ProvenanceError(f"could not read release archive: {error}") from error
+
+
+def require_archive_entry(
+    archive: tarfile.TarFile, name: str, size: int, mode: int
+) -> tarfile.TarInfo:
+    entry = archive.next()
+    if entry is None or entry.name != name or entry.type != tarfile.REGTYPE or entry.size != size:
+        raise ProvenanceError(f"release archive has an invalid {name} entry")
+    if (entry.uid, entry.gid, entry.mtime, entry.mode) != (0, 0, 0, mode):
+        raise ProvenanceError(f"release archive {name} metadata is not normalized")
+    return entry
 
 
 def create_archive(
