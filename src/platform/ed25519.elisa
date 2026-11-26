@@ -11,20 +11,12 @@ module NativeEd25519:
     public:
         def verify_ed25519(public_key: darray[u8]&, message: darray[u8]&, signature: darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return -22 if public_key.count != 32.usize() or signature.count != 64.usize() or message.count > 1048576.usize()
-            openssl: mutable cstr = ""
             # Homebrew's stable `opt` paths are symlinks. Resolve the fixed
             # candidates before the no-follow executable check so the secure
             # filesystem wrapper does not accidentally select LibreSSL.
             resolved_openssl: mutable darray[u8] = []
             resolved_openssl <- resolved_openssl.resize(4096)
-            if PlatformNative::realpath("/opt/homebrew/opt/openssl@3/bin/openssl", &resolved_openssl) is canonical and NativeTrustedPaths::is_trusted_crypto_executable(canonical, native_geteuid().u64()):
-                openssl <- canonical
-            elif PlatformNative::realpath("/opt/homebrew/opt/openssl/bin/openssl", &resolved_openssl) is canonical and NativeTrustedPaths::is_trusted_crypto_executable(canonical, native_geteuid().u64()):
-                openssl <- canonical
-            elif PlatformNative::realpath("/usr/bin/openssl", &resolved_openssl) is canonical and NativeTrustedPaths::is_trusted_crypto_executable(canonical, native_geteuid().u64()):
-                openssl <- canonical
-            else:
-                return -38
+            openssl: cstr = get trusted_openssl(&resolved_openssl) else return -38
             encoded_key: mutable darray[u8] = [48, 42, 48, 5, 6, 3, 43, 101, 112, 3, 33, 0]
             for index in 0..<public_key.count |encoded_key, public_key|:
                 encoded_key <- encoded_key.push(public_key[index])
@@ -64,31 +56,51 @@ module NativeEd25519:
             child_process_identifier: i64 = native_fork()
             result: mutable i64 = NativeErrors::negative_errno() if child_process_identifier < 0 else -1
             if child_process_identifier == 0:
-                if NativeProcess::set_process_group() != 0:
-                    native_exit(126)
-                if NativeProcess::set_process_limits(2) != 0:
-                    native_exit(126)
-                # OpenSSL writes a success sentence to stdout and diagnostics
-                # to stderr. Keep helper output from corrupting CLI JSON or
-                # exposing provider details; callers receive only this status.
-                region null_file_descriptor_scope:
-                    null_file_descriptor: i64 = native_open("/dev/null", flag_read_write)
-                    if null_file_descriptor < 0 or PlatformNative::duplicate_file_descriptor(null_file_descriptor, 0) != 0 or PlatformNative::duplicate_file_descriptor(null_file_descriptor, 1) != 1 or PlatformNative::duplicate_file_descriptor(null_file_descriptor, 2) != 2:
-                        native_exit(126)
-                if PlatformNative::close_inherited_file_descriptors() != 0:
-                    native_exit(126)
-                _ = native_execve(openssl, raw_child_argument_vector, raw_child_environment)
-                native_exit(127)
+                run_verifier_child(openssl, raw_child_argument_vector, raw_child_environment)
             elif child_process_identifier > 0:
-                status: mutable i32 = 0
-                waited: i64 = NativeProcess::waitpid_group_timeout(child_process_identifier, &status, 10000)
-                result <- waited if waited < 0
-                result <- 0 if waited == 0 and status == 0
-                result <- -38 if waited == 0 and (status == 126 * 256 or status == 127 * 256)
+                result <- wait_for_verifier(child_process_identifier)
             return -5 if cleanup_crypto_inputs(staging_name, public_path, message_path, signature_path) != 0
             return result
 
     private:
+        # The first fixed OpenSSL candidate that resolves to a trusted
+        # executable, in Homebrew openssl@3, Homebrew openssl, system order.
+        def trusted_openssl(resolved_openssl: mutable darray[u8]&) -> cstr? can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            candidates: darray[cstr] = ["/opt/homebrew/opt/openssl@3/bin/openssl", "/opt/homebrew/opt/openssl/bin/openssl", "/usr/bin/openssl"]
+            for index in 0..<candidates.count:
+                if PlatformNative::realpath(candidates[index], resolved_openssl) is canonical and NativeTrustedPaths::is_trusted_crypto_executable(canonical, native_geteuid().u64()):
+                    return canonical
+            return null
+
+        # In the forked child: isolate the process, discard its output, and
+        # execute OpenSSL. OpenSSL writes a success sentence to stdout and
+        # diagnostics to stderr; discarding both keeps helper output from
+        # corrupting CLI JSON or exposing provider details. Never returns.
+        def run_verifier_child(openssl: cstr, raw_child_argument_vector: void&, raw_child_environment: void&) -> void can[Unsafe.PointerCast]:
+            if NativeProcess::set_process_group() != 0:
+                native_exit(126)
+            if NativeProcess::set_process_limits(2) != 0:
+                native_exit(126)
+            region null_file_descriptor_scope:
+                null_file_descriptor: i64 = native_open("/dev/null", flag_read_write)
+                if null_file_descriptor < 0 or PlatformNative::duplicate_file_descriptor(null_file_descriptor, 0) != 0 or PlatformNative::duplicate_file_descriptor(null_file_descriptor, 1) != 1 or PlatformNative::duplicate_file_descriptor(null_file_descriptor, 2) != 2:
+                    native_exit(126)
+            if PlatformNative::close_inherited_file_descriptors() != 0:
+                native_exit(126)
+            _ = native_execve(openssl, raw_child_argument_vector, raw_child_environment)
+            native_exit(127)
+
+        # 0 when the signature verified, -38 when OpenSSL could not run, -1
+        # for a rejected signature, or the negative wait error.
+        def wait_for_verifier(child_process_identifier: i64) -> i64 can[Unsafe.PointerCast]:
+            status: mutable i32 = 0
+            waited: i64 = NativeProcess::waitpid_group_timeout(child_process_identifier, &status, 10000)
+            return waited if waited < 0
+            return -1 if waited != 0
+            return 0 if status == 0
+            return -38 if status == 126 * 256 or status == 127 * 256
+            return -1
+
         def crypto_input_path(directory: darray[u8]&, suffix: cstr) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
             path: mutable darray[u8] = []
             if directory.count > 0:

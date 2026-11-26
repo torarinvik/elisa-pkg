@@ -56,7 +56,8 @@ def main() -> int:
 
     native_source = (ROOT / "src/platform/ed25519.elisa").read_text(encoding="utf-8")
     verifier_start = native_source.find("def verify_ed25519(")
-    verifier_end = native_source.find("    private:", verifier_start)
+    # The verifier and its process helpers end where the path helpers begin.
+    verifier_end = native_source.find("def crypto_input_path(", verifier_start)
     if verifier_start < 0 or verifier_end < 0:
         raise SystemExit("error: could not locate the native Ed25519 verifier")
     verifier = native_source[verifier_start:verifier_end]
