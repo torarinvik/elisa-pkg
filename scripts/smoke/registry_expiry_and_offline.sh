@@ -175,6 +175,25 @@ resolve_registry_app() {
   )
 }
 
+REGISTRY_EXPIRY_ONLY_APP="$REGISTRY_EXPIRY_CASE/app-expired-only"
+write_registry_dependency "$REGISTRY_EXPIRY_ONLY_APP" "^1.0.0"
+write_registry_index foo 1 1.0.0
+if (
+  cd "$REGISTRY_EXPIRY_ONLY_APP"
+  ELISAPKG_REGISTRY_DIR="$REGISTRY_EXPIRY_ROOT" \
+  ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_EXPIRY_KEY" \
+  ELISAPKG_TRUST_STATE="$REGISTRY_EXPIRY_CASE/expired-only.state" \
+    "$BIN" resolve > resolve.stdout 2> resolve.stderr
+); then
+  echo "resolution accepted a registry with only expired releases" >&2
+  exit 1
+else
+  test "$?" -eq 3
+fi
+grep -F 'no registry version satisfies the requirement' "$REGISTRY_EXPIRY_ONLY_APP/resolve.stderr" >/dev/null
+test ! -e "$REGISTRY_EXPIRY_ONLY_APP/elisapkg.lock"
+write_registry_index foo 1 1.0.0,1.1.0
+
 write_registry_dependency "$REGISTRY_EXPIRY_APP" "^1.0.0"
 (
   cd "$REGISTRY_EXPIRY_APP"
