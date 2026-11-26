@@ -54,10 +54,8 @@ module SemVer:
         # v1 requirement grammar: exact versions, ^, ~, and one comparison.
         # The resolver will reject a range it cannot parse; it never guesses.
         def parse_requirement(value: darray[u8]&, out: mutable Requirement&) -> bool:
-            empty: Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-            out <- Requirement{lower: empty, upper: empty, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
+            out <- unbounded_requirement()
             return false if value.count == 0.usize() or value.count > maximum_requirement_bytes
-            candidate: mutable Requirement = Requirement{lower: empty, upper: empty, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
             start: usize = skip_spaces(value, 0.usize(), value.count)
             finish: usize =
                 while finish > start and is_space(value[finish - 1.usize()]) |finish: usize = value.count| -> finish:
@@ -83,37 +81,48 @@ module SemVer:
                 not parse_range(value, version_start, version_end, &parsed)
                 parsed.prerelease
 
-            has_second: bool = version_end < finish
-            if has_second:
-                return false if operator != 60 and operator != 62
-                cursor: usize = skip_spaces(value, version_end, finish)
-                return false if cursor >= finish or (value[cursor] != 60 and value[cursor] != 62)
-                region second_operator_scope:
-                    second_operator: u8 = value[cursor]
-                    return false if second_operator == operator
-                second_length: mutable usize = 1.usize()
-                if cursor + 1.usize() < finish and value[cursor + 1.usize()] == 61:
-                    second_length <- 2.usize()
-                second_start: usize = skip_spaces(value, cursor + second_length, finish)
-                second_end: usize = token_end(value, second_start, finish)
-                return false if second_start >= second_end or second_end != finish
-                second: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-                return false if:
-                    not parse_range(value, second_start, second_end, &second)
-                    second.prerelease
-                candidate.lower <- parsed if operator == 62 else second
-                candidate.upper <- parsed if operator == 60 else second
-                candidate.has_lower <- true
-                candidate.has_upper <- true
-                candidate.include_lower <- operator_length == 2.usize() if operator == 62 else second_length == 2.usize()
-                candidate.include_upper <- operator_length == 2.usize() if operator == 60 else second_length == 2.usize()
-                return false if:
-                    compare(candidate.lower, candidate.upper) > 0
-                    compare(candidate.lower, candidate.upper) == 0 and (not candidate.include_lower or not candidate.include_upper)
-                out <- candidate
-                return true
-            return false if version_end != finish
+            return parse_bounded_range(value, operator, operator_length, parsed, version_end, finish, out) if version_end < finish
+            return single_bound_requirement(operator, operator_length, parsed, out)
 
+        def unbounded_requirement() -> Requirement:
+            empty: Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
+            return Requirement{lower: empty, upper: empty, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
+
+        # A two-sided range such as ">=1.0.0 <2.0.0": one `>` bound and one
+        # `<` bound, in either order, forming a non-empty interval.
+        def parse_bounded_range(value: darray[u8]&, operator: u8, operator_length: usize, parsed: Model::Version, version_end: usize, finish: usize, out: mutable Requirement&) -> bool:
+            candidate: mutable Requirement = unbounded_requirement()
+            return false if operator != 60 and operator != 62
+            cursor: usize = skip_spaces(value, version_end, finish)
+            return false if cursor >= finish or (value[cursor] != 60 and value[cursor] != 62)
+            region second_operator_scope:
+                second_operator: u8 = value[cursor]
+                return false if second_operator == operator
+            second_length: mutable usize = 1.usize()
+            if cursor + 1.usize() < finish and value[cursor + 1.usize()] == 61:
+                second_length <- 2.usize()
+            second_start: usize = skip_spaces(value, cursor + second_length, finish)
+            second_end: usize = token_end(value, second_start, finish)
+            return false if second_start >= second_end or second_end != finish
+            second: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
+            return false if:
+                not parse_range(value, second_start, second_end, &second)
+                second.prerelease
+            candidate.lower <- parsed if operator == 62 else second
+            candidate.upper <- parsed if operator == 60 else second
+            candidate.has_lower <- true
+            candidate.has_upper <- true
+            candidate.include_lower <- operator_length == 2.usize() if operator == 62 else second_length == 2.usize()
+            candidate.include_upper <- operator_length == 2.usize() if operator == 60 else second_length == 2.usize()
+            return false if:
+                compare(candidate.lower, candidate.upper) > 0
+                compare(candidate.lower, candidate.upper) == 0 and (not candidate.include_lower or not candidate.include_upper)
+            out <- candidate
+            return true
+
+        # A single comparator: exact, caret, tilde, or a one-sided bound.
+        def single_bound_requirement(operator: u8, operator_length: usize, parsed: Model::Version, out: mutable Requirement&) -> bool:
+            candidate: mutable Requirement = unbounded_requirement()
             candidate.lower <- parsed
             candidate.upper <- parsed
             candidate.has_lower <- true
