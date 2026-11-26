@@ -1,0 +1,131 @@
+# Private platform ABI constants and directory entry layouts.
+
+static if ELISA_TARGET_OS_LINUX and ELISA_TARGET_ARCH_ARM64:
+    # glibc places st_mode at offset 16 on Linux arm64.
+    const stat_mode_offset: usize = 16
+    const stat_uid_offset: usize = 24
+    const stat_gid_offset: usize = 28
+static elif ELISA_TARGET_OS_LINUX:
+    # glibc places st_mode at offset 24 on Linux x86_64.
+    const stat_mode_offset: usize = 24
+    const stat_uid_offset: usize = 28
+    const stat_gid_offset: usize = 32
+static else:
+    const stat_mode_offset: usize = 4
+    const stat_uid_offset: usize = 16
+    const stat_gid_offset: usize = 20
+
+static if ELISA_TARGET_OS_LINUX and ELISA_TARGET_ARCH_ARM64:
+    # Linux arm64 defines architecture-specific values for these open flags.
+    const flag_no_follow: i64 = 32768
+    const flag_directory: i64 = 16384
+    static assert (flag_no_follow == 32768 and flag_directory == 16384), "Linux arm64 open flags must match its UAPI"
+static elif ELISA_TARGET_OS_LINUX:
+    # Linux x86_64 has architecture-specific values for these two flags.
+    const flag_no_follow: i64 = 131072
+    const flag_directory: i64 = 65536
+    static assert (flag_no_follow == 131072 and flag_directory == 65536), "Linux x86_64 open flags must match its ABI"
+static else:
+    const flag_no_follow: i64 = 256
+    const flag_directory: i64 = 1048576
+
+static if ELISA_TARGET_OS_LINUX:
+    # Keep operating-system constants in Elisa so the FFI declarations stay
+    # ABI-neutral while each supported architecture gets its actual ABI values.
+    const flag_read_only: i64 = 0
+    const flag_write_only: i64 = 1
+    const flag_read_write: i64 = 2
+    const flag_nonblock: i64 = 2048
+    const flag_create: i64 = 64
+    const flag_exclusive: i64 = 128
+    const flag_close_on_exec: i64 = 524288
+    const dirent_type_offset: usize = 18
+    const dirent_name_offset: usize = 19
+    const monotonic_clock_id: i64 = 1
+    const directory_not_empty_error: i64 = 39
+    const symlink_error: i64 = 40
+    const unsupported_file_type_error: i64 = 95
+    const at_remove_directory: i64 = 512
+    const at_no_follow: i64 = 256
+    const access_effective_ids: i32 = 512
+    const access_no_follow: i32 = 256
+    const crypto_key_template: cstr = "/tmp/elisapkg-key.XXXXXX"
+    const crypto_message_template: cstr = "/tmp/elisapkg-message.XXXXXX"
+    const crypto_signature_template: cstr = "/tmp/elisapkg-signature.XXXXXX"
+static else:
+    const flag_read_only: i64 = 0
+    const flag_write_only: i64 = 1
+    const flag_read_write: i64 = 2
+    const flag_nonblock: i64 = 4
+    const flag_create: i64 = 512
+    const flag_exclusive: i64 = 2048
+    const flag_close_on_exec: i64 = 16777216
+    const dirent_type_offset: usize = 20
+    const dirent_name_offset: usize = 21
+    const monotonic_clock_id: i64 = 6
+    const directory_not_empty_error: i64 = 66
+    const symlink_error: i64 = 62
+    const unsupported_file_type_error: i64 = 45
+    const at_remove_directory: i64 = 128
+    const at_no_follow: i64 = 32
+    const access_effective_ids: i32 = 16
+    const access_no_follow: i32 = 32
+    const crypto_key_template: cstr = "/private/tmp/elisapkg-key.XXXXXX"
+    const crypto_message_template: cstr = "/private/tmp/elisapkg-message.XXXXXX"
+    const crypto_signature_template: cstr = "/private/tmp/elisapkg-signature.XXXXXX"
+
+# Linux-only values are kept named even on macOS because the private FFI
+# implementation shares one runtime-guarded open path across supported hosts.
+static if ELISA_TARGET_OS_LINUX:
+    const platform_is_linux: bool = true
+    # Linux POSIX ACL xattrs have a four-byte version header followed by at
+    # most 32 eight-byte entries (the kernel's ACL_MAX_ENTRIES limit).
+    const linux_acl_xattr_capacity: usize = 260
+    const linux_acl_xattr_version: u64 = 2
+    const linux_acl_tag_user_object: u64 = 1
+    const linux_acl_tag_user: u64 = 2
+    const linux_acl_tag_group_object: u64 = 4
+    const linux_acl_tag_group: u64 = 8
+    const linux_acl_tag_mask: u64 = 16
+    const linux_acl_tag_other: u64 = 32
+    const linux_acl_undefined_id: u64 = 4294967295.u64()
+static else:
+    const platform_is_linux: bool = false
+const linux_open_path: i64 = 2097152
+const linux_openat2_syscall: i64 = 437
+# Linux openat2 RESOLVE_* UAPI bits; these belong in open_how.resolve.
+const linux_resolve_no_symlinks: u64 = 4
+const linux_resolve_beneath: u64 = 8
+
+# flock operation bits have the same values on the supported macOS and Linux
+# targets. Keep their meaning named at the FFI boundary instead of embedding a
+# platform magic number at the call site.
+const lock_operation_exclusive: i64 = 2
+const lock_operation_nonblocking: i64 = 4
+
+static if ELISA_TARGET_OS_LINUX:
+    # A zero result means the dirent length or terminating NUL is malformed.
+    # POSIX entries cannot have empty names, so callers must fail closed.
+    def dirent_name_length(raw: mutable u8&) -> usize:
+        record_length: usize = raw[16].usize() + raw[17].usize() * 256.usize()
+        return 0 if record_length <= dirent_name_offset
+        available: usize = record_length - dirent_name_offset
+        scan_limit: usize = available if available < 256.usize() else 256.usize()
+        index: mutable usize = 0.usize()
+        while index < scan_limit |raw, index|:
+            return index if raw[dirent_name_offset + index] == 0
+            index <- index + 1.usize()
+        return 0
+
+    def dirent_type(raw: mutable u8&) -> u8:
+        return raw[dirent_type_offset]
+static else:
+    # A zero result means the kernel-provided name length is invalid; callers
+    # must not interpret it as an ignorable empty entry.
+    def dirent_name_length(raw: mutable u8&) -> usize:
+        length: usize = raw[18].usize() + raw[19].usize() * 256.usize()
+        return 0 if length > 255.usize()
+        return length
+
+    def dirent_type(raw: mutable u8&) -> u8:
+        return raw[dirent_type_offset]
