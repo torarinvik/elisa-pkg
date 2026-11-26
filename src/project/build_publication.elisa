@@ -1,0 +1,51 @@
+# Publish a validated compiler artifact and its build receipt.
+include "../cli/output.elisa"
+include "../platform.elisa"
+include "../text/bytes.elisa"
+include "./build_receipt.elisa"
+include "./files.elisa"
+
+module BuildPublication:
+    public:
+        def publish(build_dir: darray[u8]&, artifact_leaf: cstr, emit_kind: cstr, artifact_access_mode: i64, temp_name: cstr, artifact_name: cstr, receipt_name: cstr, artifact_content: darray[u8]&, artifact_digest: darray[u8]&, receipt: mutable darray[u8]&) -> bool can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            # Never publish the compiler-owned inode directly. A descendant can
+            # leave its process group and retain an already-open descriptor even
+            # after the main compiler exits. Copy the bytes we hashed into a new
+            # parent-owned inode that was not present in the sandbox during build.
+            publish_template: mutable darray[u8] = []
+            ByteText::append(&publish_template, build_dir)
+            if publish_template.count == 0.usize() or publish_template[publish_template.count - 1.usize()] != 47:
+                publish_template.push(47)
+            ByteText::append_bounded_text(&publish_template, artifact_leaf)
+            ByteText::append_text(&publish_template, ".publish.XXXXXX")
+            publish_template.push(0)
+            publish_fd: i64 = Platform::pkg_mkstemp(&publish_template)
+            if publish_fd < 0:
+                _ = Platform::pkg_unlink(temp_name)
+                return false
+            publish_name: cstr = (&publish_template[0]).cast[cstr] can Unsafe.PointerCast
+            output_mode: u16 = 493.u16() if Platform::pkg_cstr_equal(emit_kind, "exe") else 420.u16()
+            publish_ok: mutable bool = ProjectFiles::write_fd_all(publish_fd, artifact_content)
+            publish_ok <- false if Platform::pkg_chmod(publish_name, output_mode) != 0
+            publish_ok <- false if Platform::pkg_access(publish_name, artifact_access_mode) != 0
+            publish_ok <- false if Platform::pkg_fsync(publish_fd) != 0
+            publish_close_status: i64 = Platform::pkg_close(publish_fd)
+            if not publish_ok or publish_close_status != 0:
+                _ = Platform::pkg_unlink(publish_name)
+                _ = Platform::pkg_unlink(temp_name)
+                CliOutput::write_error("error: unable to create a normalized parent-owned build artifact\n") can Global.Read
+                return false
+            if Platform::pkg_rename(publish_name, artifact_name) != 0:
+                _ = Platform::pkg_unlink(publish_name)
+                _ = Platform::pkg_unlink(temp_name)
+                return false
+            BuildReceipt::append_receipt_digest(receipt, artifact_digest)
+            if not ProjectFiles::write_cstr_file(receipt_name, receipt):
+                # The artifact has already been atomically published. Do not unlink
+                # this pathname after a receipt failure: an older artifact may have
+                # been replaced by the rename, and removing it would destroy package
+                # output whose ownership is no longer distinguishable at this point.
+                # The missing or stale receipt makes the next build reject the cache
+                # and re-establish the pair before reuse.
+                return false
+            return true
