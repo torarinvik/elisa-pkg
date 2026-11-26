@@ -59,28 +59,8 @@ module Cli:
             can Global.Read:
                 root: mutable darray[u8] = [46]
                 target_kind: mutable cstr = "bin"
-                target_kind_seen: mutable bool = false
-                region path_seen_scope:
-                    path_seen: mutable bool = false
-                    for index in 2..<argument_count |slots, root, target_kind, target_kind_seen, path_seen|:
-                        argument: cstr = slots[index].cast[cstr]
-                        if Platform::c_string_equal(argument, "--lib"):
-                            return CliStatus::usage if target_kind_seen and not Platform::c_string_equal(target_kind, "lib")
-                            target_kind <- "lib"
-                            target_kind_seen <- true
-                        elif Platform::c_string_equal(argument, "--bin"):
-                            return CliStatus::usage if target_kind_seen and not Platform::c_string_equal(target_kind, "bin")
-                            target_kind <- "bin"
-                            target_kind_seen <- true
-                        elif Platform::c_string_equal(argument, "--help"):
-                            CliOutput::usage()
-                            return CliStatus::success
-                        elif Platform::c_string_length(argument) == 0.usize() or argument[0].u8() == 45 or path_seen:
-                            return CliStatus::usage
-                        else:
-                            root <- []
-                            ByteText::append_bounded_text(&root, argument)
-                            path_seen <- true
+                if read_initialize_arguments(argument_count, slots, &root, &target_kind) is early_status:
+                    return early_status
                 return CliStatus::usage if:
                     root.count == 0.usize()
                     root.count > 4096.usize()
@@ -234,20 +214,51 @@ module Cli:
                 archive_digest: mutable darray[u8] = []
                 return CliStatus::security_failed if not Integrity::sha256_hex(archive, &archive_digest)
                 if options.json:
-                    region size_text_scope:
-                        size_text: mutable darray[u8] = []
-                        ByteText::append_decimal(&size_text, archive.count.u64())
-                        CliOutput::write_ok("{\"schema-version\":1,\"command\":\"publish\",\"dry-run\":true,\"valid\":true,\"source-tree-digest\":\"sha256:")
-                        CliOutput::write_bytes(1, &source_digest)
-                        CliOutput::write_ok("\",\"archive-size\":")
-                        CliOutput::write_bytes(1, &size_text)
-                    CliOutput::write_ok(",\"archive-digest\":\"sha256:")
-                    CliOutput::write_bytes(1, &archive_digest)
-                    CliOutput::write_ok("\"}\n")
+                    report_publish_dry_run_json(source_digest, archive.count, archive_digest)
                     return CliStatus::success
                 CliOutput::write_ok("publish dry-run: manifest, lockfile, source tree, and package file selection are valid\n")
                 CliOutput::write_error("note: signing and authenticated publication are still required\n")
                 return CliStatus::success
+
+        # Parse `init [--lib|--bin] [PATH]`. Returns the status to exit with
+        # for invalid arguments or `--help`, or null to continue.
+        def read_initialize_arguments(argument_count: i64, slots: mutable cstr&&, root: mutable darray[u8]&, target_kind: mutable cstr&) -> i64? can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                target_kind_seen: mutable bool = false
+                path_seen: mutable bool = false
+                for index in 2..<argument_count |target_kind_seen, path_seen|:
+                    argument: cstr = slots[index].cast[cstr]
+                    if Platform::c_string_equal(argument, "--lib"):
+                        return CliStatus::usage if target_kind_seen and not Platform::c_string_equal(target_kind, "lib")
+                        target_kind <- "lib"
+                        target_kind_seen <- true
+                    elif Platform::c_string_equal(argument, "--bin"):
+                        return CliStatus::usage if target_kind_seen and not Platform::c_string_equal(target_kind, "bin")
+                        target_kind <- "bin"
+                        target_kind_seen <- true
+                    elif Platform::c_string_equal(argument, "--help"):
+                        CliOutput::usage()
+                        return CliStatus::success
+                    elif Platform::c_string_length(argument) == 0.usize() or argument[0].u8() == 45 or path_seen:
+                        return CliStatus::usage
+                    else:
+                        root.resize(0)
+                        ByteText::append_bounded_text(root, argument)
+                        path_seen <- true
+                return null
+
+        def report_publish_dry_run_json(source_digest: darray[u8]&, archive_size: usize, archive_digest: darray[u8]&) -> void can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                region size_text_scope:
+                    size_text: mutable darray[u8] = []
+                    ByteText::append_decimal(&size_text, archive_size.u64())
+                    CliOutput::write_ok("{\"schema-version\":1,\"command\":\"publish\",\"dry-run\":true,\"valid\":true,\"source-tree-digest\":\"sha256:")
+                    CliOutput::write_bytes(1, source_digest)
+                    CliOutput::write_ok("\",\"archive-size\":")
+                    CliOutput::write_bytes(1, &size_text)
+                CliOutput::write_ok(",\"archive-digest\":\"sha256:")
+                CliOutput::write_bytes(1, archive_digest)
+                CliOutput::write_ok("\"}\n")
 
         def run_publish() -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
