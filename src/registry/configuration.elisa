@@ -1,0 +1,69 @@
+# Registry configuration and the separately configured verification key.
+include "../integrity.elisa"
+include "../platform.elisa"
+include "./files.elisa"
+
+module RegistryConfiguration:
+    public:
+        const enum Code of u8:
+            InvalidConfiguration
+            MissingTrustRoot
+            Ok
+            TrustStateUnavailable
+
+        def configured_root(out: mutable darray[u8]&) -> bool:
+            out.resize(0)
+            value_ref: u8&? = Platform::pkg_getenv("ELISAPKG_REGISTRY_DIR")
+            if value_ref is configured:
+                value: cstr = configured.cast[cstr]
+                length: usize = Platform::pkg_strlen(value)
+                return false if length == 0 or length > 4096
+                for index in 0..<length |out, value|:
+                    out.push(value[index].u8())
+                return true
+            return false
+
+        def configured_trust_root(registry_root: darray[u8]&, out: mutable darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            # Trust material is configured out of band. Keeping the key next
+            # to mutable registry metadata would let a registry replacement
+            # replace its own verification root as well.
+            out.resize(0)
+            value_ref: u8&? = Platform::pkg_getenv("ELISAPKG_REGISTRY_TRUST_ROOT")
+            if value_ref is configured:
+                value: cstr = configured.cast[cstr]
+                length: usize = Platform::pkg_strlen(value)
+                return Code.InvalidConfiguration if length == 0 or length > 4096 or value[0].u8() != 47
+                for index in 0..<length |out, value|:
+                    byte: u8 = value[index].u8()
+                    return Code.InvalidConfiguration if byte == 0 or byte < 32 or byte == 127 or byte == 92
+                    out.push(byte)
+                return Code.InvalidConfiguration if out[out.count - 1.usize()] == 47
+                segment_start: mutable usize = 1.usize()
+                for index in 1..<(length + 1.usize()) |value, segment_start|:
+                    if index == length or value[index].u8() == 47:
+                        segment_length: usize = index - segment_start
+                        return Code.InvalidConfiguration if segment_length == 0.usize() or segment_length == 1.usize() and value[segment_start].u8() == 46 or segment_length == 2.usize() and value[segment_start].u8() == 46 and value[segment_start + 1.usize()].u8() == 46
+                        segment_start <- index + 1.usize()
+                return Code.InvalidConfiguration if RegistryFiles::path_is_same_or_beneath(out, registry_root)
+                canonical_registry: mutable darray[u8] = []
+                canonical_trust: mutable darray[u8] = []
+                return Code.InvalidConfiguration if not RegistryFiles::canonical_path(registry_root, &canonical_registry)
+                return Code.MissingTrustRoot if not RegistryFiles::canonical_path(out, &canonical_trust)
+                return Code.InvalidConfiguration if RegistryFiles::path_is_same_or_beneath(canonical_trust, canonical_registry)
+                return Code.Ok
+            return Code.MissingTrustRoot
+
+        def configured_trust_key_fingerprint(registry_root: darray[u8]&, out: mutable darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            out.resize(0)
+            key_path: mutable darray[u8] = []
+            root_status: Code = configured_trust_root(registry_root, &key_path)
+            return root_status if root_status != Code.Ok
+            public_key: mutable darray[u8] = []
+            return Code.MissingTrustRoot if RegistryFiles::read_trusted_file(key_path, 32.usize(), &public_key) != 32
+            fingerprint_bytes: mutable darray[u8] = []
+            return Code.TrustStateUnavailable if Integrity::sha256(public_key, &fingerprint_bytes) != Integrity::DigestCode.Ok
+            fingerprint_hex: mutable darray[u8] = []
+            return Code.TrustStateUnavailable if not Integrity::hex_digest(fingerprint_bytes, &fingerprint_hex)
+            for index in 0..<fingerprint_hex.count |out, fingerprint_hex|:
+                out.push(fingerprint_hex[index])
+            return Code.Ok
