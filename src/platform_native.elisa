@@ -685,16 +685,26 @@ module PlatformNative:
             encoded_key: mutable darray[u8] = [48, 42, 48, 5, 6, 3, 43, 101, 112, 3, 33, 0]
             for index in 0..<public_key.count |encoded_key, public_key|:
                 encoded_key.push(public_key[index])
-            public_path: mutable darray[u8] = []
-            message_path: mutable darray[u8] = []
-            signature_path: mutable darray[u8] = []
-            return -38 if not write_temp_blob(crypto_key_template, encoded_key, &public_path)
-            if not write_temp_blob(crypto_message_template, message, &message_path):
-                return -38 if remove_temp_blob(public_path) == 0 else -5
-            if not write_temp_blob(crypto_signature_template, signature, &signature_path):
-                key_cleanup: i64 = remove_temp_blob(public_path)
-                message_cleanup: i64 = remove_temp_blob(message_path)
-                return -38 if key_cleanup == 0 and message_cleanup == 0 else -5
+            # OpenSSL reopens the inputs by name. Keep those names inside a
+            # private directory while the child is running.
+            staging: mutable darray[u8] =
+                empty_directory: darray[u8] = []
+                crypto_input_path(empty_directory, crypto_directory_template)
+            return -38 if mkdtemp(&staging) != 0
+            staging_name: cstr = (&staging[0]).cast[cstr] can Unsafe.PointerCast
+            public_path: mutable darray[u8] = crypto_input_path(staging, "/key.XXXXXX")
+            message_path: mutable darray[u8] = crypto_input_path(staging, "/message.XXXXXX")
+            signature_path: mutable darray[u8] = crypto_input_path(staging, "/signature.XXXXXX")
+            key_status: i64 = write_temp_blob(encoded_key, &public_path)
+            message_status: i64 = write_temp_blob(message, &message_path) if key_status == 0 else -38
+            signature_status: i64 = write_temp_blob(signature, &signature_path) if message_status == 0 else -38
+            if signature_status != 0:
+                if key_status != 0:
+                    message_path.resize(0)
+                if message_status != 0:
+                    signature_path.resize(0)
+                cleanup: i64 = cleanup_crypto_inputs(staging_name, public_path, message_path, signature_path)
+                return -38 if cleanup == 0 else -5
             public_name: cstr = (&public_path[0]).cast[cstr] can Unsafe.PointerCast
             message_name: cstr = (&message_path[0]).cast[cstr] can Unsafe.PointerCast
             signature_name: cstr = (&signature_path[0]).cast[cstr] can Unsafe.PointerCast
@@ -744,10 +754,7 @@ module PlatformNative:
                 result <- waited if waited < 0
                 result <- 0 if waited == 0 and status == 0
                 result <- -38 if waited == 0 and (status == 126 * 256 or status == 127 * 256)
-            remove_status: i64 = remove_temp_blob(public_path)
-            message_remove_status: i64 = remove_temp_blob(message_path)
-            signature_remove_status: i64 = remove_temp_blob(signature_path)
-            return -5 if remove_status != 0 or message_remove_status != 0 or signature_remove_status != 0
+            return -5 if cleanup_crypto_inputs(staging_name, public_path, message_path, signature_path) != 0
             return result
 
     private:
@@ -792,32 +799,21 @@ module PlatformNative:
         const max_collect_traversal_nodes: usize = 16384.usize()
         const max_archive_extracted_nodes: usize = 4096.usize()
 
-        def write_temp_blob(prefix: cstr, value: darray[u8]&, path_out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            path_out.resize(0)
-            return false if value.count > 67108864.usize()
-            template: mutable darray[u8] = []
-            length: mutable usize = native_strlen(prefix)
-            return false if length == 0 or length > 4096
-            for index in 0..<length |template, prefix|:
-                template.push(prefix[index].u8())
-            template.push(0)
-            fd: mutable i64 = mkstemp(&template)
-            if fd < 0 and length > 13.usize():
-                is_private_tmp: mutable bool = true
-                private_prefix: darray[u8] = [47, 112, 114, 105, 118, 97, 116, 101, 47, 116, 109, 112, 47]
-                for index in 0..<13 |is_private_tmp, prefix, private_prefix|:
-                    is_private_tmp <- is_private_tmp and prefix[index].u8() == private_prefix[index]
-                if is_private_tmp:
-                    template <- []
-                    fallback_prefix: darray[u8] = [47, 116, 109, 112, 47]
-                    for index in 0..<5 |template, fallback_prefix|:
-                        template.push(fallback_prefix[index])
-                    for index in 13..<length |template, prefix|:
-                        template.push(prefix[index].u8())
-                    template.push(0)
-                    length <- template.count - 1.usize()
-                    fd <- mkstemp(&template)
-            return false if fd < 0
+        def crypto_input_path(directory: darray[u8]&, suffix: cstr) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
+            path: mutable darray[u8] = []
+            if directory.count > 0:
+                for index in 0..<(directory.count - 1.usize()) |path, directory|:
+                    path.push(directory[index])
+            for index in 0..<native_strlen(suffix) |path, suffix|:
+                path.push(suffix[index].u8())
+            path.push(0)
+            return path
+
+        def write_temp_blob(value: darray[u8]&, path: mutable darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            fd: i64 = mkstemp(path)
+            if fd < 0:
+                path.resize(0)
+                return fd
             written: mutable usize = 0.usize()
             failed: mutable bool = false
             while written < value.count |value, written, fd, failed|:
@@ -831,18 +827,20 @@ module PlatformNative:
                     failed <- true
                     break
                 written <- written + amount.usize()
-            if not failed and native_fsync(fd) != 0:
-                failed <- true
             close_status: i64 = native_close(fd)
-            if failed or close_status != 0:
-                _ = remove_temp_blob(template)
-                return false
-            for index in 0..<length |path_out, template|:
-                path_out.push(template[index])
-            path_out.push(0)
-            return true
+            return -5 if failed or close_status != 0
+            return 0
+
+        def cleanup_crypto_inputs(directory: cstr, key: darray[u8]&, message: darray[u8]&, signature: darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            key_status: i64 = remove_temp_blob(key)
+            message_status: i64 = remove_temp_blob(message)
+            signature_status: i64 = remove_temp_blob(signature)
+            directory_status: i64 = rmdir_secure(directory)
+            return -5 if key_status != 0 or message_status != 0 or signature_status != 0 or directory_status != 0
+            return 0
 
         def remove_temp_blob(path: darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return 0 if path.count == 0
             path_name: cstr = (&path[0]).cast[cstr] can Unsafe.PointerCast
             return unlink_kind(path_name, 0)
 

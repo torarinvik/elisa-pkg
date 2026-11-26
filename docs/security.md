@@ -35,8 +35,10 @@ may use an effective-user-owned group-writable provider directory only when
 the owning group is the system `admin` group; that group is treated as
 privileged. A process running as root never trusts an effective-user-owned
 provider tree. If no candidate meets the policy or supports Ed25519, signature
-verification fails closed. Package trust records also require the version to
-appear in the currently authenticated index, and the exact generation and
+verification fails closed. Verification stages the DER key, message, and
+signature in a private directory with owner-only access and removes the staged
+inputs after the helper exits or setup fails. Package trust records also require
+the version to appear in the currently authenticated index, and the exact generation and
 snapshot digest are rechecked under the trust-state lock before package
 history is written.
 Individual signed release metadata must also expire within 30 days of
