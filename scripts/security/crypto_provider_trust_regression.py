@@ -65,20 +65,17 @@ def main() -> int:
     limits_setup = verifier.find("if set_process_limits(2) != 0:", child_start)
     output_redirect = verifier.find("duplicate_fd(null_fd, 2) != 2", child_start)
     descriptor_close = verifier.find("if close_inherited_fds() != 0:", child_start)
-    provider_exec = verifier.find('_ = execvp("/usr/bin/env", child_argv)', child_start)
-    exec_wrapper_start = native_source.find(
-        "def execvp(path: cstr, argv: mutable cstr&&)"
+    provider_exec = verifier.find(
+        "_ = native_execve(openssl, raw_child_argv, raw_child_environment)", child_start
     )
-    exec_wrapper_end = native_source.find("\n        def ", exec_wrapper_start)
-    exec_wrapper = native_source[exec_wrapper_start:exec_wrapper_end]
+    empty_environment = verifier.find("empty_environment: mutable darray[cstr] = [null]")
+    environment_pointer = verifier.find("raw_child_environment: void& = child_environment.cast[void&]")
     if not (
-        0 <= child_start < group_setup < limits_setup < output_redirect < descriptor_close < provider_exec
-        and exec_wrapper_start >= 0
-        and "raw_argv: void& = argv.cast[void&] can Unsafe.PointerCast" in exec_wrapper
-        and "return native_execvp(path, raw_argv)" in exec_wrapper
+        0 <= empty_environment < environment_pointer < child_start
+        < group_setup < limits_setup < output_redirect < descriptor_close < provider_exec
     ):
         raise SystemExit(
-            "error: crypto provider launch must close inherited descriptors after child setup and before exec"
+            "error: crypto provider launch must close inherited descriptors and exec with an empty environment"
         )
 
     (ROOT / "build").mkdir(parents=True, exist_ok=True)

@@ -667,7 +667,21 @@ module PlatformNative:
             return seconds
 
         def verify_ed25519(public_key: darray[u8]&, message: darray[u8]&, signature: darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            return -22 if public_key.count != 32.usize() or signature.count != 64.usize()
+            return -22 if public_key.count != 32.usize() or signature.count != 64.usize() or message.count > 1048576.usize()
+            openssl: mutable cstr = ""
+            # Homebrew's stable `opt` paths are symlinks. Resolve the fixed
+            # candidates before the no-follow executable check so the secure
+            # filesystem wrapper does not accidentally select LibreSSL.
+            resolved_openssl: mutable darray[u8] = []
+            resolved_openssl.resize(4096)
+            if realpath("/opt/homebrew/opt/openssl@3/bin/openssl", &resolved_openssl) is canonical and is_trusted_crypto_executable(canonical, native_geteuid().u64()):
+                openssl <- canonical
+            elif realpath("/opt/homebrew/opt/openssl/bin/openssl", &resolved_openssl) is canonical and is_trusted_crypto_executable(canonical, native_geteuid().u64()):
+                openssl <- canonical
+            elif realpath("/usr/bin/openssl", &resolved_openssl) is canonical and is_trusted_crypto_executable(canonical, native_geteuid().u64()):
+                openssl <- canonical
+            else:
+                return -38
             encoded_key: mutable darray[u8] = [48, 42, 48, 5, 6, 3, 43, 101, 112, 3, 33, 0]
             for index in 0..<public_key.count |encoded_key, public_key|:
                 encoded_key.push(public_key[index])
@@ -686,23 +700,6 @@ module PlatformNative:
             message_name: cstr = (&message_path[0]).cast[cstr] can Unsafe.PointerCast
             signature_name: cstr = (&signature_path[0]).cast[cstr] can Unsafe.PointerCast
             args: mutable darray[cstr] = []
-            openssl: mutable cstr = ""
-            # Homebrew's stable `opt` paths are symlinks. Resolve the fixed
-            # candidates before the no-follow executable check so the secure
-            # filesystem wrapper does not accidentally select LibreSSL.
-            resolved_openssl: mutable darray[u8] = []
-            resolved_openssl.resize(4096)
-            if realpath("/opt/homebrew/opt/openssl@3/bin/openssl", &resolved_openssl) is canonical and is_trusted_crypto_executable(canonical, native_geteuid().u64()):
-                openssl <- canonical
-            elif realpath("/opt/homebrew/opt/openssl/bin/openssl", &resolved_openssl) is canonical and is_trusted_crypto_executable(canonical, native_geteuid().u64()):
-                openssl <- canonical
-            elif realpath("/usr/bin/openssl", &resolved_openssl) is canonical and is_trusted_crypto_executable(canonical, native_geteuid().u64()):
-                openssl <- canonical
-            else:
-                _ = remove_temp_blob(public_path)
-                _ = remove_temp_blob(message_path)
-                _ = remove_temp_blob(signature_path)
-                return -38
             # Use execve with an empty environment directly. A helper such as
             # `/usr/bin/env -i` still starts under the caller's loader settings,
             # which could replace the verifier before it clears those values.
