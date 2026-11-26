@@ -23,17 +23,21 @@ module RegistryIndexSnapshot:
                 not consume_positive_decimal_line(raw, "expires:", &cursor, expires_out)
                 not consume_label(raw, "versions:\n", &cursor)
             return false if not RegistryRoot::valid(registry_out) or not PackageIdentity::valid_name(package_out)
-            yanked_versions: mutable darray[u8] = []
-            return false if not read_versions(raw, cursor, versions_out, &yanked_versions)
-            return mark_yanked_versions(versions_out, yanked_versions, yanked_flags_out)
+            versions: mutable darray[VersionEntry] = []
+            yanked_versions: mutable darray[VersionEntry] = []
+            return false if not read_versions(raw, cursor, versions_out, &versions, &yanked_versions)
+            return mark_yanked_versions(raw, versions, yanked_versions, yanked_flags_out)
 
     private:
-        def read_versions(raw: darray[u8]&, start_offset: usize, versions_out: mutable darray[u8]&, yanked_versions: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+        struct VersionEntry:
+            version: Model::Version
+            start: usize
+            finish: usize
+
+        def read_versions(raw: darray[u8]&, start_offset: usize, versions_out: mutable darray[u8]&, versions: mutable darray[VersionEntry]&, yanked_versions: mutable darray[VersionEntry]&) -> bool can[Memory.Allocate, Abort.Panic]:
             cursor: mutable usize = start_offset
             previous: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
             previous_yanked: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-            candidates: mutable usize = 0
-            yanked_count: mutable usize = 0
             reading_yanked: mutable bool = false
             while cursor < raw.count:
                 start: usize = cursor
@@ -45,62 +49,52 @@ module RegistryIndexSnapshot:
                 for index in start..<finish |version, raw|:
                     return false if raw[index] < 33 or raw[index] == 127 or raw[index] == 92
                     version <- version.push(raw[index])
-                if not reading_yanked and candidates > 0.usize() and ByteText::equal_text(version, "yanked:"):
+                if not reading_yanked and versions.count > 0.usize() and ByteText::equal_text(version, "yanked:"):
                     reading_yanked <- true
                     cursor <- finish + 1.usize()
                     continue
                 parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
                 return false if not SemVer::parse(version, &parsed) or parsed.prerelease
+                entry: VersionEntry = VersionEntry{version: parsed, start: start, finish: finish}
                 if reading_yanked:
-                    return false if yanked_count > 0.usize() and SemVer::compare(parsed, previous_yanked) <= 0
-                    ByteText::append(yanked_versions, version)
-                    yanked_versions.push(10)
+                    return false if yanked_versions.count > 0.usize() and SemVer::compare(parsed, previous_yanked) <= 0
+                    yanked_versions.push(entry)
                     previous_yanked <- parsed
-                    yanked_count <- yanked_count + 1.usize()
-                    return false if yanked_count > candidates
+                    return false if yanked_versions.count > versions.count
                 else:
                     # Stable versions must have strictly increasing precedence.
                     # This also rules out duplicate spellings and build variants.
-                    return false if candidates > 0 and SemVer::compare(parsed, previous) <= 0
+                    return false if versions.count > 0 and SemVer::compare(parsed, previous) <= 0
                     previous <- parsed
                     ByteText::append(versions_out, version)
                     versions_out.push(10)
-                    candidates <- candidates + 1.usize()
-                    return false if candidates > 4096.usize()
+                    versions.push(entry)
+                    return false if versions.count > 4096.usize()
                 cursor <- finish + 1
-            return candidates > 0.usize()
+            return versions.count > 0.usize()
 
-        def mark_yanked_versions(versions_out: darray[u8]&, yanked_versions: darray[u8]&, yanked_flags_out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            version_cursor: mutable usize = 0.usize()
-            yanked_cursor: mutable usize = 0.usize()
-            while version_cursor < versions_out.count:
-                version_finish: mutable usize = version_cursor
-                while version_finish < versions_out.count and versions_out[version_finish] != 10 |versions_out, version_finish|:
-                    version_finish <- version_finish + 1.usize()
-                return false if version_finish == versions_out.count
-                current_version: mutable darray[u8] = []
-                ByteText::append_range(&current_version, versions_out, version_cursor, version_finish)
-                current_parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-                return false if not SemVer::parse(current_version, &current_parsed)
+        def mark_yanked_versions(raw: darray[u8]&, versions: darray[VersionEntry]&, yanked_versions: darray[VersionEntry]&, yanked_flags_out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            yanked_index: mutable usize = 0
+            for index in 0..<versions.count |raw, versions, yanked_versions, yanked_index, yanked_flags_out|:
+                current: VersionEntry = versions[index]
                 is_yanked: mutable bool = false
-                if yanked_cursor < yanked_versions.count:
-                    yanked_finish: mutable usize = yanked_cursor
-                    while yanked_finish < yanked_versions.count and yanked_versions[yanked_finish] != 10 |yanked_versions, yanked_finish|:
-                        yanked_finish <- yanked_finish + 1.usize()
-                    return false if yanked_finish == yanked_versions.count
-                    yanked_version: mutable darray[u8] = []
-                    ByteText::append_range(&yanked_version, yanked_versions, yanked_cursor, yanked_finish)
-                    yanked_parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-                    return false if not SemVer::parse(yanked_version, &yanked_parsed)
-                    comparison: i64 = SemVer::compare(yanked_parsed, current_parsed)
+                if yanked_index < yanked_versions.count:
+                    yanked: VersionEntry = yanked_versions[yanked_index]
+                    comparison: i64 = SemVer::compare(yanked.version, current.version)
                     return false if comparison < 0
                     if comparison == 0:
-                        return false if not ByteText::equal(current_version, yanked_version)
+                        return false if not same_version_spelling(raw, current, yanked)
                         is_yanked <- true
-                        yanked_cursor <- yanked_finish + 1.usize()
+                        yanked_index <- yanked_index + 1.usize()
                 yanked_flags_out.push(1 if is_yanked else 0)
-                version_cursor <- version_finish + 1.usize()
-            return yanked_cursor == yanked_versions.count
+            return yanked_index == yanked_versions.count
+
+        def same_version_spelling(raw: darray[u8]&, left: VersionEntry, right: VersionEntry) -> bool:
+            length: usize = left.finish - left.start
+            return false if length != right.finish - right.start
+            for offset in 0..<length |raw, left, right|:
+                return false if raw[left.start + offset] != raw[right.start + offset]
+            return true
 
         def consume_label(raw: darray[u8]&, label: cstr, cursor: mutable usize&) -> bool:
             finish: i64 = ByteText::match_text_end(raw, cursor, label)
