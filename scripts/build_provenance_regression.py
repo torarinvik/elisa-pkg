@@ -271,6 +271,17 @@ def main() -> int:
             raise SystemExit("error: empty toolchain input created an output directory")
 
         project_root = inputs["project_root"]
+        binary.chmod(0o700)
+        try:
+            provenance.generate_candidate(**inputs)
+        except provenance.ProvenanceError as error:
+            if "mode 0755" not in str(error):
+                raise
+        else:
+            raise SystemExit("error: release provenance accepted an executable with noncanonical mode")
+        finally:
+            binary.chmod(0o755)
+
         try:
             provenance.generate_candidate(**{**inputs, "output_dir_input": project_root})
         except provenance.ProvenanceError:

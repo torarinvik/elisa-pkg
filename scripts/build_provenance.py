@@ -16,7 +16,7 @@ import stat
 import subprocess
 import tarfile
 import tempfile
-from typing import Mapping
+from typing import Mapping, TypedDict
 import zlib
 
 
@@ -100,7 +100,12 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def file_record(path: Path) -> dict[str, int | str]:
+class FileRecord(TypedDict):
+    sha256: str
+    size_bytes: int
+
+
+def file_record(path: Path, *, expected_mode: int | None = None) -> FileRecord:
     digest = hashlib.sha256()
     size = 0
     try:
@@ -109,6 +114,8 @@ def file_record(path: Path) -> dict[str, int | str]:
             before = os.fstat(stream.fileno())
             if not stat.S_ISREG(before.st_mode) or before.st_size <= 0:
                 raise ProvenanceError(f"provenance input must be a nonempty regular file: {path}")
+            if expected_mode is not None and stat.S_IMODE(before.st_mode) != expected_mode:
+                raise ProvenanceError(f"provenance input must have mode {expected_mode:04o}: {path}")
             while chunk := stream.read(1024 * 1024):
                 size += len(chunk)
                 if size > before.st_size:
@@ -391,8 +398,6 @@ def generate_candidate(
         binary_input, "elisapkg executable", executable=True, reject_symlink=True
     )
     require_within(binary, project_root, "elisapkg executable")
-    if stat.S_IMODE(binary.stat().st_mode) != 0o755:
-        raise ProvenanceError("elisapkg executable must have normalized mode 0755")
     compiler_wrapper = resolved_file(wrapper_input, "compiler wrapper", executable=True)
     stage1 = resolved_file(stage1_input, "stage1 compiler", executable=True)
     runtime = resolved_file(runtime_input, "Elisa runtime object")
@@ -419,8 +424,9 @@ def generate_candidate(
 
     run_id = required_env(env, "GITHUB_RUN_ID")
     run_attempt = required_env(env, "GITHUB_RUN_ATTEMPT")
-    binary_size = binary.stat().st_size
-    binary_digest = sha256_file(binary)
+    binary_record = file_record(binary, expected_mode=0o755)
+    binary_size = binary_record["size_bytes"]
+    binary_digest = binary_record["sha256"]
     manifest: dict[str, object] = {
         "schema_version": 1,
         "source": {
