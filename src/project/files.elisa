@@ -4,6 +4,81 @@ include "../text/bytes.elisa"
 
 module ProjectFiles:
     public:
+        # Return zero when this call publishes the destination, -17 when an
+        # existing destination wins the exclusive link, and another negative
+        # value for an I/O or durability failure. Callers that tolerate a
+        # concurrent writer must distinguish EEXIST from failed publication.
+        def write_cstr_file_noclobber_status(path_name: cstr, value: darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            # Link the fsynced temporary into place so an existing destination can
+            # never be replaced by a rename race. The temporary is removed after the
+            # link, leaving one durable directory entry for the caller to own.
+            path_snapshot: mutable darray[u8] = []
+            path_length: usize = Platform::pkg_strlen(path_name)
+            return -22 if path_length == 0.usize() or path_length > 4084.usize()
+            ByteText::append_text(&path_snapshot, path_name)
+            template: mutable darray[u8] = []
+            ByteText::append(&template, path_snapshot)
+            ByteText::append_text(&template, ".tmp.XXXXXX")
+            template.push(0)
+            fd: i64 = Platform::pkg_mkstemp(&template)
+            return -5 if fd < 0
+            temp_snapshot: mutable darray[u8] = []
+            ByteText::append(&temp_snapshot, template)
+            if not write_fd_all(fd, value) or Platform::pkg_fsync(fd) != 0:
+                _ = Platform::pkg_close(fd)
+                return -5
+            if Platform::pkg_close(fd) != 0:
+                return -5
+            temp_c: mutable darray[u8] = []
+            ByteText::append(&temp_c, temp_snapshot)
+            target_c: mutable darray[u8] = []
+            path_with_nul_into(&path_snapshot, &target_c)
+            temp_name: mutable cstr = (&temp_c[0]).cast[cstr] can Unsafe.PointerCast
+            target_name: mutable cstr = (&target_c[0]).cast[cstr] can Unsafe.PointerCast
+            link_status: i64 = Platform::pkg_link(temp_name, target_name)
+            if link_status != 0:
+                # Keep the exclusive temporary for recovery. Unlinking this
+                # pathname after the descriptor is closed could remove a
+                # replacement installed by another actor.
+                return link_status
+            temp_c.resize(0)
+            ByteText::append(&temp_c, temp_snapshot)
+            temp_name <- (&temp_c[0]).cast[cstr] can Unsafe.PointerCast
+            unlink_status: i64 = Platform::pkg_unlink(temp_name)
+            if unlink_status != 0:
+                # The destination link is already published. Do not remove it
+                # by pathname after a cleanup failure: another actor may have
+                # replaced that name while the temporary link was being
+                # retired. Leave the evidence for a later recovery pass.
+                return -5
+            target_c.resize(0)
+            path_with_nul_into(&path_snapshot, &target_c)
+            target_name <- (&target_c[0]).cast[cstr] can Unsafe.PointerCast
+            if Platform::pkg_fsync_parent(target_name) != 0:
+                # The link is visible, but its directory durability is unknown.
+                # Removing the destination by pathname could delete a concurrent
+                # replacement, so report the durability failure and leave the
+                # published evidence for recovery instead.
+                return -5
+            return 0
+
+        def write_cstr_file_noclobber(path_name: cstr, value: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            return write_cstr_file_noclobber_status(path_name, value) == 0
+
+        def remove_known_file(path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            path_snapshot: mutable darray[u8] = []
+            ByteText::append(&path_snapshot, path)
+            path_c: mutable darray[u8] = []
+            path_with_nul_into(&path_snapshot, &path_c)
+            path_name: mutable cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
+            state: i64 = Platform::pkg_package_file_size(path_name)
+            return true if state == -2
+            return false if state < 0
+            path_c.resize(0)
+            path_with_nul_into(&path_snapshot, &path_c)
+            path_name <- (&path_c[0]).cast[cstr] can Unsafe.PointerCast
+            return Platform::pkg_unlink(path_name) == 0
+
         def valid_path_bytes(path: darray[u8]&) -> bool:
             return false if path.count == 0.usize() or path.count > 4096.usize()
             for index in 0..<path.count |path|:
