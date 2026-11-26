@@ -1,0 +1,100 @@
+# Content and logical path identity for a sanitized package source tree.
+include "../integrity.elisa"
+include "../package_path_policy.elisa"
+include "../platform.elisa"
+include "../text/bytes.elisa"
+
+module SourceFingerprint:
+    public:
+        const maximum_snapshot_bytes: usize = 268435456.usize()
+
+        def at_bounded(root: darray[u8]&, out: mutable darray[u8]&, maximum_bytes: usize, bytes_hashed_out: mutable usize&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            # Build inputs are the complete sanitized source tree, not only the
+            # selected entry file. The native walker returns a deterministic,
+            # NUL-separated list and excludes build state, VCS data, and credential
+            # names before any file is opened. Hash each logical path with its
+            # content digest so a source rename, addition, deletion, or mutation
+            # cannot leave a stale lock or artifact looking reusable. Dependency
+            # roots are stripped from the fingerprint so the same package remains
+            # portable when its containing checkout moves.
+            out.resize(0)
+            bytes_hashed_out <- 0.usize()
+            return false if root.count == 0.usize() or root.count > 4096.usize()
+            root_c: mutable darray[u8] = []
+            root_c.resize(root.count + 1.usize())
+            for index in 0..<root.count |root_c, root, index|:
+                root_c[index] <- root[index]
+            root_c[root.count] <- 0
+            root_name: cstr = (&root_c[0]).cast[cstr] can Unsafe.PointerCast
+            resolved_root: mutable darray[u8] = []
+            resolved_root.resize(4096)
+            root_real_name: mutable cstr = ""
+            if Platform::pkg_realpath(root_name, &resolved_root) is canonical_root:
+                root_real_name <- canonical_root
+            else:
+                return false
+            root_real_length: usize = Platform::pkg_strlen(root_real_name)
+            return false if root_real_length == 0.usize() or root_real_length >= 4096.usize()
+            root_policy_path: mutable darray[u8] = []
+            ByteText::append_bounded_text(&root_policy_path, root_real_name)
+            root_policy_path.push(0)
+            return false if PackagePathPolicy::credential_root_forbidden(root_policy_path)
+            buffer: mutable darray[u8] = []
+            buffer.resize(16777216)
+            buffer_raw: mutable u8& = (&buffer[0]).cast[mutable u8&] can Unsafe.PointerCast
+            collected: i64 = Platform::pkg_collect_files(root_real_name, buffer_raw, buffer.count)
+            return false if collected < 0
+            root_prefix: usize = root_real_length + 1.usize()
+            fingerprint: mutable darray[u8] = []
+            bytes_hashed: mutable usize = 0.usize()
+            cursor: mutable usize = 0.usize()
+            while cursor < collected.usize():
+                path: mutable darray[u8] = []
+                while cursor < collected.usize() and buffer[cursor] != 0 |buffer, cursor, path|:
+                    path.push(buffer[cursor])
+                    cursor <- cursor + 1.usize()
+                return false if cursor >= collected.usize() or path.count == 0.usize()
+                cursor <- cursor + 1.usize()
+                return false if path.count <= root_prefix or path[root_real_length] != 47
+                for index in 0..<root_real_length |path, root_real_name|:
+                    return false if path[index] != root_real_name[index].u8()
+                logical_path: mutable darray[u8] = []
+                for index in root_prefix..<path.count |logical_path, path|:
+                    logical_path.push(path[index])
+                # These files are represented by dedicated lock/manifest
+                # digests. Including the lock itself would make its source
+                # fingerprint self-referential and impossible to stabilize.
+                continue if ByteText::equal_text(logical_path, "elisapkg.json") or ByteText::equal_text(logical_path, "elisapkg.lock")
+                remaining_bytes: usize = maximum_bytes - bytes_hashed
+                file_limit: usize = remaining_bytes if remaining_bytes < Integrity::max_input else Integrity::max_input
+                content: mutable darray[u8] = []
+                return false if not Platform::pkg_read_bounded_file(path, file_limit, &content)
+                bytes_hashed <- bytes_hashed + content.count
+                digest_bytes: mutable darray[u8] = []
+                return false if Integrity::sha256(content, &digest_bytes) != Integrity::DigestCode.Ok
+                for index in 0..<logical_path.count |fingerprint, logical_path|:
+                    fingerprint.push(logical_path[index])
+                fingerprint.push(0)
+                for index in 0..<digest_bytes.count |fingerprint, digest_bytes|:
+                    fingerprint.push(digest_bytes[index])
+                fingerprint.push(0)
+            digest_bytes: mutable darray[u8] = []
+            return false if Integrity::sha256(fingerprint, &digest_bytes) != Integrity::DigestCode.Ok
+            digest_hex: mutable darray[u8] = []
+            return false if not Integrity::hex_digest(digest_bytes, &digest_hex)
+            for index in 0..<digest_hex.count |out, digest_hex|:
+                out.push(digest_hex[index])
+            bytes_hashed_out <- bytes_hashed
+            return true
+
+        def at(root: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            bytes_hashed: mutable usize = 0.usize()
+            return at_bounded(root, out, maximum_snapshot_bytes, &bytes_hashed)
+
+        def current_bounded(out: mutable darray[u8]&, maximum_bytes: usize, bytes_hashed_out: mutable usize&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            root: mutable darray[u8] = [46]
+            return at_bounded(root, out, maximum_bytes, bytes_hashed_out)
+
+        def current(out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            bytes_hashed: mutable usize = 0.usize()
+            return current_bounded(out, maximum_snapshot_bytes, &bytes_hashed)
