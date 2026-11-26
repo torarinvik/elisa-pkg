@@ -65,6 +65,24 @@ The default build produces `.elisapkg/build/app`. Put program arguments after `-
 
 The preview shows which source files will ship. Packaging writes `.elisapkg/package.tar` and a verification receipt. Creating the archive does not compile or upload it.
 
+### 5. Install and remove a local binary on macOS
+
+From the example project directory, use a dedicated prefix under your home directory.
+
+```sh
+export ELISAPKG_INSTALL_PREFIX="$HOME/.local/elisapkg-example"
+"$ELISAPKG" install --local --bin app
+"$ELISAPKG_INSTALL_PREFIX/bin/app"
+"$ELISAPKG" uninstall --local app
+unset ELISAPKG_INSTALL_PREFIX
+```
+
+The install destination uses the manifest's package name. Without a custom prefix, the binary goes under `$HOME/.local/bin`. Use the full path to run it if that directory is missing from your `PATH`. Keep the same prefix for uninstall so it can find the receipt and check that the installed file still matches.
+
+## Verifying a CI build candidate
+
+The macOS workflow can produce a downloadable build candidate with an attested executable, provenance manifest, archive, and checksum. Follow the verification commands before running a downloaded binary. [CI candidate verification](docs/ci.md#verify-a-candidate)
+
 ## Command reference
 
 Run project commands from the project directory. Where supported, `--manifest-path PATH` selects a different project directory or its `elisapkg.json`. Use `elisapkg --help` for the full command list.
@@ -109,6 +127,6 @@ The local registry fixture verifies detached Ed25519 signatures, expiry, cached 
 | [CI and regression checks](docs/ci.md) | Development checks and host requirements |
 | [TUF profile](docs/tuf-profile.md) | Requirements for future production registry support |
 
-Source lives in `src/`. Build and regression tooling lives in `scripts/`. With the toolchain configured, `make build` builds the CLI and `make test` runs the smoke suite on a supported build host.
+Source lives in `src/`. Build and regression tooling lives in `scripts/`. With the toolchain configured, `make build` builds the CLI, `make lint` checks layout and Elisa semantics, and `make test` runs the regression suite on a supported build host.
 
 See [LICENSE](LICENSE) for license terms.

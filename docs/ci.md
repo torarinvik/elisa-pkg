@@ -33,6 +33,8 @@ attestation job checks those identities against the active workflow run and
 validates the archive, including its full gzip checksum trailer, normalized
 tar members, executable bytes, and sidecar checksum.
 
+## Verify a candidate
+
 To verify a downloaded candidate online, use GitHub CLI with the repository
 that created the attestation. Run this for each of the four subject files:
 
@@ -60,6 +62,8 @@ understands. The client does not yet consume or verify these attestations.
 Artifact Attestations are available for public repositories on current GitHub
 plans; private or internal repositories require GitHub Enterprise Cloud. An
 unsupported repository plan makes the attestation job fail closed.
+
+## Pinned toolchain
 
 The workflow builds its toolchain from exact source revisions instead of
 using whatever compiler happens to be installed on the runner:
