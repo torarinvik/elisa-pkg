@@ -111,7 +111,7 @@ module CliArguments:
             target_name_seen: mutable bool = false
             color_seen: mutable bool = false
             index: mutable i64 = 2
-            while index < argument_count |slots, options, flags_ok, positional_count, separator_seen, profile_seen, publish_dry_run, index|:
+            while index < argument_count |slots, options, flags_ok, positional_count, separator_seen, profile_seen, target_name_seen, publish_dry_run, index|:
                 flag: cstr = slots[index].cast[cstr]
                 if Platform::c_string_equal(flag, "--"):
                     separator_seen <- true
@@ -122,28 +122,13 @@ module CliArguments:
                     index <- index + 1
                     continue
                 if Platform::c_string_equal(flag, "--bin") or Platform::c_string_equal(flag, "--lib") or Platform::c_string_equal(flag, "--test"):
-                    region target_allowed_scope:
-                        target_allowed: bool = (Platform::c_string_equal(command, "build") and (Platform::c_string_equal(flag, "--bin") or Platform::c_string_equal(flag, "--lib") or Platform::c_string_equal(flag, "--test"))) or (Platform::c_string_equal(command, "run") and Platform::c_string_equal(flag, "--bin")) or (Platform::c_string_equal(command, "test") and Platform::c_string_equal(flag, "--test")) or (Platform::c_string_equal(command, "install") and Platform::c_string_equal(flag, "--bin"))
-                        flags_ok <- false if not target_allowed or index + 1 >= argument_count
-                    if flags_ok:
-                        target_value: cstr = slots[index + 1].cast[cstr]
-                        region target_length_scope:
-                            target_length: usize = Platform::c_string_length(target_value)
-                            flags_ok <- false if target_length == 0.usize() or target_length > 64.usize() or target_value[0].u8() == 45 or target_name_seen
-                        if flags_ok:
-                            target_name_seen <- true
+                    flags_ok <- false if not flags_ok or not target_flag_valid(argument_count, slots, index, command, flag) or target_name_seen
+                    target_name_seen <- true if flags_ok
                     index <- index + 2
                     continue
                 if Platform::c_string_equal(flag, "--profile"):
-                    region profile_allowed_scope:
-                        profile_allowed: bool = Platform::c_string_equal(command, "build") or Platform::c_string_equal(command, "run") or Platform::c_string_equal(command, "test") or Platform::c_string_equal(command, "install")
-                        flags_ok <- false if not profile_allowed or profile_seen or index + 1 >= argument_count
-                    if flags_ok:
-                        region profile_value_scope:
-                            profile_value: cstr = slots[index + 1].cast[cstr]
-                            flags_ok <- false if not Platform::c_string_equal(profile_value, "debug") and not Platform::c_string_equal(profile_value, "release")
-                        if flags_ok:
-                            profile_seen <- true
+                    flags_ok <- false if not flags_ok or profile_seen or not profile_flag_valid(argument_count, slots, index, command)
+                    profile_seen <- true if flags_ok
                     index <- index + 2
                     continue
                 options.locked <- true if Platform::c_string_equal(flag, "--locked")
@@ -173,6 +158,22 @@ module CliArguments:
                     positional_count <- positional_count + 1 if recognized and is_positional
                 index <- index + 1
             return flags_ok
+
+        # A target flag the command accepts, followed by a short name that is
+        # not itself a flag.
+        def target_flag_valid(argument_count: i64, slots: mutable cstr&&, index: i64, command: cstr, flag: cstr) -> bool can[Unsafe.PointerCast]:
+            target_allowed: bool = (Platform::c_string_equal(command, "build") and (Platform::c_string_equal(flag, "--bin") or Platform::c_string_equal(flag, "--lib") or Platform::c_string_equal(flag, "--test"))) or (Platform::c_string_equal(command, "run") and Platform::c_string_equal(flag, "--bin")) or (Platform::c_string_equal(command, "test") and Platform::c_string_equal(flag, "--test")) or (Platform::c_string_equal(command, "install") and Platform::c_string_equal(flag, "--bin"))
+            return false if not target_allowed or index + 1 >= argument_count
+            target_value: cstr = slots[index + 1].cast[cstr]
+            target_length: usize = Platform::c_string_length(target_value)
+            return target_length > 0.usize() and target_length <= 64.usize() and target_value[0].u8() != 45
+
+        # `--profile debug` or `--profile release` on a building command.
+        def profile_flag_valid(argument_count: i64, slots: mutable cstr&&, index: i64, command: cstr) -> bool can[Unsafe.PointerCast]:
+            profile_allowed: bool = Platform::c_string_equal(command, "build") or Platform::c_string_equal(command, "run") or Platform::c_string_equal(command, "test") or Platform::c_string_equal(command, "install")
+            return false if not profile_allowed or index + 1 >= argument_count
+            profile_value: cstr = slots[index + 1].cast[cstr]
+            return Platform::c_string_equal(profile_value, "debug") or Platform::c_string_equal(profile_value, "release")
 
         def read_target_flags(argument_count: i64, dispatch_slots: mutable cstr&&, command: cstr, options: mutable Model::CommandOptions&) -> void can[Unsafe.PointerCast]:
             dispatch_index: mutable i64 = 2
