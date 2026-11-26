@@ -17,6 +17,7 @@ include "./resolution/semver.elisa"
 include "./resolution/solver.elisa"
 include "./trust.elisa"
 include "./tuf.elisa"
+include "./registry/index_snapshot.elisa"
 
 module Registry:
     public:
@@ -91,7 +92,7 @@ module Registry:
             return ResultCode.InvalidConfiguration if not valid_package_name(package)
             root: mutable darray[u8] = []
             return ResultCode.NotConfigured if not configured_root(&root)
-            return ResultCode.InvalidConfiguration if not valid_registry_root(root)
+            return ResultCode.InvalidConfiguration if not RegistryRoot::valid(root)
             key_path: mutable darray[u8] = []
             trust_root_status: ResultCode = configured_trust_root(root, &key_path)
             return trust_root_status if trust_root_status != ResultCode.Ok
@@ -110,7 +111,7 @@ module Registry:
             return ResultCode.InvalidConfiguration if not valid_package_name(package) or not valid_package_version(version) or not Archive::is_safe_entry(archive) or not Integrity::valid_sha256_hex(expected_digest) or expected_size > Archive::max_archive_bytes.u64()
             root: mutable darray[u8] = []
             return ResultCode.NotConfigured if not configured_root(&root)
-            return ResultCode.InvalidConfiguration if not valid_registry_root(root)
+            return ResultCode.InvalidConfiguration if not RegistryRoot::valid(root)
             return ResultCode.MalformedMetadata if metadata.count == 0.usize() or metadata.count > Json::max_document_bytes or not Json::valid_document(metadata) or not Json::unique_object_keys(metadata) or not metadata_root_object(metadata) or not metadata_allowed_fields(metadata)
             metadata_archive: mutable darray[u8] = []
             metadata_digest: mutable darray[u8] = []
@@ -278,7 +279,7 @@ module Registry:
             return ResultCode.InvalidConfiguration if not SemVer::parse(version, &parsed) or parsed.prerelease
             root: mutable darray[u8] = []
             return ResultCode.NotConfigured if not configured_root(&root)
-            return ResultCode.InvalidConfiguration if not valid_registry_root(root)
+            return ResultCode.InvalidConfiguration if not RegistryRoot::valid(root)
             key_path: mutable darray[u8] = []
             trust_root_status: ResultCode = configured_trust_root(root, &key_path)
             return trust_root_status if trust_root_status != ResultCode.Ok
@@ -313,7 +314,7 @@ module Registry:
             return ResultCode.InvalidConfiguration if not valid_package_name(package) or not valid_package_version(version)
             root: mutable darray[u8] = []
             return ResultCode.NotConfigured if not configured_root(&root)
-            return ResultCode.InvalidConfiguration if not valid_registry_root(root)
+            return ResultCode.InvalidConfiguration if not RegistryRoot::valid(root)
             key_path: mutable darray[u8] = []
             trust_root_status: ResultCode = configured_trust_root(root, &key_path)
             return trust_root_status if trust_root_status != ResultCode.Ok
@@ -327,7 +328,7 @@ module Registry:
             return ResultCode.InvalidConfiguration if not valid_package_name(package) or not valid_package_version(version)
             root: mutable darray[u8] = []
             return ResultCode.NotConfigured if not configured_root(&root)
-            return ResultCode.InvalidConfiguration if not valid_registry_root(root)
+            return ResultCode.InvalidConfiguration if not RegistryRoot::valid(root)
             metadata_path: mutable darray[u8] = []
             return ResultCode.InvalidConfiguration if not join_path_version(root, package, version, &metadata_path)
             metadata_path.push(47)
@@ -361,7 +362,7 @@ module Registry:
             return ResultCode.MalformedMetadata if metadata.count == 0.usize() or metadata.count > 1048576.usize() or not Json::valid_document(metadata) or not Json::unique_object_keys(metadata) or not metadata_root_object(metadata) or not metadata_allowed_fields(metadata)
             root: mutable darray[u8] = []
             return ResultCode.NotConfigured if not configured_root(&root)
-            return ResultCode.InvalidConfiguration if not valid_registry_root(root)
+            return ResultCode.InvalidConfiguration if not RegistryRoot::valid(root)
             verified_archive: mutable darray[u8] = []
             verified_digest: mutable darray[u8] = []
             verified_archive_size: mutable u64 = 0
@@ -404,7 +405,7 @@ module Registry:
             return ResultCode.InvalidConfiguration if not valid_package_name(package)
             root: mutable darray[u8] = []
             return ResultCode.NotConfigured if not configured_root(&root)
-            return ResultCode.InvalidConfiguration if not valid_registry_root(root)
+            return ResultCode.InvalidConfiguration if not RegistryRoot::valid(root)
             key_path: mutable darray[u8] = []
             trust_root_status: ResultCode = configured_trust_root(root, &key_path)
             return trust_root_status if trust_root_status != ResultCode.Ok
@@ -958,23 +959,6 @@ module Registry:
                 return true
             return false
 
-        def valid_registry_root(root: darray[u8]&) -> bool:
-            return false if root.count == 0 or root[0] != 47 or root.count > 4096 or root[root.count - 1] == 47 and root.count > 1
-            segment_start: mutable usize = 1
-            for index in 1..<(root.count + 1) |root, segment_start|:
-                if index == root.count or root[index] == 47:
-                    return false if index == segment_start
-                    # Keep the configured root in canonical component form.
-                    # Dot components are harmless to POSIX resolution but can
-                    # create alternate textual identities for the same trust
-                    # store and undermine path-boundary comparisons.
-                    return false if index - segment_start == 1 and root[segment_start] == 46
-                    return false if index - segment_start == 2 and root[segment_start] == 46 and root[segment_start + 1] == 46
-                    segment_start <- index + 1
-                else:
-                    return false if root[index] < 32 or root[index] == 127 or root[index] == 0
-            return true
-
         def valid_package_name(package: darray[u8]&) -> bool:
             return PackageIdentity::valid_name(package)
 
@@ -984,7 +968,7 @@ module Registry:
 
         def join_path_leaf(root: darray[u8]&, package: darray[u8]&, leaf: cstr, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
             out.resize(0)
-            return false if root.count == 0 or not valid_registry_root(root)
+            return false if root.count == 0 or not RegistryRoot::valid(root)
             for index in 0..<root.count |out, root|:
                 out.push(root[index])
             if package.count > 0:
@@ -1106,7 +1090,7 @@ module Registry:
             snapshot_package: mutable darray[u8] = []
             generation: mutable u64 = 0
             expires: mutable u64 = 0
-            return ResultCode.MalformedMetadata if not parse_index_snapshot(snapshot, &snapshot_root, &snapshot_package, &generation, &expires, &versions, &yanked_flags)
+            return ResultCode.MalformedMetadata if not RegistryIndexSnapshot::parse(snapshot, &snapshot_root, &snapshot_package, &generation, &expires, &versions, &yanked_flags)
             return ResultCode.InvalidSignature if not bytes_equal(snapshot_root, root) or not bytes_equal(snapshot_package, package)
             now: i64 = Platform::pkg_wall_clock_seconds()
             return ResultCode.ClockUnavailable if now < 0
@@ -1132,174 +1116,6 @@ module Registry:
             for index in 0..<key_fingerprint_hex.count |key_fingerprint_out, key_fingerprint_hex|:
                 key_fingerprint_out.push(key_fingerprint_hex[index])
             return ResultCode.Ok
-
-        def parse_index_snapshot(raw: darray[u8]&, registry_out: mutable darray[u8]&, package_out: mutable darray[u8]&, generation_out: mutable u64&, expires_out: mutable u64&, versions_out: mutable darray[u8]&, yanked_flags_out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            registry_out.resize(0)
-            package_out.resize(0)
-            generation_out <- 0
-            expires_out <- 0
-            versions_out.resize(0)
-            yanked_flags_out.resize(0)
-            return false if raw.count == 0 or raw.count > 1048576 or raw[raw.count - 1.usize()] != 10
-            cursor: mutable usize = 0
-            header: cstr = "elisapkg-index:1\n"
-            header_length: usize = Platform::pkg_strlen(header)
-            return false if header_length > raw.count
-            for index in 0..<header_length |raw, header|:
-                return false if raw[index] != header[index].u8()
-            cursor <- header_length
-
-            registry_prefix: cstr = "registry:"
-            registry_prefix_length: usize = Platform::pkg_strlen(registry_prefix)
-            return false if cursor > raw.count or registry_prefix_length > raw.count - cursor
-            for index in 0..<registry_prefix_length |raw, cursor, registry_prefix|:
-                return false if raw[cursor + index] != registry_prefix[index].u8()
-            cursor <- cursor + registry_prefix_length
-            registry_start: usize = cursor
-            while cursor < raw.count and raw[cursor] != 10 |raw, cursor|:
-                return false if raw[cursor] < 32 or raw[cursor] == 127 or raw[cursor] == 92
-                cursor <- cursor + 1
-            return false if cursor == raw.count or cursor == registry_start
-            for index in registry_start..<cursor |registry_out, raw|:
-                registry_out.push(raw[index])
-            cursor <- cursor + 1
-
-            package_prefix: cstr = "package:"
-            package_prefix_length: usize = Platform::pkg_strlen(package_prefix)
-            return false if cursor > raw.count or package_prefix_length > raw.count - cursor
-            for index in 0..<package_prefix_length |raw, cursor, package_prefix|:
-                return false if raw[cursor + index] != package_prefix[index].u8()
-            cursor <- cursor + package_prefix_length
-            package_start: usize = cursor
-            while cursor < raw.count and raw[cursor] != 10 |raw, cursor|:
-                return false if raw[cursor] < 32 or raw[cursor] == 127 or raw[cursor] == 92
-                cursor <- cursor + 1
-            return false if cursor == raw.count or cursor == package_start
-            for index in package_start..<cursor |package_out, raw|:
-                package_out.push(raw[index])
-            cursor <- cursor + 1
-
-            generation_prefix: cstr = "generation:"
-            generation_prefix_length: usize = Platform::pkg_strlen(generation_prefix)
-            return false if cursor > raw.count or generation_prefix_length > raw.count - cursor
-            for index in 0..<generation_prefix_length |raw, cursor, generation_prefix|:
-                return false if raw[cursor + index] != generation_prefix[index].u8()
-            cursor <- cursor + generation_prefix_length
-            generation_start: usize = cursor
-            generation_value: mutable u64 = 0
-            while cursor < raw.count and raw[cursor] >= 48 and raw[cursor] <= 57 |raw, cursor, generation_value|:
-                digit: u64 = (raw[cursor] - 48).u64()
-                return false if generation_value > 1844674407370955161 or generation_value == 1844674407370955161 and digit > 5
-                generation_value <- generation_value * 10 + digit
-                cursor <- cursor + 1
-            return false if cursor == generation_start or cursor >= raw.count or raw[cursor] != 10 or cursor - generation_start > 1.usize() and raw[generation_start] == 48
-            return false if generation_value == 0
-            generation_out <- generation_value
-            cursor <- cursor + 1
-
-            expires_prefix: cstr = "expires:"
-            expires_prefix_length: usize = Platform::pkg_strlen(expires_prefix)
-            return false if cursor > raw.count or expires_prefix_length > raw.count - cursor
-            for index in 0..<expires_prefix_length |raw, cursor, expires_prefix|:
-                return false if raw[cursor + index] != expires_prefix[index].u8()
-            cursor <- cursor + expires_prefix_length
-            expires_start: usize = cursor
-            expires_value: mutable u64 = 0
-            while cursor < raw.count and raw[cursor] >= 48 and raw[cursor] <= 57 |raw, cursor, expires_value|:
-                digit: u64 = (raw[cursor] - 48).u64()
-                return false if expires_value > 1844674407370955161 or expires_value == 1844674407370955161 and digit > 5
-                expires_value <- expires_value * 10 + digit
-                cursor <- cursor + 1
-            return false if cursor == expires_start or cursor >= raw.count or raw[cursor] != 10 or cursor - expires_start > 1.usize() and raw[expires_start] == 48
-            return false if expires_value == 0
-            expires_out <- expires_value
-            cursor <- cursor + 1
-
-            versions_header: cstr = "versions:\n"
-            versions_header_length: usize = Platform::pkg_strlen(versions_header)
-            return false if cursor > raw.count or versions_header_length > raw.count - cursor
-            for index in 0..<versions_header_length |raw, cursor, versions_header|:
-                return false if raw[cursor + index] != versions_header[index].u8()
-            cursor <- cursor + versions_header_length
-            return false if not valid_registry_root(registry_out) or not valid_package_name(package_out)
-            previous: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-            seen: mutable darray[u8] = []
-            yanked_versions: mutable darray[u8] = []
-            previous_yanked: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-            candidates: mutable usize = 0
-            yanked_count: mutable usize = 0
-            reading_yanked: mutable bool = false
-            while cursor < raw.count:
-                start: usize = cursor
-                finish: mutable usize = start
-                while finish < raw.count and raw[finish] != 10 |raw, finish|:
-                    finish <- finish + 1
-                return false if finish == raw.count or finish == start or finish - start > 128
-                version: mutable darray[u8] = []
-                for index in start..<finish |version, raw|:
-                    return false if raw[index] < 33 or raw[index] == 127 or raw[index] == 92
-                    version.push(raw[index])
-                if not reading_yanked and candidates > 0.usize() and bytes_equal_text(version, "yanked:"):
-                    reading_yanked <- true
-                    cursor <- finish + 1.usize()
-                    continue
-                parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-                return false if not SemVer::parse(version, &parsed) or parsed.prerelease
-                if reading_yanked:
-                    return false if yanked_count > 0.usize() and SemVer::compare(parsed, previous_yanked) <= 0
-                    for index in 0..<version.count |yanked_versions, version|:
-                        yanked_versions.push(version[index])
-                    yanked_versions.push(10)
-                    previous_yanked <- parsed
-                    yanked_count <- yanked_count + 1.usize()
-                    return false if yanked_count > candidates
-                else:
-                    return false if registry_version_seen(seen, version)
-                    return false if candidates > 0 and SemVer::compare(parsed, previous) <= 0
-                    for index in 0..<version.count |seen, version|:
-                        seen.push(version[index])
-                    seen.push(0)
-                    previous <- parsed
-                    for index in 0..<version.count |versions_out, version|:
-                        versions_out.push(version[index])
-                    versions_out.push(10)
-                    candidates <- candidates + 1.usize()
-                    return false if candidates > 4096.usize()
-                cursor <- finish + 1
-            return false if candidates == 0.usize()
-
-            version_cursor: mutable usize = 0.usize()
-            yanked_cursor: mutable usize = 0.usize()
-            while version_cursor < versions_out.count:
-                version_finish: mutable usize = version_cursor
-                while version_finish < versions_out.count and versions_out[version_finish] != 10 |versions_out, version_finish|:
-                    version_finish <- version_finish + 1.usize()
-                return false if version_finish == versions_out.count
-                current_version: mutable darray[u8] = []
-                for index in version_cursor..<version_finish |current_version, versions_out|:
-                    current_version.push(versions_out[index])
-                current_parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-                return false if not SemVer::parse(current_version, &current_parsed)
-                is_yanked: mutable bool = false
-                if yanked_cursor < yanked_versions.count:
-                    yanked_finish: mutable usize = yanked_cursor
-                    while yanked_finish < yanked_versions.count and yanked_versions[yanked_finish] != 10 |yanked_versions, yanked_finish|:
-                        yanked_finish <- yanked_finish + 1.usize()
-                    return false if yanked_finish == yanked_versions.count
-                    yanked_version: mutable darray[u8] = []
-                    for index in yanked_cursor..<yanked_finish |yanked_version, yanked_versions|:
-                        yanked_version.push(yanked_versions[index])
-                    yanked_parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-                    return false if not SemVer::parse(yanked_version, &yanked_parsed)
-                    comparison: i64 = SemVer::compare(yanked_parsed, current_parsed)
-                    return false if comparison < 0
-                    if comparison == 0:
-                        return false if not registry_slice_equal(versions_out, version_cursor, version_finish, yanked_version)
-                        is_yanked <- true
-                        yanked_cursor <- yanked_finish + 1.usize()
-                yanked_flags_out.push(1 if is_yanked else 0)
-                version_cursor <- version_finish + 1.usize()
-            return yanked_cursor == yanked_versions.count
 
         def make_index_identity(root: darray[u8]&, package: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             root_digest_bytes: mutable darray[u8] = []
