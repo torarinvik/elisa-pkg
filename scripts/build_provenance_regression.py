@@ -255,6 +255,21 @@ def main() -> int:
         if unverified_output.parent.exists():
             raise SystemExit("error: rejected release candidate created an output directory")
 
+        runtime = inputs["runtime_input"]
+        original_runtime = runtime.read_bytes()
+        runtime.write_bytes(b"")
+        try:
+            provenance.generate_candidate(**{**inputs, "output_dir_input": unverified_output})
+        except provenance.ProvenanceError as error:
+            if "nonempty regular file" not in str(error):
+                raise
+        else:
+            raise SystemExit("error: release candidate accepted an empty runtime object")
+        finally:
+            runtime.write_bytes(original_runtime)
+        if unverified_output.parent.exists():
+            raise SystemExit("error: empty toolchain input created an output directory")
+
         project_root = inputs["project_root"]
         try:
             provenance.generate_candidate(**{**inputs, "output_dir_input": project_root})

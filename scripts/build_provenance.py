@@ -101,8 +101,27 @@ def sha256_file(path: Path) -> str:
 
 
 def file_record(path: Path) -> dict[str, int | str]:
-    info = path.stat()
-    return {"sha256": sha256_file(path), "size_bytes": info.st_size}
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as stream:
+            before = os.fstat(stream.fileno())
+            if not stat.S_ISREG(before.st_mode) or before.st_size <= 0:
+                raise ProvenanceError(f"provenance input must be a nonempty regular file: {path}")
+            while chunk := stream.read(1024 * 1024):
+                size += len(chunk)
+                if size > before.st_size:
+                    raise ProvenanceError(f"provenance input grew while it was read: {path}")
+                digest.update(chunk)
+            after = os.fstat(stream.fileno())
+    except OSError as error:
+        raise ProvenanceError(f"could not read provenance input {path}: {error}") from error
+    if (size, after.st_size, after.st_mtime_ns, after.st_ctime_ns) != (
+        before.st_size, before.st_size, before.st_mtime_ns, before.st_ctime_ns
+    ):
+        raise ProvenanceError(f"provenance input changed while it was read: {path}")
+    return {"sha256": digest.hexdigest(), "size_bytes": size}
 
 
 def git_environment(env: Mapping[str, str]) -> dict[str, str]:
