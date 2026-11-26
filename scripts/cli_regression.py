@@ -123,6 +123,17 @@ with tempfile.TemporaryDirectory(prefix='cli-review-', dir=ROOT / 'build') as di
         check=False)
     assert colored_fetch.returncode == 3, colored_fetch
     assert 'registry is not configured' in colored_fetch.stderr
+    root_manifest = project / 'elisapkg.json'
+    original_manifest = root_manifest.read_bytes()
+    original_lock = (project / 'elisapkg.lock').read_bytes()
+    registry_add = subprocess.run(
+        [BIN, 'add', 'foo', '--version', '1.0.0', '--registry', 'primary'], cwd=project,
+        env=fetch_environment, capture_output=True, text=True, timeout=120,
+        check=False)
+    assert registry_add.returncode == 3, registry_add
+    assert 'registry is not configured' in registry_add.stderr
+    assert root_manifest.read_bytes() == original_manifest
+    assert (project / 'elisapkg.lock').read_bytes() == original_lock
 
     library = work / 'library'
     run([BIN, 'init', library, '--lib'], stdout=subprocess.DEVNULL)
