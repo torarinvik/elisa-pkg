@@ -23,8 +23,14 @@ module RegistryIndexSnapshot:
                 not consume_positive_decimal_line(raw, "expires:", &cursor, expires_out)
                 not consume_label(raw, "versions:\n", &cursor)
             return false if not RegistryRoot::valid(registry_out) or not PackageIdentity::valid_name(package_out)
-            previous: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
             yanked_versions: mutable darray[u8] = []
+            return false if not read_versions(raw, cursor, versions_out, &yanked_versions)
+            return mark_yanked_versions(versions_out, yanked_versions, yanked_flags_out)
+
+    private:
+        def read_versions(raw: darray[u8]&, start_offset: usize, versions_out: mutable darray[u8]&, yanked_versions: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            cursor: mutable usize = start_offset
+            previous: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
             previous_yanked: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
             candidates: mutable usize = 0
             yanked_count: mutable usize = 0
@@ -47,9 +53,8 @@ module RegistryIndexSnapshot:
                 return false if not SemVer::parse(version, &parsed) or parsed.prerelease
                 if reading_yanked:
                     return false if yanked_count > 0.usize() and SemVer::compare(parsed, previous_yanked) <= 0
-                    for index in 0..<version.count |yanked_versions, version|:
-                        yanked_versions <- yanked_versions.push(version[index])
-                    yanked_versions <- yanked_versions.push(10)
+                    ByteText::append(yanked_versions, version)
+                    yanked_versions.push(10)
                     previous_yanked <- parsed
                     yanked_count <- yanked_count + 1.usize()
                     return false if yanked_count > candidates
@@ -58,14 +63,14 @@ module RegistryIndexSnapshot:
                     # This also rules out duplicate spellings and build variants.
                     return false if candidates > 0 and SemVer::compare(parsed, previous) <= 0
                     previous <- parsed
-                    for index in 0..<version.count |versions_out, version|:
-                        versions_out.push(version[index])
+                    ByteText::append(versions_out, version)
                     versions_out.push(10)
                     candidates <- candidates + 1.usize()
                     return false if candidates > 4096.usize()
                 cursor <- finish + 1
-            return false if candidates == 0.usize()
+            return candidates > 0.usize()
 
+        def mark_yanked_versions(versions_out: darray[u8]&, yanked_versions: darray[u8]&, yanked_flags_out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
             version_cursor: mutable usize = 0.usize()
             yanked_cursor: mutable usize = 0.usize()
             while version_cursor < versions_out.count:
@@ -97,7 +102,6 @@ module RegistryIndexSnapshot:
                 version_cursor <- version_finish + 1.usize()
             return yanked_cursor == yanked_versions.count
 
-    private:
         def consume_label(raw: darray[u8]&, label: cstr, cursor: mutable usize&) -> bool:
             finish: i64 = ByteText::match_text_end(raw, cursor, label)
             return false if finish < 0
