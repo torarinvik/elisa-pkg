@@ -22,60 +22,10 @@ module PackageAssembly:
         def collect_paths(raw: darray[u8]&, target: darray[u8]&, out: mutable darray[u8]&) -> bool can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             can Global.Read:
                 out.resize(0)
-                resolved_root: mutable darray[u8] = []
-                resolved_root.resize(4096)
-                root_real_name: mutable cstr = ""
-                if Platform::pkg_realpath(".", &resolved_root) is canonical_root:
-                    root_real_name <- canonical_root
-                else:
+                if not select_paths(raw, target, out):
+                    out.resize(0)
                     return false
-                root_policy_path: mutable darray[u8] = []
-                ByteText::append_bounded_text(&root_policy_path, root_real_name)
-                root_policy_path.push(0)
-                return false if PackagePathPolicy::credential_root_forbidden(root_policy_path)
-                buffer: mutable darray[u8] = []
-                buffer.resize(8388608)
-                buffer_raw: mutable u8& = (&buffer[0]).cast[mutable u8&] can Unsafe.PointerCast
-                collected: i64 = Platform::pkg_collect_files(".", buffer_raw, buffer.count)
-                return false if collected < 0
-                cursor: mutable usize = 0.usize()
-                selected: mutable usize = 0.usize()
-                target_found: mutable bool = false
-                include_start: usize = Json::root_value_offset(raw, "include")
-                include_end: usize = Json::array_end(raw, include_start) if include_start < raw.count else raw.count
-                exclude_start: usize = Json::root_value_offset(raw, "exclude")
-                exclude_end: usize = Json::array_end(raw, exclude_start) if exclude_start < raw.count else raw.count
-                return false if not PackageSelection::valid_pattern_range(raw, include_start, include_end)
-                return false if not PackageSelection::valid_pattern_range(raw, exclude_start, exclude_end)
-                glob_work_remaining: mutable usize = PackageSelection::max_work
-                glob_rows_remaining: mutable usize = PackageSelection::max_rows
-                glob_budget_exhausted: mutable bool = false
-                while cursor < collected.usize():
-                    path: mutable darray[u8] = []
-                    while cursor < collected.usize() and buffer[cursor] != 0 |buffer, cursor, path|:
-                        path.push(buffer[cursor])
-                        cursor <- cursor + 1.usize()
-                    return false if cursor >= collected.usize()
-                    cursor <- cursor + 1.usize()
-                    return false if path.count == 0.usize() or PackageSelection::publish_path_forbidden(path)
-                    required: bool = ByteText::equal_text(path, "elisapkg.json") or ByteText::equal_text(path, "elisapkg.lock")
-                    include_selected: mutable bool = required or PackageSelection::include_allows_path(raw, include_start, include_end, path, &glob_work_remaining, &glob_rows_remaining, &glob_budget_exhausted)
-                    if glob_budget_exhausted:
-                        CliOutput::write_error("error: package include/exclude patterns exceeded the bounded matching budget\n")
-                        return false
-                    if include_selected and not required and PackageSelection::exclude_allows_path(raw, exclude_start, exclude_end, path, &glob_work_remaining, &glob_rows_remaining, &glob_budget_exhausted):
-                        include_selected <- false
-                    if glob_budget_exhausted:
-                        CliOutput::write_error("error: package include/exclude patterns exceeded the bounded matching budget\n")
-                        return false
-                    if include_selected:
-                        return false if selected >= PackagePathPolicy::max_package_archive_entries
-                        for index in 0..<path.count |out, path|:
-                            out.push(path[index])
-                        out.push(0)
-                        selected <- selected + 1.usize()
-                        target_found <- true if ByteText::equal(path, target)
-                return selected > 0.usize() and target_found
+                return true
 
         def archive_bytes(raw: darray[u8]&, target: darray[u8]&, out: mutable darray[u8]&) -> bool can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             can Global.Read:
@@ -168,3 +118,61 @@ module PackageAssembly:
                 CliOutput::write_bytes(1, &digest)
                 CliOutput::write_ok("\n")
                 return Code.Ok
+
+    private:
+        def select_paths(raw: darray[u8]&, target: darray[u8]&, out: mutable darray[u8]&) -> bool can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            can Global.Read:
+                resolved_root: mutable darray[u8] = []
+                resolved_root.resize(4096)
+                root_real_name: mutable cstr = ""
+                if Platform::pkg_realpath(".", &resolved_root) is canonical_root:
+                    root_real_name <- canonical_root
+                else:
+                    return false
+                root_policy_path: mutable darray[u8] = []
+                ByteText::append_bounded_text(&root_policy_path, root_real_name)
+                root_policy_path.push(0)
+                return false if PackagePathPolicy::credential_root_forbidden(root_policy_path)
+                buffer: mutable darray[u8] = []
+                buffer.resize(8388608)
+                buffer_raw: mutable u8& = (&buffer[0]).cast[mutable u8&] can Unsafe.PointerCast
+                collected: i64 = Platform::pkg_collect_files(".", buffer_raw, buffer.count)
+                return false if collected < 0
+                cursor: mutable usize = 0.usize()
+                selected: mutable usize = 0.usize()
+                target_found: mutable bool = false
+                include_start: usize = Json::root_value_offset(raw, "include")
+                include_end: usize = Json::array_end(raw, include_start) if include_start < raw.count else raw.count
+                exclude_start: usize = Json::root_value_offset(raw, "exclude")
+                exclude_end: usize = Json::array_end(raw, exclude_start) if exclude_start < raw.count else raw.count
+                return false if not PackageSelection::valid_pattern_range(raw, include_start, include_end)
+                return false if not PackageSelection::valid_pattern_range(raw, exclude_start, exclude_end)
+                glob_work_remaining: mutable usize = PackageSelection::max_work
+                glob_rows_remaining: mutable usize = PackageSelection::max_rows
+                glob_budget_exhausted: mutable bool = false
+                while cursor < collected.usize():
+                    path: mutable darray[u8] = []
+                    while cursor < collected.usize() and buffer[cursor] != 0 |buffer, cursor, path|:
+                        path.push(buffer[cursor])
+                        cursor <- cursor + 1.usize()
+                    return false if cursor >= collected.usize()
+                    cursor <- cursor + 1.usize()
+                    return false if path.count == 0.usize() or PackageSelection::publish_path_forbidden(path)
+                    required: bool = ByteText::equal_text(path, "elisapkg.json") or ByteText::equal_text(path, "elisapkg.lock")
+                    include_selected: mutable bool = required or PackageSelection::include_allows_path(raw, include_start, include_end, path, &glob_work_remaining, &glob_rows_remaining, &glob_budget_exhausted)
+                    if glob_budget_exhausted:
+                        CliOutput::write_error("error: package include/exclude patterns exceeded the bounded matching budget\n")
+                        return false
+                    if include_selected and not required and PackageSelection::exclude_allows_path(raw, exclude_start, exclude_end, path, &glob_work_remaining, &glob_rows_remaining, &glob_budget_exhausted):
+                        include_selected <- false
+                    if glob_budget_exhausted:
+                        CliOutput::write_error("error: package include/exclude patterns exceeded the bounded matching budget\n")
+                        return false
+                    if include_selected:
+                        return false if selected >= PackagePathPolicy::max_package_archive_entries
+                        for index in 0..<path.count |out, path|:
+                            out.push(path[index])
+                        out.push(0)
+                        selected <- selected + 1.usize()
+                        target_found <- true if ByteText::equal(path, target)
+                return selected > 0.usize() and target_found
