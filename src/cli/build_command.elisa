@@ -416,29 +416,15 @@ module BuildCommand:
                         CompilerProcess::discard_scratch(sandbox_work_name, temp_name, aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
                         CliOutput::write_error("error: unable to start the sandboxed compiler process\n")
                         return CliStatus::build_failed
-                    status: mutable i32 = 0
                     if not Toolchain::set_callback_path_pid(&callback_parameter, callback_digits_offset, pid):
-                        # The wait helper requires a positive timeout. One
-                        # millisecond gives an already-exited child a chance to be
-                        # reaped, then kills and reaps it before group cleanup.
-                        stop_status: i64 = Platform::pkg_waitpid_group_timeout(pid, &status, 1)
-                        if stop_status != 0 and stop_status != Platform::pkg_timeout_error():
-                            _ = Platform::pkg_close(compiler_stdout_fd)
-                            _ = Platform::pkg_close(compiler_stderr_fd)
-                            CliOutput::write_error("error: unable to confirm compiler process termination; retained its scratch files\n")
-                            return CliStatus::build_failed
+                        return retain_scratch_after_unconfirmed_exit(compiler_stdout_fd, compiler_stderr_fd) if not CompilerProcess::stop_after_setup_failure(pid)
                         CompilerProcess::discard_logs(compiler_stdout_fd, compiler_stderr_fd, compiler_stdout_name, compiler_stderr_name)
                         CompilerProcess::discard_scratch(sandbox_work_name, temp_name, aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
                         CliOutput::write_error("error: unable to name the stage1 callback file safely\n")
                         return CliStatus::build_failed
                     callback_file_name: cstr = (&callback_parameter[14]).cast[cstr] can Unsafe.PointerCast
-                    waited: i64 = Platform::pkg_waitpid_timeout(pid, &status, BUILD_TIMEOUT_MS)
-                    group_cleanup: i64 = Platform::pkg_terminate_process_group(pid)
-                    if group_cleanup != 0:
-                        _ = Platform::pkg_close(compiler_stdout_fd)
-                        _ = Platform::pkg_close(compiler_stderr_fd)
-                        CliOutput::write_error("error: unable to confirm compiler process termination; retained its scratch files\n")
-                        return CliStatus::build_failed
+                    completion: CompilerProcess::Completion = CompilerProcess::await_exit(pid, BUILD_TIMEOUT_MS)
+                    return retain_scratch_after_unconfirmed_exit(compiler_stdout_fd, compiler_stderr_fd) if not completion.group_stopped
                     callback_remove_status: i64 = Platform::pkg_unlink(callback_file_name)
                     if callback_remove_status != 0 and callback_remove_status != -2:
                         CompilerProcess::discard_logs(compiler_stdout_fd, compiler_stderr_fd, compiler_stdout_name, compiler_stderr_name)
@@ -449,11 +435,11 @@ module BuildCommand:
                         CompilerProcess::discard_scratch(sandbox_work_name, temp_name, aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
                         CliOutput::write_error("error: unable to safely collect compiler output\n")
                         return CliStatus::build_failed
-                    if waited == Platform::pkg_timeout_error():
+                    if completion.wait_status == Platform::pkg_timeout_error():
                         CompilerProcess::discard_scratch(sandbox_work_name, temp_name, aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
                         CliOutput::write_error("error: compiler exceeded the 10-minute execution limit\n")
                         return CliStatus::cancelled
-                    if waited < 0 or status != 0:
+                    if completion.wait_status < 0 or completion.exit_status != 0:
                         CompilerProcess::discard_scratch(sandbox_work_name, temp_name, aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
                         CliOutput::write_error("error: sandboxed compiler process failed or could not be reaped\n")
                         return CliStatus::build_failed
@@ -510,6 +496,12 @@ module BuildCommand:
                         out_artifact_digest[digest_index] <- artifact_digest[digest_index]
                     _ = options
                     return CliStatus::success
+
+        def retain_scratch_after_unconfirmed_exit(stdout_descriptor: i64, stderr_descriptor: i64) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            _ = Platform::pkg_close(stdout_descriptor)
+            _ = Platform::pkg_close(stderr_descriptor)
+            CliOutput::write_error("error: unable to confirm compiler process termination; retained its scratch files\n") can Global.Read
+            return CliStatus::build_failed
 
         def capture_compiler_output(path: cstr, content: mutable darray[u8]&, digest: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return false if Platform::pkg_package_file_size(path) <= 0
