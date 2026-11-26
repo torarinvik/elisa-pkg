@@ -3055,4 +3055,5 @@ else
 fi
 
 python3 "$ROOT/scripts/regression_test.py"
+python3 "$ROOT/scripts/cli_regression.py"
 echo "elisapkg smoke tests passed"

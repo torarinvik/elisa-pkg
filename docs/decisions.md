@@ -18,7 +18,7 @@ package name, and declared version. A dependency alias must equal the package
 name. Serialized paths remain relative to the declaring project where possible;
 absolute paths are never emitted. Fixture: the transitive local graph in the
 smoke suite and the external sibling dependency in
-`scripts/regression_test.py`.
+`scripts/cli_regression.py`.
 
 ## D-003: one stable version per package identity
 
