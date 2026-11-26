@@ -49,19 +49,19 @@ def main() -> int:
 def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
     sdk: mutable darray[u8] = []
     developer: mutable darray[u8] = []
-    resolved: bool = Platform::pkg_macos_toolchain_paths(&sdk, &developer)
-    if Platform::pkg_getenv("ELISAPKG_EXPECT_INVALID_TOOLCHAIN") is invalid_case:
+    resolved: bool = Platform::macos_toolchain_paths(&sdk, &developer)
+    if Platform::environment_variable("ELISAPKG_EXPECT_INVALID_TOOLCHAIN") is invalid_case:
         return 0 if not resolved
         return 2
     return 1 if not resolved or sdk.count == 0.usize() or developer.count == 0.usize()
     developer_name: cstr = (&developer[0]).cast[cstr] can Unsafe.PointerCast
     expected_developer: cstr = "{developer}"
-    return 3 if not Platform::pkg_cstr_equal(developer_name, expected_developer)
+    return 3 if not Platform::c_string_equal(developer_name, expected_developer)
     sdk_name: mutable darray[u8] = []
     for index in 0..<sdk.count |sdk_name, sdk|:
         sdk_name.push(sdk[index])
     sdk_name.push(0)
-    return 4 if Platform::pkg_is_directory((&sdk_name[0]).cast[cstr] can Unsafe.PointerCast) != 1
+    return 4 if Platform::is_directory((&sdk_name[0]).cast[cstr] can Unsafe.PointerCast) != 1
     return 0
 '''
 

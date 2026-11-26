@@ -21,13 +21,13 @@ def source_for(check_group_only: bool, selected_llvm: Path | None) -> str:
         f'include "{ROOT / "src/platform.elisa"}"',
         "",
         "def main() -> i64:",
-        '    return 1 if Platform::pkg_access("exec-target", 1) != 0',
-        '    return 2 if Platform::pkg_access("exec-link", 1) == 0',
+        '    return 1 if Platform::access_path("exec-target", 1) != 0',
+        '    return 2 if Platform::access_path("exec-link", 1) == 0',
     ]
     if check_group_only:
-        lines.append('    return 3 if Platform::pkg_access("group-only", 1) == 0')
+        lines.append('    return 3 if Platform::access_path("group-only", 1) == 0')
     if selected_llvm is not None:
-        lines.append(f'    return 4 if Platform::pkg_access("{selected_llvm}", 1) != 0')
+        lines.append(f'    return 4 if Platform::access_path("{selected_llvm}", 1) != 0')
     lines.append("    return 0")
     return "\n".join(lines) + "\n"
 

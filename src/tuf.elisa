@@ -57,7 +57,7 @@ module Tuf:
         def validate_checkpoint_batch(batch: darray[u8]&) -> ValidationCode can[Memory.Allocate, Abort.Panic]:
             header: cstr = "elisapkg-tuf-batch:1\n"
             header_length: usize = ByteText::text_length(header)
-            return ValidationCode.ResourceLimit if batch.count > max_metadata_file_bytes
+            return ValidationCode.ResourceLimit if batch.count > maximum_metadata_file_bytes
             return ValidationCode.MalformedCheckpointBatch if batch.count <= header_length or not ByteText::starts_with_text(batch, header)
             cursor: mutable usize = header_length
             previous_role: mutable darray[u8] = []
@@ -80,7 +80,7 @@ module Tuf:
                 for index in cursor..<first_separator |role, batch|:
                     role <- role.push(batch[index])
                 return ValidationCode.MalformedCheckpointBatch if not valid_checkpoint_role(role)
-                return ValidationCode.ResourceLimit if role_count >= max_checkpoint_roles
+                return ValidationCode.ResourceLimit if role_count >= maximum_checkpoint_roles
                 if role_count > 0.usize():
                     return ValidationCode.MalformedCheckpointBatch if compare_checkpoint_role(previous_role, role) >= 0
                 version: mutable darray[u8] = []
@@ -96,7 +96,7 @@ module Tuf:
             return ValidationCode.WellFormed
 
         def valid_checkpoint_role(role: darray[u8]&) -> bool:
-            return false if role.count == 0.usize() or role.count > max_checkpoint_role_bytes
+            return false if role.count == 0.usize() or role.count > maximum_checkpoint_role_bytes
             first: u8 = role[0]
             last: u8 = role[role.count - 1.usize()]
             return false if not checkpoint_role_alphanumeric(first) or not checkpoint_role_alphanumeric(last)
@@ -119,30 +119,30 @@ module Tuf:
         # These limits bound a single repository refresh under the current
         # package-scoped delegation model. Changing them requires independent
         # metadata-size and worst-case-work review.
-        const max_metadata_file_bytes: usize = Json::max_document_bytes
-        const max_authorized_keys_per_role: usize = 64.usize()
-        const max_registry_identity_bytes: usize = 128.usize()
-        const max_signatures_per_metadata: usize = 64.usize()
-        const max_delegated_roles: usize = 4096.usize()
+        const maximum_metadata_file_bytes: usize = Json::maximum_document_bytes
+        const maximum_authorized_keys_per_role: usize = 64.usize()
+        const maximum_registry_identity_bytes: usize = 128.usize()
+        const maximum_signatures_per_metadata: usize = 64.usize()
+        const maximum_delegated_roles: usize = 4096.usize()
         # The batch can contain roles retained from older metadata even when
         # the current root has revoked or removed them. The byte cap remains
         # the tighter practical bound for long identities and digest records.
-        const max_checkpoint_roles: usize = 32768.usize()
-        const max_checkpoint_role_bytes: usize = 128.usize()
-        const max_delegation_depth: usize = 1.usize()
-        const max_targets_per_package_role: usize = 4096.usize()
-        const max_root_updates_per_refresh: usize = 1024.usize()
-        const max_json_container_depth: usize = Json::max_container_depth
-        const max_json_object_keys: usize = Json::max_object_keys
-        const max_duplicate_key_candidates: usize = Json::max_duplicate_key_candidates
-        const max_duplicate_key_comparison_bytes: usize = Json::max_duplicate_key_comparison_bytes
+        const maximum_checkpoint_roles: usize = 32768.usize()
+        const maximum_checkpoint_role_bytes: usize = 128.usize()
+        const maximum_delegation_depth: usize = 1.usize()
+        const maximum_targets_per_package_role: usize = 4096.usize()
+        const maximum_root_updates_per_refresh: usize = 1024.usize()
+        const maximum_json_container_depth: usize = Json::maximum_container_depth
+        const maximum_json_object_keys: usize = Json::maximum_object_keys
+        const maximum_duplicate_key_candidates: usize = Json::maximum_duplicate_key_candidates
+        const maximum_duplicate_key_comparison_bytes: usize = Json::maximum_duplicate_key_comparison_bytes
 
         # Bounded syntax precheck for the pinned metadata profile. This does
         # not decode role schemas, canonicalize signed bytes, verify signatures,
         # or authorize targets.
         def precheck_metadata_json(raw: darray[u8]&) -> ValidationCode can[Memory.Allocate, Abort.Panic]:
             return ValidationCode.MalformedJson if raw.count == 0.usize()
-            return ValidationCode.ResourceLimit if raw.count > max_metadata_file_bytes
+            return ValidationCode.ResourceLimit if raw.count > maximum_metadata_file_bytes
             return ValidationCode.MalformedJson if not Json::valid_document(raw)
             return ValidationCode.InvalidJsonKeys if not Json::unique_object_keys(raw)
             return ValidationCode.NoncanonicalNumber if not tuf_integer_numbers_only(raw)
@@ -177,7 +177,7 @@ module Tuf:
         # Registry identities are stable configuration labels, never URLs or
         # credentials. TUF targets must echo this configured token exactly.
         def valid_registry_identity_bytes(value: darray[u8]&) -> bool:
-            return false if value.count == 0.usize() or value.count > max_registry_identity_bytes
+            return false if value.count == 0.usize() or value.count > maximum_registry_identity_bytes
             first: u8 = value[0]
             return false if not ((first >= 48 and first <= 57) or (first >= 97 and first <= 122))
             for index in 0..<value.count |value, index|:
@@ -201,35 +201,35 @@ module Tuf:
             return ValidationCode.UnsupportedSpecVersion if patch > 36.u64()
             return ValidationCode.WellFormed
 
-        # Validate the shape of the authorized and supplied signature key-id
+        # Validate the shape of the authorized and supplied signature key-identifier
         # lists. Each input is a flat sequence of 64-byte lowercase SHA-256
         # hex IDs. Unknown supplied IDs are permitted but cannot satisfy the
         # role threshold. The matching count is only a pre-verification upper
         # bound: it does not prove that any signature is cryptographically
         # valid or authorized by the exact role metadata.
-        def precheck_signature_key_ids(authorized_ids: darray[u8]&, supplied_ids: darray[u8]&, threshold: u64) -> ValidationCode:
-            return ValidationCode.ResourceLimit if authorized_ids.count > max_authorized_keys_per_role * 64.usize() or supplied_ids.count > max_signatures_per_metadata * 64.usize()
-            return ValidationCode.MalformedKeyId if authorized_ids.count % 64.usize() != 0.usize() or supplied_ids.count % 64.usize() != 0.usize()
-            authorized_count: usize = authorized_ids.count / 64.usize()
-            supplied_count: usize = supplied_ids.count / 64.usize()
+        def precheck_signature_key_identifiers(authorized_identifiers: darray[u8]&, supplied_identifiers: darray[u8]&, threshold: u64) -> ValidationCode:
+            return ValidationCode.ResourceLimit if authorized_identifiers.count > maximum_authorized_keys_per_role * 64.usize() or supplied_identifiers.count > maximum_signatures_per_metadata * 64.usize()
+            return ValidationCode.MalformedKeyId if authorized_identifiers.count % 64.usize() != 0.usize() or supplied_identifiers.count % 64.usize() != 0.usize()
+            authorized_count: usize = authorized_identifiers.count / 64.usize()
+            supplied_count: usize = supplied_identifiers.count / 64.usize()
             return ValidationCode.InvalidThreshold if threshold == 0.u64() or threshold > authorized_count.u64()
-            authorized_status: ValidationCode = validate_key_id_list(authorized_ids)
+            authorized_status: ValidationCode = validate_key_identifier_list(authorized_identifiers)
             return authorized_status if authorized_status != ValidationCode.WellFormed
-            supplied_status: ValidationCode = validate_key_id_list(supplied_ids)
+            supplied_status: ValidationCode = validate_key_identifier_list(supplied_identifiers)
             return supplied_status if supplied_status != ValidationCode.WellFormed
             authorized_signatures: mutable usize = 0.usize()
-            for supplied_index in 0..<supplied_count |authorized_ids, supplied_ids, supplied_index, authorized_signatures|:
+            for supplied_index in 0..<supplied_count |authorized_identifiers, supplied_identifiers, supplied_index, authorized_signatures|:
                 supplied_offset: usize = supplied_index * 64.usize()
-                for authorized_index in 0..<authorized_count |authorized_ids, supplied_ids, supplied_offset, authorized_index, authorized_signatures|:
+                for authorized_index in 0..<authorized_count |authorized_identifiers, supplied_identifiers, supplied_offset, authorized_index, authorized_signatures|:
                     authorized_offset: usize = authorized_index * 64.usize()
-                    if key_id_equal(authorized_ids, authorized_offset, supplied_ids, supplied_offset):
+                    if key_identifier_equal(authorized_identifiers, authorized_offset, supplied_identifiers, supplied_offset):
                         authorized_signatures <- authorized_signatures + 1.usize()
                         break
             return ValidationCode.ThresholdInsufficient if authorized_signatures.u64() < threshold
             return ValidationCode.WellFormed
 
     private:
-        const key_id_size: usize = 64.usize()
+        const key_identifier_size: usize = 64.usize()
 
         def compare_checkpoint_role(left: darray[u8]&, right: darray[u8]&) -> i64:
             common: usize = left.count if left.count < right.count else right.count
@@ -313,15 +313,15 @@ module Tuf:
                 cursor <- cursor + 1.usize()
             return raw.count
 
-        def validate_key_id_list(ids: darray[u8]&) -> ValidationCode:
-            count: usize = ids.count / key_id_size
-            for index in 0..<count |ids, count|:
-                offset: usize = index * key_id_size
-                for byte_index in 0..<key_id_size |ids, offset|:
-                    byte: u8 = ids[offset + byte_index]
+        def validate_key_identifier_list(identifiers: darray[u8]&) -> ValidationCode:
+            count: usize = identifiers.count / key_identifier_size
+            for index in 0..<count |identifiers, count|:
+                offset: usize = index * key_identifier_size
+                for byte_index in 0..<key_identifier_size |identifiers, offset|:
+                    byte: u8 = identifiers[offset + byte_index]
                     return ValidationCode.MalformedKeyId if not ((byte >= 48 and byte <= 57) or (byte >= 97 and byte <= 102))
-                for previous in 0..<index |ids, offset|:
-                    return ValidationCode.DuplicateKeyId if key_id_equal(ids, previous * key_id_size, ids, offset)
+                for previous in 0..<index |identifiers, offset|:
+                    return ValidationCode.DuplicateKeyId if key_identifier_equal(identifiers, previous * key_identifier_size, identifiers, offset)
             return ValidationCode.WellFormed
 
         def tuf_bytes_equal(left: darray[u8]&, right: darray[u8]&) -> bool:
@@ -330,7 +330,7 @@ module Tuf:
                 return false if left[index] != right[index]
             return true
 
-        def key_id_equal(left: darray[u8]&, left_offset: usize, right: darray[u8]&, right_offset: usize) -> bool:
-            for byte_index in 0..<key_id_size |left, right, left_offset, right_offset|:
+        def key_identifier_equal(left: darray[u8]&, left_offset: usize, right: darray[u8]&, right_offset: usize) -> bool:
+            for byte_index in 0..<key_identifier_size |left, right, left_offset, right_offset|:
                 return false if left[left_offset + byte_index] != right[right_offset + byte_index]
             return true

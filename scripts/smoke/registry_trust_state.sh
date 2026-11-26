@@ -32,7 +32,7 @@ def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.
     metadata_digest: mutable darray[u8] = []
     for _index in 0..<64 |metadata_digest|:
         metadata_digest.push(99)
-    return 0 if Registry::record_trusted(package, version, digest, metadata_digest, Platform::pkg_wall_clock_seconds().u64() + 3600) == Registry::ResultCode.Ok else 1
+    return 0 if Registry::record_trusted(package, version, digest, metadata_digest, Platform::wall_clock_seconds().u64() + 3600) == Registry::ResultCode.Ok else 1
 EOF
 ELISA_STAGE1_BIN="${ELISA_STAGE1_BIN:-$ELISA_COMPILER_ROOT/bin/elisac-stage1}" \
 ELISA_ALLOW_STALE_STAGE1="${ELISA_ALLOW_STALE_STAGE1:-0}" \
@@ -49,7 +49,7 @@ def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.
     metadata_digest: mutable darray[u8] = []
     for _index in 0..<64 |metadata_digest|:
         metadata_digest.push(99)
-    return 0 if Registry::verify_trusted(package, version, digest, metadata_digest, Platform::pkg_wall_clock_seconds().u64() + 3600) == Registry::ResultCode.Ok else 1
+    return 0 if Registry::verify_trusted(package, version, digest, metadata_digest, Platform::wall_clock_seconds().u64() + 3600) == Registry::ResultCode.Ok else 1
 EOF
 ELISA_STAGE1_BIN="${ELISA_STAGE1_BIN:-$ELISA_COMPILER_ROOT/bin/elisac-stage1}" \
 ELISA_ALLOW_STALE_STAGE1="${ELISA_ALLOW_STALE_STAGE1:-0}" \
@@ -65,7 +65,7 @@ def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.
     for _index in 0..<64 |digest, metadata_digest|:
         digest.push(97)
         metadata_digest.push(99)
-    return 0 if Registry::verify_trusted(package, version, digest, metadata_digest, Platform::pkg_wall_clock_seconds().u64() + 3600) == Registry::ResultCode.TrustStateMalformed else 1
+    return 0 if Registry::verify_trusted(package, version, digest, metadata_digest, Platform::wall_clock_seconds().u64() + 3600) == Registry::ResultCode.TrustStateMalformed else 1
 EOF
 ELISA_STAGE1_BIN="${ELISA_STAGE1_BIN:-$ELISA_COMPILER_ROOT/bin/elisac-stage1}" \
 ELISA_ALLOW_STALE_STAGE1="${ELISA_ALLOW_STALE_STAGE1:-0}" \
@@ -108,7 +108,7 @@ def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.
     for _index in 0..<64 |digest, metadata_digest|:
         digest.push(97)
         metadata_digest.push(100)
-    return 1 if Registry::verify_trusted(package, version, digest, metadata_digest, Platform::pkg_wall_clock_seconds().u64() + 3600) != Registry::ResultCode.DigestMismatch
+    return 1 if Registry::verify_trusted(package, version, digest, metadata_digest, Platform::wall_clock_seconds().u64() + 3600) != Registry::ResultCode.DigestMismatch
     metadata_digest.resize(0)
     for _index in 0..<64 |metadata_digest|:
         metadata_digest.push(99)
@@ -132,7 +132,7 @@ def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.
         digest.push(97)
         metadata_digest.push(99)
     return 1 if Registry::record_trusted(package, version, digest, metadata_digest, 1) != Registry::ResultCode.ExpiredMetadata
-    beyond_horizon: u64 = Platform::pkg_wall_clock_seconds().u64() + 2592001
+    beyond_horizon: u64 = Platform::wall_clock_seconds().u64() + 2592001
     return 2 if Registry::record_trusted(package, version, digest, metadata_digest, beyond_horizon) != Registry::ResultCode.ExpiryHorizon
     return 3 if Registry::verify_trusted(package, version, digest, metadata_digest, beyond_horizon) != Registry::ResultCode.ExpiryHorizon
     return 0
@@ -161,12 +161,12 @@ def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.
     digest_b: mutable darray[u8] = filled(98)
     metadata_a: mutable darray[u8] = filled(99)
     metadata_b: mutable darray[u8] = filled(100)
-    return 1 if Registry::record_trusted(package, v1, digest_a, metadata_a, Platform::pkg_wall_clock_seconds().u64() + 3600) != Registry::ResultCode.Ok
-    return 2 if Registry::record_trusted(package, v0, digest_a, metadata_a, Platform::pkg_wall_clock_seconds().u64() + 3600) != Registry::ResultCode.RollbackDetected
-    return 3 if Registry::record_trusted(package, v1, digest_b, metadata_a, Platform::pkg_wall_clock_seconds().u64() + 3600) != Registry::ResultCode.DigestMismatch
-    return 4 if Registry::record_trusted(package, v1, digest_a, metadata_b, Platform::pkg_wall_clock_seconds().u64() + 3600) != Registry::ResultCode.DigestMismatch
-    return 5 if Registry::record_trusted(package, v2, digest_b, metadata_b, Platform::pkg_wall_clock_seconds().u64() + 3600) != Registry::ResultCode.Ok
-    return 6 if Registry::record_trusted(package, v2, digest_b, metadata_b, Platform::pkg_wall_clock_seconds().u64() + 3600) != Registry::ResultCode.Ok
+    return 1 if Registry::record_trusted(package, v1, digest_a, metadata_a, Platform::wall_clock_seconds().u64() + 3600) != Registry::ResultCode.Ok
+    return 2 if Registry::record_trusted(package, v0, digest_a, metadata_a, Platform::wall_clock_seconds().u64() + 3600) != Registry::ResultCode.RollbackDetected
+    return 3 if Registry::record_trusted(package, v1, digest_b, metadata_a, Platform::wall_clock_seconds().u64() + 3600) != Registry::ResultCode.DigestMismatch
+    return 4 if Registry::record_trusted(package, v1, digest_a, metadata_b, Platform::wall_clock_seconds().u64() + 3600) != Registry::ResultCode.DigestMismatch
+    return 5 if Registry::record_trusted(package, v2, digest_b, metadata_b, Platform::wall_clock_seconds().u64() + 3600) != Registry::ResultCode.Ok
+    return 6 if Registry::record_trusted(package, v2, digest_b, metadata_b, Platform::wall_clock_seconds().u64() + 3600) != Registry::ResultCode.Ok
     return 0
 EOF
 ELISA_STAGE1_BIN="${ELISA_STAGE1_BIN:-$ELISA_COMPILER_ROOT/bin/elisac-stage1}" \
@@ -185,7 +185,7 @@ def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.
     for _index in 0..<64 |metadata_digest|:
         metadata_digest.push(100)
     version: mutable darray[u8] = [50,46,48,46,48]
-    return 0 if Registry::record_trusted(package, version, digest, metadata_digest, Platform::pkg_wall_clock_seconds().u64() + 3600) == Registry::ResultCode.Ok else 1
+    return 0 if Registry::record_trusted(package, version, digest, metadata_digest, Platform::wall_clock_seconds().u64() + 3600) == Registry::ResultCode.Ok else 1
 EOF
 ELISA_STAGE1_BIN="${ELISA_STAGE1_BIN:-$ELISA_COMPILER_ROOT/bin/elisac-stage1}" \
 ELISA_ALLOW_STALE_STAGE1="${ELISA_ALLOW_STALE_STAGE1:-0}" \

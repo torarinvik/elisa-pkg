@@ -422,14 +422,14 @@ def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
     metadata: mutable darray[u8] = []
     metadata.resize(1048576)
     metadata_raw: mutable u8& = (&metadata[0]).cast[mutable u8&] can Unsafe.PointerCast
-    metadata_size: i64 = Platform::pkg_read_trusted_file("$REGISTRY_EXPIRY_ROOT/foo/1.2.0/metadata.json", metadata_raw, metadata.count)
+    metadata_size: i64 = Platform::read_trusted_file("$REGISTRY_EXPIRY_ROOT/foo/1.2.0/metadata.json", metadata_raw, metadata.count)
     return 1 if metadata_size <= 0
     metadata.resize(metadata_size.usize())
     signature: mutable darray[u8] = []
     # The trusted-file API reserves an extra byte to detect exact-limit files.
     signature.resize(65)
     signature_raw: mutable u8& = (&signature[0]).cast[mutable u8&] can Unsafe.PointerCast
-    return 2 if Platform::pkg_read_trusted_file("$REGISTRY_EXPIRY_ROOT/foo/1.2.0/metadata.sig", signature_raw, signature.count) != 64
+    return 2 if Platform::read_trusted_file("$REGISTRY_EXPIRY_ROOT/foo/1.2.0/metadata.sig", signature_raw, signature.count) != 64
     signature.resize(64)
     metadata_digest_bytes: mutable darray[u8] = []
     metadata_digest: mutable darray[u8] = []

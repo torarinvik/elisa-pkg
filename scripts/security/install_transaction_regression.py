@@ -33,7 +33,7 @@ def check_install_recovery_sync_order() -> None:
     source = (ROOT / "src/package/install_transaction.elisa").read_text(encoding="utf-8")
     retire = function_source(source, "retire_local_install_transaction")
     unlink = retire.find("remove_known_file(&path_snapshot)")
-    journal_parent_sync = retire.find("Platform::pkg_fsync_parent(path_name)")
+    journal_parent_sync = retire.find("Platform::synchronize_parent_directory(path_name)")
     if unlink < 0 or journal_parent_sync <= unlink:
         raise SystemExit("error: transaction journal retirement must sync its parent after unlink")
 
@@ -73,7 +73,7 @@ def check_install_recovery_sync_order() -> None:
 
     publish = function_source(source, "publish_local_install_receipt")
     matching_receipt = publish.find("not ByteText::equal(existing, receipt)")
-    parent_sync = publish.find("Platform::pkg_fsync_parent(path_name)")
+    parent_sync = publish.find("Platform::synchronize_parent_directory(path_name)")
     if matching_receipt < 0 or parent_sync <= matching_receipt:
         raise SystemExit("error: receipt publication must sync its parent before success")
 

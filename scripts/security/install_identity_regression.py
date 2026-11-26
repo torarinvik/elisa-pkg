@@ -17,10 +17,10 @@ def probe_source(device: int, inode: int, target: Path, backup: Path) -> str:
     return f'''include "{ROOT / "src/platform.elisa"}"
 
 def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-    return 1 if Platform::pkg_unlink_file_identity("{target}", {device}.u64(), {inode}.u64()) == 0
-    return 2 if Platform::pkg_package_file_size("{target}") != 11
-    return 3 if Platform::pkg_unlink_file_identity("{backup}", {device}.u64(), {inode}.u64()) != 0
-    return 4 if Platform::pkg_package_file_size("{backup}") != -2
+    return 1 if Platform::unlink_file_identity("{target}", {device}.u64(), {inode}.u64()) == 0
+    return 2 if Platform::package_file_size("{target}") != 11
+    return 3 if Platform::unlink_file_identity("{backup}", {device}.u64(), {inode}.u64()) != 0
+    return 4 if Platform::package_file_size("{backup}") != -2
     return 0
 '''
 

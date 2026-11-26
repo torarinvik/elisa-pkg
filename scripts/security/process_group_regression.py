@@ -20,55 +20,55 @@ def source_for() -> str:
     return f'''include "{ROOT / "src/platform.elisa"}"
 
 def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-    leader: i64 = Platform::pkg_fork()
+    leader: i64 = Platform::fork_process()
     if leader == 0:
-        if Platform::pkg_set_process_group() != 0:
-            Platform::pkg_process_exit(20)
-        if Platform::pkg_set_process_limits(2) != 0:
-            Platform::pkg_process_exit(21)
-        descendant: i64 = Platform::pkg_fork()
+        if Platform::set_process_group() != 0:
+            Platform::exit_process(20)
+        if Platform::set_process_limits(2) != 0:
+            Platform::exit_process(21)
+        descendant: i64 = Platform::fork_process()
         if descendant < 0:
-            Platform::pkg_process_exit(22)
+            Platform::exit_process(22)
         if descendant == 0:
-            if Platform::pkg_create_exclusive_file("ready") != 0:
-                Platform::pkg_process_exit(23)
-            descendant_deadline: i64 = Platform::pkg_monotonic_milliseconds() + 8000
+            if Platform::create_exclusive_file("ready") != 0:
+                Platform::exit_process(23)
+            descendant_deadline: i64 = Platform::monotonic_milliseconds() + 8000
             descendant_now: mutable i64 = 0
-            while Platform::pkg_access("release", 0) != 0 |descendant_deadline, descendant_now|:
-                descendant_now <- Platform::pkg_monotonic_milliseconds()
+            while Platform::access_path("release", 0) != 0 |descendant_deadline, descendant_now|:
+                descendant_now <- Platform::monotonic_milliseconds()
                 if descendant_now < 0 or descendant_now > descendant_deadline:
-                    Platform::pkg_process_exit(24)
-                if Platform::pkg_sleep_milliseconds(10) != 0:
-                    Platform::pkg_process_exit(27)
-            if Platform::pkg_create_exclusive_file("escaped") != 0:
-                Platform::pkg_process_exit(25)
-            Platform::pkg_process_exit(0)
-        ready_deadline: i64 = Platform::pkg_monotonic_milliseconds() + 15000
+                    Platform::exit_process(24)
+                if Platform::sleep_milliseconds(10) != 0:
+                    Platform::exit_process(27)
+            if Platform::create_exclusive_file("escaped") != 0:
+                Platform::exit_process(25)
+            Platform::exit_process(0)
+        ready_deadline: i64 = Platform::monotonic_milliseconds() + 15000
         ready_now: mutable i64 = 0
-        while Platform::pkg_access("ready", 0) != 0 |ready_deadline, ready_now|:
-            ready_now <- Platform::pkg_monotonic_milliseconds()
+        while Platform::access_path("ready", 0) != 0 |ready_deadline, ready_now|:
+            ready_now <- Platform::monotonic_milliseconds()
             if ready_now < 0 or ready_now > ready_deadline:
-                Platform::pkg_process_exit(26)
-            if Platform::pkg_sleep_milliseconds(10) != 0:
-                Platform::pkg_process_exit(28)
-        Platform::pkg_process_exit(0)
+                Platform::exit_process(26)
+            if Platform::sleep_milliseconds(10) != 0:
+                Platform::exit_process(28)
+        Platform::exit_process(0)
     if leader < 0:
         return 1
 
     status: mutable i32 = 0
-    waited: i64 = Platform::pkg_waitpid_group_timeout(leader, &status, 20000)
+    waited: i64 = Platform::wait_for_process_group_with_timeout(leader, &status, 20000)
     return 2 if waited != 0
     return 7 if status != 0
-    return 3 if Platform::pkg_access("ready", 0) != 0
-    return 4 if Platform::pkg_create_exclusive_file("release") != 0
-    observe_deadline: i64 = Platform::pkg_monotonic_milliseconds() + 2000
+    return 3 if Platform::access_path("ready", 0) != 0
+    return 4 if Platform::create_exclusive_file("release") != 0
+    observe_deadline: i64 = Platform::monotonic_milliseconds() + 2000
     observe_now: mutable i64 = 0
-    while Platform::pkg_access("escaped", 0) != 0 |observe_deadline, observe_now|:
-        observe_now <- Platform::pkg_monotonic_milliseconds()
+    while Platform::access_path("escaped", 0) != 0 |observe_deadline, observe_now|:
+        observe_now <- Platform::monotonic_milliseconds()
         return 5 if observe_now < 0
         break if observe_now >= observe_deadline
-        return 8 if Platform::pkg_sleep_milliseconds(10) != 0
-    return 6 if Platform::pkg_access("escaped", 0) == 0
+        return 8 if Platform::sleep_milliseconds(10) != 0
+    return 6 if Platform::access_path("escaped", 0) == 0
     return 0
 '''
 

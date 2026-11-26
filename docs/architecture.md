@@ -30,7 +30,7 @@ The current source units are:
 | `Cache` | Digest-addressed paths, verified byte reads, quarantine, and registry receipt codecs | Bounded file reads, path construction, and receipt fields | Blob reads return the bytes that passed SHA-256 verification. The CLI coordinates publication. |
 | `Cli` | `run(argc, argv)` | None | The public command surface delegates to private command helpers. |
 
-The current compiler backend requires foreign declarations at compilation-unit scope, so the declarations live in `src/platform/libc.elisa`. Target constants and directory entry layouts live in `src/platform/abi.elisa`. Only `PlatformNative` calls the foreign functions to implement descriptor-relative operating-system policy. `Platform` exposes only the reviewed wrapper surface. Callers use qualified names such as `Platform::pkg_read_package_file`, `Model::Version`, and `Security::remote_fetch_status`; `using` imports are deliberately avoided.
+The current compiler backend requires foreign declarations at compilation-unit scope, so the declarations live in `src/platform/libc.elisa`. Target constants and directory entry layouts live in `src/platform/abi.elisa`. Only `PlatformNative` calls the foreign functions to implement descriptor-relative operating-system policy. `Platform` exposes only the reviewed wrapper surface. Callers use qualified names such as `Platform::read_package_file`, `Model::Version`, and `Security::remote_fetch_status`; `using` imports are deliberately avoided.
 
 The current CLI also has a local deployment path. `install --local` stays in
 the command layer, but delegates digesting and filesystem publication to the

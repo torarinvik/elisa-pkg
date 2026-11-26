@@ -147,7 +147,7 @@ def main() -> i64 can[Memory.Allocate, Abort.Panic]:
             large_metadata.push(48)
         append_ascii(&large_metadata, "\\\"}},\\\"custom\\\":{{\\\"schema-version\\\":1}}}}")
     append_ascii(&large_metadata, "}}}},\\\"signatures\\\":[]}}")
-    return 41 if large_metadata.count > Tuf::max_metadata_file_bytes
+    return 41 if large_metadata.count > Tuf::maximum_metadata_file_bytes
     large_status: Tuf::ValidationCode = Tuf::precheck_metadata_json(large_metadata)
     return 42 if large_status == Tuf::ValidationCode.MalformedJson
     return 45 if large_status == Tuf::ValidationCode.ResourceLimit
@@ -169,35 +169,35 @@ def main() -> i64 can[Memory.Allocate, Abort.Panic]:
         malformed.push(97)
     for index in 0..<64 |known_and_unknown|:
         known_and_unknown.push(98)
-    return 20 if Tuf::precheck_signature_key_ids(authorized, known_and_unknown, 1) != Tuf::ValidationCode.WellFormed
-    return 21 if Tuf::precheck_signature_key_ids(authorized, unknown_only, 1) != Tuf::ValidationCode.ThresholdInsufficient
+    return 20 if Tuf::precheck_signature_key_identifiers(authorized, known_and_unknown, 1) != Tuf::ValidationCode.WellFormed
+    return 21 if Tuf::precheck_signature_key_identifiers(authorized, unknown_only, 1) != Tuf::ValidationCode.ThresholdInsufficient
     for index in 0..<64 |duplicate_authorized|:
         duplicate_authorized.push(97)
-    return 22 if Tuf::precheck_signature_key_ids(duplicate_authorized, known_and_unknown, 1) != Tuf::ValidationCode.DuplicateKeyId
+    return 22 if Tuf::precheck_signature_key_identifiers(duplicate_authorized, known_and_unknown, 1) != Tuf::ValidationCode.DuplicateKeyId
     for index in 0..<64 |duplicate_supplied|:
         duplicate_supplied.push(97)
-    return 23 if Tuf::precheck_signature_key_ids(authorized, duplicate_supplied, 1) != Tuf::ValidationCode.DuplicateKeyId
+    return 23 if Tuf::precheck_signature_key_identifiers(authorized, duplicate_supplied, 1) != Tuf::ValidationCode.DuplicateKeyId
     malformed[63] <- 103
-    return 24 if Tuf::precheck_signature_key_ids(authorized, malformed, 1) != Tuf::ValidationCode.MalformedKeyId
-    return 25 if Tuf::precheck_signature_key_ids(authorized, known_and_unknown, 0) != Tuf::ValidationCode.InvalidThreshold
-    return 26 if Tuf::precheck_signature_key_ids(authorized, known_and_unknown, 2) != Tuf::ValidationCode.InvalidThreshold
+    return 24 if Tuf::precheck_signature_key_identifiers(authorized, malformed, 1) != Tuf::ValidationCode.MalformedKeyId
+    return 25 if Tuf::precheck_signature_key_identifiers(authorized, known_and_unknown, 0) != Tuf::ValidationCode.InvalidThreshold
+    return 26 if Tuf::precheck_signature_key_identifiers(authorized, known_and_unknown, 2) != Tuf::ValidationCode.InvalidThreshold
     malformed_length: mutable darray[u8] = [97]
-    return 27 if Tuf::precheck_signature_key_ids(authorized, malformed_length, 1) != Tuf::ValidationCode.MalformedKeyId
+    return 27 if Tuf::precheck_signature_key_identifiers(authorized, malformed_length, 1) != Tuf::ValidationCode.MalformedKeyId
     too_many_keys: mutable darray[u8] = []
     too_many_signatures: mutable darray[u8] = []
     for key_index in 0..<65 |too_many_keys|:
         for byte_index in 0..<64 |too_many_keys|:
             too_many_keys.push(97)
-    return 28 if Tuf::precheck_signature_key_ids(too_many_keys, unknown_only, 1) != Tuf::ValidationCode.ResourceLimit
+    return 28 if Tuf::precheck_signature_key_identifiers(too_many_keys, unknown_only, 1) != Tuf::ValidationCode.ResourceLimit
     for signature_index in 0..<65 |too_many_signatures|:
         for byte_index in 0..<64 |too_many_signatures|:
             too_many_signatures.push(98)
-    return 29 if Tuf::precheck_signature_key_ids(authorized, too_many_signatures, 1) != Tuf::ValidationCode.ResourceLimit
-    return 30 if Tuf::max_metadata_file_bytes != 1048576.usize() or Tuf::max_authorized_keys_per_role != 64.usize()
-    return 31 if Tuf::max_signatures_per_metadata != 64.usize() or Tuf::max_delegation_depth != 1.usize()
-    return 32 if Tuf::max_delegated_roles != 4096.usize() or Tuf::max_targets_per_package_role != 4096.usize()
-    return 33 if Tuf::max_root_updates_per_refresh != 1024.usize() or Tuf::max_json_container_depth != 64.usize()
-    return 43 if Tuf::max_json_object_keys != 65536.usize() or Tuf::max_duplicate_key_candidates != 8500000.usize() or Tuf::max_duplicate_key_comparison_bytes != 65536.usize()
+    return 29 if Tuf::precheck_signature_key_identifiers(authorized, too_many_signatures, 1) != Tuf::ValidationCode.ResourceLimit
+    return 30 if Tuf::maximum_metadata_file_bytes != 1048576.usize() or Tuf::maximum_authorized_keys_per_role != 64.usize()
+    return 31 if Tuf::maximum_signatures_per_metadata != 64.usize() or Tuf::maximum_delegation_depth != 1.usize()
+    return 32 if Tuf::maximum_delegated_roles != 4096.usize() or Tuf::maximum_targets_per_package_role != 4096.usize()
+    return 33 if Tuf::maximum_root_updates_per_refresh != 1024.usize() or Tuf::maximum_json_container_depth != 64.usize()
+    return 43 if Tuf::maximum_json_object_keys != 65536.usize() or Tuf::maximum_duplicate_key_candidates != 8500000.usize() or Tuf::maximum_duplicate_key_comparison_bytes != 65536.usize()
     return 0
 ''',
             encoding="utf-8",

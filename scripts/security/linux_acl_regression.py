@@ -113,18 +113,18 @@ def main() -> int:
             f'''include "{ROOT / "src/platform.elisa"}"
 
 def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-    return 1 if Platform::pkg_is_trusted_directory({path_literals[0]}) != 1
-    return 2 if Platform::pkg_is_trusted_directory({path_literals[1]}) != 0
-    return 3 if Platform::pkg_is_trusted_directory({path_literals[2]}) != 0
+    return 1 if Platform::is_trusted_directory({path_literals[0]}) != 1
+    return 2 if Platform::is_trusted_directory({path_literals[1]}) != 0
+    return 3 if Platform::is_trusted_directory({path_literals[2]}) != 0
     clean_key: mutable darray[u8] = []
     clean_key.resize(33)
     clean_raw: mutable u8& = (&clean_key[0]).cast[mutable u8&] can Unsafe.PointerCast
-    return 4 if Platform::pkg_read_trusted_file({path_literals[3]}, clean_raw, clean_key.count) != 32
+    return 4 if Platform::read_trusted_file({path_literals[3]}, clean_raw, clean_key.count) != 32
     return 5 if clean_key[0] != 0 or clean_key[31] != 31
     named_key: mutable darray[u8] = []
     named_key.resize(33)
     named_raw: mutable u8& = (&named_key[0]).cast[mutable u8&] can Unsafe.PointerCast
-    return 6 if Platform::pkg_read_trusted_file({path_literals[4]}, named_raw, named_key.count) >= 0
+    return 6 if Platform::read_trusted_file({path_literals[4]}, named_raw, named_key.count) >= 0
     return 0
 ''',
             encoding="utf-8",

@@ -37,17 +37,17 @@ atexit.register(cleanup_processes)
 PROBE = f'''include "{ROOT / "src/platform.elisa"}"
 
 def main() -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-    prefix_value: u8&? = Platform::pkg_getenv("ELISAPKG_TEST_LOCK_PREFIX")
+    prefix_value: u8&? = Platform::environment_variable("ELISAPKG_TEST_LOCK_PREFIX")
     if prefix_value is prefix:
         prefix_name: cstr = prefix.cast[cstr] can Unsafe.PointerCast
-        lock_fd: i64 = Platform::pkg_acquire_install_lock(prefix_name)
+        lock_fd: i64 = Platform::acquire_install_lock(prefix_name)
         return 2 if lock_fd < 0
         ready: u8 = 82
         ready_ref: void& = (&ready).cast[void&] can Unsafe.PointerCast
-        return 3 if Platform::pkg_write(1, ready_ref, 1.usize()) != 1
+        return 3 if Platform::write_file_descriptor(1, ready_ref, 1.usize()) != 1
         input_byte: mutable u8 = 0
-        read_result: i64 = Platform::pkg_read_fd(0, &input_byte, 1.usize())
-        close_result: i64 = Platform::pkg_close(lock_fd)
+        read_result: i64 = Platform::read_file_descriptor(0, &input_byte, 1.usize())
+        close_result: i64 = Platform::close_file_descriptor(lock_fd)
         return 4 if close_result != 0
         return 0 if read_result == 0 or read_result == 1
         return 5

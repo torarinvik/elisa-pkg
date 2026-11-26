@@ -43,18 +43,18 @@ def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.
     version: mutable darray[u8] = [{version_bytes}]
     archive_digest: mutable darray[u8] = [{archive_digest}]
     metadata_digest: mutable darray[u8] = [{metadata_digest}]
-    expires: u64 = Platform::pkg_wall_clock_seconds().u64() + 3600
+    expires: u64 = Platform::wall_clock_seconds().u64() + 3600
     result: Registry::ResultCode = Registry::record_trusted(package, version, archive_digest, metadata_digest, expires)
     if result != Registry::ResultCode.Ok:
         message: cstr = Registry::result_message(result)
         message_ref: void& = message.cast[void&] can Unsafe.PointerCast
-        Platform::pkg_write(2, message_ref, Platform::pkg_strlen(message)) can Console.Write
+        Platform::write_file_descriptor(2, message_ref, Platform::c_string_length(message)) can Console.Write
         return 1
     verified: Registry::ResultCode = Registry::verify_trusted(package, version, archive_digest, metadata_digest, expires)
     if verified != Registry::ResultCode.Ok:
         message: cstr = Registry::result_message(verified)
         message_ref: void& = message.cast[void&] can Unsafe.PointerCast
-        Platform::pkg_write(2, message_ref, Platform::pkg_strlen(message)) can Console.Write
+        Platform::write_file_descriptor(2, message_ref, Platform::c_string_length(message)) can Console.Write
         return 2
     return 0
 ''',
@@ -87,7 +87,7 @@ def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.
     version: mutable darray[u8] = [49,46,48,46,48]
     archive_digest: mutable darray[u8] = [{archive_digest}]
     metadata_digest: mutable darray[u8] = [{metadata_digest}]
-    expires: u64 = Platform::pkg_wall_clock_seconds().u64() + 3600
+    expires: u64 = Platform::wall_clock_seconds().u64() + 3600
     result: Registry::ResultCode = Registry::verify_trusted(package, version, archive_digest, metadata_digest, expires)
     return 0 if result != Registry::ResultCode.Ok else 1
 ''',

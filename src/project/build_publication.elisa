@@ -7,37 +7,37 @@ include "./files.elisa"
 
 module BuildPublication:
     public:
-        def publish(build_dir: darray[u8]&, artifact_leaf: darray[u8]&, emit_kind: cstr, artifact_access_mode: i64, temp_name: cstr, artifact_name: cstr, receipt_path: darray[u8]&, artifact_content: darray[u8]&, artifact_digest: darray[u8]&, receipt: mutable darray[u8]&) -> bool can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+        def publish(build_directory: darray[u8]&, artifact_leaf: darray[u8]&, emit_kind: cstr, artifact_access_mode: i64, temporary_name: cstr, artifact_name: cstr, receipt_path: darray[u8]&, artifact_content: darray[u8]&, artifact_digest: darray[u8]&, receipt: mutable darray[u8]&) -> bool can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             # Never publish the compiler-owned inode directly. A descendant can
             # leave its process group and retain an already-open descriptor even
             # after the main compiler exits. Copy the bytes we hashed into a new
             # parent-owned inode that was not present in the sandbox during build.
             publish_template: mutable darray[u8] = []
-            ByteText::append(&publish_template, build_dir)
+            ByteText::append(&publish_template, build_directory)
             if publish_template.count == 0.usize() or publish_template[publish_template.count - 1.usize()] != 47:
                 publish_template <- publish_template.push(47)
             ByteText::append(&publish_template, artifact_leaf)
             ByteText::append_text(&publish_template, ".publish.XXXXXX")
             publish_template <- publish_template.push(0)
-            publish_fd: i64 = Platform::pkg_mkstemp(&publish_template)
-            if publish_fd < 0:
-                _ = Platform::pkg_unlink(temp_name)
+            publish_file_descriptor: i64 = Platform::make_temporary_file(&publish_template)
+            if publish_file_descriptor < 0:
+                _ = Platform::unlink_path(temporary_name)
                 return false
             publish_name: cstr = (&publish_template[0]).cast[cstr] can Unsafe.PointerCast
-            output_mode: u16 = 493.u16() if Platform::pkg_cstr_equal(emit_kind, "exe") else 420.u16()
-            publish_ok: mutable bool = ProjectFiles::write_fd_all(publish_fd, artifact_content)
-            publish_ok <- false if Platform::pkg_chmod(publish_name, output_mode) != 0
-            publish_ok <- false if Platform::pkg_access(publish_name, artifact_access_mode) != 0
-            publish_ok <- false if Platform::pkg_fsync(publish_fd) != 0
-            publish_close_status: i64 = Platform::pkg_close(publish_fd)
+            output_mode: u16 = 493.u16() if Platform::c_string_equal(emit_kind, "exe") else 420.u16()
+            publish_ok: mutable bool = ProjectFiles::write_file_descriptor_all(publish_file_descriptor, artifact_content)
+            publish_ok <- false if Platform::change_mode(publish_name, output_mode) != 0
+            publish_ok <- false if Platform::access_path(publish_name, artifact_access_mode) != 0
+            publish_ok <- false if Platform::synchronize_file(publish_file_descriptor) != 0
+            publish_close_status: i64 = Platform::close_file_descriptor(publish_file_descriptor)
             if not publish_ok or publish_close_status != 0:
-                _ = Platform::pkg_unlink(publish_name)
-                _ = Platform::pkg_unlink(temp_name)
+                _ = Platform::unlink_path(publish_name)
+                _ = Platform::unlink_path(temporary_name)
                 CliOutput::write_error("error: unable to create a normalized parent-owned build artifact\n") can Global.Read
                 return false
-            if Platform::pkg_rename(publish_name, artifact_name) != 0:
-                _ = Platform::pkg_unlink(publish_name)
-                _ = Platform::pkg_unlink(temp_name)
+            if Platform::rename_path(publish_name, artifact_name) != 0:
+                _ = Platform::unlink_path(publish_name)
+                _ = Platform::unlink_path(temporary_name)
                 return false
             BuildReceipt::append_receipt_digest(receipt, artifact_digest)
             if not ProjectFiles::replace_file(receipt_path, receipt):

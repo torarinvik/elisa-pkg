@@ -90,17 +90,17 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
              'def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:']
     lines.extend([
         '    platform_buffer: mutable darray[u8] = []',
-        '    platform_size: i64 = Platform::pkg_package_file_size("src/main.elisa")',
+        '    platform_size: i64 = Platform::package_file_size("src/main.elisa")',
         '    return 803 if platform_size <= 0 or platform_size > 1048576',
         '    platform_buffer.resize(platform_size.usize() + 1.usize())',
         '    platform_raw: mutable u8& = (&platform_buffer[0]).cast[mutable u8&] can Unsafe.PointerCast',
-        '    return 800 if Platform::pkg_is_directory(".") != 1',
-        '    return 801 if Platform::pkg_is_directory("src") != 1',
-        '    return 802 if Platform::pkg_is_directory("../") != 0',
-        '    return 803 if Platform::pkg_read_package_file("src/main.elisa", platform_raw, platform_buffer.count) <= 0',
-        '    return 804 if Platform::pkg_access("src/main.elisa", 0) != 0',
-        '    return 805 if Platform::pkg_access(".", 0) == 0',
-        '    return 806 if Platform::pkg_chmod(".", 493.u16()) == 0',
+        '    return 800 if Platform::is_directory(".") != 1',
+        '    return 801 if Platform::is_directory("src") != 1',
+        '    return 802 if Platform::is_directory("../") != 0',
+        '    return 803 if Platform::read_package_file("src/main.elisa", platform_raw, platform_buffer.count) <= 0',
+        '    return 804 if Platform::access_path("src/main.elisa", 0) != 0',
+        '    return 805 if Platform::access_path(".", 0) == 0',
+        '    return 806 if Platform::change_mode(".", 493.u16()) == 0',
     ])
     number = 0
 
@@ -228,7 +228,7 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
     verify_metadata_digest = data('b' * 64)
     lines.append(f'    trust_status: Registry::ResultCode = Registry::verify_trusted({verify_package}, {verify_version}, {verify_digest}, {verify_metadata_digest}, 4102444800)')
     check('trust_status == Registry::ResultCode.TrustStateUnavailable')
-    check('Platform::pkg_strlen(Registry::result_message(Registry::ResultCode.Unsatisfiable)) > 0.usize()')
+    check('Platform::c_string_length(Registry::result_message(Registry::ResultCode.Unsatisfiable)) > 0.usize()')
     cache_digest = data('a' * 64)
     cache_path: str = 'cache_path'
     lines.append(f'    {cache_path}: mutable darray[u8] = []')

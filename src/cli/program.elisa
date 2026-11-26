@@ -11,11 +11,11 @@ include "./output.elisa"
 
 module ProgramCommand:
     public:
-        def run(argc: i64, slots: mutable cstr&&, options: Model::CommandOptions, expected_kind: cstr) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+        def run(argument_count: i64, slots: mutable cstr&&, options: Model::CommandOptions, expected_kind: cstr) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
                 manifest_raw: mutable darray[u8] = []
                 manifest_raw <- manifest_raw.resize(ProjectFiles::project_document_limit)
-                return CliStatus::build_failed if not ProjectFiles::read_cstr_into("elisapkg.json", &manifest_raw)
+                return CliStatus::build_failed if not ProjectFiles::read_c_string_into("elisapkg.json", &manifest_raw)
                 target_name: mutable darray[u8] = []
                 target_kind: mutable darray[u8] = []
                 target_entry: mutable darray[u8] = []
@@ -25,43 +25,43 @@ module ProgramCommand:
                     return CliStatus::build_failed
                 artifact_label: darray[u8] = ManifestTargets::artifact_leaf(target_name, false)
                 current_directory: darray[u8] = []
-                build_root: darray[u8] = Build::output_directory(current_directory, Platform::pkg_cstr_equal(options.profile, "release"))
+                build_root: darray[u8] = Build::output_directory(current_directory, Platform::c_string_equal(options.profile, "release"))
                 artifact_path: mutable darray[u8] = []
                 ProjectFiles::path_join_bytes_into(build_root, artifact_label, &artifact_path)
                 artifact_path_c: mutable darray[u8] = []
-                ProjectFiles::path_with_nul_into(&artifact_path, &artifact_path_c)
+                ProjectFiles::path_with_null_terminator_into(&artifact_path, &artifact_path_c)
                 artifact_name: cstr = (&artifact_path_c[0]).cast[cstr] can Unsafe.PointerCast
-                args: mutable darray[cstr] = []
-                args <- args.push("/usr/bin/env")
-                args <- args.push("-i")
-                args <- args.push(Toolchain::isolated_path_environment)
-                args <- args.push(artifact_name)
+                arguments: mutable darray[cstr] = []
+                arguments <- arguments.push("/usr/bin/env")
+                arguments <- arguments.push("-i")
+                arguments <- arguments.push(Toolchain::isolated_path_environment)
+                arguments <- arguments.push(artifact_name)
                 index: mutable i64 = 2
-                while index < argc and not Platform::pkg_cstr_equal(slots[index].cast[cstr], "--") |slots, index|:
+                while index < argument_count and not Platform::c_string_equal(slots[index].cast[cstr], "--") |slots, index|:
                     index <- index + 1
-                index <- index + 1 if index < argc and Platform::pkg_cstr_equal(slots[index].cast[cstr], "--")
-                while index < argc |args, slots, index|:
-                    args <- args.push(slots[index].cast[cstr])
+                index <- index + 1 if index < argument_count and Platform::c_string_equal(slots[index].cast[cstr], "--")
+                while index < argument_count |arguments, slots, index|:
+                    arguments <- arguments.push(slots[index].cast[cstr])
                     index <- index + 1
-                args <- args.push(null)
-                child_argv: mutable cstr&& = (&args[0]).cast[mutable cstr&&] can Unsafe.PointerCast
-                pid: i64 = Platform::pkg_fork()
-                if pid == 0:
-                    if Platform::pkg_set_process_group() != 0:
-                        Platform::pkg_process_exit(126)
-                    if Platform::pkg_set_process_limits(2) != 0:
-                        Platform::pkg_process_exit(126)
+                arguments <- arguments.push(null)
+                child_argument_vector: mutable cstr&& = (&arguments[0]).cast[mutable cstr&&] can Unsafe.PointerCast
+                child_process_identifier: i64 = Platform::fork_process()
+                if child_process_identifier == 0:
+                    if Platform::set_process_group() != 0:
+                        Platform::exit_process(126)
+                    if Platform::set_process_limits(2) != 0:
+                        Platform::exit_process(126)
                     # Package code must not inherit file, socket, or credential-agent
                     # descriptors supplied by the invoking process. Preserve only the
                     # standard streams and stop if the close sweep cannot prove cleanup.
-                    if Platform::pkg_close_inherited_fds() != 0:
-                        Platform::pkg_process_exit(126)
-                    _ = Platform::pkg_execvp("/usr/bin/env", child_argv)
-                    Platform::pkg_process_exit(127)
-                return CliStatus::build_failed if pid < 0
+                    if Platform::close_inherited_file_descriptors() != 0:
+                        Platform::exit_process(126)
+                    _ = Platform::execute_program("/usr/bin/env", child_argument_vector)
+                    Platform::exit_process(127)
+                return CliStatus::build_failed if child_process_identifier < 0
                 status: mutable i32 = 0
-                waited: i64 = Platform::pkg_waitpid_group_timeout(pid, &status, PROGRAM_TIMEOUT_MS)
-                return CliStatus::cancelled if waited == Platform::pkg_timeout_error()
+                waited: i64 = Platform::wait_for_process_group_with_timeout(child_process_identifier, &status, PROGRAM_TIMEOUT_MS)
+                return CliStatus::cancelled if waited == Platform::timeout_error()
                 return CliStatus::build_failed if waited < 0
                 # waitpid returns the platform wait status. Preserve a normal child's exit
                 # code for `run`, and map signal termination to the documented cancellation

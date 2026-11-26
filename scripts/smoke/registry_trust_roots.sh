@@ -18,8 +18,8 @@ def main() -> i64:
     size: mutable u64 = 0
     previous: Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
     status: Registry::ResultCode = Registry::resolve(package, requirement, previous, &selected, &archive, &digest, &size, &metadata)
-    if Platform::pkg_getenv("ELISAPKG_REGISTRY_DIR") is configured:
-        if Platform::pkg_getenv("ELISAPKG_EXPECT_MISSING_TRUST_ROOT") is expected_missing:
+    if Platform::environment_variable("ELISAPKG_REGISTRY_DIR") is configured:
+        if Platform::environment_variable("ELISAPKG_EXPECT_MISSING_TRUST_ROOT") is expected_missing:
             return 0 if status == Registry::ResultCode.MissingTrustRoot
             return 1
         return 0 if status == Registry::ResultCode.InvalidConfiguration

@@ -23,21 +23,21 @@ def main() -> int:
             raise SystemExit(f"error: {label} is missing: {path}")
 
     source = (ROOT / "src/cli/compiler_process.elisa").read_text(encoding="utf-8")
-    stdio_setup = source.find("if null_fd < 0 or Platform::pkg_dup2(null_fd, 0)")
-    child_setup = source.find("if null_fd > 2:")
-    descriptor_close = source.find("Platform::pkg_close_inherited_fds()", child_setup)
-    compiler_exec = source.find('Platform::pkg_execvp("/usr/bin/sandbox-exec", child_argv)', child_setup)
+    stdio_setup = source.find("if null_file_descriptor < 0 or Platform::duplicate_file_descriptor_to(null_file_descriptor, 0)")
+    child_setup = source.find("if null_file_descriptor > 2:")
+    descriptor_close = source.find("Platform::close_inherited_file_descriptors()", child_setup)
+    compiler_exec = source.find('Platform::execute_program("/usr/bin/sandbox-exec", child_argument_vector)', child_setup)
     if stdio_setup < 0 or not stdio_setup < child_setup < descriptor_close < compiler_exec:
         raise SystemExit("error: compiler launch must close inherited descriptors after stdio setup and before exec")
 
     program_launcher = (ROOT / "src/cli/program.elisa").read_text(encoding="utf-8")
-    program_child = program_launcher.find("if pid == 0:")
-    program_group = program_launcher.find("Platform::pkg_set_process_group()", program_child)
-    program_limits = program_launcher.find("Platform::pkg_set_process_limits(2)", program_child)
-    program_close = program_launcher.find("Platform::pkg_close_inherited_fds()", program_child)
-    program_close_guard = program_launcher.find("if Platform::pkg_close_inherited_fds() != 0:", program_child)
-    program_close_exit = program_launcher.find("Platform::pkg_process_exit(126)", program_close_guard)
-    program_exec = program_launcher.find('Platform::pkg_execvp("/usr/bin/env", child_argv)', program_child)
+    program_child = program_launcher.find("if child_process_identifier == 0:")
+    program_group = program_launcher.find("Platform::set_process_group()", program_child)
+    program_limits = program_launcher.find("Platform::set_process_limits(2)", program_child)
+    program_close = program_launcher.find("Platform::close_inherited_file_descriptors()", program_child)
+    program_close_guard = program_launcher.find("if Platform::close_inherited_file_descriptors() != 0:", program_child)
+    program_close_exit = program_launcher.find("Platform::exit_process(126)", program_close_guard)
+    program_exec = program_launcher.find('Platform::execute_program("/usr/bin/env", child_argument_vector)', program_child)
     if not (
         0 <= program_child < program_group < program_limits < program_close
         and program_close_guard > program_limits
@@ -57,7 +57,7 @@ def main() -> int:
         probe.write_text(
             f'include "{ROOT / "src/platform.elisa"}"\n\n'
             'def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:\n'
-            '    inherited_fd: i64 = Platform::pkg_open_null()\n'
+            '    inherited_fd: i64 = Platform::open_null_device()\n'
             '    return 1 if inherited_fd < 3\n'
             '    fd_path: mutable darray[u8] = [47, 100, 101, 118, 47, 102, 100, 47]\n'
             '    digits: mutable darray[u8] = []\n'
@@ -71,25 +71,25 @@ def main() -> int:
             '        fd_path.push(digits[cursor])\n'
             '    fd_path.push(0)\n'
             '    fd_name: cstr = (&fd_path[0]).cast[cstr] can Unsafe.PointerCast\n'
-            '    args: mutable darray[cstr] = []\n'
-            '    args.push("/bin/sh")\n'
-            '    args.push("-c")\n'
-            '    args.push("test -e \\\"$1\\\" -a ! -e \\\"$2\\\"")\n'
-            '    args.push("elisapkg-fd-probe")\n'
-            '    args.push("/dev/fd/1")\n'
-            '    args.push(fd_name)\n'
-            '    args.push(null)\n'
-            '    child_argv: mutable cstr&& = (&args[0]).cast[mutable cstr&&] can Unsafe.PointerCast\n'
-            '    pid: i64 = Platform::pkg_fork()\n'
-            '    if pid == 0:\n'
-            '        return 126 if Platform::pkg_dup2(inherited_fd, 1) != 1\n'
-            '        return 126 if Platform::pkg_close_inherited_fds() != 0\n'
-            '        _ = Platform::pkg_execvp("/bin/sh", child_argv)\n'
-            '        Platform::pkg_process_exit(127)\n'
-            '    return 2 if pid < 0\n'
+            '    arguments: mutable darray[cstr] = []\n'
+            '    arguments.push("/bin/sh")\n'
+            '    arguments.push("-c")\n'
+            '    arguments.push("test -e \\\"$1\\\" -a ! -e \\\"$2\\\"")\n'
+            '    arguments.push("elisapkg-fd-probe")\n'
+            '    arguments.push("/dev/fd/1")\n'
+            '    arguments.push(fd_name)\n'
+            '    arguments.push(null)\n'
+            '    child_argument_vector: mutable cstr&& = (&arguments[0]).cast[mutable cstr&&] can Unsafe.PointerCast\n'
+            '    child_process_identifier: i64 = Platform::fork_process()\n'
+            '    if child_process_identifier == 0:\n'
+            '        return 126 if Platform::duplicate_file_descriptor_to(inherited_fd, 1) != 1\n'
+            '        return 126 if Platform::close_inherited_file_descriptors() != 0\n'
+            '        _ = Platform::execute_program("/bin/sh", child_argument_vector)\n'
+            '        Platform::exit_process(127)\n'
+            '    return 2 if child_process_identifier < 0\n'
             '    status: mutable i32 = 0\n'
-            '    waited: i64 = Platform::pkg_waitpid_timeout(pid, &status, 1000)\n'
-            '    _ = Platform::pkg_close(inherited_fd)\n'
+            '    waited: i64 = Platform::wait_for_process_with_timeout(child_process_identifier, &status, 1000)\n'
+            '    _ = Platform::close_file_descriptor(inherited_fd)\n'
             '    return 3 if waited != 0\n'
             '    return 4 if status != 0\n'
             '    return 0\n',

@@ -19,11 +19,11 @@ module InstallTransaction:
             InstallFaults::transaction_boundary("transaction.journal.unlinked")
             return ProjectFiles::sync_parent_directory(path_snapshot)
 
-        def release_install_lock(lock_fd: i64) -> bool:
+        def release_install_lock(lock_file_descriptor: i64) -> bool:
             # The lock file's inode remains in the prefix permanently. Closing this
             # descriptor releases the kernel lock without allowing another process
             # to create a second lock inode by racing an unlink.
-            return Platform::pkg_close(lock_fd) == 0
+            return Platform::close_file_descriptor(lock_file_descriptor) == 0
 
         def local_install_transaction_path(prefix: darray[u8]&, out: mutable darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
             ProjectFiles::path_join_into(prefix, ".elisapkg-install-transaction", out)
@@ -34,13 +34,13 @@ module InstallTransaction:
             out_inode <- 0.u64()
             return false if not ProjectFiles::valid_path_bytes(path)
             path_c: mutable darray[u8] = []
-            ProjectFiles::path_with_nul_into(path, &path_c)
+            ProjectFiles::path_with_null_terminator_into(path, &path_c)
             path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
-            file_size: i64 = Platform::pkg_package_file_size(path_name)
+            file_size: i64 = Platform::package_file_size(path_name)
             return false if file_size < 0 or file_size.usize() > maximum
             out.resize(file_size.usize() + 1.usize())
             output: mutable u8& = (&out[0]).cast[mutable u8&] can Unsafe.PointerCast
-            read_size: i64 = Platform::pkg_read_trusted_file_identity(path_name, output, out.count, out_device, out_inode)
+            read_size: i64 = Platform::read_trusted_file_identity(path_name, output, out.count, out_device, out_inode)
             if read_size != file_size:
                 out.resize(0)
                 out_device <- 0.u64()
@@ -52,15 +52,15 @@ module InstallTransaction:
         def remove_trusted_install_file_identity(path: darray[u8]&, device: u64, inode: u64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return false if not ProjectFiles::valid_path_bytes(path)
             path_c: mutable darray[u8] = []
-            ProjectFiles::path_with_nul_into(path, &path_c)
+            ProjectFiles::path_with_null_terminator_into(path, &path_c)
             path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
-            return Platform::pkg_unlink_file_identity(path_name, device, inode) == 0
+            return Platform::unlink_file_identity(path_name, device, inode) == 0
 
         def sync_local_install_entry_parents(destination_name: cstr, receipt_name: cstr) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             # A transaction journal may be retired only after both target
             # directories durably record the current install or uninstall state.
-            return false if Platform::pkg_fsync_parent(destination_name) != 0
-            return Platform::pkg_fsync_parent(receipt_name) == 0
+            return false if Platform::synchronize_parent_directory(destination_name) != 0
+            return Platform::synchronize_parent_directory(receipt_name) == 0
 
         def publish_local_install_receipt(path: darray[u8]&, receipt: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             return false if not ProjectFiles::valid_path_bytes(path)
@@ -70,13 +70,13 @@ module InstallTransaction:
                 # temporary name or syncing the directory reported an error. Inspect
                 # the destination before deciding whether recovery can continue.
                 path_c: mutable darray[u8] = []
-                ProjectFiles::path_with_nul_into(path, &path_c)
+                ProjectFiles::path_with_null_terminator_into(path, &path_c)
                 path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
-                state: i64 = Platform::pkg_package_file_size(path_name)
-                return false if state < 0 or state.usize() > InstallRecords::max_record_bytes
+                state: i64 = Platform::package_file_size(path_name)
+                return false if state < 0 or state.usize() > InstallRecords::maximum_record_bytes
                 existing: mutable darray[u8] = []
                 return false if not:
-                    read_trusted_install_file(path, InstallRecords::max_record_bytes, &existing)
+                    read_trusted_install_file(path, InstallRecords::maximum_record_bytes, &existing)
                     ByteText::equal(existing, receipt)
             # Even a matching visible receipt is incomplete evidence until its
             # containing directory has been synced. In particular, the publish
@@ -93,38 +93,38 @@ module InstallTransaction:
             local_install_transaction_path(prefix, &transaction_path)
             return false if not ProjectFiles::valid_path_bytes(transaction_path)
             transaction_c: mutable darray[u8] = []
-            ProjectFiles::path_with_nul_into(&transaction_path, &transaction_c)
+            ProjectFiles::path_with_null_terminator_into(&transaction_path, &transaction_c)
             transaction_name: cstr = (&transaction_c[0]).cast[cstr] can Unsafe.PointerCast
-            transaction_state: i64 = Platform::pkg_package_file_size(transaction_name)
+            transaction_state: i64 = Platform::package_file_size(transaction_name)
             return true if transaction_state == -2
-            return false if transaction_state < 0 or transaction_state.usize() > InstallRecords::max_record_bytes
+            return false if transaction_state < 0 or transaction_state.usize() > InstallRecords::maximum_record_bytes
             raw: mutable darray[u8] = []
-            return false if not read_trusted_install_file(transaction_path, InstallRecords::max_record_bytes, &raw)
+            return false if not read_trusted_install_file(transaction_path, InstallRecords::maximum_record_bytes, &raw)
             operation: mutable darray[u8] = []
             name: mutable darray[u8] = []
             version: mutable darray[u8] = []
             expected_digest: mutable darray[u8] = []
             return false if not InstallRecords::parse_journal(raw, &operation, &name, &version, &expected_digest)
-            bin_dir: mutable darray[u8] = []
-            receipt_dir: mutable darray[u8] = []
-            ProjectFiles::path_join_into(prefix, "bin", &bin_dir)
-            ProjectFiles::path_join_into(prefix, "share/elisapkg/receipts", &receipt_dir)
-            return false if not InstallPrefix::trusted_directory(bin_dir) or not InstallPrefix::trusted_directory(receipt_dir)
+            binary_directory: mutable darray[u8] = []
+            receipt_directory: mutable darray[u8] = []
+            ProjectFiles::path_join_into(prefix, "bin", &binary_directory)
+            ProjectFiles::path_join_into(prefix, "share/elisapkg/receipts", &receipt_directory)
+            return false if not InstallPrefix::trusted_directory(binary_directory) or not InstallPrefix::trusted_directory(receipt_directory)
             destination: mutable darray[u8] = []
             receipt_path: mutable darray[u8] = []
-            ProjectFiles::path_join_bytes_into(bin_dir, name, &destination)
-            ProjectFiles::path_join_bytes_into(receipt_dir, name, &receipt_path)
+            ProjectFiles::path_join_bytes_into(binary_directory, name, &destination)
+            ProjectFiles::path_join_bytes_into(receipt_directory, name, &receipt_path)
             return false if not:
                 ProjectFiles::valid_path_bytes(destination)
                 ProjectFiles::valid_path_bytes(receipt_path)
             destination_c: mutable darray[u8] = []
             receipt_c: mutable darray[u8] = []
-            ProjectFiles::path_with_nul_into(&destination, &destination_c)
-            ProjectFiles::path_with_nul_into(&receipt_path, &receipt_c)
+            ProjectFiles::path_with_null_terminator_into(&destination, &destination_c)
+            ProjectFiles::path_with_null_terminator_into(&receipt_path, &receipt_c)
             destination_name: cstr = (&destination_c[0]).cast[cstr] can Unsafe.PointerCast
             receipt_name: cstr = (&receipt_c[0]).cast[cstr] can Unsafe.PointerCast
-            destination_state: i64 = Platform::pkg_package_file_size(destination_name)
-            receipt_state: i64 = Platform::pkg_package_file_size(receipt_name)
+            destination_state: i64 = Platform::package_file_size(destination_name)
+            receipt_state: i64 = Platform::package_file_size(receipt_name)
             return false if:
                 destination_state < 0 and destination_state != -2
                 receipt_state < 0 and receipt_state != -2
@@ -144,13 +144,13 @@ module InstallTransaction:
                     return false if not Integrity::sha256_hex(artifact, &actual_digest) or not ByteText::equal(actual_digest, expected_digest)
                     if receipt_state == -2:
                         return false if:
-                            Platform::pkg_chmod(destination_name, 493.u16()) != 0
+                            Platform::change_mode(destination_name, 493.u16()) != 0
                             not publish_local_install_receipt(receipt_path, expected_receipt)
                     else:
                         existing_receipt: mutable darray[u8] = []
                         return false if:
-                            not read_trusted_install_file(receipt_path, InstallRecords::max_record_bytes, &existing_receipt) or not ByteText::equal(existing_receipt, expected_receipt)
-                            Platform::pkg_access(destination_name, 1) != 0
+                            not read_trusted_install_file(receipt_path, InstallRecords::maximum_record_bytes, &existing_receipt) or not ByteText::equal(existing_receipt, expected_receipt)
+                            Platform::access_path(destination_name, 1) != 0
                     # Recovery may observe names published before a previous
                     # process reported a directory-sync failure. Make both names
                     # durable before retiring the only recovery record.
@@ -171,7 +171,7 @@ module InstallTransaction:
                     existing_receipt: mutable darray[u8] = []
                     receipt_device: mutable u64 = 0.u64()
                     receipt_inode: mutable u64 = 0.u64()
-                    return false if not read_trusted_install_file_identity(receipt_path, InstallRecords::max_record_bytes, &existing_receipt, &receipt_device, &receipt_inode) or not ByteText::equal(existing_receipt, expected_receipt)
+                    return false if not read_trusted_install_file_identity(receipt_path, InstallRecords::maximum_record_bytes, &existing_receipt, &receipt_device, &receipt_inode) or not ByteText::equal(existing_receipt, expected_receipt)
                     if destination_state >= 0:
                         artifact: mutable darray[u8] = []
                         artifact_device: mutable u64 = 0.u64()

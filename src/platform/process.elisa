@@ -9,9 +9,9 @@ module NativeProcess:
         def fork() -> i64:
             return native_fork()
 
-        def execvp(path: cstr, argv: mutable cstr&&) -> i64 can[Unsafe.PointerCast]:
-            raw_argv: void& = argv.cast[void&] can Unsafe.PointerCast
-            return native_execvp(path, raw_argv)
+        def execvp(path: cstr, argument_vector: mutable cstr&&) -> i64 can[Unsafe.PointerCast]:
+            raw_argument_vector: void& = argument_vector.cast[void&] can Unsafe.PointerCast
+            return native_execvp(path, raw_argument_vector)
 
         def process_exit(code: i64):
             native_exit(code.i32())
@@ -46,11 +46,11 @@ module NativeProcess:
                     request[index] <- remaining[index]
             return -5
 
-        def process_id() -> i64:
+        def process_identifier() -> i64:
             return native_getpid()
 
         def terminate_process_group(process_group: i64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            return -22 if not valid_child_process_id(process_group)
+            return -22 if not valid_child_process_identifier(process_group)
             if native_kill((-process_group).i32(), 9) != 0:
                 kill_errno: i64 = NativeErrors::current_errno()
                 return 0 if kill_errno == 3
@@ -99,53 +99,53 @@ module NativeProcess:
             return 0
 
         # Return zero after reaping the child and put its wait status in status.
-        def waitpid_timeout(pid: i64, status: mutable i32&, timeout_ms: i64) -> i64 can[Memory.Allocate, Unsafe.PointerCast]:
+        def waitpid_timeout(child_process_identifier: i64, status: mutable i32&, timeout_milliseconds: i64) -> i64 can[Memory.Allocate, Unsafe.PointerCast]:
             status <- 0
-            return -22 if not valid_child_process_id(pid) or timeout_ms <= 0
+            return -22 if not valid_child_process_identifier(child_process_identifier) or timeout_milliseconds <= 0
             clock_buffer: mutable darray[u8] = []
             clock_buffer <- clock_buffer.resize(NativeProcessValues::record_bytes)
             started: i64 = monotonic_milliseconds_into(&clock_buffer)
             if started < 0:
-                reap_status: i64 = terminate_and_reap(pid, status)
+                reap_status: i64 = terminate_and_reap(child_process_identifier, status)
                 return reap_status if reap_status != 0 else -5
-            deadline: i64 = started + timeout_ms if started <= 9223372036854775807 - timeout_ms else 9223372036854775807
+            deadline: i64 = started + timeout_milliseconds if started <= 9223372036854775807 - timeout_milliseconds else 9223372036854775807
             pause: mutable darray[u8] = NativeProcessValues::timespec_bytes(0, 10000000)
             pause_raw: void& = (&pause[0]).cast[void&] can Unsafe.PointerCast
             remaining: mutable darray[u8] = NativeProcessValues::timespec_bytes(0, 0)
             remaining_raw: mutable void& = (&remaining[0]).cast[mutable void&] can Unsafe.PointerCast
-            while true |status, pid, deadline, clock_buffer, pause, pause_raw, remaining, remaining_raw|:
-                waited: i64 = native_waitpid(pid.i32(), status, 1)
-                if waited == pid:
+            while true |status, child_process_identifier, deadline, clock_buffer, pause, pause_raw, remaining, remaining_raw|:
+                waited: i64 = native_waitpid(child_process_identifier.i32(), status, 1)
+                if waited == child_process_identifier:
                     return 0
                 interrupted: bool = waited < 0 and NativeErrors::current_errno() == 4
                 if waited < 0 and not interrupted:
                     wait_error: i64 = NativeErrors::negative_errno()
-                    reap_status: i64 = terminate_and_reap(pid, status)
+                    reap_status: i64 = terminate_and_reap(child_process_identifier, status)
                     return reap_status if reap_status != 0 else wait_error
                 now: i64 = monotonic_milliseconds_into(&clock_buffer)
                 if now < 0:
-                    reap_status: i64 = terminate_and_reap(pid, status)
+                    reap_status: i64 = terminate_and_reap(child_process_identifier, status)
                     return reap_status if reap_status != 0 else -5
                 if now >= deadline:
-                    reap_status: i64 = terminate_and_reap(pid, status)
+                    reap_status: i64 = terminate_and_reap(child_process_identifier, status)
                     return reap_status if reap_status != 0 else -110
                 # A stream of signals must not bypass the deadline check.
                 continue if interrupted
                 sleep_status: i64 = native_nanosleep(pause_raw, remaining_raw)
                 if sleep_status != 0 and NativeErrors::current_errno() != 4:
                     sleep_errno: i64 = NativeErrors::current_errno()
-                    reap_status: i64 = terminate_and_reap(pid, status)
+                    reap_status: i64 = terminate_and_reap(child_process_identifier, status)
                     return reap_status if reap_status != 0 else NativeErrors::negative_value(sleep_errno)
             return -110
 
         # Waiting for the group leader alone can leave a same-group descendant
         # running after its parent exits. Reap the direct child under the normal
         # deadline, then kill and drain the whole isolated group on every result.
-        def waitpid_group_timeout(pid: i64, status: mutable i32&, timeout_ms: i64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+        def waitpid_group_timeout(child_process_identifier: i64, status: mutable i32&, timeout_milliseconds: i64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             status <- 0
-            return -22 if not valid_child_process_id(pid) or timeout_ms <= 0
-            waited: i64 = waitpid_timeout(pid, status, timeout_ms)
-            group_cleanup: i64 = terminate_process_group(pid)
+            return -22 if not valid_child_process_identifier(child_process_identifier) or timeout_milliseconds <= 0
+            waited: i64 = waitpid_timeout(child_process_identifier, status, timeout_milliseconds)
+            group_cleanup: i64 = terminate_process_group(child_process_identifier)
             return -5 if group_cleanup != 0
             return waited
 
@@ -155,15 +155,15 @@ module NativeProcess:
     private:
         # The supported pid_t ABI is signed 32-bit. A group identifier of
         # one is also invalid here because kill(-1, ...) signals broadly.
-        def valid_child_process_id(pid: i64) -> bool:
-            return pid > 1 and pid <= 2147483647
+        def valid_child_process_identifier(child_process_identifier: i64) -> bool:
+            return child_process_identifier > 1 and child_process_identifier <= 2147483647
 
-        def terminate_and_reap(pid: i64, status: mutable i32&) -> i64:
-            _ = native_kill((-pid).i32(), 9)
-            _ = native_kill(pid.i32(), 9)
-            while true |pid, status|:
-                waited: i64 = native_waitpid(pid.i32(), status, 0)
-                return 0 if waited == pid
+        def terminate_and_reap(child_process_identifier: i64, status: mutable i32&) -> i64:
+            _ = native_kill((-child_process_identifier).i32(), 9)
+            _ = native_kill(child_process_identifier.i32(), 9)
+            while true |child_process_identifier, status|:
+                waited: i64 = native_waitpid(child_process_identifier.i32(), status, 0)
+                return 0 if waited == child_process_identifier
                 if waited < 0:
                     errno_value: i64 = NativeErrors::current_errno()
                     return 0 if errno_value == 10
@@ -178,5 +178,5 @@ module NativeProcess:
 
         def monotonic_milliseconds_into(stamp: mutable darray[u8]&) -> i64 can[Unsafe.PointerCast]:
             raw: mutable void& = (&stamp[0]).cast[mutable void&] can Unsafe.PointerCast
-            return -1 if native_clock_gettime(monotonic_clock_id, raw) != 0
+            return -1 if native_clock_gettime(monotonic_clock_identifier, raw) != 0
             return NativeProcessValues::milliseconds(stamp)

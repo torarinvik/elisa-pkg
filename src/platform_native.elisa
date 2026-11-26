@@ -19,7 +19,7 @@ module PlatformNative:
         # symbols, keeping the FFI vocabulary confined to one reviewed unit.
         def strlen(value: cstr) -> usize:
             return native_strlen(value)
-        def cstr_equal(left: cstr, right: cstr) -> bool:
+        def c_string_equal(left: cstr, right: cstr) -> bool:
             left_length: usize = native_strlen(left)
             right_length: usize = native_strlen(right)
             return false if left_length != right_length
@@ -28,34 +28,34 @@ module PlatformNative:
             return true
         def getenv(name: cstr) -> u8&?:
             return native_getenv(name)
-        def write(fd: i64, buffer: void&, count: usize) -> i64 can[Console.Write]:
-            while true |fd, buffer, count|:
-                result: i64 = native_write(fd, buffer, count) can Console.Write
+        def write(file_descriptor: i64, buffer: void&, count: usize) -> i64 can[Console.Write]:
+            while true |file_descriptor, buffer, count|:
+                result: i64 = native_write(file_descriptor, buffer, count) can Console.Write
                 continue if result < 0 and NativeErrors::current_errno() == 4
                 return result
             return -5
-        def read_fd(fd: i64, buffer: mutable u8&, capacity: usize) -> i64 can[Unsafe.PointerCast]:
-            return -22 if fd < 0
+        def read_file_descriptor(file_descriptor: i64, buffer: mutable u8&, capacity: usize) -> i64 can[Unsafe.PointerCast]:
+            return -22 if file_descriptor < 0
             raw: mutable void& = buffer.cast[mutable void&] can Unsafe.PointerCast
-            while true |fd, raw, capacity|:
-                result: i64 = native_read(fd, raw, capacity)
+            while true |file_descriptor, raw, capacity|:
+                result: i64 = native_read(file_descriptor, raw, capacity)
                 continue if result < 0 and NativeErrors::current_errno() == 4
                 return result if result >= 0
                 return NativeErrors::negative_errno()
             return -5
-        def seek_fd(fd: i64, offset: i64, origin: i64) -> i64:
-            return native_lseek(fd, offset, origin)
-        def duplicate_fd(fd: i64, target: i64) -> i64:
-            return native_dup2(fd, target)
-        def duplicate_fd_min(fd: i64, minimum: i64) -> i64:
-            return native_fcntl(fd, 0, minimum)
+        def seek_file_descriptor(file_descriptor: i64, offset: i64, origin: i64) -> i64:
+            return native_lseek(file_descriptor, offset, origin)
+        def duplicate_file_descriptor(file_descriptor: i64, target: i64) -> i64:
+            return native_dup2(file_descriptor, target)
+        def duplicate_file_descriptor_minimum(file_descriptor: i64, minimum: i64) -> i64:
+            return native_fcntl(file_descriptor, 0, minimum)
         def open_null() -> i64:
             return native_open("/dev/null", 0)
-        def close(fd: i64) -> i64:
-            return native_close(fd)
+        def close(file_descriptor: i64) -> i64:
+            return native_close(file_descriptor)
         # Run only in a post-fork child. The current soft descriptor limit
         # does not bound descriptors that were inherited above that limit.
-        def close_inherited_fds() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+        def close_inherited_file_descriptors() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             static if ELISA_TARGET_OS_LINUX:
                 while true:
                     close_status: i64 = native_syscall(linux_close_range_syscall, 3, 4294967295, 0)
@@ -67,14 +67,14 @@ module PlatformNative:
             static else:
                 return close_macos_inherited_descriptors()
 
-        def fsync(fd: i64) -> i64:
-            return native_fsync(fd)
+        def fsync(file_descriptor: i64) -> i64:
+            return native_fsync(file_descriptor)
         def read_package_file(path: cstr, output: mutable u8&, capacity: usize) -> i64 can[Unsafe.PointerCast]:
             return -22 if capacity == 0.usize()
-            fd: i64 = open_package_file(path)
-            return fd if fd < 0
-            return close_error(fd, -21) if not regular_fd(fd)
-            return close_result(fd, read_regular_descriptor(fd, output, capacity))
+            file_descriptor: i64 = open_package_file(path)
+            return file_descriptor if file_descriptor < 0
+            return close_error(file_descriptor, -21) if not regular_file_descriptor(file_descriptor)
+            return close_result(file_descriptor, read_regular_descriptor(file_descriptor, output, capacity))
 
         # Size and read the opened inode. A pathname replacement between those
         # operations cannot redirect the read to a different file.
@@ -83,7 +83,7 @@ module PlatformNative:
             return false if maximum_bytes > 67108864.usize()
             descriptor: i64 = open_package_file(path)
             return false if descriptor < 0
-            size: i64 = native_lseek(descriptor, 0, 2) if regular_fd(descriptor) else -1
+            size: i64 = native_lseek(descriptor, 0, 2) if regular_file_descriptor(descriptor) else -1
             if size < 0 or size.usize() > maximum_bytes or native_lseek(descriptor, 0, 0) != 0:
                 _ = native_close(descriptor)
                 return false
@@ -104,11 +104,11 @@ module PlatformNative:
         # by group/other. This prevents a co-user from swapping trust material
         # through a shared directory between path validation and file reads.
         def package_file_size(path: cstr) -> i64:
-            fd: i64 = open_package_file(path)
-            return fd if fd < 0
-            return close_error(fd, -21) if not regular_fd(fd)
-            size: i64 = native_lseek(fd, 0, 2)
-            close_status: i64 = native_close(fd)
+            file_descriptor: i64 = open_package_file(path)
+            return file_descriptor if file_descriptor < 0
+            return close_error(file_descriptor, -21) if not regular_file_descriptor(file_descriptor)
+            size: i64 = native_lseek(file_descriptor, 0, 2)
+            close_status: i64 = native_close(file_descriptor)
             return -5 if close_status != 0
             return -5 if size < 0
             return size
@@ -119,10 +119,10 @@ module PlatformNative:
         # platform module so its filesystem trust policy can be regression
         # tested directly; application code should use verify_ed25519.
         def is_directory(path: cstr) -> i64:
-            fd: i64 = open_directory_path(path)
+            file_descriptor: i64 = open_directory_path(path)
             return 0 if:
-                fd < 0
-                native_close(fd) != 0
+                file_descriptor < 0
+                native_close(file_descriptor) != 0
             return 1
 
         def open_directory_for_process(path: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -136,8 +136,8 @@ module PlatformNative:
             return close_result(directory, 0) if result == 0
             return close_error(directory, NativeErrors::negative_value(errno_value))
 
-        def fchdir(fd: i64) -> i64:
-            result: i64 = native_fchdir(fd)
+        def fchdir(file_descriptor: i64) -> i64:
+            result: i64 = native_fchdir(file_descriptor)
             return 0 if result == 0
             return -NativeErrors::error_code()
 
@@ -183,11 +183,11 @@ module PlatformNative:
                 return 0
 
     public:
-        def read_regular_descriptor(fd: i64, output: mutable u8&, capacity: usize) -> i64 can[Unsafe.PointerCast]:
+        def read_regular_descriptor(file_descriptor: i64, output: mutable u8&, capacity: usize) -> i64 can[Unsafe.PointerCast]:
             used: mutable usize = 0.usize()
-            while used < capacity |output, used, capacity, fd|:
+            while used < capacity |output, used, capacity, file_descriptor|:
                 raw: mutable void& = (&output[used]).cast[mutable void&] can Unsafe.PointerCast
-                amount: i64 = native_read(fd, raw, capacity - used)
+                amount: i64 = native_read(file_descriptor, raw, capacity - used)
                 if amount < 0:
                     errno_value: i64 = NativeErrors::current_errno()
                     continue if errno_value == 4
@@ -235,13 +235,13 @@ module PlatformNative:
 
 
     public:
-        def close_error(fd: i64, errno_value: i64) -> i64:
-            return -5 if native_close(fd) != 0
+        def close_error(file_descriptor: i64, errno_value: i64) -> i64:
+            return -5 if native_close(file_descriptor) != 0
             return errno_value
 
     public:
-        def close_result(fd: i64, result: i64) -> i64:
-            return -5 if native_close(fd) != 0
+        def close_result(file_descriptor: i64, result: i64) -> i64:
+            return -5 if native_close(file_descriptor) != 0
             return result
 
     private:
@@ -272,11 +272,11 @@ module PlatformNative:
             return result
 
     public:
-        def regular_fd(fd: i64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+        def regular_file_descriptor(file_descriptor: i64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             stat: mutable darray[u8] = []
-            stat <- stat.resize(stat_buffer_bytes)
+            stat <- stat.resize(status_buffer_bytes)
             raw: mutable void& = (&stat[0]).cast[mutable void&] can Unsafe.PointerCast
-            return native_fstat(fd, raw) == 0 and (NativeStat::file_type(stat)) == NativeStat::regular_mode
+            return native_fstat(file_descriptor, raw) == 0 and (NativeStat::file_type(stat)) == NativeStat::regular_mode
 
     public:
         def name_is_dot(raw: mutable u8&, offset: usize, length: usize) -> bool:

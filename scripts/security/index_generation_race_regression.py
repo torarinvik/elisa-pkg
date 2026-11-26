@@ -39,7 +39,7 @@ def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.
     index_digest: mutable darray[u8] = []
     index_identity: mutable darray[u8] = []
     status: Registry::ResultCode = Registry::read_index(package, &versions, &generation, &index_digest, &index_identity)
-    if Platform::pkg_cstr_equal("{mode}", "unauthorized"):
+    if Platform::c_string_equal("{mode}", "unauthorized"):
         read_rejected: bool = status == Registry::ResultCode.InvalidSignature
         selected: mutable darray[u8] = []
         archive: mutable darray[u8] = []
@@ -53,15 +53,15 @@ def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.
         return 11
     return 10 if status != Registry::ResultCode.Ok
 
-    return 0 if Platform::pkg_cstr_equal("{mode}", "advance")
+    return 0 if Platform::c_string_equal("{mode}", "advance")
 
-    if Platform::pkg_cstr_equal("{mode}", "stale"):
+    if Platform::c_string_equal("{mode}", "stale"):
         marker: mutable darray[u8] = [114,101,97,100,121,10]
         marker_raw: void& = (&marker[0]).cast[void&] can Unsafe.PointerCast
-        return 13 if Platform::pkg_write(1, marker_raw, marker.count) != marker.count.i64()
+        return 13 if Platform::write_file_descriptor(1, marker_raw, marker.count) != marker.count.i64()
         release_byte: mutable darray[u8] = [0]
         release_raw: mutable u8& = (&release_byte[0]).cast[mutable u8&] can Unsafe.PointerCast
-        return 14 if Platform::pkg_read_fd(0, release_raw, 1.usize()) != 1
+        return 14 if Platform::read_file_descriptor(0, release_raw, 1.usize()) != 1
 
     version: mutable darray[u8] = [49,46,48,46,48]
     archive_digest: mutable darray[u8] = []
@@ -69,11 +69,11 @@ def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.
     for _index in 0..<64 |archive_digest, metadata_digest|:
         archive_digest.push(97)
         metadata_digest.push(98)
-    expires: u64 = Platform::pkg_wall_clock_seconds().u64() + 3600
+    expires: u64 = Platform::wall_clock_seconds().u64() + 3600
     record_status: Registry::ResultCode = Registry::record_trusted_at_index(package, version, archive_digest, metadata_digest, expires, generation, index_digest, index_identity)
-    return 0 if Platform::pkg_cstr_equal("{mode}", "stale") and record_status == Registry::ResultCode.RollbackDetected
-    return 1 if Platform::pkg_cstr_equal("{mode}", "commit") and record_status != Registry::ResultCode.Ok
-    if Platform::pkg_cstr_equal("{mode}", "commit"):
+    return 0 if Platform::c_string_equal("{mode}", "stale") and record_status == Registry::ResultCode.RollbackDetected
+    return 1 if Platform::c_string_equal("{mode}", "commit") and record_status != Registry::ResultCode.Ok
+    if Platform::c_string_equal("{mode}", "commit"):
         unlisted_version: mutable darray[u8] = [57,46,57,46,57]
         unlisted_status: Registry::ResultCode = Registry::record_trusted(package, unlisted_version, archive_digest, metadata_digest, expires)
         return 0 if unlisted_status == Registry::ResultCode.NoMatchingVersion

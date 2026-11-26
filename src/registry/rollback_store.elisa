@@ -52,10 +52,10 @@ module RollbackStore:
             ByteText::append(&digest_value, digest)
             ByteText::append(&metadata_digest_value, metadata_digest)
             root: mutable darray[u8] = []
-            value_ref: u8&? = Platform::pkg_getenv("ELISAPKG_REGISTRY_DIR")
+            value_ref: u8&? = Platform::environment_variable("ELISAPKG_REGISTRY_DIR")
             if value_ref is configured_root_value:
                 value: cstr = configured_root_value.cast[cstr]
-                length: usize = Platform::pkg_strlen(value)
+                length: usize = Platform::c_string_length(value)
                 return Code.InvalidConfiguration if length == 0 or length > 4096
                 for index in 0..<length |root, value|:
                     root <- root.push(value[index].u8())
@@ -70,49 +70,49 @@ module RollbackStore:
             lock_path_snapshot: mutable darray[u8] = []
             ByteText::append(&lock_path_snapshot, lock_path)
             lock_c: mutable darray[u8] = []
-            ProjectFiles::path_with_nul_into(lock_path, &lock_c)
+            ProjectFiles::path_with_null_terminator_into(lock_path, &lock_c)
             lock_name: cstr = (&lock_c[0]).cast[cstr] can Unsafe.PointerCast
-            lock_fd: i64 = Platform::pkg_acquire_trust_state_lock(lock_name)
-            return Code.TrustStateUnavailable if lock_fd < 0
+            lock_file_descriptor: i64 = Platform::acquire_trust_state_lock(lock_name)
+            return Code.TrustStateUnavailable if lock_file_descriptor < 0
             # FFI may invalidate caller-owned array headers. Rebuild the state
             # and lock paths after acquiring the lock before using either one.
             root_after_lock: mutable darray[u8] = []
-            root_ref: u8&? = Platform::pkg_getenv("ELISAPKG_REGISTRY_DIR")
+            root_ref: u8&? = Platform::environment_variable("ELISAPKG_REGISTRY_DIR")
             if root_ref is configured_root_after_lock:
                 root_value: cstr = configured_root_after_lock.cast[cstr]
-                root_length: usize = Platform::pkg_strlen(root_value)
+                root_length: usize = Platform::c_string_length(root_value)
                 if root_length == 0 or root_length > 4096:
-                    return trust_state_finish(lock_fd, Code.InvalidConfiguration)
+                    return trust_state_finish(lock_file_descriptor, Code.InvalidConfiguration)
                 for index in 0..<root_length |root_after_lock, root_value|:
                     root_after_lock <- root_after_lock.push(root_value[index].u8())
             key_fingerprint: mutable darray[u8] = []
             key_fingerprint_status: Code = read_key_fingerprint(root_after_lock, &key_fingerprint)
             if key_fingerprint_status != Code.Ok:
-                return trust_state_finish(lock_fd, key_fingerprint_status)
+                return trust_state_finish(lock_file_descriptor, key_fingerprint_status)
             root_after_key: mutable darray[u8] = []
             if not RegistryConfiguration::configured_root(&root_after_key):
-                return trust_state_finish(lock_fd, Code.TrustStateUnavailable)
+                return trust_state_finish(lock_file_descriptor, Code.TrustStateUnavailable)
             root_key_identity: mutable darray[u8] = []
             if not TrustIdentity::root_key(root_after_key, &root_key_identity):
-                return trust_state_finish(lock_fd, Code.TrustStateUnavailable)
+                return trust_state_finish(lock_file_descriptor, Code.TrustStateUnavailable)
             state_path <- TrustPaths::lookup(root_after_key)
             if state_path.count == 0 or state_path.count > 4090.usize():
-                return trust_state_finish(lock_fd, Code.TrustStateUnavailable)
+                return trust_state_finish(lock_file_descriptor, Code.TrustStateUnavailable)
             lock_path <- lock_path.resize(0)
             ByteText::append(&lock_path, state_path)
             ByteText::append_text(&lock_path, ".lock")
             if lock_path.count > 4096:
-                return trust_state_finish(lock_fd, Code.TrustStateUnavailable)
+                return trust_state_finish(lock_file_descriptor, Code.TrustStateUnavailable)
             if not ByteText::equal(lock_path, lock_path_snapshot):
-                return trust_state_finish(lock_fd, Code.TrustStateUnavailable)
+                return trust_state_finish(lock_file_descriptor, Code.TrustStateUnavailable)
             state: mutable darray[u8] = []
             read_status: Code = trust_state_read(state_path, &state)
-            return trust_state_finish(lock_fd, read_status) if read_status != Code.Ok
+            return trust_state_finish(lock_file_descriptor, read_status) if read_status != Code.Ok
             key_pin_found: mutable bool = false
             key_pin_status: Code = trust_state_check_root_pin(state, root_key_identity, key_fingerprint, true, true, &key_pin_found)
-            return trust_state_finish(lock_fd, key_pin_status) if key_pin_status != Code.Ok
+            return trust_state_finish(lock_file_descriptor, key_pin_status) if key_pin_status != Code.Ok
             legacy_override_status: Code = rollback_result(RollbackRecords::legacy_override_status(state, trust_state_has_override()))
-            return trust_state_finish(lock_fd, legacy_override_status) if legacy_override_status != Code.Ok
+            return trust_state_finish(lock_file_descriptor, legacy_override_status) if legacy_override_status != Code.Ok
             observed_clock: mutable u64 = 0
             clock_missing: mutable bool = false
             observed_state_digest: mutable darray[u8] = []
@@ -120,47 +120,47 @@ module RollbackStore:
             ByteText::append(&clock_path, state_path)
             ByteText::append_text(&clock_path, ".clock")
             clock_status: Code = read_rollback_clock(clock_path, &observed_clock, &observed_state_digest, &clock_missing)
-            return trust_state_finish(lock_fd, clock_status) if clock_status != Code.Ok
+            return trust_state_finish(lock_file_descriptor, clock_status) if clock_status != Code.Ok
             root_after_clock: mutable darray[u8] = []
             if not RegistryConfiguration::configured_root(&root_after_clock):
-                return trust_state_finish(lock_fd, Code.TrustStateUnavailable)
+                return trust_state_finish(lock_file_descriptor, Code.TrustStateUnavailable)
             clock_root_key_identity: mutable darray[u8] = []
             if not TrustIdentity::root_key(root_after_clock, &clock_root_key_identity) or not ByteText::equal(clock_root_key_identity, root_key_identity):
-                return trust_state_finish(lock_fd, Code.TrustStateUnavailable)
-            return trust_state_finish(lock_fd, Code.TrustStateUnavailable) if clock_missing and state.count > 23.usize()
+                return trust_state_finish(lock_file_descriptor, Code.TrustStateUnavailable)
+            return trust_state_finish(lock_file_descriptor, Code.TrustStateUnavailable) if clock_missing and state.count > 23.usize()
             current_state_digest: mutable darray[u8] = []
-            return trust_state_finish(lock_fd, Code.TrustStateUnavailable) if:
+            return trust_state_finish(lock_file_descriptor, Code.TrustStateUnavailable) if:
                 not Integrity::sha256_hex(state, &current_state_digest)
                 not clock_missing and not ByteText::equal(observed_state_digest, current_state_digest)
-            now: i64 = Platform::pkg_wall_clock_seconds()
-            return trust_state_finish(lock_fd, Code.TrustStateUnavailable) if now < 0
-            return trust_state_finish(lock_fd, Code.ClockRollback) if observed_clock > now.u64()
+            now: i64 = Platform::wall_clock_seconds()
+            return trust_state_finish(lock_file_descriptor, Code.TrustStateUnavailable) if now < 0
+            return trust_state_finish(lock_file_descriptor, Code.ClockRollback) if observed_clock > now.u64()
             expiry_status: Code = metadata_expiry_status(expires, now.u64())
-            return trust_state_finish(lock_fd, expiry_status) if expiry_status != Code.Ok
+            return trust_state_finish(lock_file_descriptor, expiry_status) if expiry_status != Code.Ok
             previous_version: mutable darray[u8] = []
             previous_digest: mutable darray[u8] = []
             previous_metadata_digest: mutable darray[u8] = []
             find_status: Code = trust_state_find_package_history(state, root_after_clock, package_value, &previous_version, &previous_digest, &previous_metadata_digest)
-            return trust_state_finish(lock_fd, find_status) if find_status != Code.Ok
-            return trust_state_finish(lock_fd, Code.TrustStateUnavailable) if previous_version.count == 0.usize()
+            return trust_state_finish(lock_file_descriptor, find_status) if find_status != Code.Ok
+            return trust_state_finish(lock_file_descriptor, Code.TrustStateUnavailable) if previous_version.count == 0.usize()
             previous: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-            return trust_state_finish(lock_fd, Code.TrustStateMalformed) if not SemVer::parse(previous_version, &previous)
-            return trust_state_finish(lock_fd, Code.RollbackDetected) if SemVer::compare(parsed, previous) < 0
+            return trust_state_finish(lock_file_descriptor, Code.TrustStateMalformed) if not SemVer::parse(previous_version, &previous)
+            return trust_state_finish(lock_file_descriptor, Code.RollbackDetected) if SemVer::compare(parsed, previous) < 0
             if SemVer::compare(parsed, previous) == 0 and (not ByteText::equal(previous_digest, digest_value) or not ByteText::equal(previous_metadata_digest, metadata_digest_value)):
-                return trust_state_finish(lock_fd, Code.DigestMismatch)
-            return trust_state_finish(lock_fd, Code.TrustStateUnavailable) if SemVer::compare(parsed, previous) > 0
+                return trust_state_finish(lock_file_descriptor, Code.DigestMismatch)
+            return trust_state_finish(lock_file_descriptor, Code.TrustStateUnavailable) if SemVer::compare(parsed, previous) > 0
             if now.u64() > observed_clock:
                 clock_written: bool = TrustStorage::write_clock(clock_path, now.u64(), current_state_digest)
-                return trust_state_finish(lock_fd, Code.TrustStateUnavailable) if not clock_written
-            return trust_state_finish(lock_fd, Code.Ok)
+                return trust_state_finish(lock_file_descriptor, Code.TrustStateUnavailable) if not clock_written
+            return trust_state_finish(lock_file_descriptor, Code.Ok)
 
         def metadata_expiry_status(expires: u64, now: u64) -> Code:
             return Code.ExpiredMetadata if expires <= now
-            return Code.ExpiryHorizon if expires - now > max_metadata_lifetime_seconds
+            return Code.ExpiryHorizon if expires - now > maximum_metadata_lifetime_seconds
             return Code.Ok
 
     private:
-        const max_metadata_lifetime_seconds: u64 = 2592000
+        const maximum_metadata_lifetime_seconds: u64 = 2592000
 
         def trust_state_read(path: darray[u8]&, out: mutable darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out.resize(0)
@@ -228,8 +228,8 @@ module RollbackStore:
                 metadata_digest_out.push(legacy_metadata_digest[index])
             return Code.Ok
 
-        def trust_state_finish(lock_fd: i64, code: Code) -> Code:
-            return Code.TrustStateUnavailable if Platform::pkg_close(lock_fd) != 0
+        def trust_state_finish(lock_file_descriptor: i64, code: Code) -> Code:
+            return Code.TrustStateUnavailable if Platform::close_file_descriptor(lock_file_descriptor) != 0
             return code
 
         def trust_state_record_internal(package: darray[u8]&, version: darray[u8]&, digest: darray[u8]&, metadata_digest: darray[u8]&, expires: u64, guard_index: bool, index_generation: u64, index_digest: darray[u8]&, index_identity: darray[u8]&, key_fingerprint: darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
@@ -259,49 +259,49 @@ module RollbackStore:
             lock_path_snapshot: mutable darray[u8] = []
             ByteText::append(&lock_path_snapshot, lock_path)
             lock_c: mutable darray[u8] = []
-            ProjectFiles::path_with_nul_into(lock_path, &lock_c)
+            ProjectFiles::path_with_null_terminator_into(lock_path, &lock_c)
             lock_name: cstr = (&lock_c[0]).cast[cstr] can Unsafe.PointerCast
-            lock_fd: i64 = Platform::pkg_acquire_trust_state_lock(lock_name)
-            return Code.TrustStateUnavailable if lock_fd < 0
+            lock_file_descriptor: i64 = Platform::acquire_trust_state_lock(lock_name)
+            return Code.TrustStateUnavailable if lock_file_descriptor < 0
             # Rebuild path buffers after the filesystem call. The stage1 ABI
             # may invalidate caller-owned darrays across FFI boundaries.
             root_after_lock: mutable darray[u8] = []
             if not RegistryConfiguration::configured_root(&root_after_lock):
-                return trust_state_finish(lock_fd, Code.TrustStateUnavailable)
+                return trust_state_finish(lock_file_descriptor, Code.TrustStateUnavailable)
             root_after_fingerprint: mutable darray[u8] = []
             if not RegistryConfiguration::configured_root(&root_after_fingerprint):
-                return trust_state_finish(lock_fd, Code.TrustStateUnavailable)
+                return trust_state_finish(lock_file_descriptor, Code.TrustStateUnavailable)
             if guard_index:
                 current_index_identity: mutable darray[u8] = []
                 if not TrustIdentity::index(root_after_fingerprint, package, &current_index_identity):
-                    return trust_state_finish(lock_fd, Code.TrustStateUnavailable)
+                    return trust_state_finish(lock_file_descriptor, Code.TrustStateUnavailable)
                 if not ByteText::equal(current_index_identity, index_identity):
-                    return trust_state_finish(lock_fd, Code.InvalidConfiguration)
+                    return trust_state_finish(lock_file_descriptor, Code.InvalidConfiguration)
             state_identity: mutable darray[u8] = []
             if PackageIdentity::valid_name(package):
                 if not TrustIdentity::package(root_after_fingerprint, package, &state_identity):
-                    return trust_state_finish(lock_fd, Code.TrustStateUnavailable)
+                    return trust_state_finish(lock_file_descriptor, Code.TrustStateUnavailable)
             else:
                 ByteText::append(&state_identity, package)
             root_key_identity: mutable darray[u8] = []
-            return trust_state_finish(lock_fd, Code.TrustStateUnavailable) if not TrustIdentity::root_key_from_history(state_identity, &root_key_identity)
+            return trust_state_finish(lock_file_descriptor, Code.TrustStateUnavailable) if not TrustIdentity::root_key_from_history(state_identity, &root_key_identity)
             state_path <- TrustPaths::prepare(root_after_fingerprint)
             if state_path.count == 0 or state_path.count > 4090.usize():
-                return trust_state_finish(lock_fd, Code.TrustStateUnavailable)
+                return trust_state_finish(lock_file_descriptor, Code.TrustStateUnavailable)
             lock_path <- lock_path.resize(0)
             for index in 0..<state_path.count |lock_path, state_path|:
                 lock_path <- lock_path.push(state_path[index])
             ByteText::append_text(&lock_path, ".lock")
             if not ByteText::equal(lock_path, lock_path_snapshot):
-                return trust_state_finish(lock_fd, Code.TrustStateUnavailable)
+                return trust_state_finish(lock_file_descriptor, Code.TrustStateUnavailable)
             state: mutable darray[u8] = []
             read_status: Code = trust_state_read(state_path, &state)
-            return trust_state_finish(lock_fd, read_status) if read_status != Code.Ok
+            return trust_state_finish(lock_file_descriptor, read_status) if read_status != Code.Ok
             key_pin_found: mutable bool = false
             key_pin_status: Code = trust_state_check_root_pin(state, root_key_identity, key_fingerprint, guard_index, not guard_index, &key_pin_found)
-            return trust_state_finish(lock_fd, key_pin_status) if key_pin_status != Code.Ok
+            return trust_state_finish(lock_file_descriptor, key_pin_status) if key_pin_status != Code.Ok
             legacy_override_status: Code = rollback_result(RollbackRecords::legacy_override_status(state, trust_state_has_override()))
-            return trust_state_finish(lock_fd, legacy_override_status) if legacy_override_status != Code.Ok
+            return trust_state_finish(lock_file_descriptor, legacy_override_status) if legacy_override_status != Code.Ok
             observed_clock: mutable u64 = 0
             clock_missing: mutable bool = false
             observed_state_digest: mutable darray[u8] = []
@@ -309,20 +309,20 @@ module RollbackStore:
             ByteText::append_text(&state_path, ".clock")
             clock_status: Code = read_rollback_clock(state_path, &observed_clock, &observed_state_digest, &clock_missing)
             state_path <- state_path.resize(clock_path_start)
-            return trust_state_finish(lock_fd, clock_status) if clock_status != Code.Ok
+            return trust_state_finish(lock_file_descriptor, clock_status) if clock_status != Code.Ok
             root_after_clock: mutable darray[u8] = []
             if not RegistryConfiguration::configured_root(&root_after_clock):
-                return trust_state_finish(lock_fd, Code.TrustStateUnavailable)
-            return trust_state_finish(lock_fd, Code.TrustStateUnavailable) if clock_missing and state.count > 23.usize()
+                return trust_state_finish(lock_file_descriptor, Code.TrustStateUnavailable)
+            return trust_state_finish(lock_file_descriptor, Code.TrustStateUnavailable) if clock_missing and state.count > 23.usize()
             current_state_digest: mutable darray[u8] = []
-            return trust_state_finish(lock_fd, Code.TrustStateUnavailable) if:
+            return trust_state_finish(lock_file_descriptor, Code.TrustStateUnavailable) if:
                 not Integrity::sha256_hex(state, &current_state_digest)
                 not clock_missing and not ByteText::equal(observed_state_digest, current_state_digest)
-            now: i64 = Platform::pkg_wall_clock_seconds()
-            return trust_state_finish(lock_fd, Code.TrustStateUnavailable) if now < 0
-            return trust_state_finish(lock_fd, Code.ClockRollback) if observed_clock > now.u64()
+            now: i64 = Platform::wall_clock_seconds()
+            return trust_state_finish(lock_file_descriptor, Code.TrustStateUnavailable) if now < 0
+            return trust_state_finish(lock_file_descriptor, Code.ClockRollback) if observed_clock > now.u64()
             expiry_status: Code = metadata_expiry_status(expires, now.u64())
-            return trust_state_finish(lock_fd, expiry_status) if expiry_status != Code.Ok
+            return trust_state_finish(lock_file_descriptor, expiry_status) if expiry_status != Code.Ok
             if guard_index:
                 expected_index_version: mutable darray[u8] = []
                 ByteText::append_text(&expected_index_version, "0.0.")
@@ -331,14 +331,14 @@ module RollbackStore:
                 observed_index_digest: mutable darray[u8] = []
                 observed_index_metadata_digest: mutable darray[u8] = []
                 index_find_status: Code = trust_state_find(state, index_identity, &observed_index_version, &observed_index_digest, &observed_index_metadata_digest) if state.count > 0 else Code.Ok
-                return trust_state_finish(lock_fd, index_find_status) if index_find_status != Code.Ok
-                return trust_state_finish(lock_fd, Code.TrustStateUnavailable) if observed_index_version.count == 0
+                return trust_state_finish(lock_file_descriptor, index_find_status) if index_find_status != Code.Ok
+                return trust_state_finish(lock_file_descriptor, Code.TrustStateUnavailable) if observed_index_version.count == 0
                 expected_index_parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
                 observed_index_parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-                return trust_state_finish(lock_fd, Code.TrustStateMalformed) if not SemVer::parse(expected_index_version, &expected_index_parsed) or not SemVer::parse(observed_index_version, &observed_index_parsed)
-                return trust_state_finish(lock_fd, Code.RollbackDetected) if SemVer::compare(observed_index_parsed, expected_index_parsed) > 0
-                return trust_state_finish(lock_fd, Code.TrustStateUnavailable) if SemVer::compare(observed_index_parsed, expected_index_parsed) < 0
-                return trust_state_finish(lock_fd, Code.DigestMismatch) if not ByteText::equal(observed_index_digest, index_digest) or not ByteText::equal(observed_index_metadata_digest, index_digest)
+                return trust_state_finish(lock_file_descriptor, Code.TrustStateMalformed) if not SemVer::parse(expected_index_version, &expected_index_parsed) or not SemVer::parse(observed_index_version, &observed_index_parsed)
+                return trust_state_finish(lock_file_descriptor, Code.RollbackDetected) if SemVer::compare(observed_index_parsed, expected_index_parsed) > 0
+                return trust_state_finish(lock_file_descriptor, Code.TrustStateUnavailable) if SemVer::compare(observed_index_parsed, expected_index_parsed) < 0
+                return trust_state_finish(lock_file_descriptor, Code.DigestMismatch) if not ByteText::equal(observed_index_digest, index_digest) or not ByteText::equal(observed_index_metadata_digest, index_digest)
             previous_version: mutable darray[u8] = []
             previous_digest: mutable darray[u8] = []
             previous_metadata_digest: mutable darray[u8] = []
@@ -348,28 +348,28 @@ module RollbackStore:
                     find_status <- trust_state_find_package_history(state, root_after_clock, package, &previous_version, &previous_digest, &previous_metadata_digest)
                 else:
                     find_status <- trust_state_find(state, package, &previous_version, &previous_digest, &previous_metadata_digest)
-            return trust_state_finish(lock_fd, find_status) if find_status != Code.Ok
+            return trust_state_finish(lock_file_descriptor, find_status) if find_status != Code.Ok
             if previous_version.count > 0.usize():
                 previous: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-                return trust_state_finish(lock_fd, Code.TrustStateMalformed) if not SemVer::parse(previous_version, &previous)
-                return trust_state_finish(lock_fd, Code.RollbackDetected) if SemVer::compare(parsed, previous) < 0
-                return trust_state_finish(lock_fd, Code.DigestMismatch) if SemVer::compare(parsed, previous) == 0 and (not ByteText::equal(previous_digest, digest) or not ByteText::equal(previous_metadata_digest, metadata_digest))
+                return trust_state_finish(lock_file_descriptor, Code.TrustStateMalformed) if not SemVer::parse(previous_version, &previous)
+                return trust_state_finish(lock_file_descriptor, Code.RollbackDetected) if SemVer::compare(parsed, previous) < 0
+                return trust_state_finish(lock_file_descriptor, Code.DigestMismatch) if SemVer::compare(parsed, previous) == 0 and (not ByteText::equal(previous_digest, digest) or not ByteText::equal(previous_metadata_digest, metadata_digest))
                 if SemVer::compare(parsed, previous) == 0:
                     if key_pin_found:
-                        return trust_state_finish(lock_fd, Code.Ok) if observed_clock == now.u64()
+                        return trust_state_finish(lock_file_descriptor, Code.Ok) if observed_clock == now.u64()
                         ByteText::append_text(&state_path, ".clock")
                         clock_written: bool = TrustStorage::write_clock(state_path, now.u64(), current_state_digest)
                         state_path <- state_path.resize(clock_path_start)
-                        return trust_state_finish(lock_fd, Code.TrustStateUnavailable) if not clock_written
-                        return trust_state_finish(lock_fd, Code.Ok)
+                        return trust_state_finish(lock_file_descriptor, Code.TrustStateUnavailable) if not clock_written
+                        return trust_state_finish(lock_file_descriptor, Code.Ok)
             upgraded_state: mutable darray[u8] = []
             upgrade_status: Code = rollback_result(RollbackRecords::upgrade_to_v4(root_after_clock, state, trust_state_has_override(), &upgraded_state))
-            return trust_state_finish(lock_fd, upgrade_status) if upgrade_status != Code.Ok
+            return trust_state_finish(lock_file_descriptor, upgrade_status) if upgrade_status != Code.Ok
             state <- upgraded_state
             if not key_pin_found:
-                return trust_state_finish(lock_fd, Code.TrustStateUnavailable) if not TrustIdentity::valid_root_key(root_key_identity)
+                return trust_state_finish(lock_file_descriptor, Code.TrustStateUnavailable) if not TrustIdentity::valid_root_key(root_key_identity)
                 pin_record_size: usize = root_key_identity.count + 9.usize() + key_fingerprint.count * 2.usize()
-                return trust_state_finish(lock_fd, Code.TrustStateUnavailable) if pin_record_size > 1048576.usize() or state.count > 1048576.usize() - pin_record_size
+                return trust_state_finish(lock_file_descriptor, Code.TrustStateUnavailable) if pin_record_size > 1048576.usize() or state.count > 1048576.usize() - pin_record_size
                 ByteText::append(&state, root_key_identity)
                 ByteText::append_text(&state, " 0.0.0 ")
                 ByteText::append(&state, key_fingerprint)
@@ -377,7 +377,7 @@ module RollbackStore:
                 ByteText::append(&state, key_fingerprint)
                 state <- state.push(10)
             record_size: usize = state_identity.count + version.count + digest.count + metadata_digest.count + 4.usize()
-            return trust_state_finish(lock_fd, Code.TrustStateUnavailable) if record_size > 1048576.usize() or state.count > 1048576.usize() - record_size
+            return trust_state_finish(lock_file_descriptor, Code.TrustStateUnavailable) if record_size > 1048576.usize() or state.count > 1048576.usize() - record_size
             ByteText::append(&state, state_identity)
             state <- state.push(32)
             ByteText::append(&state, version)
@@ -387,23 +387,23 @@ module RollbackStore:
             ByteText::append(&state, metadata_digest)
             state <- state.push(10)
             updated_state_digest: mutable darray[u8] = []
-            return trust_state_finish(lock_fd, Code.TrustStateUnavailable) if not Integrity::sha256_hex(state, &updated_state_digest)
+            return trust_state_finish(lock_file_descriptor, Code.TrustStateUnavailable) if not Integrity::sha256_hex(state, &updated_state_digest)
             # Bind the proposed state bytes into the sidecar before publishing
             # the state. A crash between these atomic writes leaves a mismatch,
             # which fails closed instead of accepting either history.
             ByteText::append_text(&state_path, ".clock")
             clock_written: bool = TrustStorage::write_clock(state_path, now.u64(), updated_state_digest)
             state_path <- state_path.resize(clock_path_start)
-            return trust_state_finish(lock_fd, Code.TrustStateUnavailable) if:
+            return trust_state_finish(lock_file_descriptor, Code.TrustStateUnavailable) if:
                 not clock_written
                 not TrustStorage::write(state_path, state)
-            return trust_state_finish(lock_fd, Code.Ok)
+            return trust_state_finish(lock_file_descriptor, Code.Ok)
 
         # Persist TUF role floors separately from the fixture provider's
         # SemVer history. The state file is scoped by registry identity inside
         # each row so an explicit shared trust-state override cannot mix roots.
         def trust_state_has_override() -> bool:
-            override: u8&? = Platform::pkg_getenv("ELISAPKG_TRUST_STATE")
+            override: u8&? = Platform::environment_variable("ELISAPKG_TRUST_STATE")
             return true if override is configured
             return false
 

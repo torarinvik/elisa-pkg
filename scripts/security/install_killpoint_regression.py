@@ -20,11 +20,11 @@ BUILD_ROOT = ROOT / "build"
 FAULT_MODULE = r'''module InstallFaults:
     private:
         def write_text(value: cstr) -> void can[Console.Write, Unsafe.PointerCast]:
-            length: usize = Platform::pkg_strlen(value)
+            length: usize = Platform::c_string_length(value)
             offset: mutable usize = 0.usize()
             while offset < length |value, offset|:
                 raw: void& = (&value[offset]).cast[void&] can Unsafe.PointerCast
-                written: i64 = Platform::pkg_write(1, raw, length - offset) can Console.Write
+                written: i64 = Platform::write_file_descriptor(1, raw, length - offset) can Console.Write
                 return if written <= 0 or written > (length - offset).i64()
                 offset <- offset + written.usize()
 
@@ -33,15 +33,15 @@ FAULT_MODULE = r'''module InstallFaults:
             return true
 
         def transaction_boundary(name: cstr) -> void can[Console.Write, Memory.Allocate, Unsafe.PointerCast]:
-            if Platform::pkg_getenv("ELISAPKG_TEST_CRASH_POINT") is raw_point:
+            if Platform::environment_variable("ELISAPKG_TEST_CRASH_POINT") is raw_point:
                 requested: cstr = raw_point.cast[cstr] can Unsafe.PointerCast
-                return if not Platform::pkg_cstr_equal(requested, name)
+                return if not Platform::c_string_equal(requested, name)
                 write_text("ELISAPKG_FAULT_POINT:")
                 write_text(name)
                 write_text("\n")
                 wake: mutable u8 = 0
                 while true:
-                    read: i64 = Platform::pkg_read_fd(0, &wake, 1.usize()) can Unsafe.PointerCast
+                    read: i64 = Platform::read_file_descriptor(0, &wake, 1.usize()) can Unsafe.PointerCast
                     return if read <= 0
 '''
 

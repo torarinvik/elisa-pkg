@@ -61,17 +61,17 @@ module NativeFileMutation:
                 leaf_c <- leaf_c.push(leaf_snapshot[index])
             leaf_c <- leaf_c.push(0)
             leaf_name: cstr = (&leaf_c[0]).cast[cstr] can Unsafe.PointerCast
-            fd: i64 = PlatformNative::open_regular_file_at(directory, leaf_name)
-            if fd < 0:
-                return PlatformNative::close_error(directory, fd)
-            return PlatformNative::close_two_error(directory, fd, -21) if not PlatformNative::regular_fd(fd)
-            result: i64 = native_fchmod(fd, mode.i64())
+            file_descriptor: i64 = PlatformNative::open_regular_file_at(directory, leaf_name)
+            if file_descriptor < 0:
+                return PlatformNative::close_error(directory, file_descriptor)
+            return PlatformNative::close_two_error(directory, file_descriptor, -21) if not PlatformNative::regular_file_descriptor(file_descriptor)
+            result: i64 = native_fchmod(file_descriptor, mode.i64())
             errno_value: i64 = NativeErrors::current_errno()
-            return PlatformNative::close_two_error(fd, directory, NativeErrors::negative_value(errno_value)) if result != 0
-            sync_status: i64 = native_fsync(fd)
+            return PlatformNative::close_two_error(file_descriptor, directory, NativeErrors::negative_value(errno_value)) if result != 0
+            sync_status: i64 = native_fsync(file_descriptor)
             sync_errno: i64 = NativeErrors::current_errno()
-            return PlatformNative::close_two_result(fd, directory, 0) if sync_status == 0
-            return PlatformNative::close_two_error(fd, directory, NativeErrors::negative_value(sync_errno))
+            return PlatformNative::close_two_result(file_descriptor, directory, 0) if sync_status == 0
+            return PlatformNative::close_two_error(file_descriptor, directory, NativeErrors::negative_value(sync_errno))
 
         def unlink(path: cstr) -> i64:
             return unlink_kind(path, 0)
@@ -111,13 +111,13 @@ module NativeFileMutation:
                 for index in 0..<6 |leaf, alphabet, entropy, attempt|:
                     leaf[suffix + index] <- alphabet[((entropy[index].u64() + attempt.u64() * 17.u64() + index.u64()) % 62.u64()).usize()].u8()
                 leaf_name: cstr = (&leaf[0]).cast[cstr] can Unsafe.PointerCast
-                fd: i64 = native_openat(directory, leaf_name, flags_read_write_create_exclusive(), 384)
-                if fd >= 0:
+                file_descriptor: i64 = native_openat(directory, leaf_name, flags_read_write_create_exclusive(), 384)
+                if file_descriptor >= 0:
                     start: usize = path_length - leaf.count + 1.usize()
                     for index in 0..<leaf.count |template_path, leaf, start|:
                         template_path[start + index] <- leaf[index]
                     if native_close(directory) != 0:
-                        _ = native_close(fd)
+                        _ = native_close(file_descriptor)
                         # The descriptor close failure means the caller must
                         # treat creation as failed. Remove the newly-created
                         # name so an unreported temporary cannot accumulate
@@ -128,17 +128,17 @@ module NativeFileMutation:
                         cleanup_name: cstr = (&cleanup_path[0]).cast[cstr] can Unsafe.PointerCast
                         _ = unlink_kind(cleanup_name, 0)
                         return -5
-                    return fd
+                    return file_descriptor
                 return PlatformNative::close_error(directory, NativeErrors::negative_errno()) if NativeErrors::current_errno() != 17
             return PlatformNative::close_error(directory, -17)
 
         # Reserve a caller-selected name without following a pre-planted symlink.
         # This is used only for the legacy stage1 callback filename, which is
-        # fixed to /tmp/<compiler-pid> by the external compiler.
+        # fixed to /tmp/<compiler-child_process_identifier> by the external compiler.
         def create_exclusive_file(path: cstr) -> i64:
-            fd: i64 = native_open(path, PlatformNative::flags_write_create_exclusive(), 384)
-            return fd if fd < 0
-            return -5 if native_close(fd) != 0
+            file_descriptor: i64 = native_open(path, PlatformNative::flags_write_create_exclusive(), 384)
+            return file_descriptor if file_descriptor < 0
+            return -5 if native_close(file_descriptor) != 0
             return 0
 
         # Create a private per-build directory under an already trusted parent.
@@ -230,35 +230,35 @@ module NativeFileMutation:
             new_name: cstr = (&new_parent_c[0]).cast[cstr] can Unsafe.PointerCast
             new_directory: i64 = PlatformNative::open_directory_path(new_name)
             return PlatformNative::close_error(old_directory, new_directory) if new_directory < 0
-            expected_uid: u64 = native_geteuid().u64()
+            expected_user_identifier: u64 = native_geteuid().u64()
             # The source is checked by descriptor and then acted on by name.
             # Require both already-open parents to exclude writes by other
             # users, so an untrusted directory cannot swap that name between
             # validation and rename.
-            return PlatformNative::close_two_error(old_directory, new_directory, -13) if not NativeTrustedPaths::trusted_directory_fd(old_directory, expected_uid) or not NativeTrustedPaths::trusted_directory_fd(new_directory, expected_uid)
+            return PlatformNative::close_two_error(old_directory, new_directory, -13) if not NativeTrustedPaths::trusted_directory_file_descriptor(old_directory, expected_user_identifier) or not NativeTrustedPaths::trusted_directory_file_descriptor(new_directory, expected_user_identifier)
             old_leaf_c: mutable darray[u8] = []
             for index in 0..<old_leaf_snapshot.count |old_leaf_c, old_leaf_snapshot|:
                 old_leaf_c <- old_leaf_c.push(old_leaf_snapshot[index])
             old_leaf_name: cstr = (&old_leaf_c[0]).cast[cstr] can Unsafe.PointerCast
-            source_fd: i64 = PlatformNative::open_regular_file_at(old_directory, old_leaf_name)
-            return PlatformNative::close_two_error(old_directory, new_directory, -21 if source_fd == -unsupported_file_type_error else source_fd) if source_fd < 0
-            source_regular: bool = NativeTrustedPaths::trusted_regular_fd(source_fd, expected_uid)
-            source_close_status: i64 = native_close(source_fd)
+            source_file_descriptor: i64 = PlatformNative::open_regular_file_at(old_directory, old_leaf_name)
+            return PlatformNative::close_two_error(old_directory, new_directory, -21 if source_file_descriptor == -unsupported_file_type_error else source_file_descriptor) if source_file_descriptor < 0
+            source_regular: bool = NativeTrustedPaths::trusted_regular_file_descriptor(source_file_descriptor, expected_user_identifier)
+            source_close_status: i64 = native_close(source_file_descriptor)
             return PlatformNative::close_two_error(old_directory, new_directory, -5) if source_close_status != 0
             return PlatformNative::close_two_error(old_directory, new_directory, -21) if not source_regular
             new_leaf_c: mutable darray[u8] = []
             for index in 0..<new_leaf_snapshot.count |new_leaf_c, new_leaf_snapshot|:
                 new_leaf_c <- new_leaf_c.push(new_leaf_snapshot[index])
             new_leaf_name: cstr = (&new_leaf_c[0]).cast[cstr] can Unsafe.PointerCast
-            destination_fd: i64 = PlatformNative::open_regular_file_at(new_directory, new_leaf_name)
-            destination_errno: mutable i64 = -destination_fd if destination_fd < 0 else 0
-            destination_errno <- 21 if destination_fd == -unsupported_file_type_error
-            if destination_fd >= 0:
-                destination_regular: bool = NativeTrustedPaths::trusted_regular_fd(destination_fd, expected_uid)
-                destination_close_status: i64 = native_close(destination_fd)
+            destination_file_descriptor: i64 = PlatformNative::open_regular_file_at(new_directory, new_leaf_name)
+            destination_errno: mutable i64 = -destination_file_descriptor if destination_file_descriptor < 0 else 0
+            destination_errno <- 21 if destination_file_descriptor == -unsupported_file_type_error
+            if destination_file_descriptor >= 0:
+                destination_regular: bool = NativeTrustedPaths::trusted_regular_file_descriptor(destination_file_descriptor, expected_user_identifier)
+                destination_close_status: i64 = native_close(destination_file_descriptor)
                 return PlatformNative::close_two_error(old_directory, new_directory, -5) if destination_close_status != 0
                 return PlatformNative::close_two_error(old_directory, new_directory, -21) if not destination_regular
-            if destination_fd < 0 and destination_errno != 2:
+            if destination_file_descriptor < 0 and destination_errno != 2:
                 return PlatformNative::close_two_error(old_directory, new_directory, -destination_errno)
             old_rename_leaf: mutable darray[u8] = []
             new_rename_leaf: mutable darray[u8] = []
@@ -281,47 +281,47 @@ module NativeFileMutation:
             for index in 0..<leaf.count |leaf_snapshot, leaf|:
                 leaf_snapshot <- leaf_snapshot.push(leaf[index])
             parent_name: cstr = (&parent[0]).cast[cstr] can Unsafe.PointerCast
-            expected_uid: u64 = native_geteuid().u64()
-            directory: i64 = NativeTrustedPaths::open_trusted_directory(parent_name, expected_uid)
+            expected_user_identifier: u64 = native_geteuid().u64()
+            directory: i64 = NativeTrustedPaths::open_trusted_directory(parent_name, expected_user_identifier)
             return directory if directory < 0
             leaf_c: mutable darray[u8] = []
             for index in 0..<leaf_snapshot.count |leaf_c, leaf_snapshot|:
                 leaf_c <- leaf_c.push(leaf_snapshot[index])
             leaf_c <- leaf_c.push(0)
             leaf_name: cstr = (&leaf_c[0]).cast[cstr] can Unsafe.PointerCast
-            fd: i64 = PlatformNative::open_regular_file_at(directory, leaf_name)
-            return PlatformNative::close_error(directory, fd) if fd < 0
-            return PlatformNative::close_two_error(directory, fd, -13) if not NativeTrustedPaths::trusted_regular_fd(fd, expected_uid)
-            fd_stat: mutable darray[u8] = []
-            fd_stat <- fd_stat.resize(stat_buffer_bytes)
-            fd_stat_raw: mutable void& = (&fd_stat[0]).cast[mutable void&] can Unsafe.PointerCast
-            if native_fstat(fd, fd_stat_raw) != 0:
+            file_descriptor: i64 = PlatformNative::open_regular_file_at(directory, leaf_name)
+            return PlatformNative::close_error(directory, file_descriptor) if file_descriptor < 0
+            return PlatformNative::close_two_error(directory, file_descriptor, -13) if not NativeTrustedPaths::trusted_regular_file_descriptor(file_descriptor, expected_user_identifier)
+            file_descriptor_status: mutable darray[u8] = []
+            file_descriptor_status <- file_descriptor_status.resize(status_buffer_bytes)
+            file_descriptor_status_raw: mutable void& = (&file_descriptor_status[0]).cast[mutable void&] can Unsafe.PointerCast
+            if native_fstat(file_descriptor, file_descriptor_status_raw) != 0:
                 errno_value: i64 = NativeErrors::current_errno()
-                return PlatformNative::close_two_error(directory, fd, NativeErrors::negative_value(errno_value))
-            fd_device: u64 = NativeStat::device(fd_stat)
-            fd_inode: u64 = NativeStat::inode(fd_stat)
-            return PlatformNative::close_two_error(directory, fd, -13) if fd_device != expected_device or fd_inode != expected_inode
-            path_stat: mutable darray[u8] = []
-            path_stat <- path_stat.resize(stat_buffer_bytes)
-            path_stat_raw: mutable void& = (&path_stat[0]).cast[mutable void&] can Unsafe.PointerCast
-            if native_fstatat(directory, leaf_name, path_stat_raw, at_no_follow) != 0:
+                return PlatformNative::close_two_error(directory, file_descriptor, NativeErrors::negative_value(errno_value))
+            file_descriptor_device: u64 = NativeStat::device(file_descriptor_status)
+            file_descriptor_inode: u64 = NativeStat::inode(file_descriptor_status)
+            return PlatformNative::close_two_error(directory, file_descriptor, -13) if file_descriptor_device != expected_device or file_descriptor_inode != expected_inode
+            path_status: mutable darray[u8] = []
+            path_status <- path_status.resize(status_buffer_bytes)
+            path_status_raw: mutable void& = (&path_status[0]).cast[mutable void&] can Unsafe.PointerCast
+            if native_fstatat(directory, leaf_name, path_status_raw, at_no_follow) != 0:
                 errno_value: i64 = NativeErrors::current_errno()
-                return PlatformNative::close_two_error(directory, fd, NativeErrors::negative_value(errno_value))
-            return PlatformNative::close_two_error(directory, fd, -13) if NativeStat::file_type(path_stat) != NativeStat::regular_mode
-            return PlatformNative::close_two_error(directory, fd, -13) if not NativeStat::same_identity(path_stat, fd_stat)
+                return PlatformNative::close_two_error(directory, file_descriptor, NativeErrors::negative_value(errno_value))
+            return PlatformNative::close_two_error(directory, file_descriptor, -13) if NativeStat::file_type(path_status) != NativeStat::regular_mode
+            return PlatformNative::close_two_error(directory, file_descriptor, -13) if not NativeStat::same_identity(path_status, file_descriptor_status)
             # POSIX has no unlink-if-inode primitive: this is the narrowest
             # descriptor-relative check available, but a same-UID actor can
             # still replace the leaf between fstatat and unlinkat.
             removed: i64 = native_unlinkat(directory, leaf_name, 0)
             remove_errno: i64 = NativeErrors::current_errno()
-            return PlatformNative::close_two_error(directory, fd, NativeErrors::negative_value(remove_errno)) if removed != 0
+            return PlatformNative::close_two_error(directory, file_descriptor, NativeErrors::negative_value(remove_errno)) if removed != 0
             sync_status: i64 = native_fsync(directory)
             sync_errno: i64 = NativeErrors::current_errno()
             if sync_status != 0:
-                return PlatformNative::close_two_error(directory, fd, NativeErrors::negative_value(sync_errno))
+                return PlatformNative::close_two_error(directory, file_descriptor, NativeErrors::negative_value(sync_errno))
             directory_close: i64 = native_close(directory)
-            fd_close: i64 = native_close(fd)
-            return -5 if directory_close != 0 or fd_close != 0
+            file_descriptor_close: i64 = native_close(file_descriptor)
+            return -5 if directory_close != 0 or file_descriptor_close != 0
             return 0
 
         def unlink_kind(path: cstr, flags: i64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -372,33 +372,33 @@ module NativeFileMutation:
             new_name: cstr = (&new_parent_c[0]).cast[cstr] can Unsafe.PointerCast
             new_directory: i64 = PlatformNative::open_directory_path(new_name)
             return PlatformNative::close_error(old_directory, new_directory) if new_directory < 0
-            expected_uid: u64 = native_geteuid().u64()
+            expected_user_identifier: u64 = native_geteuid().u64()
             # Keep name-based linkat/renameat operations inside directories
             # that other users cannot mutate after the source inode check.
-            return PlatformNative::close_two_error(old_directory, new_directory, -13) if not NativeTrustedPaths::trusted_directory_fd(old_directory, expected_uid) or not NativeTrustedPaths::trusted_directory_fd(new_directory, expected_uid)
+            return PlatformNative::close_two_error(old_directory, new_directory, -13) if not NativeTrustedPaths::trusted_directory_file_descriptor(old_directory, expected_user_identifier) or not NativeTrustedPaths::trusted_directory_file_descriptor(new_directory, expected_user_identifier)
             old_leaf_c: mutable darray[u8] = []
             for index in 0..<old_leaf_snapshot.count |old_leaf_c, old_leaf_snapshot|:
                 old_leaf_c <- old_leaf_c.push(old_leaf_snapshot[index])
             old_leaf_name: cstr = (&old_leaf_c[0]).cast[cstr] can Unsafe.PointerCast
-            source_fd: i64 = PlatformNative::open_regular_file_at(old_directory, old_leaf_name)
-            return PlatformNative::close_two_error(old_directory, new_directory, -21 if source_fd == -unsupported_file_type_error else source_fd) if source_fd < 0
-            source_regular: bool = NativeTrustedPaths::trusted_regular_fd(source_fd, expected_uid)
-            source_close_status: i64 = native_close(source_fd)
+            source_file_descriptor: i64 = PlatformNative::open_regular_file_at(old_directory, old_leaf_name)
+            return PlatformNative::close_two_error(old_directory, new_directory, -21 if source_file_descriptor == -unsupported_file_type_error else source_file_descriptor) if source_file_descriptor < 0
+            source_regular: bool = NativeTrustedPaths::trusted_regular_file_descriptor(source_file_descriptor, expected_user_identifier)
+            source_close_status: i64 = native_close(source_file_descriptor)
             return PlatformNative::close_two_error(old_directory, new_directory, -5) if source_close_status != 0
             return PlatformNative::close_two_error(old_directory, new_directory, -21) if not source_regular
             new_leaf_c: mutable darray[u8] = []
             for index in 0..<new_leaf_snapshot.count |new_leaf_c, new_leaf_snapshot|:
                 new_leaf_c <- new_leaf_c.push(new_leaf_snapshot[index])
             new_leaf_name: cstr = (&new_leaf_c[0]).cast[cstr] can Unsafe.PointerCast
-            new_stat: mutable darray[u8] = []
-            new_stat <- new_stat.resize(stat_buffer_bytes)
-            new_stat_raw: mutable void& = (&new_stat[0]).cast[mutable void&] can Unsafe.PointerCast
-            new_result: i64 = native_fstatat(new_directory, new_leaf_name, new_stat_raw, at_no_follow)
+            new_status: mutable darray[u8] = []
+            new_status <- new_status.resize(status_buffer_bytes)
+            new_status_raw: mutable void& = (&new_status[0]).cast[mutable void&] can Unsafe.PointerCast
+            new_result: i64 = native_fstatat(new_directory, new_leaf_name, new_status_raw, at_no_follow)
             new_errno: i64 = NativeErrors::error_code()
             result: mutable i64 = 0
             if is_move:
                 if new_result == 0:
-                    new_mode: u64 = NativeStat::mode(new_stat)
+                    new_mode: u64 = NativeStat::mode(new_status)
                     return PlatformNative::close_two_error(old_directory, new_directory, -40) if (new_mode & NativeStat::file_type_mask) == NativeStat::symlink_mode
                     return PlatformNative::close_two_error(old_directory, new_directory, -21) if (new_mode & NativeStat::file_type_mask) != NativeStat::regular_mode
                 if new_result != 0 and new_errno != 2:

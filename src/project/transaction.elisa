@@ -25,22 +25,22 @@ module ProjectTransaction:
 
         # One descriptor holds the project-local transaction flock across the
         # entire manifest/lock update and its recovery or cleanup.
-        global mutable transaction_lock_fd: i64 = -1
+        global mutable transaction_lock_file_descriptor: i64 = -1
 
         def transaction_lock_acquire() -> bool can[Global{Read,Write}, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global{Read,Write}:
-                return false if transaction_lock_fd >= 0
-                fd: i64 = Platform::pkg_acquire_project_transaction_lock(kernel_lock_path)
-                return false if fd < 0
-                transaction_lock_fd <- fd
+                return false if transaction_lock_file_descriptor >= 0
+                file_descriptor: i64 = Platform::acquire_project_transaction_lock(kernel_lock_path)
+                return false if file_descriptor < 0
+                transaction_lock_file_descriptor <- file_descriptor
                 return true
 
         def transaction_lock_release() -> bool can[Global{Read,Write}]:
             can Global{Read,Write}:
-                return true if transaction_lock_fd < 0
-                fd: i64 = transaction_lock_fd
-                transaction_lock_fd <- -1
-                return Platform::pkg_close(fd) == 0
+                return true if transaction_lock_file_descriptor < 0
+                file_descriptor: i64 = transaction_lock_file_descriptor
+                transaction_lock_file_descriptor <- -1
+                return Platform::close_file_descriptor(file_descriptor) == 0
 
         def transaction_abort_begin(guard: darray[u8]&) -> bool can[Global{Read,Write}, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global{Read,Write}:
@@ -53,10 +53,10 @@ module ProjectTransaction:
             # file size helper returns -21 for directories, so verify that case
             # with the no-follow directory opener instead of treating every
             # negative result as an absent guard.
-            state: i64 = Platform::pkg_package_file_size(guard_path)
+            state: i64 = Platform::package_file_size(guard_path)
             return 0 if state == -2
             return -1 if state >= 0 or state != -21
-            return 1 if Platform::pkg_is_directory(guard_path) == 1
+            return 1 if Platform::is_directory(guard_path) == 1
             return -1
 
         def invalid_journal_file(size_result: i64) -> bool:
@@ -70,15 +70,15 @@ module ProjectTransaction:
 
         def remove_transaction_files() -> bool:
             return false if not:
-                ProjectFiles::remove_cstr_file(original_manifest_path)
-                ProjectFiles::remove_cstr_file(original_lock_path)
-                ProjectFiles::remove_cstr_file(staged_manifest_path)
-                ProjectFiles::remove_cstr_file(staged_lock_path)
-                ProjectFiles::remove_cstr_file(staged_missing_lock_path)
+                ProjectFiles::remove_c_string_file(original_manifest_path)
+                ProjectFiles::remove_c_string_file(original_lock_path)
+                ProjectFiles::remove_c_string_file(staged_manifest_path)
+                ProjectFiles::remove_c_string_file(staged_lock_path)
+                ProjectFiles::remove_c_string_file(staged_missing_lock_path)
             guard: mutable darray[u8] = []
             ByteText::append_text(&guard, guard_path)
             return false if not ProjectFiles::remove_empty_directory(&guard)
-            return ProjectFiles::remove_cstr_file(phase_path)
+            return ProjectFiles::remove_c_string_file(phase_path)
 
         def live_file_matches(expected_path: cstr, live_path: cstr) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             expected: mutable darray[u8] = []
@@ -86,8 +86,8 @@ module ProjectTransaction:
             live: mutable darray[u8] = []
             live <- live.resize(ProjectFiles::project_document_limit)
             return false if not:
-                ProjectFiles::read_cstr_into(expected_path, &expected)
-                ProjectFiles::read_cstr_into(live_path, &live)
+                ProjectFiles::read_c_string_into(expected_path, &expected)
+                ProjectFiles::read_c_string_into(live_path, &live)
             return ByteText::equal(expected, live)
 
         def has_manifest_intent(state: darray[u8]&) -> bool:
@@ -96,7 +96,7 @@ module ProjectTransaction:
         def published_manifest_matches_journal() -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             state: mutable darray[u8] = []
             state <- state.resize(128)
-            return false if not ProjectFiles::read_cstr_into(phase_path, &state)
+            return false if not ProjectFiles::read_c_string_into(phase_path, &state)
             if ByteText::equal_text(state, prepared_with_lock) or ByteText::equal_text(state, prepared_without_lock):
                 return live_file_matches(original_manifest_path, live_manifest_path)
             if has_manifest_intent(state):
@@ -106,7 +106,7 @@ module ProjectTransaction:
         def report_recovery_error(message: cstr) -> void can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             bytes: mutable darray[u8] = []
             ByteText::append_text(&bytes, message)
-            _ = ProjectFiles::write_fd_all(2, &bytes)
+            _ = ProjectFiles::write_file_descriptor_all(2, &bytes)
 
     public:
         const enum LockPublication of u8:
@@ -125,18 +125,18 @@ module ProjectTransaction:
                     ProjectFiles::make_directory(&state_root)
                     transaction_lock_acquire()
                 journal_exists: bool =
-                    Platform::pkg_package_file_size(phase_path) != -2 or
-                    Platform::pkg_package_file_size(original_manifest_path) != -2 or
-                    Platform::pkg_package_file_size(original_lock_path) != -2 or
-                    Platform::pkg_package_file_size(staged_manifest_path) != -2 or
-                    Platform::pkg_package_file_size(staged_lock_path) != -2 or
-                    Platform::pkg_package_file_size(staged_missing_lock_path) != -2
+                    Platform::package_file_size(phase_path) != -2 or
+                    Platform::package_file_size(original_manifest_path) != -2 or
+                    Platform::package_file_size(original_lock_path) != -2 or
+                    Platform::package_file_size(staged_manifest_path) != -2 or
+                    Platform::package_file_size(staged_lock_path) != -2 or
+                    Platform::package_file_size(staged_missing_lock_path) != -2
                 if journal_exists:
                     _ = transaction_lock_release()
                     return false
                 guard: mutable darray[u8] = []
                 ByteText::append_text(&guard, guard_path)
-                if Platform::pkg_mkdir(guard_path, 448.u16()) != 0:
+                if Platform::make_directory(guard_path, 448.u16()) != 0:
                     _ = transaction_lock_release()
                     return false
                 # The caller prepared its edit before taking the guard. Another
@@ -145,29 +145,29 @@ module ProjectTransaction:
                 # overwriting a newer dependency edit from a stale snapshot.
                 current_manifest: mutable darray[u8] = []
                 current_manifest <- current_manifest.resize(ProjectFiles::project_document_limit)
-                if not ProjectFiles::read_cstr_into(live_manifest_path, &current_manifest) or not ByteText::equal(current_manifest, original_manifest):
+                if not ProjectFiles::read_c_string_into(live_manifest_path, &current_manifest) or not ByteText::equal(current_manifest, original_manifest):
                     _ = transaction_abort_begin(guard)
                     return false
                 if expected_lock_state != -3:
-                    current_lock_state: i64 = Platform::pkg_package_file_size(live_lock_path)
+                    current_lock_state: i64 = Platform::package_file_size(live_lock_path)
                     if current_lock_state != expected_lock_state:
                         _ = transaction_abort_begin(guard)
                         return false
                     if current_lock_state >= 0:
                         current_lock: mutable darray[u8] = []
                         current_lock <- current_lock.resize(ProjectFiles::project_document_limit)
-                        if not ProjectFiles::read_cstr_into(live_lock_path, &current_lock) or not ByteText::equal(current_lock, expected_lock):
+                        if not ProjectFiles::read_c_string_into(live_lock_path, &current_lock) or not ByteText::equal(current_lock, expected_lock):
                             _ = transaction_abort_begin(guard)
                             return false
-                if not ProjectFiles::write_cstr_file(original_manifest_path, original_manifest):
+                if not ProjectFiles::write_c_string_file(original_manifest_path, original_manifest):
                     _ = transaction_cleanup()
                     return false
                 state: mutable darray[u8] = []
-                lock_state: i64 = Platform::pkg_package_file_size(live_lock_path)
+                lock_state: i64 = Platform::package_file_size(live_lock_path)
                 if lock_state >= 0:
                     original_lock: mutable darray[u8] = []
                     original_lock <- original_lock.resize(ProjectFiles::project_document_limit)
-                    if not ProjectFiles::read_cstr_into(live_lock_path, &original_lock) or not ProjectFiles::write_cstr_file(original_lock_path, &original_lock):
+                    if not ProjectFiles::read_c_string_into(live_lock_path, &original_lock) or not ProjectFiles::write_c_string_file(original_lock_path, &original_lock):
                         _ = transaction_cleanup()
                         return false
                     ByteText::append_text(&state, prepared_with_lock)
@@ -176,7 +176,7 @@ module ProjectTransaction:
                 else:
                     _ = transaction_cleanup()
                     return false
-                if not ProjectFiles::write_cstr_file(phase_path, &state):
+                if not ProjectFiles::write_c_string_file(phase_path, &state):
                     _ = transaction_cleanup()
                     return false
                 return true
@@ -192,50 +192,50 @@ module ProjectTransaction:
             # the old, new, and externally edited states even across a crash at
             # either atomic rename boundary.
             can Global.Read:
-                return false if transaction_lock_fd < 0
-            if new_manifest.count > Json::max_document_bytes:
+                return false if transaction_lock_file_descriptor < 0
+            if new_manifest.count > Json::maximum_document_bytes:
                 report_recovery_error("error: manifest replacement exceeds the project document size limit\n")
                 return false
             if not valid_replacement_document(new_manifest):
                 report_recovery_error("error: manifest replacement must be a valid JSON object with unique keys\n")
                 return false
-            if Platform::pkg_package_file_size(staged_manifest_path) != -2:
+            if Platform::package_file_size(staged_manifest_path) != -2:
                 report_recovery_error("error: a manifest replacement is already staged or its journal entry is unreadable\n")
                 return false
             if not live_file_matches(original_manifest_path, live_manifest_path):
                 report_recovery_error("error: manifest changed before transaction publication\n")
                 return false
-            return false if not ProjectFiles::write_cstr_file(staged_manifest_path, new_manifest)
+            return false if not ProjectFiles::write_c_string_file(staged_manifest_path, new_manifest)
             state: mutable darray[u8] = []
             ByteText::append_text(&state, manifest_pending)
-            return false if not ProjectFiles::write_cstr_file(phase_path, &state)
-            return ProjectFiles::write_cstr_file(live_manifest_path, new_manifest)
+            return false if not ProjectFiles::write_c_string_file(phase_path, &state)
+            return ProjectFiles::write_c_string_file(live_manifest_path, new_manifest)
 
         def publish_lock(new_lock: darray[u8]&) -> LockPublication can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             # Record the intended bytes before replacing the live lockfile so
             # recovery can distinguish publication from an external edit.
             can Global.Read:
-                return LockPublication.JournalFailed if transaction_lock_fd < 0
-            if new_lock.count > Json::max_document_bytes:
+                return LockPublication.JournalFailed if transaction_lock_file_descriptor < 0
+            if new_lock.count > Json::maximum_document_bytes:
                 report_recovery_error("error: lockfile replacement exceeds the project document size limit\n")
                 return LockPublication.WriteFailed
             if not valid_replacement_document(new_lock):
                 report_recovery_error("error: lockfile replacement must be a valid JSON object with unique keys\n")
                 return LockPublication.WriteFailed
-            if Platform::pkg_package_file_size(staged_lock_path) != -2 or Platform::pkg_package_file_size(staged_missing_lock_path) != -2:
+            if Platform::package_file_size(staged_lock_path) != -2 or Platform::package_file_size(staged_missing_lock_path) != -2:
                 report_recovery_error("error: a lockfile replacement is already staged or its journal entry is unreadable\n")
                 return LockPublication.JournalFailed
-            original_size: i64 = Platform::pkg_package_file_size(original_lock_path)
-            original_matches: bool = Platform::pkg_package_file_size(live_lock_path) == -2 if original_size == -2 else live_file_matches(original_lock_path, live_lock_path)
+            original_size: i64 = Platform::package_file_size(original_lock_path)
+            original_matches: bool = Platform::package_file_size(live_lock_path) == -2 if original_size == -2 else live_file_matches(original_lock_path, live_lock_path)
             if not original_matches:
                 report_recovery_error("error: lockfile changed before transaction publication\n")
                 return LockPublication.JournalFailed
-            return LockPublication.JournalFailed if not ProjectFiles::write_cstr_file(staged_lock_path, new_lock)
-            return LockPublication.Published if ProjectFiles::write_cstr_file(live_lock_path, new_lock) else LockPublication.WriteFailed
+            return LockPublication.JournalFailed if not ProjectFiles::write_c_string_file(staged_lock_path, new_lock)
+            return LockPublication.Published if ProjectFiles::write_c_string_file(live_lock_path, new_lock) else LockPublication.WriteFailed
 
         def restore() -> bool can[Global{Read,Write}, Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             can Global{Read,Write}:
-                return false if transaction_lock_fd < 0
+                return false if transaction_lock_file_descriptor < 0
                 restored: bool = restore_journal()
                 released: bool = transaction_lock_release()
                 return restored and released
@@ -250,29 +250,29 @@ module ProjectTransaction:
             can Global{Read,Write}:
                 state: mutable darray[u8] = []
                 state <- state.resize(128)
-                return false if not ProjectFiles::read_cstr_into(phase_path, &state)
+                return false if not ProjectFiles::read_c_string_into(phase_path, &state)
                 recognized: bool = ByteText::equal_text(state, prepared_with_lock) or ByteText::equal_text(state, prepared_without_lock) or has_manifest_intent(state)
                 if not recognized:
                     report_recovery_error("error: unrecognized project transaction state; preserve .elisapkg/transaction.* for recovery\n")
                     return false
                 original_manifest: mutable darray[u8] = []
                 original_manifest <- original_manifest.resize(ProjectFiles::project_document_limit)
-                return false if not ProjectFiles::read_cstr_into(original_manifest_path, &original_manifest)
+                return false if not ProjectFiles::read_c_string_into(original_manifest_path, &original_manifest)
                 current_manifest: mutable darray[u8] = []
                 current_manifest <- current_manifest.resize(ProjectFiles::project_document_limit)
-                return false if not ProjectFiles::read_cstr_into(live_manifest_path, &current_manifest)
+                return false if not ProjectFiles::read_c_string_into(live_manifest_path, &current_manifest)
                 manifest_is_original: bool = ByteText::equal(current_manifest, original_manifest)
                 if has_manifest_intent(state):
                     new_manifest: mutable darray[u8] = []
                     new_manifest <- new_manifest.resize(ProjectFiles::project_document_limit)
-                    return false if not ProjectFiles::read_cstr_into(staged_manifest_path, &new_manifest)
+                    return false if not ProjectFiles::read_c_string_into(staged_manifest_path, &new_manifest)
                     if not manifest_is_original and not ByteText::equal(current_manifest, new_manifest):
                         report_recovery_error("error: transaction recovery found an external manifest edit; recovery files were retained\n")
                         return false
                 elif not manifest_is_original:
                     report_recovery_error("error: transaction recovery found an external manifest edit; recovery files were retained\n")
                     return false
-                original_lock_state: i64 = Platform::pkg_package_file_size(original_lock_path)
+                original_lock_state: i64 = Platform::package_file_size(original_lock_path)
                 return false if original_lock_state < 0 and original_lock_state != -2
                 original_lock_present: bool = original_lock_state >= 0
                 if ByteText::equal_text(state, prepared_with_lock) and not original_lock_present:
@@ -284,30 +284,30 @@ module ProjectTransaction:
                 original_lock: mutable darray[u8] = []
                 if original_lock_present:
                     original_lock <- original_lock.resize(ProjectFiles::project_document_limit)
-                    return false if not ProjectFiles::read_cstr_into(original_lock_path, &original_lock)
-                current_lock_state: i64 = Platform::pkg_package_file_size(live_lock_path)
+                    return false if not ProjectFiles::read_c_string_into(original_lock_path, &original_lock)
+                current_lock_state: i64 = Platform::package_file_size(live_lock_path)
                 return false if current_lock_state < 0 and current_lock_state != -2
                 current_lock_present: bool = current_lock_state >= 0
-                new_lock_state: i64 = Platform::pkg_package_file_size(staged_lock_path)
+                new_lock_state: i64 = Platform::package_file_size(staged_lock_path)
                 return false if new_lock_state < 0 and new_lock_state != -2
-                new_lock_missing_state: i64 = Platform::pkg_package_file_size(staged_missing_lock_path)
+                new_lock_missing_state: i64 = Platform::package_file_size(staged_missing_lock_path)
                 return false if:
                     new_lock_missing_state < 0 and new_lock_missing_state != -2
                     new_lock_state >= 0 and new_lock_missing_state >= 0
                 if new_lock_missing_state >= 0:
                     missing_lock_marker: mutable darray[u8] = []
                     missing_lock_marker <- missing_lock_marker.resize(64)
-                    return false if not ProjectFiles::read_cstr_into(staged_missing_lock_path, &missing_lock_marker) or not ByteText::equal_text(missing_lock_marker, "missing\n")
+                    return false if not ProjectFiles::read_c_string_into(staged_missing_lock_path, &missing_lock_marker) or not ByteText::equal_text(missing_lock_marker, "missing\n")
                 lock_is_original: mutable bool = not current_lock_present and not original_lock_present
                 if current_lock_present:
                     current_lock: mutable darray[u8] = []
                     current_lock <- current_lock.resize(ProjectFiles::project_document_limit)
-                    return false if not ProjectFiles::read_cstr_into(live_lock_path, &current_lock)
+                    return false if not ProjectFiles::read_c_string_into(live_lock_path, &current_lock)
                     lock_is_original <- original_lock_present and ByteText::equal(current_lock, original_lock)
                     if new_lock_state >= 0:
                         new_lock: mutable darray[u8] = []
                         new_lock <- new_lock.resize(ProjectFiles::project_document_limit)
-                        return false if not ProjectFiles::read_cstr_into(staged_lock_path, &new_lock)
+                        return false if not ProjectFiles::read_c_string_into(staged_lock_path, &new_lock)
                         if not lock_is_original and not ByteText::equal(current_lock, new_lock):
                             report_recovery_error("error: transaction recovery found an external lockfile edit; recovery files were retained\n")
                             return false
@@ -318,34 +318,34 @@ module ProjectTransaction:
                     report_recovery_error("error: transaction recovery found an external lockfile edit; recovery files were retained\n")
                     return false
                 if not manifest_is_original:
-                    return false if not ProjectFiles::write_cstr_file(live_manifest_path, &original_manifest)
+                    return false if not ProjectFiles::write_c_string_file(live_manifest_path, &original_manifest)
                 if not lock_is_original:
                     if original_lock_present:
-                        return false if not ProjectFiles::write_cstr_file(live_lock_path, &original_lock)
+                        return false if not ProjectFiles::write_c_string_file(live_lock_path, &original_lock)
                     else:
-                        return false if not ProjectFiles::remove_cstr_file(live_lock_path)
+                        return false if not ProjectFiles::remove_c_string_file(live_lock_path)
                 restored_state: mutable darray[u8] = []
                 ByteText::append_text(&restored_state, rolled_back)
-                return false if not ProjectFiles::write_cstr_file(phase_path, &restored_state)
+                return false if not ProjectFiles::write_c_string_file(phase_path, &restored_state)
                 return remove_transaction_files()
 
     public:
         def recover() -> bool can[Global{Read,Write}, Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             can Global{Read,Write}:
-                return false if transaction_lock_fd >= 0
-                transaction_state: mutable i64 = Platform::pkg_package_file_size(phase_path)
+                return false if transaction_lock_file_descriptor >= 0
+                transaction_state: mutable i64 = Platform::package_file_size(phase_path)
                 return false if invalid_journal_file(transaction_state)
                 guard_state: mutable i64 = transaction_guard_state()
                 if guard_state < 0:
                     report_recovery_error("error: invalid project transaction guard at .elisapkg/transaction.guard; preserve it for recovery\n")
                     return false
-                lock_state: i64 = Platform::pkg_package_file_size(kernel_lock_path)
+                lock_state: i64 = Platform::package_file_size(kernel_lock_path)
                 return false if invalid_journal_file(lock_state)
-                original_manifest_state: i64 = Platform::pkg_package_file_size(original_manifest_path)
-                original_lock_state: i64 = Platform::pkg_package_file_size(original_lock_path)
-                new_manifest_state: i64 = Platform::pkg_package_file_size(staged_manifest_path)
-                new_lock_state: i64 = Platform::pkg_package_file_size(staged_lock_path)
-                missing_lock_state: i64 = Platform::pkg_package_file_size(staged_missing_lock_path)
+                original_manifest_state: i64 = Platform::package_file_size(original_manifest_path)
+                original_lock_state: i64 = Platform::package_file_size(original_lock_path)
+                new_manifest_state: i64 = Platform::package_file_size(staged_manifest_path)
+                new_lock_state: i64 = Platform::package_file_size(staged_lock_path)
+                missing_lock_state: i64 = Platform::package_file_size(staged_missing_lock_path)
                 return false if:
                     invalid_journal_file(original_manifest_state)
                     invalid_journal_file(original_lock_state)
@@ -367,7 +367,7 @@ module ProjectTransaction:
                 if not transaction_lock_acquire():
                     report_recovery_error("error: could not acquire the project transaction lock; wait for any active edit to finish, then retry\n")
                     return false
-                transaction_state <- Platform::pkg_package_file_size(phase_path)
+                transaction_state <- Platform::package_file_size(phase_path)
                 guard_state <- transaction_guard_state()
                 if invalid_journal_file(transaction_state) or guard_state < 0:
                     _ = transaction_lock_release()
@@ -379,18 +379,18 @@ module ProjectTransaction:
                     return transaction_cleanup()
                 state: mutable darray[u8] = []
                 state <- state.resize(128)
-                if not ProjectFiles::read_cstr_into(phase_path, &state):
+                if not ProjectFiles::read_c_string_into(phase_path, &state):
                     _ = transaction_lock_release()
                     return false
                 return transaction_cleanup() if ByteText::equal_text(state, committed) or ByteText::equal_text(state, rolled_back)
-                if guard_state == 0 and Platform::pkg_mkdir(guard_path, 448.u16()) != 0:
+                if guard_state == 0 and Platform::make_directory(guard_path, 448.u16()) != 0:
                     _ = transaction_lock_release()
                     return false
                 return restore()
 
         def commit() -> bool can[Global{Read,Write}, Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             can Global{Read,Write}:
-                return false if transaction_lock_fd < 0
+                return false if transaction_lock_file_descriptor < 0
                 if not published_manifest_matches_journal():
                     report_recovery_error("error: published manifest does not match the transaction journal\n")
                     _ = restore()
@@ -401,7 +401,7 @@ module ProjectTransaction:
                     return false
                 state: mutable darray[u8] = []
                 ByteText::append_text(&state, committed)
-                if not ProjectFiles::write_cstr_file(phase_path, &state):
+                if not ProjectFiles::write_c_string_file(phase_path, &state):
                     _ = transaction_lock_release()
                     return false
                 return transaction_cleanup()

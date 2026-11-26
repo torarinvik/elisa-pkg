@@ -327,12 +327,12 @@ def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
     key: mutable darray[u8] = []
     key.resize(33)
     key_raw: mutable u8& = (&key[0]).cast[mutable u8&] can Unsafe.PointerCast
-    return 1 if Platform::pkg_read_trusted_file("$TRUST_ROOT_FILE", key_raw, key.count) != 32
+    return 1 if Platform::read_trusted_file("$TRUST_ROOT_FILE", key_raw, key.count) != 32
     return 2 if key[0] != 0 or key[31] != 31
-    return 3 if Platform::pkg_read_trusted_file("$TRUST_ROOT_INSECURE_FILE", key_raw, key.count) >= 0
-    return 4 if Platform::pkg_read_trusted_file("$TRUST_ROOT_DIR_LINK/key", key_raw, key.count) >= 0
-    return 5 if Platform::pkg_read_trusted_file("$TRUST_ROOT_SYMLINK_FILE", key_raw, key.count) >= 0
-    return 6 if Platform::pkg_is_trusted_directory("$TRUST_ROOT_INSECURE_DIR") != 0
+    return 3 if Platform::read_trusted_file("$TRUST_ROOT_INSECURE_FILE", key_raw, key.count) >= 0
+    return 4 if Platform::read_trusted_file("$TRUST_ROOT_DIR_LINK/key", key_raw, key.count) >= 0
+    return 5 if Platform::read_trusted_file("$TRUST_ROOT_SYMLINK_FILE", key_raw, key.count) >= 0
+    return 6 if Platform::is_trusted_directory("$TRUST_ROOT_INSECURE_DIR") != 0
     return 0
 EOF
 ELISA_STAGE1_BIN="${ELISA_STAGE1_BIN:-$ELISA_COMPILER_ROOT/bin/elisac-stage1}" \
@@ -363,18 +363,18 @@ if [ "$(uname -s)" = "Darwin" ]; then
   cat > "$ACL_PROBE" <<EOF
 include "$ROOT/src/platform.elisa"
 def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-    return 1 if Platform::pkg_is_trusted_directory("$ACL_NONE_DIR") != 1
-    return 2 if Platform::pkg_is_trusted_directory("$ACL_DENY_DIR") != 1
-    return 3 if Platform::pkg_is_trusted_directory("$ACL_ALLOW_DIR") != 0
+    return 1 if Platform::is_trusted_directory("$ACL_NONE_DIR") != 1
+    return 2 if Platform::is_trusted_directory("$ACL_DENY_DIR") != 1
+    return 3 if Platform::is_trusted_directory("$ACL_ALLOW_DIR") != 0
     denied_key: mutable darray[u8] = []
     denied_key.resize(33)
     denied_raw: mutable u8& = (&denied_key[0]).cast[mutable u8&] can Unsafe.PointerCast
-    return 4 if Platform::pkg_read_trusted_file("$ACL_DENY_FILE", denied_raw, denied_key.count) != 32
+    return 4 if Platform::read_trusted_file("$ACL_DENY_FILE", denied_raw, denied_key.count) != 32
     return 5 if denied_key[0] != 0 or denied_key[31] != 31
     allowed_key: mutable darray[u8] = []
     allowed_key.resize(33)
     allowed_raw: mutable u8& = (&allowed_key[0]).cast[mutable u8&] can Unsafe.PointerCast
-    return 6 if Platform::pkg_read_trusted_file("$ACL_ALLOW_FILE", allowed_raw, allowed_key.count) >= 0
+    return 6 if Platform::read_trusted_file("$ACL_ALLOW_FILE", allowed_raw, allowed_key.count) >= 0
     return 0
 EOF
   ELISA_STAGE1_BIN="${ELISA_STAGE1_BIN:-$ELISA_COMPILER_ROOT/bin/elisac-stage1}" \

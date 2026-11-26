@@ -96,16 +96,16 @@ def source_for(cases: list[tuple[str, Path, Path, bool, bytes]]) -> str:
             [
                 f"    archive_path_{index}: mutable darray[u8] = [{archive_path_values}]",
                 f"    archive_name_{index}: cstr = (&archive_path_{index}[0]).cast[cstr] can Unsafe.PointerCast",
-                f"    archive_size_{index}: i64 = Platform::pkg_package_file_size(archive_name_{index})",
+                f"    archive_size_{index}: i64 = Platform::package_file_size(archive_name_{index})",
                 f"    return {index} if archive_size_{index} < 0 or archive_size_{index} > 1048576",
                 f"    archive_{index}: mutable darray[u8] = []",
                 f"    archive_{index}.resize(archive_size_{index}.usize() + 1.usize())",
                 f"    archive_raw_{index}: mutable u8& = (&archive_{index}[0]).cast[mutable u8&] can Unsafe.PointerCast",
-                f"    archive_read_{index}: i64 = Platform::pkg_read_package_file(archive_name_{index}, archive_raw_{index}, archive_{index}.count)",
+                f"    archive_read_{index}: i64 = Platform::read_package_file(archive_name_{index}, archive_raw_{index}, archive_{index}.count)",
                 f"    return {index} if archive_read_{index} != archive_size_{index}",
                 f"    archive_{index}.resize(archive_read_{index}.usize())",
                 f"    destination_{index}: mutable darray[u8] = [{destination_values}]",
-                f"    result_{index}: i64 = Platform::pkg_extract_ustar(archive_{index}, destination_{index})",
+                f"    result_{index}: i64 = Platform::extract_ustar_archive(archive_{index}, destination_{index})",
             ]
         )
         if should_succeed:

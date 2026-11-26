@@ -55,7 +55,7 @@ module PackageAssembly:
                 manifest_after <- manifest_after.resize(ProjectFiles::project_document_limit)
                 lock_after: mutable darray[u8] = []
                 lock_after <- lock_after.resize(ProjectFiles::project_document_limit)
-                return Code.OutputFailure if not ProjectFiles::read_cstr_into("elisapkg.json", &manifest_after) or not ProjectFiles::read_cstr_into("elisapkg.lock", &lock_after)
+                return Code.OutputFailure if not ProjectFiles::read_c_string_into("elisapkg.json", &manifest_after) or not ProjectFiles::read_c_string_into("elisapkg.lock", &lock_after)
                 return Code.SecurityFailure if not ByteText::equal(manifest_after, raw) or not ByteText::equal(lock_after, lock_raw)
                 return Code.OutputFailure if not Archive::verify_ustar_archive(archive)
                 archive_path: mutable darray[u8] = []
@@ -64,7 +64,7 @@ module PackageAssembly:
                 ProjectFiles::path_join_into(start, ".elisapkg/package.receipt", &receipt_path)
                 return Code.OutputFailure if not ProjectFiles::replace_file(archive_path, &archive)
                 persisted_archive: mutable darray[u8] = []
-                return Code.OutputFailure if not Platform::pkg_read_bounded_file(archive_path, Integrity::max_input, &persisted_archive)
+                return Code.OutputFailure if not Platform::read_bounded_file(archive_path, Integrity::maximum_input, &persisted_archive)
                 # The receipt and cache identify the bytes that remain at the
                 # published path. Refuse a pathname replacement between the
                 # atomic write and this read unless it still matches the exact tar
@@ -81,25 +81,25 @@ module PackageAssembly:
                 blob_name_c: mutable darray[u8] = []
                 archive_source_c: mutable darray[u8] = []
                 quarantine_parent: mutable darray[u8] = []
-                ProjectFiles::path_with_nul_into(&blob_path, &blob_name_c)
-                ProjectFiles::path_with_nul_into(&archive_path, &archive_source_c)
+                ProjectFiles::path_with_null_terminator_into(&blob_path, &blob_name_c)
+                ProjectFiles::path_with_null_terminator_into(&archive_path, &archive_source_c)
                 ByteText::append_text(&quarantine_parent, Cache::quarantine_directory)
                 blob_name: cstr = (&blob_name_c[0]).cast[cstr] can Unsafe.PointerCast
                 archive_source_name: cstr = (&archive_source_c[0]).cast[cstr] can Unsafe.PointerCast
-                if ProjectFiles::cstr_file_exists(blob_name):
+                if ProjectFiles::c_string_file_exists(blob_name):
                     if not Cache::verify_blob(digest):
                         return Code.OutputFailure if:
                             not ProjectFiles::make_directory(&quarantine_parent)
                             not Cache::quarantine_blob(digest)
-                            Platform::pkg_link(archive_source_name, blob_name) != 0
-                elif Platform::pkg_link(archive_source_name, blob_name) != 0:
-                    return Code.OutputFailure if not ProjectFiles::cstr_file_exists(blob_name) or not Cache::verify_blob(digest)
+                            Platform::create_hard_link(archive_source_name, blob_name) != 0
+                elif Platform::create_hard_link(archive_source_name, blob_name) != 0:
+                    return Code.OutputFailure if not ProjectFiles::c_string_file_exists(blob_name) or not Cache::verify_blob(digest)
                 # Revalidate after every publication path. A concurrent rename can change
                 # a pathname after the initial existence check; the receipt is written only
                 # once the final cache bytes still match the in-memory archive digest. The
                 # parent flush makes the hard-link durable before the receipt can claim it.
                 return Code.OutputFailure if:
-                    Platform::pkg_fsync_parent(blob_name) != 0
+                    Platform::synchronize_parent_directory(blob_name) != 0
                     not Cache::verify_blob(digest)
                 receipt: darray[u8] = PackageReceipt::encode(package_name, package_version, manifest_digest, lock_digest, digest)
                 return Code.OutputFailure if receipt.count == 0.usize()
@@ -121,7 +121,7 @@ module PackageAssembly:
                 resolved_root: mutable darray[u8] = []
                 resolved_root <- resolved_root.resize(4096)
                 root_real_name: mutable cstr = ""
-                if Platform::pkg_realpath(".", &resolved_root) is canonical_root:
+                if Platform::resolve_real_path(".", &resolved_root) is canonical_root:
                     root_real_name <- canonical_root
                 else:
                     return false
@@ -132,7 +132,7 @@ module PackageAssembly:
                 buffer: mutable darray[u8] = []
                 buffer <- buffer.resize(8388608)
                 buffer_raw: mutable u8& = (&buffer[0]).cast[mutable u8&] can Unsafe.PointerCast
-                collected: i64 = Platform::pkg_collect_files(".", buffer_raw, buffer.count)
+                collected: i64 = Platform::collect_files(".", buffer_raw, buffer.count)
                 return false if collected < 0
                 cursor: mutable usize = 0.usize()
                 selected: mutable usize = 0.usize()
@@ -144,8 +144,8 @@ module PackageAssembly:
                 return false if not:
                     PackageSelection::valid_pattern_range(raw, include_start, include_end)
                     PackageSelection::valid_pattern_range(raw, exclude_start, exclude_end)
-                glob_work_remaining: mutable usize = PackageSelection::max_work
-                glob_rows_remaining: mutable usize = PackageSelection::max_rows
+                glob_work_remaining: mutable usize = PackageSelection::maximum_work
+                glob_rows_remaining: mutable usize = PackageSelection::maximum_rows
                 glob_budget_exhausted: mutable bool = false
                 while cursor < collected.usize():
                     path: mutable darray[u8] = []
@@ -166,7 +166,7 @@ module PackageAssembly:
                         CliOutput::write_error("error: package include/exclude patterns exceeded the bounded matching budget\n")
                         return false
                     if include_selected:
-                        return false if selected >= PackagePathPolicy::max_package_archive_entries
+                        return false if selected >= PackagePathPolicy::maximum_package_archive_entries
                         for index in 0..<path.count |out, path|:
                             out.push(path[index])
                         out.push(0)

@@ -40,11 +40,11 @@ def main() -> int:
         probe.write_text(
             f'include "{ROOT / "src/platform.elisa"}"\n\n'
             'def main() -> i64:\n'
-            '    result: i64 = Platform::pkg_rename("source", "destination")\n'
+            '    result: i64 = Platform::rename_path("source", "destination")\n'
             '    return 1 if result != -21\n'
-            '    rename_result: i64 = Platform::pkg_rename("shared/rename-source", "shared/rename-destination")\n'
+            '    rename_result: i64 = Platform::rename_path("shared/rename-source", "shared/rename-destination")\n'
             '    return 2 if rename_result != -13\n'
-            '    link_result: i64 = Platform::pkg_link("shared/link-source", "shared/link-destination")\n'
+            '    link_result: i64 = Platform::create_hard_link("shared/link-source", "shared/link-destination")\n'
             '    return 3 if link_result != -13\n'
             '    return 0\n',
             encoding="utf-8",
@@ -63,15 +63,15 @@ def main() -> int:
         try:
             result = subprocess.run([str(binary)], cwd=work, timeout=3, check=False)
         except subprocess.TimeoutExpired as error:
-            raise SystemExit("error: pkg_rename blocked while probing a FIFO destination") from error
+            raise SystemExit("error: rename_path blocked while probing a FIFO destination") from error
         if result.returncode != 0:
-            raise SystemExit(f"error: pkg_rename returned {result.returncode}, expected rejection status 0")
+            raise SystemExit(f"error: rename_path returned {result.returncode}, expected rejection status 0")
         if not (work / "destination").is_fifo() or not (work / "source").is_file():
             raise SystemExit("error: FIFO probe unexpectedly changed either path")
         if (shared / "rename-source").read_bytes() != b"rename source\n" or (shared / "rename-destination").exists():
-            raise SystemExit("error: pkg_rename modified a source inside an untrusted parent")
+            raise SystemExit("error: rename_path modified a source inside an untrusted parent")
         if (shared / "link-source").read_bytes() != b"link source\n" or (shared / "link-destination").exists():
-            raise SystemExit("error: pkg_link modified a source inside an untrusted parent")
+            raise SystemExit("error: create_hard_link modified a source inside an untrusted parent")
     print("Elisa FFI FIFO probe passed")
     return 0
 

@@ -67,14 +67,14 @@ def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
     output: mutable darray[u8] = []
     output.resize({len(expected) + 1})
     output_raw: mutable u8& = (&output[0]).cast[mutable u8&] can Unsafe.PointerCast
-    collected: i64 = Platform::pkg_collect_files(ordered_name, output_raw, output.count)
+    collected: i64 = Platform::collect_files(ordered_name, output_raw, output.count)
     return 10 if collected < 0
     return 11 if collected < {len(expected)}
     return 12 if collected > {len(expected)}
     expected: mutable darray[u8] = [{elisa_bytes(expected)}]
     for index in 0..<expected.count |output, expected|:
         return 2 if output[index] != expected[index]
-    oversized: i64 = Platform::pkg_collect_files(stress_name, output_raw, output.count)
+    oversized: i64 = Platform::collect_files(stress_name, output_raw, output.count)
     return 3 if oversized != -75
     return 0
 ''',

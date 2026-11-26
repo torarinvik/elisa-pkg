@@ -60,16 +60,16 @@ def main() -> int:
     if verifier_start < 0 or verifier_end < 0:
         raise SystemExit("error: could not locate the native Ed25519 verifier")
     verifier = native_source[verifier_start:verifier_end]
-    child_start = verifier.find("if pid == 0:")
+    child_start = verifier.find("if child_process_identifier == 0:")
     group_setup = verifier.find("if NativeProcess::set_process_group() != 0:", child_start)
     limits_setup = verifier.find("if NativeProcess::set_process_limits(2) != 0:", child_start)
     redirects = [
-        verifier.find(f"PlatformNative::duplicate_fd(null_fd, {descriptor}) != {descriptor}", child_start)
+        verifier.find(f"PlatformNative::duplicate_file_descriptor(null_file_descriptor, {descriptor}) != {descriptor}", child_start)
         for descriptor in range(3)
     ]
-    descriptor_close = verifier.find("if PlatformNative::close_inherited_fds() != 0:", child_start)
+    descriptor_close = verifier.find("if PlatformNative::close_inherited_file_descriptors() != 0:", child_start)
     provider_exec = verifier.find(
-        "_ = native_execve(openssl, raw_child_argv, raw_child_environment)", child_start
+        "_ = native_execve(openssl, raw_child_argument_vector, raw_child_environment)", child_start
     )
     empty_environment = verifier.find("empty_environment: mutable darray[cstr] = [null]")
     environment_pointer = verifier.find("raw_child_environment: void& = child_environment.cast[void&]")
