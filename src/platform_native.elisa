@@ -3,8 +3,6 @@
 # This module contains policy-aware filesystem code in Elisa. The only native
 # boundary is the set of libc/POSIX declarations in platform/libc.elisa.
 
-include "./package_path_policy.elisa"
-
 include "./platform/libc.elisa"
 include "./platform/errors.elisa"
 include "./platform/process.elisa"
@@ -13,7 +11,6 @@ include "./platform/abi.elisa"
 include "./platform/stat.elisa"
 include "./platform/process_values.elisa"
 include "./platform/linux_access_acl.elisa"
-include "./platform/path_order.elisa"
 
 module PlatformNative:
     public:
@@ -410,39 +407,6 @@ module PlatformNative:
                 native_free(canonical.cast[void&] can Unsafe.PointerCast)
             return null
 
-        def collect_files(root: cstr, output: mutable u8&, capacity: usize) -> i64 can[Memory.Allocate, Unsafe.PointerCast]:
-            return -22 if native_strlen(root) == 0.usize() or native_strlen(root) > 4096.usize() or capacity == 0.usize()
-            paths: mutable darray[u8] = []
-            visited_nodes: mutable usize = 1.usize()
-            if not collect_directory(root, root, &paths, 0.usize(), &visited_nodes):
-                return -75 if visited_nodes > max_collect_traversal_nodes
-                return -5
-            rows: mutable darray[darray[u8]] = []
-            cursor: mutable usize = 0.usize()
-            while cursor < paths.count:
-                row: mutable darray[u8] = []
-                while cursor < paths.count and paths[cursor] != 0:
-                    row.push(paths[cursor])
-                    cursor <- cursor + 1.usize()
-                return -5 if row.count == 0.usize() or cursor >= paths.count
-                rows.push(row)
-                return -75 if rows.count > 4096.usize()
-                cursor <- cursor + 1.usize()
-            ordered_rows: mutable darray[usize] = []
-            for row_index in 0..<rows.count |ordered_rows|:
-                ordered_rows.push(row_index)
-            CollectedPathOrder::sort_indices(&ordered_rows, rows)
-            used: mutable usize = 0.usize()
-            for sorted_index in 0..<ordered_rows.count |rows, ordered_rows, output, used, capacity|:
-                row_index: usize = ordered_rows[sorted_index]
-                return -7 if used + rows[row_index].count + 1.usize() > capacity
-                for index in 0..<rows[row_index].count |output, rows, row_index, used|:
-                    output[used + index] <- rows[row_index][index]
-                used <- used + rows[row_index].count
-                output[used] <- 0
-                used <- used + 1.usize()
-            return used.i64()
-
         def mkstemp(template_path: mutable darray[u8]&) -> i64 can[Memory.Allocate, Unsafe.PointerCast]:
             return -22 if template_path.count == 0 or template_path.count > 4096.usize() or template_path[template_path.count - 1.usize()] != 0
             path_length: usize = native_strlen((&template_path[0]).cast[cstr] can Unsafe.PointerCast)
@@ -576,7 +540,6 @@ module PlatformNative:
             return -27 if used == capacity
             return used.i64()
 
-        const max_collect_traversal_nodes: usize = 16384.usize()
 
     public:
         def directory_not_empty_error_code() -> i64:
@@ -1043,6 +1006,7 @@ module PlatformNative:
             return directory
 
     private:
+    public:
         def open_package_file(path: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             length: usize = native_strlen(path)
             return -22 if length == 0 or length > 4096
@@ -1086,6 +1050,7 @@ module PlatformNative:
             _ = native_close(directory)
             return -22
 
+    private:
     public:
         def close_error(fd: i64, errno_value: i64) -> i64:
             return -5 if native_close(fd) != 0
@@ -1567,107 +1532,6 @@ module PlatformNative:
             raw: mutable void& = (&stat[0]).cast[mutable void&] can Unsafe.PointerCast
             return native_fstat(fd, raw) == 0 and (NativeStat::file_type(stat)) == regular_mode
 
-    private:
-        def collect_directory(root: cstr, path: cstr, out: mutable darray[u8]&, depth: usize, visited_nodes: mutable usize&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            return false if depth > 64.usize()
-            # Resolve the directory through the descriptor-relative no-follow
-            # walker before enumeration. Opening `path` with `opendir` here
-            # would re-follow a swapped symlink after the caller's probe.
-            directory_fd: i64 = open_package_directory_path(path)
-            return false if directory_fd < 0
-            duplicate: i64 = native_dup(directory_fd)
-            if duplicate < 0:
-                _ = native_close(directory_fd)
-                return false
-            directory: mutable heap void&? = native_fdopendir(duplicate)
-            directory_close_status: i64 = native_close(directory_fd)
-            if directory_close_status != 0:
-                if directory is stream:
-                    _ = native_closedir(stream)
-                else:
-                    _ = native_close(duplicate)
-                return false
-            if directory is stream:
-                while true |stream, out, path, depth, visited_nodes|:
-                    native_errno()[0] <- 0
-                    entry: mutable heap void&? = native_readdir(stream)
-                    if entry is record:
-                        raw: mutable u8& = record.cast[mutable u8&] can Unsafe.PointerCast
-                        name_length: usize = dirent_name_length(raw)
-                        return directory_failure(stream) if name_length == 0 or name_length > 255.usize()
-                        continue if name_is_dot(raw, dirent_name_offset, name_length)
-                        visited_nodes <- visited_nodes + 1.usize()
-                        return directory_failure(stream) if visited_nodes > max_collect_traversal_nodes
-                        # Some filesystems report DT_UNKNOWN. Credential
-                        # exclusions must therefore not depend on d_type.
-                        child: mutable darray[u8] = []
-                        if not cstr_equal(path, "."):
-                            parent_length: usize = path_length(path)
-                            for index in 0..<parent_length |child, path|:
-                                child.push(path[index].u8())
-                            child.push(47) if parent_length == 0 or path[parent_length - 1.usize()].u8() != 47
-                        for index in 0..<name_length |child, raw|:
-                            child.push(raw[dirent_name_offset + index])
-                        child.push(0)
-                        child_name: cstr = (&child[0]).cast[cstr] can Unsafe.PointerCast
-                        child_length: usize = path_length(child_name)
-                        return directory_failure(stream) if child_length == 0 or child_length > 4096.usize()
-                        relative_policy_path: mutable darray[u8] = []
-                        return directory_failure(stream) if not relative_path_under(root, child_name, &relative_policy_path)
-                        continue if PackagePathPolicy::credential_path_forbidden(relative_policy_path)
-                        continue if PackagePathPolicy::reserved_source_path_forbidden(relative_policy_path)
-                        directory_probe: i64 = open_package_directory_path(child_name)
-                        if directory_probe >= 0:
-                            return directory_failure(stream) if native_close(directory_probe) != 0
-                            return directory_failure(stream) if not collect_directory(root, child_name, out, depth + 1.usize(), visited_nodes)
-                        else:
-                            file_probe: i64 = open_package_file(child_name)
-                            if file_probe < 0:
-                                # The directory probe already ruled out a
-                                # stable directory. Any failed file open means
-                                # the entry changed or was unsafe; skipping it
-                                # would produce an incomplete source digest.
-                                return directory_failure(stream)
-                            regular: bool = regular_fd(file_probe)
-                            close_status: i64 = native_close(file_probe)
-                            return directory_failure(stream) if not regular or close_status != 0
-                            return directory_failure(stream) if out.count + child_length + 1.usize() > 16777216.usize()
-                            for index in 0..<child_length |out, child_name|:
-                                out.push(child_name[index].u8())
-                            out.push(0)
-                    else:
-                        return directory_failure(stream) if NativeErrors::current_errno() != 0
-                        break
-                return native_closedir(stream) == 0
-            _ = native_close(duplicate)
-            return false
-
-        def directory_failure(stream: heap void&) -> bool:
-            _ = native_closedir(stream)
-            return false
-
-        def path_length(path: cstr) -> usize:
-            return native_strlen(path)
-
-        def relative_path_under(root: cstr, path: cstr, out: mutable darray[u8]&) -> bool:
-            out.resize(0)
-            root_length: usize = native_strlen(root)
-            path_length_value: usize = native_strlen(path)
-            if cstr_equal(root, "."):
-                return false if path_length_value == 0 or path_length_value > 4096
-                for index in 0..<path_length_value |out, path|:
-                    out.push(path[index].u8())
-                return true
-            return false if root_length == 0 or path_length_value <= root_length or path_length_value > 4096
-            for index in 0..<root_length |root, path|:
-                return false if root[index].u8() != path[index].u8()
-            relative_start: mutable usize = root_length
-            if root[root_length - 1].u8() != 47:
-                return false if path[root_length].u8() != 47
-                relative_start <- root_length + 1.usize()
-            for index in relative_start..<path_length_value |out, path|:
-                out.push(path[index].u8())
-            return out.count > 0.usize()
-
+    public:
         def name_is_dot(raw: mutable u8&, offset: usize, length: usize) -> bool:
             return length == 1 and raw[offset] == 46 or length == 2 and raw[offset] == 46 and raw[offset + 1] == 46

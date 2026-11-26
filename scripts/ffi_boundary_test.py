@@ -14,6 +14,7 @@ NATIVE_MODULES = {
         "src/platform/archive_extract.elisa",
         "src/platform/ed25519.elisa",
         "src/platform/errors.elisa",
+        "src/platform/file_collection.elisa",
         "src/platform/process.elisa",
         "src/platform/snapshot_tree.elisa",
         "src/platform/staging_tree.elisa",
