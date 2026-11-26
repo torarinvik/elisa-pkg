@@ -1,5 +1,6 @@
 # Clean build outputs and verify package cache contents.
 include "../archive.elisa"
+include "./status.elisa"
 include "../build.elisa"
 include "../cache.elisa"
 include "../integrity.elisa"
@@ -26,7 +27,7 @@ module MaintenanceCommand:
                 package_archive: mutable darray[u8] = []
                 package_receipt: mutable darray[u8] = []
                 ProjectFiles::path_join_into(root, ".elisapkg", &state)
-                return EXIT_BUILD if not ProjectFiles::make_directory(&state)
+                return CliStatus::build_failed if not ProjectFiles::make_directory(&state)
                 build_dir <- Build::output_directory(root, false)
                 release_build_dir <- Build::output_directory(root, true)
                 ProjectFiles::path_join_into(build_dir, "app", &artifact)
@@ -38,72 +39,72 @@ module MaintenanceCommand:
                 manifest_raw.resize(1048577)
                 if ProjectFiles::read_cstr_into("elisapkg.json", &manifest_raw):
                     output_leaves: mutable darray[darray[u8]] = []
-                    return EXIT_BUILD if not ManifestTargets::cleanup_output_leaves(manifest_raw, &output_leaves)
-                    return EXIT_BUILD if not remove_target_outputs(output_leaves, build_dir)
-                    return EXIT_BUILD if not remove_target_outputs(output_leaves, release_build_dir)
+                    return CliStatus::build_failed if not ManifestTargets::cleanup_output_leaves(manifest_raw, &output_leaves)
+                    return CliStatus::build_failed if not remove_target_outputs(output_leaves, build_dir)
+                    return CliStatus::build_failed if not remove_target_outputs(output_leaves, release_build_dir)
                 # Remove legacy single-target names left by older receipts as well as the
                 # manifest-declared target outputs.
-                return EXIT_BUILD if not ProjectFiles::remove_known_file(&artifact)
-                return EXIT_BUILD if not ProjectFiles::remove_known_file(&library_artifact)
-                return EXIT_BUILD if not ProjectFiles::remove_known_file(&receipt)
-                return EXIT_BUILD if not ProjectFiles::remove_known_file(&package_archive)
-                return EXIT_BUILD if not ProjectFiles::remove_known_file(&package_receipt)
-                return EXIT_BUILD if not remove_build_directory_if_empty(&release_build_dir)
-                return EXIT_BUILD if not remove_build_directory_if_empty(&build_dir)
+                return CliStatus::build_failed if not ProjectFiles::remove_known_file(&artifact)
+                return CliStatus::build_failed if not ProjectFiles::remove_known_file(&library_artifact)
+                return CliStatus::build_failed if not ProjectFiles::remove_known_file(&receipt)
+                return CliStatus::build_failed if not ProjectFiles::remove_known_file(&package_archive)
+                return CliStatus::build_failed if not ProjectFiles::remove_known_file(&package_receipt)
+                return CliStatus::build_failed if not remove_build_directory_if_empty(&release_build_dir)
+                return CliStatus::build_failed if not remove_build_directory_if_empty(&build_dir)
                 # `.elisapkg` is removed only when it is empty; cache/state files are never
                 # traversed or recursively deleted by clean. A retained cache makes this
                 # directory intentionally non-empty, which is a successful clean result.
-                return EXIT_BUILD if not remove_state_directory(&state)
+                return CliStatus::build_failed if not remove_state_directory(&state)
                 CliOutput::write_ok("cleaned known .elisapkg outputs\n")
-                return EXIT_OK
+                return CliStatus::success
 
         def verify_cache(start: darray[u8]&) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
                 raw: mutable darray[u8] = []
                 raw.resize(1048577)
-                return EXIT_USAGE if not ProjectFiles::read_cstr_into("elisapkg.json", &raw)
+                return CliStatus::usage if not ProjectFiles::read_cstr_into("elisapkg.json", &raw)
                 name: mutable darray[u8] = []
                 version: mutable darray[u8] = []
-                return EXIT_SECURITY if not ProjectManifest::validate_at(raw, start, &name, &version)
+                return CliStatus::security_failed if not ProjectManifest::validate_at(raw, start, &name, &version)
                 lock: mutable darray[u8] = []
                 lock.resize(1048577)
-                return EXIT_SECURITY if not ProjectFiles::read_cstr_into("elisapkg.lock", &lock)
-                return EXIT_SECURITY if not LockValidation::matches_manifest(raw, lock, name, version, start)
+                return CliStatus::security_failed if not ProjectFiles::read_cstr_into("elisapkg.lock", &lock)
+                return CliStatus::security_failed if not LockValidation::matches_manifest(raw, lock, name, version, start)
                 archive_state: i64 = Platform::pkg_package_file_size(".elisapkg/package.tar")
                 receipt_state: i64 = Platform::pkg_package_file_size(".elisapkg/package.receipt")
-                return EXIT_SECURITY if archive_state < 0 and archive_state != -2
-                return EXIT_SECURITY if receipt_state < 0 and receipt_state != -2
+                return CliStatus::security_failed if archive_state < 0 and archive_state != -2
+                return CliStatus::security_failed if receipt_state < 0 and receipt_state != -2
                 archive_present: bool = archive_state >= 0
                 receipt_present: bool = receipt_state >= 0
-                return EXIT_SECURITY if archive_present != receipt_present
+                return CliStatus::security_failed if archive_present != receipt_present
                 archive_bytes: mutable darray[u8] = []
                 receipt: mutable darray[u8] = []
                 archive_digest: mutable darray[u8] = []
                 if archive_present:
                     manifest_digest: mutable darray[u8] = []
                     lock_digest: mutable darray[u8] = []
-                    return EXIT_SECURITY if not Integrity::sha256_hex(raw, &manifest_digest)
-                    return EXIT_SECURITY if not Integrity::sha256_hex(lock, &lock_digest)
+                    return CliStatus::security_failed if not Integrity::sha256_hex(raw, &manifest_digest)
+                    return CliStatus::security_failed if not Integrity::sha256_hex(lock, &lock_digest)
                     archive_path: mutable darray[u8] = []
                     ByteText::append_text(&archive_path, ".elisapkg/package.tar")
-                    return EXIT_SECURITY if not read_package_file(&archive_path, &archive_bytes)
-                    return EXIT_SECURITY if not Archive::verify_ustar_archive(archive_bytes)
-                    return EXIT_SECURITY if not Integrity::sha256_hex(archive_bytes, &archive_digest)
+                    return CliStatus::security_failed if not read_package_file(&archive_path, &archive_bytes)
+                    return CliStatus::security_failed if not Archive::verify_ustar_archive(archive_bytes)
+                    return CliStatus::security_failed if not Integrity::sha256_hex(archive_bytes, &archive_digest)
                     receipt.resize(PackageReceipt::max_encode + 1.usize())
-                    return EXIT_SECURITY if not ProjectFiles::read_cstr_into(".elisapkg/package.receipt", &receipt)
+                    return CliStatus::security_failed if not ProjectFiles::read_cstr_into(".elisapkg/package.receipt", &receipt)
                     expected_receipt: darray[u8] = PackageReceipt::encode(name, version, manifest_digest, lock_digest, archive_digest)
-                    return EXIT_SECURITY if not ByteText::equal(receipt, expected_receipt)
+                    return CliStatus::security_failed if not ByteText::equal(receipt, expected_receipt)
                 manifest_after: mutable darray[u8] = []
                 manifest_after.resize(1048577)
                 lock_after: mutable darray[u8] = []
                 lock_after.resize(1048577)
-                return EXIT_SECURITY if not ProjectFiles::read_cstr_into("elisapkg.json", &manifest_after) or not ProjectFiles::read_cstr_into("elisapkg.lock", &lock_after)
-                return EXIT_SECURITY if not ByteText::equal(manifest_after, raw) or not ByteText::equal(lock_after, lock)
+                return CliStatus::security_failed if not ProjectFiles::read_cstr_into("elisapkg.json", &manifest_after) or not ProjectFiles::read_cstr_into("elisapkg.lock", &lock_after)
+                return CliStatus::security_failed if not ByteText::equal(manifest_after, raw) or not ByteText::equal(lock_after, lock)
                 archive_state_after: i64 = Platform::pkg_package_file_size(".elisapkg/package.tar")
                 receipt_state_after: i64 = Platform::pkg_package_file_size(".elisapkg/package.receipt")
-                return EXIT_SECURITY if archive_state_after < 0 and archive_state_after != -2
-                return EXIT_SECURITY if receipt_state_after < 0 and receipt_state_after != -2
-                return EXIT_SECURITY if archive_present != (archive_state_after >= 0) or receipt_present != (receipt_state_after >= 0)
+                return CliStatus::security_failed if archive_state_after < 0 and archive_state_after != -2
+                return CliStatus::security_failed if receipt_state_after < 0 and receipt_state_after != -2
+                return CliStatus::security_failed if archive_present != (archive_state_after >= 0) or receipt_present != (receipt_state_after >= 0)
                 if archive_present:
                     archive_path_after: mutable darray[u8] = []
                     ByteText::append_text(&archive_path_after, ".elisapkg/package.tar")
@@ -112,32 +113,27 @@ module MaintenanceCommand:
                     archive_after_digest: mutable darray[u8] = []
                     receipt_after: mutable darray[u8] = []
                     receipt_after.resize(PackageReceipt::max_encode + 1.usize())
-                    return EXIT_SECURITY if not read_package_file(&archive_path_after, &archive_bytes) or not ProjectFiles::read_cstr_into(".elisapkg/package.receipt", &receipt_after)
-                    return EXIT_SECURITY if not Integrity::sha256_hex(archive_bytes, &archive_after_digest)
-                    return EXIT_SECURITY if not ByteText::equal(archive_after_digest, archive_digest) or not ByteText::equal(receipt_after, receipt)
-                    return EXIT_SECURITY if not Cache::verify_blob(archive_digest)
+                    return CliStatus::security_failed if not read_package_file(&archive_path_after, &archive_bytes) or not ProjectFiles::read_cstr_into(".elisapkg/package.receipt", &receipt_after)
+                    return CliStatus::security_failed if not Integrity::sha256_hex(archive_bytes, &archive_after_digest)
+                    return CliStatus::security_failed if not ByteText::equal(archive_after_digest, archive_digest) or not ByteText::equal(receipt_after, receipt)
+                    return CliStatus::security_failed if not Cache::verify_blob(archive_digest)
                 CliOutput::write_ok("cache: local lock and manifest digests verified\n")
                 if archive_present:
                     CliOutput::write_ok("cache: deterministic package archive and receipt verified\n")
                 CliOutput::write_ok("cache: no shared remote cache configured\n")
-                return EXIT_OK
+                return CliStatus::success
 
         def cache_gc(argc: i64, slots: mutable cstr&&) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
                 if argc == 4 and Platform::pkg_cstr_equal(slots[2].cast[cstr], "gc") and Platform::pkg_cstr_equal(slots[3].cast[cstr], "--dry-run"):
                     CliOutput::write_ok("cache: no shared cache configured; nothing would be collected\n")
-                    return EXIT_OK
+                    return CliStatus::success
                 if argc == 3 and Platform::pkg_cstr_equal(slots[2].cast[cstr], "gc"):
                     CliOutput::write_error("error: cache garbage collection is disabled until a verified cache store is configured; use `cache gc --dry-run`\n")
-                    return 7
-                return EXIT_USAGE
+                    return CliStatus::operation_failed
+                return CliStatus::usage
 
     private:
-        const EXIT_OK: i64 = 0
-        const EXIT_USAGE: i64 = 2
-        const EXIT_SECURITY: i64 = 5
-        const EXIT_BUILD: i64 = 6
-
         def remove_build_directory_if_empty(path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             path_c: mutable darray[u8] = []
             ProjectFiles::path_with_nul_into(path, &path_c)

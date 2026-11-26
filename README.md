@@ -100,6 +100,12 @@ Run project commands from the project directory. Where supported, `--manifest-pa
 | Remove generated build outputs | `clean` | Removes known local build and package outputs. |
 | Check release inputs | `publish --dry-run` | Validates release inputs and deterministic archive contents without uploading. |
 
+For scripts, elisapkg uses exit status `0` for success, `2` for usage errors,
+`3` for resolution failures, `4` for source failures, `5` for verification or
+security failures, `6` for build failures, `7` for operation failures, and
+`130` for cancellation. Once a program starts through `run` or `test`, a
+normal exit returns the program's status.
+
 ## Troubleshooting
 
 - **Missing compiler, wrapper, or runtime:** Check the three paths in step 1 against your Elisa compiler checkout. Bootstrap the compiler in that checkout first if its Stage1 or runtime artifacts are missing.

@@ -1,5 +1,6 @@
 # Execute a built program with a bounded lifetime and a scrubbed environment.
 include "../build.elisa"
+include "./status.elisa"
 include "../package/model.elisa"
 include "../package/targets.elisa"
 include "../platform.elisa"
@@ -14,14 +15,14 @@ module ProgramCommand:
             can Global.Read:
                 manifest_raw: mutable darray[u8] = []
                 manifest_raw.resize(1048577)
-                return EXIT_BUILD if not ProjectFiles::read_cstr_into("elisapkg.json", &manifest_raw)
+                return CliStatus::build_failed if not ProjectFiles::read_cstr_into("elisapkg.json", &manifest_raw)
                 target_name: mutable darray[u8] = []
                 target_kind: mutable darray[u8] = []
                 target_entry: mutable darray[u8] = []
-                return EXIT_BUILD if not ManifestTargets::select_target(manifest_raw, options.target_name, options.target_kind, &target_name, &target_kind, &target_entry)
+                return CliStatus::build_failed if not ManifestTargets::select_target(manifest_raw, options.target_name, options.target_kind, &target_name, &target_kind, &target_entry)
                 if not ByteText::equal_text(target_kind, expected_kind):
                     CliOutput::write_error("error: selected target does not produce an executable\n")
-                    return EXIT_BUILD
+                    return CliStatus::build_failed
                 artifact_label: darray[u8] = ManifestTargets::artifact_leaf(target_name, false)
                 artifact_leaf_storage: mutable darray[u8] = []
                 ProjectFiles::path_with_nul_into(artifact_label, &artifact_leaf_storage)
@@ -60,18 +61,16 @@ module ProgramCommand:
                         Platform::pkg_process_exit(126)
                     _ = Platform::pkg_execvp("/usr/bin/env", child_argv)
                     Platform::pkg_process_exit(127)
-                return EXIT_BUILD if pid < 0
+                return CliStatus::build_failed if pid < 0
                 status: mutable i32 = 0
                 waited: i64 = Platform::pkg_waitpid_group_timeout(pid, &status, PROGRAM_TIMEOUT_MS)
-                return EXIT_CANCEL if waited == Platform::pkg_timeout_error()
-                return EXIT_BUILD if waited < 0
+                return CliStatus::cancelled if waited == Platform::pkg_timeout_error()
+                return CliStatus::build_failed if waited < 0
                 # waitpid returns the platform wait status. Preserve a normal child's exit
                 # code for `run`, and map signal termination to the documented cancellation
                 # status instead of exposing the platform-specific wait encoding.
                 return status.i64() / 256.i64() if status % 256 == 0
-                return EXIT_CANCEL
+                return CliStatus::cancelled
 
     private:
-        const EXIT_BUILD: i64 = 6
-        const EXIT_CANCEL: i64 = 130
         const PROGRAM_TIMEOUT_MS: i64 = 120000

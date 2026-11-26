@@ -1,5 +1,6 @@
 # Resolve and fingerprint the inputs bound to a build receipt.
 include "../integrity.elisa"
+include "./status.elisa"
 include "../json.elisa"
 include "../package/model.elisa"
 include "../platform.elisa"
@@ -18,7 +19,7 @@ module BuildInputs:
                 lock_raw.resize(0)
                 lock_digest.resize(0)
                 lock_status: i64 = ResolutionCommand::resolve(start, options, false, false)
-                return lock_status if lock_status != EXIT_OK
+                return lock_status if lock_status != CliStatus::success
                 candidate_lock: mutable darray[u8] = []
                 candidate_lock.resize(Json::max_document_bytes + 1.usize())
                 # Resolution reads the manifest again and may replace the lock. Bind
@@ -27,17 +28,17 @@ module BuildInputs:
                 # starting the compiler.
                 manifest_after_resolve: mutable darray[u8] = []
                 manifest_after_resolve.resize(Json::max_document_bytes + 1.usize())
-                return EXIT_BUILD if:
+                return CliStatus::build_failed if:
                     not ProjectFiles::read_cstr_into("elisapkg.lock", &candidate_lock)
                     not ProjectFiles::read_cstr_into("elisapkg.json", &manifest_after_resolve)
                     not ByteText::equal(manifest_after_resolve, manifest_raw)
                     not LockValidation::matches_manifest(manifest_raw, candidate_lock, root_name, root_version, start)
                 if Lockfile::version_is(candidate_lock, 3):
                     CliOutput::write_error("error: builds with registry dependencies are not supported; local dependency builds require a version 2 local lock\n")
-                    return EXIT_BUILD
-                return EXIT_BUILD if not Integrity::sha256_hex(candidate_lock, lock_digest)
+                    return CliStatus::build_failed
+                return CliStatus::build_failed if not Integrity::sha256_hex(candidate_lock, lock_digest)
                 ByteText::append(lock_raw, candidate_lock)
-                return EXIT_OK
+                return CliStatus::success
 
         def fingerprint_source(source_tree_digest: mutable darray[u8]&, source_tree_bytes: mutable usize&) -> bool can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
@@ -57,7 +58,3 @@ module BuildInputs:
             return false if target_source_read < 0 or target_source_read != target_source_size
             target_source.resize(target_source_read.usize())
             return Integrity::sha256_hex(target_source, source_digest)
-
-    private:
-        const EXIT_OK: i64 = 0
-        const EXIT_BUILD: i64 = 6

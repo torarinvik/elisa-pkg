@@ -1,5 +1,6 @@
 # Publish and remove verified local installations.
 include "../install_faults.elisa"
+include "./status.elisa"
 include "../integrity.elisa"
 include "../package/install_prefix.elisa"
 include "../package/install_records.elisa"
@@ -21,24 +22,24 @@ module LocalInstallCommand:
                 while index < argc:
                     argument: cstr = slots[index].cast[cstr]
                     if Platform::pkg_cstr_equal(argument, "--local"):
-                        return EXIT_USAGE if local_seen
+                        return CliStatus::usage if local_seen
                         local_seen <- true
                     elif Platform::pkg_cstr_equal(argument, "--") or Platform::pkg_strlen(argument) == 0.usize() or argument[0].u8() == 45 or Platform::pkg_strlen(name) != 0.usize():
                         CliOutput::write_error("error: invalid uninstall arguments\n")
-                        return EXIT_USAGE
+                        return CliStatus::usage
                     else:
                         name <- argument
                     index <- index + 1
-                return EXIT_USAGE if not local_seen or Platform::pkg_strlen(name) == 0.usize()
+                return CliStatus::usage if not local_seen or Platform::pkg_strlen(name) == 0.usize()
                 name_bytes: mutable darray[u8] = []
                 ByteText::append_bounded_text(&name_bytes, name)
-                return EXIT_USAGE if not PackageIdentity::valid_name(name_bytes)
+                return CliStatus::usage if not PackageIdentity::valid_name(name_bytes)
                 return uninstall_local(name)
 
         # The caller verifies artifact_bytes against the build receipt before publication.
         def publish_verified(prefix: darray[u8]&, name: darray[u8]&, version: darray[u8]&, artifact_bytes: darray[u8]&, digest: darray[u8]&) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
-                return EXIT_USAGE if:
+                return CliStatus::usage if:
                     not PackageIdentity::valid_name(name)
                     not PackageIdentity::valid_version(version)
                     not Integrity::valid_sha256_hex(digest)
@@ -46,10 +47,10 @@ module LocalInstallCommand:
                 receipt_dir: mutable darray[u8] = []
                 ProjectFiles::path_join_into(prefix, "bin", &bin_dir)
                 ProjectFiles::path_join_into(prefix, "share/elisapkg/receipts", &receipt_dir)
-                return 7 if not InstallPrefix::ensure_trusted_directory(bin_dir) or not InstallPrefix::ensure_trusted_directory(receipt_dir)
+                return CliStatus::operation_failed if not InstallPrefix::ensure_trusted_directory(bin_dir) or not InstallPrefix::ensure_trusted_directory(receipt_dir)
                 if not InstallPrefix::trusted_directory(bin_dir) or not InstallPrefix::trusted_directory(receipt_dir):
                     CliOutput::write_error("error: install directories are not trusted; refusing publication\n")
-                    return 7
+                    return CliStatus::operation_failed
                 name_c: mutable darray[u8] = []
                 ProjectFiles::path_with_nul_into(name, &name_c)
                 name_raw: cstr = (&name_c[0]).cast[cstr] can Unsafe.PointerCast
@@ -67,7 +68,7 @@ module LocalInstallCommand:
                 lock_fd: i64 = Platform::pkg_acquire_install_lock(prefix_name)
                 if lock_fd < 0:
                     CliOutput::write_error("error: could not acquire the local installation lock; check the prefix and any legacy lock path\n")
-                    return 7
+                    return CliStatus::operation_failed
                 recovered_operation: mutable darray[u8] = []
                 recovered_name: mutable darray[u8] = []
                 recovered_version: mutable darray[u8] = []
@@ -80,13 +81,13 @@ module LocalInstallCommand:
                 if recovered_install_published and ByteText::equal_text(recovered_operation, "install") and ByteText::equal(recovered_name, name) and ByteText::equal(recovered_version, version) and ByteText::equal(recovered_digest, digest):
                     if not InstallTransaction::release_install_lock(lock_fd):
                         CliOutput::write_error("error: could not close the recovered local installation lock descriptor\n")
-                        return 7
+                        return CliStatus::operation_failed
                     CliOutput::write_ok("already installed ")
                     CliOutput::write_bytes(1, name)
                     CliOutput::write_ok(" to ")
                     CliOutput::write_bytes(1, &destination)
                     CliOutput::write_ok("\n")
-                    return EXIT_OK
+                    return CliStatus::success
                 if ProjectFiles::path_occupied(&destination):
                     return finish_error(lock_fd, "error: install destination or receipt already exists; refusing to overwrite\n")
                 receipt_path.resize(0)
@@ -133,13 +134,13 @@ module LocalInstallCommand:
                     return finish_error(lock_fd, "error: could not sync local installation directories; recovery will inspect the durable transaction\n")
                 InstallFaults::transaction_boundary("install.targets.synced")
                 return finish_error(lock_fd, "error: the local installation was published but its transaction journal could not be retired\n") if not InstallTransaction::retire_local_install_transaction(transaction_path)
-                return 7 if not InstallTransaction::release_install_lock(lock_fd)
+                return CliStatus::operation_failed if not InstallTransaction::release_install_lock(lock_fd)
                 CliOutput::write_ok("installed ")
                 CliOutput::write_bytes(1, name)
                 CliOutput::write_ok(" to ")
                 CliOutput::write_bytes(1, &destination)
                 CliOutput::write_ok("\n")
-                return EXIT_OK
+                return CliStatus::success
 
     private:
         def finish_error(lock_fd: i64, message: cstr) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -148,24 +149,22 @@ module LocalInstallCommand:
                     CliOutput::write_error(message)
                 if not InstallTransaction::release_install_lock(lock_fd):
                     CliOutput::write_error("error: could not close the local installation lock descriptor\n")
-                return 7
+                return CliStatus::operation_failed
 
-        const EXIT_OK: i64 = 0
-        const EXIT_USAGE: i64 = 2
 
         def uninstall_local(name_raw_input: cstr) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
                 name: mutable darray[u8] = []
                 ByteText::append_bounded_text(&name, name_raw_input)
                 prefix: mutable darray[u8] = []
-                return EXIT_USAGE if not InstallPrefix::read_configured(&prefix)
+                return CliStatus::usage if not InstallPrefix::read_configured(&prefix)
                 bin_dir: mutable darray[u8] = []
                 receipt_dir: mutable darray[u8] = []
                 ProjectFiles::path_join_into(prefix, "bin", &bin_dir)
                 ProjectFiles::path_join_into(prefix, "share/elisapkg/receipts", &receipt_dir)
                 if not InstallPrefix::trusted_directory(bin_dir) or not InstallPrefix::trusted_directory(receipt_dir):
                     CliOutput::write_error("error: install directories are not trusted; refusing removal\n")
-                    return 7
+                    return CliStatus::operation_failed
                 name_c: mutable darray[u8] = []
                 ProjectFiles::path_with_nul_into(&name, &name_c)
                 name_raw: cstr = (&name_c[0]).cast[cstr] can Unsafe.PointerCast
@@ -183,7 +182,7 @@ module LocalInstallCommand:
                 lock_fd: i64 = Platform::pkg_acquire_install_lock(prefix_name)
                 if lock_fd < 0:
                     CliOutput::write_error("error: could not acquire the local installation lock; check the prefix and any legacy lock path\n")
-                    return 7
+                    return CliStatus::operation_failed
                 recovered_operation: mutable darray[u8] = []
                 recovered_name: mutable darray[u8] = []
                 recovered_version: mutable darray[u8] = []
@@ -194,11 +193,11 @@ module LocalInstallCommand:
                 if ByteText::equal_text(recovered_operation, "uninstall") and ByteText::equal(recovered_name, name):
                     if not InstallTransaction::release_install_lock(lock_fd):
                         CliOutput::write_error("error: could not close the recovered local installation lock\n")
-                        return 7
+                        return CliStatus::operation_failed
                     CliOutput::write_ok("uninstalled ")
                     CliOutput::write_bytes(1, &name)
                     CliOutput::write_ok("\n")
-                    return EXIT_OK
+                    return CliStatus::success
                 destination.resize(0)
                 ByteText::append(&destination, destination_snapshot)
                 destination_c: mutable darray[u8] = []
@@ -281,11 +280,11 @@ module LocalInstallCommand:
                 InstallFaults::transaction_boundary("uninstall.targets.synced")
                 if not InstallTransaction::retire_local_install_transaction(transaction_path):
                     return finish_error(lock_fd, "error: the local installation was removed but its transaction journal could not be retired\n")
-                return 7 if not InstallTransaction::release_install_lock(lock_fd)
+                return CliStatus::operation_failed if not InstallTransaction::release_install_lock(lock_fd)
                 CliOutput::write_ok("uninstalled ")
                 CliOutput::write_bytes(1, &name)
                 CliOutput::write_ok("\n")
-                return EXIT_OK
+                return CliStatus::success
 
         def parse_version(value: darray[u8]&, out: mutable Model::Version&) -> bool:
             out <- Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
