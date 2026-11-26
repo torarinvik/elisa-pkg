@@ -1,4 +1,4 @@
-# Byte-level ustar validation shared by archive verification and extraction.
+# Byte-level ustar encoding and validation.
 
 module UstarFields:
     private:
@@ -41,10 +41,56 @@ module UstarFields:
                 return false if archive[offset + index] != 0
             return true
 
+        # Callers provide one complete header.
+        def header_checksum(archive: darray[u8]&, offset: usize) -> usize:
+            checksum: mutable usize = 0.usize()
+            for index in 0..<512 |archive, offset, checksum|:
+                checksum <- checksum + (32.usize() if index >= 148.usize() and index < 156.usize() else archive[offset + index].usize())
+            return checksum
+
+        def write_octal(header: mutable darray[u8]&, offset: usize, value: usize, width: usize) -> void:
+            return if width == 0.usize()
+            divisor: mutable usize = 1.usize()
+            for _step in 1..<(width - 1.usize()) |divisor|:
+                divisor <- divisor * 8.usize()
+            for step in 0..<(width - 1.usize()) |header, offset, width, value, divisor, step|:
+                header[offset + step] <- 48 + ((value / divisor) % 8.usize()).u8()
+                divisor <- divisor / 8.usize() if divisor > 1.usize()
+            header[offset + width - 1.usize()] <- 0
+
     public:
         const max_archive_bytes: usize = 67108864.usize()
         # Reserve one entry header and both end-of-archive blocks.
         const max_payload_bytes: usize = max_archive_bytes - 1536.usize()
+
+        # ustar's name field is intentionally bounded. Long-name/PAX/GNU
+        # extensions are rejected until their canonical semantics have a
+        # dedicated parser and test corpus.
+        def tar_file_header(entry: darray[u8]&, size: usize) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
+            return [] if not safe_relative_path(entry) or entry.count >= 100.usize() or size > max_payload_bytes
+            header: mutable darray[u8] = []
+            header.resize(512)
+            for index in 0..<entry.count |header, entry|:
+                header[index] <- entry[index]
+            write_octal(&header, 100, 420, 8)
+            write_octal(&header, 108, 0, 8)
+            write_octal(&header, 116, 0, 8)
+            write_octal(&header, 124, size, 12)
+            write_octal(&header, 136, 0, 12)
+            header[156] <- 48
+            header[257] <- 117
+            header[258] <- 115
+            header[259] <- 116
+            header[260] <- 97
+            header[261] <- 114
+            header[262] <- 0
+            header[263] <- 48
+            header[264] <- 48
+            checksum: usize = header_checksum(header, 0.usize())
+            write_octal(&header, 148, checksum, 7)
+            header[154] <- 0
+            header[155] <- 32
+            return header
 
         def padding_bytes(payload_size: usize) -> usize:
             return (512.usize() - payload_size % 512.usize()) % 512.usize()
@@ -64,10 +110,7 @@ module UstarFields:
             stored_checksum: mutable usize = 0.usize()
             return -1 if not parse_octal_raw(archive, offset + 100.usize(), 8.usize(), &mode) or not parse_octal_raw(archive, offset + 108.usize(), 8.usize(), &uid) or not parse_octal_raw(archive, offset + 116.usize(), 8.usize(), &gid) or not parse_octal_raw(archive, offset + 124.usize(), 12.usize(), &size) or not parse_octal_raw(archive, offset + 136.usize(), 12.usize(), &mtime) or not parse_octal_raw(archive, offset + 148.usize(), 8.usize(), &stored_checksum)
             return -1 if mode != 420.usize() or uid != 0.usize() or gid != 0.usize() or mtime != 0.usize() or size > max_payload_bytes
-            checksum: mutable usize = 0.usize()
-            for index in 0..<512 |archive, offset, checksum|:
-                checksum <- checksum + (32.usize() if index >= 148.usize() and index < 156.usize() else archive[offset + index].usize())
-            return size.i64() if checksum == stored_checksum else -1
+            return size.i64() if header_checksum(archive, offset) == stored_checksum else -1
 
         # Return zero if the payload is truncated or its alignment padding
         # is invalid. A valid entry always advances by at least one block.
