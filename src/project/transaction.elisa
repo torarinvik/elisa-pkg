@@ -99,6 +99,11 @@ module ProjectTransaction:
             _ = ProjectFiles::write_fd_all(2, &bytes)
 
     public:
+        const enum LockPublication of u8:
+            Published = 0
+            JournalFailed = 1
+            WriteFailed = 2
+
         def begin_with_lock(original_manifest: darray[u8]&, expected_lock_state: i64, expected_lock: darray[u8]&) -> bool can[Global{Read,Write}, Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             can Global{Read,Write}:
                 state_root: mutable darray[u8] = []
@@ -183,12 +188,18 @@ module ProjectTransaction:
             return false if not ProjectFiles::write_cstr_file(".elisapkg/transaction.state", &state)
             return ProjectFiles::write_cstr_file("elisapkg.json", new_manifest)
 
-        def stage_lock(new_lock: darray[u8]&) -> bool can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+        def publish_lock(new_lock: darray[u8]&) -> LockPublication can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             # Record the intended bytes before replacing the live lockfile so
             # recovery can distinguish publication from an external edit.
             can Global.Read:
-                return false if transaction_lock_fd < 0
-            return ProjectFiles::write_cstr_file(".elisapkg/transaction.new-lock", new_lock)
+                return LockPublication.JournalFailed if transaction_lock_fd < 0
+            original_size: i64 = Platform::pkg_package_file_size(".elisapkg/transaction.lock")
+            original_matches: bool = Platform::pkg_package_file_size("elisapkg.lock") == -2 if original_size == -2 else live_file_matches(".elisapkg/transaction.lock", "elisapkg.lock")
+            if not original_matches:
+                report_recovery_error("error: lockfile changed before transaction publication\n")
+                return LockPublication.JournalFailed
+            return LockPublication.JournalFailed if not ProjectFiles::write_cstr_file(".elisapkg/transaction.new-lock", new_lock)
+            return LockPublication.Published if ProjectFiles::write_cstr_file("elisapkg.lock", new_lock) else LockPublication.WriteFailed
 
         def restore() -> bool can[Global{Read,Write}, Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             can Global{Read,Write}:
