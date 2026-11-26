@@ -311,9 +311,7 @@ module NativeSnapshotTree:
                 for index in 0..<length |names, destination, path_start|:
                     return PlatformNative::close_error(root, -22) if names[path_start + index] != destination[index].u8()
                 return PlatformNative::close_error(root, -22) if names[path_start + length] != 47
-                relative: mutable darray[u8] = []
-                for index in length + 1.usize()..<path_length |relative, names, path_start|:
-                    relative <- relative.push(names[path_start + index])
+                relative: darray[u8] = [names[path_start + index] for index in length + 1.usize()..<path_length]
                 return PlatformNative::close_error(root, -22) if not SnapshotPaths::relative_path_safe(relative)
                 entry_count <- entry_count + 1.usize()
                 return PlatformNative::close_error(root, -75) if entry_count > snapshot_maximum_entries
@@ -326,27 +324,31 @@ module NativeSnapshotTree:
             while directory_depth > 0.usize() |names, copied_paths, root, directory_depth|:
                 region directories_scope:
                     directories: mutable darray[u8] = []
-                    file_cursor: mutable usize = 0.usize()
-                    while file_cursor < copied_paths.count |copied_paths, directories, file_cursor, directory_depth|:
-                        file_end: mutable usize = file_cursor
-                        while file_end < copied_paths.count and copied_paths[file_end] != 0:
-                            file_end <- file_end + 1.usize()
-                        return PlatformNative::close_error(root, -22) if file_end == file_cursor or file_end >= copied_paths.count
-                        component_depth: mutable usize = 0.usize()
-                        for index in file_cursor..<file_end |copied_paths, directories, component_depth, file_end, directory_depth|:
-                            if copied_paths[index] == 47:
-                                component_depth <- component_depth + 1.usize()
-                                if component_depth == directory_depth:
-                                    for prefix_index in file_cursor..<index |directories, copied_paths|:
-                                        directories <- directories.push(copied_paths[prefix_index])
-                                    directories <- directories.push(0)
-                        file_cursor <- file_end + 1.usize()
+                    return PlatformNative::close_error(root, -22) if not directories_at_depth(copied_paths, directory_depth, &directories)
                     return PlatformNative::close_error(root, -5) if directories.count > 0.usize() and not NativeStagingTree::remove_directories(root, directories)
                 directory_depth <- directory_depth - 1.usize()
             return PlatformNative::close_error(root, -5) if not PlatformNative::directory_empty(root)
             if native_fsync(root) != 0:
                 return PlatformNative::close_error(root, NativeErrors::negative_errno())
             return PlatformNative::close_result(root, 0)
+
+        # The parent directories, `depth` components deep, of each terminated
+        # path in `paths`. Returns false for an empty or unterminated path.
+        def directories_at_depth(paths: darray[u8]&, depth: usize, directories: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            while file_cursor < paths.count |file_cursor: usize = 0.usize()|:
+                file_end: mutable usize = file_cursor
+                while file_end < paths.count and paths[file_end] != 0:
+                    file_end <- file_end + 1.usize()
+                return false if file_end == file_cursor or file_end >= paths.count
+                component_depth: mutable usize = 0.usize()
+                for index in file_cursor..<file_end |component_depth|:
+                    if paths[index] == 47:
+                        component_depth <- component_depth + 1.usize()
+                        if component_depth == depth:
+                            ByteText::append_range(directories, paths, file_cursor, index)
+                            directories.push(0)
+                file_cursor <- file_end + 1.usize()
+            return true
 
         def snapshot_open_parent(root: i64, relative: darray[u8]&, path_out: mutable darray[u8]&, leaf_offset: mutable usize&, create_missing: bool, created_directories: mutable darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             path_out.resize(0)
