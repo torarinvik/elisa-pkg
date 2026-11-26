@@ -54,6 +54,16 @@ ADDITIONAL_SCALAR_RETURNS = {
     "native_syscall": "i64",
 }
 
+PROCESS_ARGUMENT_TYPES = {
+    "native_exit": ("i32",),
+    "native_setpgid": ("i32", "i32"),
+    "native_getpid": (),
+    "native_waitpid": ("i32", "mutable i32&", "i32"),
+    "native_kill": ("i32", "i32"),
+    "native_setrlimit": ("i32", "void&"),
+    "native_proc_pidinfo": ("i32", "i32", "u64", "mutable void&?", "i32"),
+}
+
 
 def source_files():
     for directory, children, names in os.walk(ROOT, followlinks=False):
@@ -90,6 +100,19 @@ def main() -> int:
         for name, expected, actual in mismatches:
             print(f"  {name}: expected {expected}, got {', '.join(sorted(actual)) or 'missing'}", flush=True)
         return 1
+
+    for name, expected in PROCESS_ARGUMENT_TYPES.items():
+        declarations = re.findall(
+            rf"(?m)^\s*extern\s+{re.escape(name)}\(([^\n]*)\)", native_source
+        )
+        argument_lists = {
+            tuple(argument.partition(":")[2].strip() for argument in declaration.split(","))
+            if declaration.strip() else ()
+            for declaration in declarations
+        }
+        if argument_lists != {expected}:
+            print(f"error: {name} arguments must be {expected}, got {sorted(argument_lists)}", flush=True)
+            return 1
 
     sources = list(source_files())
     native_files = [
