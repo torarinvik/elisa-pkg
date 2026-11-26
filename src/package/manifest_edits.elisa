@@ -1,0 +1,66 @@
+# Formatting-preserving edits of validated manifest dependency objects.
+include "./manifest.elisa"
+
+module ManifestEdits:
+    public:
+        def append_path(raw: darray[u8]&, alias: darray[u8]&, path: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
+            return append_entry(raw, alias, "\": {\"path\": \"", path)
+
+        def append_registry(raw: darray[u8]&, alias: darray[u8]&, requirement: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
+            return append_entry(raw, alias, "\": {\"registry\": \"primary\", \"version\": \"", requirement)
+
+        def remove(raw: darray[u8]&, alias: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
+            dependency_start: usize = Json::root_value_offset(raw, "dependencies")
+            dependency_end: usize = Json::object_end(raw, dependency_start)
+            start: mutable usize = 0.usize()
+            end: mutable usize = 0.usize()
+            return [] if not Manifest::find_dependency_span(raw, alias, &start, &end)
+            probe: mutable usize = end
+            while probe < dependency_end and (raw[probe] == 32 or raw[probe] == 9 or raw[probe] == 10 or raw[probe] == 13) |raw, probe|:
+                probe <- probe + 1.usize()
+            if probe < dependency_end and raw[probe] == 44:
+                end <- probe + 1.usize()
+            else:
+                probe <- start
+                while probe > dependency_start + 1.usize() and (raw[probe - 1.usize()] == 32 or raw[probe - 1.usize()] == 9 or raw[probe - 1.usize()] == 10 or raw[probe - 1.usize()] == 13) |raw, probe|:
+                    probe <- probe - 1.usize()
+                start <- probe - 1.usize() if probe > dependency_start and raw[probe - 1.usize()] == 44
+            out: mutable darray[u8] = []
+            for index in 0..<start |out, raw|:
+                out.push(raw[index])
+            for index in end..<raw.count |out, raw|:
+                out.push(raw[index])
+            return out
+
+    private:
+        def append_entry(raw: darray[u8]&, alias: darray[u8]&, field_prefix: cstr, value: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
+            return [] if not PackageIdentity::valid_name(alias) or value.count == 0.usize() or value.count > Json::max_document_bytes
+            for index in 0..<value.count |value|:
+                byte: u8 = value[index]
+                return [] if byte < 32 or byte == 34 or byte == 92
+            dependency_start: usize = Json::root_value_offset(raw, "dependencies")
+            dependency_end: usize = Json::object_end(raw, dependency_start)
+            return [] if dependency_start >= dependency_end or dependency_end >= raw.count
+            previous_start: mutable usize = 0.usize()
+            previous_end: mutable usize = 0.usize()
+            return [] if Manifest::find_dependency_span(raw, alias, &previous_start, &previous_end)
+            has_existing: mutable bool = false
+            for index in (dependency_start + 1.usize())..<dependency_end |raw, has_existing|:
+                byte: u8 = raw[index]
+                if byte != 32 and byte != 9 and byte != 10 and byte != 13:
+                    has_existing <- true
+                    break
+            out: mutable darray[u8] = []
+            for index in 0..<dependency_end |out, raw|:
+                out.push(raw[index])
+            if has_existing:
+                ByteText::append_text(&out, ", ")
+            out.push(34)
+            ByteText::append(&out, alias)
+            ByteText::append_text(&out, field_prefix)
+            ByteText::append(&out, value)
+            ByteText::append_text(&out, "\"}")
+            for index in dependency_end..<raw.count |out, raw|:
+                out.push(raw[index])
+            return [] if out.count > Json::max_document_bytes
+            return out
