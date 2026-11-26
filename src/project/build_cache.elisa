@@ -6,22 +6,26 @@ module BuildCache:
     public:
         def verified_digest(artifact: darray[u8]&, receipt_path: darray[u8]&, expected_prefix: darray[u8]&, access_mode: i64, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out.resize(0)
-            cached_receipt: mutable darray[u8] = []
-            return false if not:
-                Platform::read_bounded_file(receipt_path, BuildReceipt::receipt_size(expected_prefix.count), &cached_receipt)
-                BuildReceipt::receipt_header_matches(cached_receipt, expected_prefix)
-                ProjectFiles::valid_path_bytes(artifact)
-            name_bytes: mutable darray[u8] = []
-            name_bytes <- ProjectFiles::with_null_terminator(artifact)
-            region name_scope:
-                name: cstr = (&name_bytes[0]).cast[cstr] can Unsafe.PointerCast
-                return false if Platform::access_path(name, access_mode) != 0
-            content: mutable darray[u8] = []
-            return false if not Platform::read_bounded_file(artifact, Integrity::maximum_input, &content)
-            region digest_scope:
+            region cached_receipt_scope:
+                cached_receipt: mutable darray[u8] = []
+                return false if not:
+                    Platform::read_bounded_file(receipt_path, BuildReceipt::receipt_size(expected_prefix.count), &cached_receipt)
+                    BuildReceipt::receipt_header_matches(cached_receipt, expected_prefix)
+                    ProjectFiles::valid_path_bytes(artifact)
+                    artifact_accessible(artifact, access_mode)
                 digest: mutable darray[u8] = []
                 return false if not:
-                    Integrity::sha256_hex(content, &digest)
+                    artifact_digest(artifact, &digest)
                     BuildReceipt::receipt_digest_matches(cached_receipt, digest)
                 ByteText::append(out, digest)
             return true
+
+    private:
+        def artifact_accessible(artifact: darray[u8]&, access_mode: i64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            name_bytes: darray[u8] = ProjectFiles::with_null_terminator(artifact)
+            name: cstr = (&name_bytes[0]).cast[cstr] can Unsafe.PointerCast
+            return Platform::access_path(name, access_mode) == 0
+
+        def artifact_digest(artifact: darray[u8]&, digest: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            content: mutable darray[u8] = []
+            return Platform::read_bounded_file(artifact, Integrity::maximum_input, &content) and Integrity::sha256_hex(content, digest)
