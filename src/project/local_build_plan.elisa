@@ -35,43 +35,18 @@ module LocalBuildPlan:
                 package_version: mutable darray[u8] = []
                 source_start: mutable usize = 0.usize()
                 source_end: mutable usize = 0.usize()
-                return false if not:
-                    Json::object_string_value(lock, cursor, record_end, "name", &package_name)
-                    PackageIdentity::valid_name(package_name)
-                    Json::object_string_value(lock, cursor, record_end, "version", &package_version)
-                    Json::object_value_span(lock, cursor, record_end, "source", &source_start, &source_end)
-                region source_type_scope:
-                    source_type: mutable darray[u8] = []
-                    return false if:
-                        not Json::object_string_value(lock, source_start, source_end, "type", &source_type) or not ByteText::equal_text(source_type, "path")
-                        packages.count > 0.usize() and not ByteText::less(packages[packages.count - 1.usize()].name, package_name)
+                return false if not read_path_record(lock, cursor, record_end, &package_name, &package_version, &source_start, &source_end)
+                return false if packages.count > 0.usize() and not ByteText::less(packages[packages.count - 1.usize()].name, package_name)
                 canonical_root: mutable darray[u8] @r = []
                 return false if not BuildPaths::resolve_local_source(lock, source_start, source_end, root_path, &canonical_root)
-                manifest_path: mutable darray[u8] = []
-                ProjectFiles::path_join_into(canonical_root, "elisapkg.json", &manifest_path)
                 package_manifest: mutable darray[u8] = []
-                return false if not Platform::read_bounded_file(manifest_path, Json::maximum_document_bytes, &package_manifest)
-                actual_name: mutable darray[u8] = []
-                region actual_version_scope:
-                    actual_version: mutable darray[u8] = []
-                    return false if not:
-                        ProjectManifest::validate_at(package_manifest, canonical_root, &actual_name, &actual_version)
-                        ByteText::equal(actual_name, package_name)
-                        ByteText::equal(actual_version, package_version)
-                region manifest_digest_scope:
-                    manifest_digest: mutable darray[u8] = []
-                    return false if not:
-                        Integrity::sha256_hex(package_manifest, &manifest_digest)
-                        Lockfile::sha256_field_equals(lock, cursor, record_end, "manifest-digest", manifest_digest)
+                return false if not read_locked_manifest(lock, cursor, record_end, canonical_root, package_name, package_version, &package_manifest)
                 source_digest: mutable darray[u8] @r = []
                 package_source_bytes: mutable usize = 0.usize()
                 return false if total_dependency_source_bytes > source_byte_budget or not SourceFingerprint::at_bounded(canonical_root, &source_digest, source_byte_budget - total_dependency_source_bytes, &package_source_bytes)
                 total_dependency_source_bytes <- total_dependency_source_bytes + package_source_bytes
                 return false if not Lockfile::sha256_field_equals(lock, cursor, record_end, "source-digest", source_digest)
-                registry_roots: mutable darray[Solver::Constraint] = []
-                region has_local_dependency_scope:
-                    has_local_dependency: mutable bool = false
-                    return false if not RegistryRoots::collect(package_manifest, &registry_roots, &has_local_dependency) or registry_roots.count != 0.usize()
+                return false if not has_only_local_dependencies(package_manifest)
                 library_entry: mutable darray[u8] @r = []
                 relative_entry: mutable darray[u8] @r = []
                 return false if not BuildPaths::resolve_library_entry(package_manifest, canonical_root, &library_entry, &relative_entry)
@@ -94,3 +69,41 @@ module LocalBuildPlan:
                 return true
             has_dependencies <- true
             return LocalBuildGraph::write_ordered_includes(packages, order, root_entry, aggregate)
+
+    private:
+        # Read a locked package's manifest and check that it names the locked
+        # package and version and matches the locked manifest digest.
+        def read_locked_manifest(lock: darray[u8]&, record_start: usize, record_end: usize, canonical_root: darray[u8]&, package_name: darray[u8]&, package_version: darray[u8]&, package_manifest: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            manifest_path: mutable darray[u8] = []
+            ProjectFiles::path_join_into(canonical_root, "elisapkg.json", &manifest_path)
+            return false if not Platform::read_bounded_file(manifest_path, Json::maximum_document_bytes, package_manifest)
+            actual_name: mutable darray[u8] = []
+            region actual_version_scope:
+                actual_version: mutable darray[u8] = []
+                return false if not:
+                    ProjectManifest::validate_at(package_manifest, canonical_root, &actual_name, &actual_version)
+                    ByteText::equal(actual_name, package_name)
+                    ByteText::equal(actual_version, package_version)
+            region manifest_digest_scope:
+                manifest_digest: mutable darray[u8] = []
+                return false if not:
+                    Integrity::sha256_hex(package_manifest, &manifest_digest)
+                    Lockfile::sha256_field_equals(lock, record_start, record_end, "manifest-digest", manifest_digest)
+            return true
+
+        # A local-lock package may depend only on other local packages.
+        def has_only_local_dependencies(package_manifest: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            registry_roots: mutable darray[Solver::Constraint] = []
+            has_local_dependency: mutable bool = false
+            return RegistryRoots::collect(package_manifest, &registry_roots, &has_local_dependency) and registry_roots.count == 0.usize()
+
+        # Read the name, version, and source span of a lock record whose
+        # source is a local path.
+        def read_path_record(lock: darray[u8]&, record_start: usize, record_end: usize, package_name: mutable darray[u8]&, package_version: mutable darray[u8]&, source_start: mutable usize&, source_end: mutable usize&) -> bool can[Memory.Allocate, Abort.Panic]:
+            source_type: mutable darray[u8] = []
+            return Json::object_string_value(lock, record_start, record_end, "name", package_name) and
+                   PackageIdentity::valid_name(package_name) and
+                   Json::object_string_value(lock, record_start, record_end, "version", package_version) and
+                   Json::object_value_span(lock, record_start, record_end, "source", source_start, source_end) and
+                   Json::object_string_value(lock, source_start, source_end, "type", &source_type) and
+                   ByteText::equal_text(source_type, "path")
