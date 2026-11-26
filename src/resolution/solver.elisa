@@ -136,7 +136,7 @@ module Solver:
             total_dependencies: mutable usize = 0.usize()
             for candidate_index in 0..<candidates.count |candidates, package_slots, total_dependencies|:
                 return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
-                return SolveCode.Malformed if not solver_valid_name(candidates[candidate_index].package)
+                return SolveCode.Malformed if not PackageIdentity::valid_name(candidates[candidate_index].package)
                 return SolveCode.ResourceLimit if not solver_charge_work(work, candidates[candidate_index].package.count)
                 # Version values are normalized by the provider boundary, but
                 # prereleases are outside the v1 graph identity. Reject them at
@@ -157,11 +157,8 @@ module Solver:
                 for dependency_index in 0..<candidates[candidate_index].dependencies.count |candidates, candidate_index|:
                     return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
                     dependency: Constraint = candidates[candidate_index].dependencies[dependency_index]
-                    return SolveCode.Malformed if not solver_valid_name(dependency.package) or dependency.requirement.count == 0.usize()
-                    return SolveCode.ResourceLimit if not solver_charge_work(work, dependency.package.count)
-                    return SolveCode.ResourceLimit if not solver_charge_work(work, dependency.requirement.count)
-                    dependency_requirement: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
-                    return SolveCode.Malformed if not SemVer::parse_requirement(dependency.requirement, &dependency_requirement)
+                    validation: SolveCode = validate_constraint(dependency, work)
+                    return validation if validation != SolveCode.Solved
                 for previous in 0..<candidate_index |candidates, candidate_index|:
                     return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
                     same_package: bool = solver_equal(candidates[previous].package, candidates[candidate_index].package, work)
@@ -169,14 +166,11 @@ module Solver:
                     return SolveCode.Malformed if same_package and SemVer::compare(candidates[previous].version, candidates[candidate_index].version) == 0
             for root_index in 0..<roots.count |roots|:
                 return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
-                return SolveCode.Malformed if not solver_valid_name(roots[root_index].package) or roots[root_index].requirement.count == 0.usize()
-                return SolveCode.ResourceLimit if not solver_charge_work(work, roots[root_index].package.count)
-                return SolveCode.ResourceLimit if not solver_charge_work(work, roots[root_index].requirement.count)
-                root_requirement: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
-                return SolveCode.Malformed if not SemVer::parse_requirement(roots[root_index].requirement, &root_requirement)
+                validation: SolveCode = validate_constraint(roots[root_index], work)
+                return validation if validation != SolveCode.Solved
             for preference_index in 0..<preferences.count |preferences|:
                 return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
-                return SolveCode.Malformed if not solver_valid_name(preferences[preference_index].package) or preferences[preference_index].version.prerelease
+                return SolveCode.Malformed if not PackageIdentity::valid_name(preferences[preference_index].package) or preferences[preference_index].version.prerelease
                 return SolveCode.ResourceLimit if not solver_charge_work(work, preferences[preference_index].package.count)
                 for previous in 0..<preference_index |preferences, preference_index|:
                     return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
@@ -492,8 +486,13 @@ module Solver:
             return preferences.count if solver_work_exhausted(work) or not equal
             return lower
 
-        def solver_valid_name(value: darray[u8]&) -> bool:
-            return PackageIdentity::valid_name(value)
+        def validate_constraint(constraint: Constraint, work: mutable WorkBudget&) -> SolveCode:
+            return SolveCode.Malformed if not PackageIdentity::valid_name(constraint.package) or constraint.requirement.count == 0.usize()
+            return SolveCode.ResourceLimit if not solver_charge_work(work, constraint.package.count)
+            return SolveCode.ResourceLimit if not solver_charge_work(work, constraint.requirement.count)
+            requirement: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
+            return SolveCode.Malformed if not SemVer::parse_requirement(constraint.requirement, &requirement)
+            return SolveCode.Solved
 
         def solver_equal(left: darray[u8]&, right: darray[u8]&, work: mutable WorkBudget&) -> bool:
             return false if not solver_charge_work(work, 1)
