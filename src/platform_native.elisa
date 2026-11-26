@@ -864,7 +864,7 @@ module PlatformNative:
             return native_getpid()
 
         def terminate_process_group(process_group: i64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            return -22 if process_group <= 0
+            return -22 if not valid_child_process_id(process_group)
             if native_kill(-process_group, 9) != 0:
                 kill_errno: i64 = current_errno()
                 return 0 if kill_errno == 3
@@ -914,7 +914,7 @@ module PlatformNative:
 
         def waitpid_timeout(pid: i64, status: mutable i32&, timeout_ms: i64) -> i64 can[Memory.Allocate, Unsafe.PointerCast]:
             status <- 0
-            return -22 if pid <= 0 or timeout_ms <= 0
+            return -22 if not valid_child_process_id(pid) or timeout_ms <= 0
             clock_buffer: mutable darray[u8] = []
             clock_buffer.resize(NativeProcessValues::record_bytes)
             started: i64 = monotonic_milliseconds_into(&clock_buffer)
@@ -955,12 +955,19 @@ module PlatformNative:
         # running after its parent exits. Reap the direct child under the normal
         # deadline, then kill and drain the whole isolated group on every result.
         def waitpid_group_timeout(pid: i64, status: mutable i32&, timeout_ms: i64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            status <- 0
+            return -22 if not valid_child_process_id(pid) or timeout_ms <= 0
             waited: i64 = waitpid_timeout(pid, status, timeout_ms)
             group_cleanup: i64 = terminate_process_group(pid)
             return -5 if group_cleanup != 0
             return waited
 
     private:
+        # The supported pid_t ABI is signed 32-bit. A group identifier of
+        # one is also invalid here because kill(-1, ...) signals broadly.
+        def valid_child_process_id(pid: i64) -> bool:
+            return pid > 1 and pid <= 2147483647
+
         def terminate_and_reap(pid: i64, status: mutable i32&) -> i64:
             _ = native_kill(-pid, 9)
             _ = native_kill(pid, 9)
