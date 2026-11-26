@@ -11,7 +11,7 @@ module RollbackRecords:
         const enum Code of u8:
             Ok
             Malformed
-            MissingPin
+            Unavailable
             RootChanged
 
         def version_2(state: darray[u8]&) -> bool:
@@ -99,11 +99,79 @@ module RollbackRecords:
             find_status: Code = find(state, root_key_identity, &pinned_version, &pinned_digest, &pinned_metadata_digest) if state.count > 0 else Code.Ok
             return find_status if find_status != Code.Ok
             if pinned_version.count == 0:
-                return Code.MissingPin if require_existing or version_4(state) and has_root_scoped_history(state, root_key_identity)
+                return Code.Unavailable if require_existing or version_4(state) and has_root_scoped_history(state, root_key_identity)
                 return Code.Ok
             return Code.Malformed if not ByteText::equal_text(pinned_version, "0.0.0") or not ByteText::equal(pinned_digest, pinned_metadata_digest)
             return Code.RootChanged if compare_key and not ByteText::equal(pinned_digest, key_fingerprint)
             found_out <- true
+            return Code.Ok
+
+        def legacy_override_status(state: darray[u8]&, has_override: bool) -> Code can[Memory.Allocate, Abort.Panic]:
+            return Code.Ok if not version_2(state)
+            return Code.Ok if not has_override
+            empty_identity: mutable darray[u8] = []
+            unused_version: mutable darray[u8] = []
+            unused_digest: mutable darray[u8] = []
+            unused_metadata_digest: mutable darray[u8] = []
+            validation_status: Code = find(state, empty_identity, &unused_version, &unused_digest, &unused_metadata_digest)
+            return validation_status if validation_status != Code.Ok
+            cursor: mutable usize = 23.usize()
+            while cursor < state.count:
+                finish: mutable usize = cursor
+                while finish < state.count and state[finish] != 10 |state, finish|:
+                    finish <- finish + 1.usize()
+                return Code.Malformed if finish == state.count
+                separator: mutable usize = cursor
+                while separator < finish and state[separator] != 32 |state, separator|:
+                    separator <- separator + 1.usize()
+                return Code.Malformed if separator == cursor or separator == finish
+                identity: mutable darray[u8] = []
+                for index in cursor..<separator |identity, state|:
+                    identity.push(state[index])
+                return Code.Unavailable if PackageIdentity::valid_name(identity)
+                cursor <- finish + 1.usize()
+            return Code.Ok
+
+        def upgrade_to_v4(root: darray[u8]&, state: darray[u8]&, has_override: bool, out: mutable darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic]:
+            out.resize(0)
+            if state.count == 0:
+                ByteText::append_text(out, "elisapkg-trust-state:4\n")
+                return Code.Ok
+            if version_4(state):
+                for index in 0..<state.count |out, state|:
+                    out.push(state[index])
+                return Code.Ok
+            return Code.Malformed if not version_2(state) and not version_3(state)
+            empty_identity: mutable darray[u8] = []
+            unused_version: mutable darray[u8] = []
+            unused_digest: mutable darray[u8] = []
+            unused_metadata_digest: mutable darray[u8] = []
+            validation_status: Code = legacy_override_status(state, true) if has_override and version_2(state) else find(state, empty_identity, &unused_version, &unused_digest, &unused_metadata_digest)
+            return validation_status if validation_status != Code.Ok
+            ByteText::append_text(out, "elisapkg-trust-state:4\n")
+            cursor: mutable usize = 23.usize()
+            while cursor < state.count:
+                finish: mutable usize = cursor
+                while finish < state.count and state[finish] != 10 |state, finish|:
+                    finish <- finish + 1.usize()
+                return Code.Malformed if finish == state.count
+                separator: mutable usize = cursor
+                while separator < finish and state[separator] != 32 |state, separator|:
+                    separator <- separator + 1.usize()
+                return Code.Malformed if separator == cursor or separator == finish
+                identity: mutable darray[u8] = []
+                for index in cursor..<separator |identity, state|:
+                    identity.push(state[index])
+                if PackageIdentity::valid_name(identity):
+                    scoped_identity: mutable darray[u8] = []
+                    return Code.Unavailable if not TrustIdentity::package(root, identity, &scoped_identity)
+                    ByteText::append(out, scoped_identity)
+                else:
+                    ByteText::append(out, identity)
+                for index in separator..=finish |out, state|:
+                    out.push(state[index])
+                return Code.Unavailable if out.count > 1048576.usize()
+                cursor <- finish + 1.usize()
             return Code.Ok
 
     private:
