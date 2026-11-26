@@ -62,6 +62,16 @@ module ProjectTransaction:
             return false if not ProjectFiles::remove_empty_directory(&guard)
             return ProjectFiles::remove_cstr_file(".elisapkg/transaction.state")
 
+        def published_lock_matches_stage() -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            staged_lock: mutable darray[u8] = []
+            staged_lock.resize(1048577)
+            current_lock: mutable darray[u8] = []
+            current_lock.resize(1048577)
+            return false if:
+                not ProjectFiles::read_cstr_into(".elisapkg/transaction.new-lock", &staged_lock)
+                not ProjectFiles::read_cstr_into("elisapkg.lock", &current_lock)
+            return ByteText::equal(staged_lock, current_lock)
+
         def report_recovery_error(message: cstr) -> void can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             bytes: mutable darray[u8] = []
             ByteText::append_text(&bytes, message)
@@ -150,16 +160,6 @@ module ProjectTransaction:
             # Record the intended bytes before replacing the live lockfile so
             # recovery can distinguish publication from an external edit.
             return ProjectFiles::write_cstr_file(".elisapkg/transaction.new-lock", new_lock)
-
-        def published_lock_matches_stage() -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            staged_lock: mutable darray[u8] = []
-            staged_lock.resize(1048577)
-            current_lock: mutable darray[u8] = []
-            current_lock.resize(1048577)
-            return false if:
-                not ProjectFiles::read_cstr_into(".elisapkg/transaction.new-lock", &staged_lock)
-                not ProjectFiles::read_cstr_into("elisapkg.lock", &current_lock)
-            return ByteText::equal(staged_lock, current_lock)
 
         def restore() -> bool can[Global{Read,Write}, Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             can Global{Read,Write}:
@@ -299,6 +299,11 @@ module ProjectTransaction:
 
         def commit() -> bool can[Global{Read,Write}, Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             can Global{Read,Write}:
+                return false if transaction_lock_fd < 0
+                if not published_lock_matches_stage():
+                    report_recovery_error("error: published lockfile does not match the staged transaction bytes\n")
+                    _ = restore()
+                    return false
                 state: mutable darray[u8] = []
                 ByteText::append_text(&state, "complete\n")
                 if not ProjectFiles::write_cstr_file(".elisapkg/transaction.state", &state):
