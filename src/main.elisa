@@ -52,6 +52,7 @@ include "./project/lockfile.elisa"
 include "./project/lock_validation.elisa"
 include "./project/build_cache.elisa"
 include "./project/build_receipt.elisa"
+include "./project/build_toolchain.elisa"
 include "./project/build_publication.elisa"
 include "./project/build_paths.elisa"
 include "./project/local_build_plan.elisa"
@@ -691,22 +692,12 @@ module Cli:
                     resolved_compiler_storage: mutable darray[u8] = []
                     ProjectFiles::path_with_nul_into(resolved_compiler_path, &resolved_compiler_storage)
                     compiler <- (&resolved_compiler_storage[0]).cast[cstr] can Unsafe.PointerCast
-                    # Capture only the compiler settings needed by the wrapper. The child is
-                    # started with a scrubbed environment so registry credentials and unrelated
-                    # user variables cannot reach compile-time execution.
-                    stage1_bin: mutable cstr = ""
-                    runtime_obj: mutable cstr = ""
-                    allow_stale: mutable cstr = ""
-                    clang_tool: mutable cstr = ""
-                    if Platform::pkg_getenv("ELISA_STAGE1_BIN") is configured_stage1:
-                        stage1_bin <- configured_stage1.cast[cstr]
-                    if Platform::pkg_getenv("ELISA_RUNTIME_OBJ") is configured_runtime:
-                        runtime_obj <- configured_runtime.cast[cstr]
-                    if Platform::pkg_getenv("ELISA_ALLOW_STALE_STAGE1") is configured_stale:
-                        allow_stale <- configured_stale.cast[cstr]
-                    if Platform::pkg_getenv("ELISA_CLANG") is configured_clang:
-                        clang_tool <- configured_clang.cast[cstr]
-                    return EXIT_BUILD if not Toolchain::valid_toolchain_value(stage1_bin, 4096.usize()) or not Toolchain::valid_toolchain_value(runtime_obj, 4096.usize()) or not Toolchain::valid_toolchain_value(allow_stale, 64.usize()) or not Toolchain::valid_toolchain_value(clang_tool, 4096.usize())
+                    environment: mutable BuildToolchain::Environment = BuildToolchain::Environment{stage1_binary: "", runtime_object: "", allow_stale: "", clang: ""}
+                    return EXIT_BUILD if not BuildToolchain::read_environment(&environment)
+                    stage1_bin: cstr = environment.stage1_binary
+                    runtime_obj: cstr = environment.runtime_object
+                    allow_stale: cstr = environment.allow_stale
+                    clang_tool: cstr = BuildToolchain::select_clang(environment.clang)
                     compiler_executable: mutable cstr = compiler
                     compiler_is_stage1_wrapper: bool = Toolchain::stage1_wrapper_pair_matches(compiler, stage1_bin)
                     if compiler_is_stage1_wrapper and stage1_bin[0].u8() != 0:
@@ -731,20 +722,6 @@ module Cli:
                     if clang_tool[0].u8() != 0:
                         tool_paths.push(clang_tool)
                         executable_paths.push(clang_tool)
-                    for candidate_index in 0..<3 |tool_paths, executable_paths|:
-                        if clang_tool[0].u8() == 0:
-                            candidate: mutable cstr = "/opt/homebrew/opt/llvm/bin/clang"
-                            if candidate_index == 1:
-                                candidate <- "/usr/local/opt/llvm/bin/clang"
-                            elif candidate_index == 2:
-                                candidate <- "/usr/bin/clang"
-                            candidate_real: mutable darray[u8] = []
-                            candidate_real.resize(4096)
-                            if Platform::pkg_realpath(candidate, &candidate_real) is resolved_candidate:
-                                if Platform::pkg_access(resolved_candidate, 1) == 0:
-                                    tool_paths.push(candidate)
-                                    executable_paths.push(candidate)
-                                    clang_tool <- candidate
                     compiler_identity: mutable darray[u8] = []
                     stage1_identity: mutable darray[u8] = []
                     runtime_identity: mutable darray[u8] = []
@@ -759,39 +736,19 @@ module Cli:
                         CliOutput::write_error("error: could not locate a supported macOS SDK and developer directory for the compiler sandbox\n")
                         return EXIT_BUILD
                     sdk_settings_path: mutable darray[u8] = []
-                    sdk_settings_path_c: mutable darray[u8] = []
-                    sdk_settings_name: mutable cstr = ""
-                    if sdk_root.count > 0.usize():
-                        ByteText::append(&sdk_settings_path, sdk_root)
-                        ByteText::append_text(&sdk_settings_path, "/SDKSettings.json")
-                        ProjectFiles::path_with_nul_into(sdk_settings_path, &sdk_settings_path_c)
-                        sdk_settings_name <- (&sdk_settings_path_c[0]).cast[cstr] can Unsafe.PointerCast
-                    sdk_identity: mutable darray[u8] = []
-                    sdk_identity_ok: bool = Toolchain::file_identity(sdk_settings_name, sdk_root.count == 0.usize(), false, &sdk_identity)
                     developer_linker_path: mutable darray[u8] = []
-                    developer_linker_path_c: mutable darray[u8] = []
-                    developer_linker_name: mutable cstr = ""
                     developer_assembler_path: mutable darray[u8] = []
-                    developer_assembler_path_c: mutable darray[u8] = []
-                    developer_assembler_name: mutable cstr = ""
+                    if not BuildToolchain::developer_paths(sdk_root, developer_dir, &sdk_settings_path, &developer_linker_path, &developer_assembler_path):
+                        CliOutput::write_error("error: unsupported macOS developer toolchain directory\n")
+                        return EXIT_BUILD
+                    sdk_settings_name: cstr = (&sdk_settings_path[0]).cast[cstr] can Unsafe.PointerCast
+                    developer_linker_name: cstr = (&developer_linker_path[0]).cast[cstr] can Unsafe.PointerCast
+                    developer_assembler_name: cstr = (&developer_assembler_path[0]).cast[cstr] can Unsafe.PointerCast
                     if developer_dir.count > 0.usize():
-                        ByteText::append(&developer_linker_path, developer_dir)
-                        ByteText::append(&developer_assembler_path, developer_dir)
-                        if ByteText::equal_text(developer_dir, "/Library/Developer/CommandLineTools"):
-                            ByteText::append_text(&developer_linker_path, "/usr/bin/ld")
-                            ByteText::append_text(&developer_assembler_path, "/usr/bin/as")
-                        elif ByteText::equal_text(developer_dir, "/Applications/Xcode.app/Contents/Developer"):
-                            ByteText::append_text(&developer_linker_path, "/Toolchains/XcodeDefault.xctoolchain/usr/bin/ld")
-                            ByteText::append_text(&developer_assembler_path, "/Toolchains/XcodeDefault.xctoolchain/usr/bin/as")
-                        else:
-                            CliOutput::write_error("error: unsupported macOS developer toolchain directory\n")
-                            return EXIT_BUILD
-                        ProjectFiles::path_with_nul_into(developer_linker_path, &developer_linker_path_c)
-                        developer_linker_name <- (&developer_linker_path_c[0]).cast[cstr] can Unsafe.PointerCast
-                        ProjectFiles::path_with_nul_into(developer_assembler_path, &developer_assembler_path_c)
-                        developer_assembler_name <- (&developer_assembler_path_c[0]).cast[cstr] can Unsafe.PointerCast
                         executable_paths.push(developer_linker_name)
                         executable_paths.push(developer_assembler_name)
+                    sdk_identity: mutable darray[u8] = []
+                    sdk_identity_ok: bool = Toolchain::file_identity(sdk_settings_name, sdk_root.count == 0.usize(), false, &sdk_identity)
                     developer_linker_identity: mutable darray[u8] = []
                     developer_assembler_identity: mutable darray[u8] = []
                     developer_linker_identity_ok: bool = Toolchain::file_identity(developer_linker_name, sdk_root.count == 0.usize(), true, &developer_linker_identity)

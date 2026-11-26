@@ -1,0 +1,66 @@
+# The explicit toolchain environment and developer files used by sandboxed builds.
+include "../platform.elisa"
+include "../text/bytes.elisa"
+include "../toolchain.elisa"
+
+module BuildToolchain:
+    public:
+        struct Environment:
+            stage1_binary: mutable cstr
+            runtime_object: mutable cstr
+            allow_stale: mutable cstr
+            clang: mutable cstr
+
+        def read_environment(out: mutable Environment&) -> bool:
+            out.stage1_binary <- ""
+            out.runtime_object <- ""
+            out.allow_stale <- ""
+            out.clang <- ""
+            if Platform::pkg_getenv("ELISA_STAGE1_BIN") is configured:
+                out.stage1_binary <- configured.cast[cstr]
+            if Platform::pkg_getenv("ELISA_RUNTIME_OBJ") is configured:
+                out.runtime_object <- configured.cast[cstr]
+            if Platform::pkg_getenv("ELISA_ALLOW_STALE_STAGE1") is configured:
+                out.allow_stale <- configured.cast[cstr]
+            if Platform::pkg_getenv("ELISA_CLANG") is configured:
+                out.clang <- configured.cast[cstr]
+            return false if:
+                not Toolchain::valid_toolchain_value(out.stage1_binary, 4096.usize())
+                not Toolchain::valid_toolchain_value(out.runtime_object, 4096.usize())
+                not Toolchain::valid_toolchain_value(out.allow_stale, 64.usize())
+                not Toolchain::valid_toolchain_value(out.clang, 4096.usize())
+            return true
+
+        def select_clang(configured: cstr) -> cstr can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return configured if configured[0].u8() != 0
+            candidates: darray[cstr] = ["/opt/homebrew/opt/llvm/bin/clang", "/usr/local/opt/llvm/bin/clang", "/usr/bin/clang"]
+            resolved: mutable darray[u8] = []
+            resolved.resize(4096)
+            for candidate in candidates |resolved|:
+                if Platform::pkg_realpath(candidate, &resolved) is canonical:
+                    return candidate if Platform::pkg_access(canonical, 1) == 0
+            return ""
+
+        # Keep all three C-string buffers in the caller through the final recheck.
+        def developer_paths(sdk_root: darray[u8]&, developer_dir: darray[u8]&, settings: mutable darray[u8]&, linker: mutable darray[u8]&, assembler: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            settings.resize(0)
+            linker.resize(0)
+            assembler.resize(0)
+            if sdk_root.count > 0.usize():
+                ByteText::append(settings, sdk_root)
+                ByteText::append_text(settings, "/SDKSettings.json")
+            if developer_dir.count > 0.usize():
+                ByteText::append(linker, developer_dir)
+                ByteText::append(assembler, developer_dir)
+                if ByteText::equal_text(developer_dir, "/Library/Developer/CommandLineTools"):
+                    ByteText::append_text(linker, "/usr/bin/ld")
+                    ByteText::append_text(assembler, "/usr/bin/as")
+                elif ByteText::equal_text(developer_dir, "/Applications/Xcode.app/Contents/Developer"):
+                    ByteText::append_text(linker, "/Toolchains/XcodeDefault.xctoolchain/usr/bin/ld")
+                    ByteText::append_text(assembler, "/Toolchains/XcodeDefault.xctoolchain/usr/bin/as")
+                else:
+                    return false
+            settings.push(0)
+            linker.push(0)
+            assembler.push(0)
+            return true
