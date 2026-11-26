@@ -13,6 +13,7 @@ import platform
 import re
 import shutil
 import stat
+import struct
 import subprocess
 import tarfile
 import tempfile
@@ -108,7 +109,8 @@ class FileRecord(TypedDict):
 
 
 def file_record(
-    path: Path, *, expected_mode: int | None = None, maximum_size: int | None = None
+    path: Path, *, expected_mode: int | None = None, maximum_size: int | None = None,
+    require_arm64_executable: bool = False,
 ) -> FileRecord:
     digest = hashlib.sha256()
     size = 0
@@ -122,6 +124,12 @@ def file_record(
                 raise ProvenanceError(f"provenance input exceeds its size limit: {path}")
             if expected_mode is not None and stat.S_IMODE(before.st_mode) != expected_mode:
                 raise ProvenanceError(f"provenance input must have mode {expected_mode:04o}: {path}")
+            if require_arm64_executable:
+                header = stream.read(32)
+                if len(header) != 32 or struct.unpack_from("<II", header) != (0xFEEDFACF, 0x0100000C) or struct.unpack_from("<I", header, 12)[0] != 2:
+                    raise ProvenanceError("release executable must have a macOS ARM64 Mach-O executable header")
+                digest.update(header)
+                size = len(header)
             while chunk := stream.read(1024 * 1024):
                 size += len(chunk)
                 if size > before.st_size:
@@ -432,7 +440,9 @@ def generate_candidate(
 
     run_id = required_env(env, "GITHUB_RUN_ID")
     run_attempt = required_env(env, "GITHUB_RUN_ATTEMPT")
-    binary_record = file_record(binary, expected_mode=0o755, maximum_size=MAX_BINARY_BYTES)
+    binary_record = file_record(
+        binary, expected_mode=0o755, maximum_size=MAX_BINARY_BYTES, require_arm64_executable=True
+    )
     binary_size = binary_record["size_bytes"]
     binary_digest = binary_record["sha256"]
     manifest: dict[str, object] = {

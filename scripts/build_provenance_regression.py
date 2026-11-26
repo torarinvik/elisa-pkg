@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import struct
 import tarfile
 import tempfile
 
@@ -74,7 +75,8 @@ def create_fixture(root: Path) -> tuple[dict[str, object], dict[str, str], Path]
     )
 
     binary = project / "build/elisapkg"
-    write_executable(binary, b"\x7fELF\x00elisapkg test executable\n")
+    header = struct.pack("<8I", 0xFEEDFACF, 0x0100000C, 0, 2, 0, 0, 0, 0)
+    write_executable(binary, header + b"elisapkg test executable\n")
     write_executable(compiler / "scripts/elisac_stage1.sh", b"#!/bin/sh\nexit 0\n")
     write_executable(compiler / "bin/elisac-stage1", b"stage1 bytes\n")
     write_executable(core / "compiler/bin/elisac", b"stage0 bytes\n")
@@ -308,6 +310,16 @@ def main() -> int:
             raise SystemExit("error: release provenance accepted an oversized executable")
         if unverified_output.parent.exists():
             raise SystemExit("error: oversized executable created an output directory")
+
+        wrong_format = binary.parent / "wrong-format"
+        write_executable(wrong_format, b"\x7fELF" + bytes(32))
+        try:
+            provenance.generate_candidate(**{**inputs, "binary_input": wrong_format})
+        except provenance.ProvenanceError as error:
+            if "Mach-O executable header" not in str(error):
+                raise
+        else:
+            raise SystemExit("error: release provenance accepted a binary with the wrong format")
 
         try:
             provenance.generate_candidate(**{**inputs, "output_dir_input": project_root})
