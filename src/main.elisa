@@ -3826,57 +3826,6 @@ module Cli:
                 count <- count + 1.usize()
             return true
 
-        def append_local_dependency_names(raw: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            out.resize(0)
-            dependency_start: usize = Json::root_value_offset(raw, "dependencies")
-            return true if dependency_start >= raw.count
-            dependency_end: usize = Json::object_end(raw, dependency_start)
-            return false if dependency_end <= dependency_start or raw[dependency_start] != 123
-            in_string: mutable bool = false
-            escaped: mutable bool = false
-            string_start: mutable usize = 0.usize()
-            braces: mutable i64 = 1
-            brackets: mutable i64 = 0
-            for index in (dependency_start + 1.usize())..<dependency_end |raw, out, in_string, escaped, string_start, braces, brackets|:
-                byte: u8 = raw[index]
-                if not in_string:
-                    if byte == 34:
-                        in_string <- true
-                        string_start <- index + 1.usize()
-                    elif byte == 123:
-                        braces <- braces + 1
-                    elif byte == 125:
-                        braces <- braces - 1
-                    elif byte == 91:
-                        brackets <- brackets + 1
-                    elif byte == 93:
-                        brackets <- brackets - 1
-                elif escaped:
-                    escaped <- false
-                elif byte == 92:
-                    escaped <- true
-                elif byte == 34:
-                    after: mutable usize = index + 1.usize()
-                    while after < dependency_end and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
-                        after <- after + 1.usize()
-                    if braces == 1 and brackets == 0 and after < dependency_end and raw[after] == 58:
-                        alias: mutable darray[u8] = []
-                        for key_index in string_start..<index |alias, raw|:
-                            alias.push(raw[key_index])
-                        return false if not valid_package_name(alias)
-                        object_start: mutable usize = after + 1.usize()
-                        while object_start < dependency_end and (raw[object_start] == 32 or raw[object_start] == 9 or raw[object_start] == 10 or raw[object_start] == 13) |raw, object_start|:
-                            object_start <- object_start + 1.usize()
-                        object_end: usize = Json::object_end(raw, object_start)
-                        return false if object_start >= dependency_end or object_end <= object_start or object_end > dependency_end or raw[object_start] != 123
-                        path_key: mutable darray[u8] = [112, 97, 116, 104]
-                        return false if not object_has_direct_key(raw, object_start, object_end, path_key)
-                        for key_index in 0..<alias.count |out, alias|:
-                            out.push(alias[key_index])
-                        out.push(0)
-                    in_string <- false
-            return true
-
         def select_unique_library_entry(raw: darray[u8]&, package_root: darray[u8]&, out: mutable darray[u8]&, relative_out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out.resize(0)
             relative_out.resize(0)
@@ -3955,19 +3904,11 @@ module Cli:
                 relative_entry: mutable darray[u8] @r = []
                 return false if not select_unique_library_entry(package_manifest, canonical_root, &library_entry, &relative_entry)
                 dependency_names: mutable darray[u8] @r = []
-                return false if not append_local_dependency_names(package_manifest, &dependency_names)
-                package_edges: mutable usize = 0.usize()
-                edge_cursor: mutable usize = 0.usize()
-                while edge_cursor < dependency_names.count:
-                    edge_end: mutable usize = edge_cursor
-                    while edge_end < dependency_names.count and dependency_names[edge_end] != 0 |dependency_names, edge_end|:
-                        edge_end <- edge_end + 1.usize()
-                    return false if edge_end == edge_cursor
-                    package_edges <- package_edges + 1.usize()
-                    return false if package_edges > MAX_DEPENDENCIES
-                    edge_cursor <- edge_end + 1.usize()
-                return false if package_edges > MAX_BUILD_GRAPH_EDGES - total_graph_edges
-                total_graph_edges <- total_graph_edges + package_edges
+                remaining_edges: usize = MAX_BUILD_GRAPH_EDGES - total_graph_edges
+                edge_limit: usize = MAX_DEPENDENCIES if MAX_DEPENDENCIES < remaining_edges else remaining_edges
+                package_edges: i64 = Manifest::local_dependency_names(package_manifest, edge_limit, &dependency_names)
+                return false if package_edges < 0
+                total_graph_edges <- total_graph_edges + package_edges.usize()
                 snapshot_entry: mutable darray[u8] @r = []
                 dependents: mutable darray[usize] @r = []
                 packages.push(LocalBuildGraph::Package{name: package_name, root: canonical_root, entry: library_entry, relative_entry: relative_entry, source_digest: source_digest, snapshot_entry: snapshot_entry, dependency_names: dependency_names, dependents: dependents, remaining_dependencies: 0})
