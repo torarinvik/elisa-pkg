@@ -32,6 +32,7 @@ include "./resolution/solver.elisa"
 include "./registry.elisa"
 include "./text/bytes.elisa"
 include "./cli/arguments.elisa"
+include "./cli/output.elisa"
 include "./project/transaction.elisa"
 
 module Cli:
@@ -64,39 +65,6 @@ module Cli:
             dependents: mutable darray[usize]
             remaining_dependencies: mutable usize
             emitted: mutable bool
-
-        # Output policy is process-local state set once by the CLI parser. Keep
-        # it out of domain records so command APIs remain deterministic values;
-        # only the final human-output sink consults these switches.
-        global mutable cli_quiet: bool = false
-        global mutable cli_json_output: bool = false
-        # ---------- byte and output helpers ---------------------------------------------------
-
-        def write_bytes(fd: i64, value: darray[u8]&) -> void can[Global.Read, Console.Write, Unsafe.PointerCast]:
-            can Global.Read:
-                return if fd == 1 and cli_quiet and not cli_json_output
-                offset: mutable usize = 0.usize()
-                while offset < value.count |value, offset|:
-                    raw: void& = (&value[offset]).cast[void&] can Unsafe.PointerCast
-                    wrote: i64 = Platform::pkg_write(fd, raw, value.count - offset) can Console.Write
-                    return if wrote <= 0 or wrote > (value.count - offset).i64()
-                    offset <- offset + wrote.usize()
-
-        def write_text(fd: i64, value: cstr) -> void can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            can Global.Read:
-                return if fd == 1 and cli_quiet and not cli_json_output
-                buffer: mutable darray[u8] = []
-                ByteText::append_text(&buffer, value)
-                write_bytes(fd, &buffer)
-
-        def write_error(value: cstr) -> void can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            can Global.Read:
-                write_text(2, value)
-
-        def write_ok(value: cstr) -> void can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            can Global.Read:
-                return if cli_quiet and not cli_json_output
-                write_text(1, value)
 
         # ---------- path and file primitives --------------------------------------------------
 
@@ -1191,7 +1159,7 @@ module Cli:
                         ByteText::append_text(&warning, "; run 'elisapkg update ")
                         ByteText::append(&warning, candidate.package)
                         ByteText::append_text(&warning, "' to select a non-yanked release\n")
-                        write_bytes(2, warning)
+                        CliOutput::write_bytes(2, warning)
                     selected_index_generation: u64 = candidate_index_generations[candidate_index]
                     selected_index_digest: mutable darray[u8] = []
                     selected_index_identity: mutable darray[u8] = []
@@ -1674,13 +1642,6 @@ module Cli:
             return false if legacy
             return current
 
-        def usage() -> void can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            can Global.Read:
-                write_ok("elisapkg — Elisa Packaging System\n\nUsage: elisapkg <command> [options]\n\nCommands:\n  init [PATH] [--bin|--lib]    create a package\n  check-manifest              validate elisapkg.json\n  add NAME --path PATH        add a verified local path dependency\n  add NAME --version RANGE --registry primary\n                              add a signed registry dependency\n  remove NAME                 remove a declared dependency\n  update [NAME]               recompute the dependency lock\n  resolve [--locked|--offline]\n                              validate and write elisapkg.lock\n  tree                        show the resolved package graph\n  metadata --json             print normalized package metadata\n  doctor                      report toolchain and trust capabilities\n  build [--bin NAME|--lib NAME|--test NAME]\n                              compile a selected target\n                              --profile debug|release\n  run [--bin NAME] [--profile debug|release] -- ARGS\n                              build and run a binary target\n  test [--test NAME]          build and run a selected test target\n  clean                       remove known local build/package outputs\n  fetch [PACKAGE REQUIREMENT] verify locked sources or a signed local registry artifact\n  cache verify                inspect cached verification records\n  cache gc --dry-run          preview unreachable cache entries\n  package [--list]            create or preview the deterministic archive\n  install --local [--bin NAME] install the selected binary target into the user prefix\n  uninstall --local NAME      remove a receipt-owned local binary\n\nModes: --locked  --offline  --frozen  --json  --verbose  --quiet  --color auto|always|never\n")
-                write_ok("  why NAME                    show the root edge for a locked package\n")
-                write_ok("  publish --dry-run           validate a release without writing or uploading\n")
-                write_ok("remote publish/install/uninstall are trust-gated; use install --local for a receipt-backed local binary\n")
-
         def change_directory(path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             path_c: mutable darray[u8] = []
             ProjectFiles::path_with_nul_into(path, &path_c)
@@ -1727,7 +1688,7 @@ module Cli:
                         target_kind <- "bin"
                         target_kind_seen <- true
                     elif Platform::pkg_cstr_equal(argument, "--help"):
-                        usage()
+                        CliOutput::usage()
                         return EXIT_OK
                     elif Platform::pkg_strlen(argument) == 0.usize() or argument[0].u8() == 45 or path_seen:
                         return EXIT_USAGE
@@ -1769,7 +1730,7 @@ module Cli:
                     # scaffold file fails: removing by pathname could delete a file that
                     # another actor installed after the first publication.
                     return EXIT_SOURCE
-                write_ok("created package\n")
+                CliOutput::write_ok("created package\n")
                 return EXIT_OK
 
         def run_add(argc: i64, slots: mutable cstr&&) -> i64 can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -1805,7 +1766,7 @@ module Cli:
                 return EXIT_USAGE if not validate_manifest_at(raw, &root, &root_name, &root_version)
                 updated: darray[u8] = append_local_dependency(raw, alias, dependency_path) if local_form else append_registry_dependency(raw, alias, requirement)
                 if updated.count == 0.usize():
-                    write_error("error: dependency is already declared or the manifest has no dependency object\n")
+                    CliOutput::write_error("error: dependency is already declared or the manifest has no dependency object\n")
                     return EXIT_RESOLVE
                 return EXIT_SECURITY if not ProjectTransaction::begin(raw)
                 if not ProjectTransaction::stage_manifest(updated) or not ProjectFiles::write_cstr_file("elisapkg.json", &updated):
@@ -1816,24 +1777,24 @@ module Cli:
                 if resolved != EXIT_OK:
                     restored: bool = ProjectTransaction::restore()
                     if not restored:
-                        write_error("error: dependency edit failed and the original manifest could not be restored\n")
+                        CliOutput::write_error("error: dependency edit failed and the original manifest could not be restored\n")
                         return EXIT_SECURITY
                     return resolved
                 if not ProjectTransaction::mark_lock():
                     _ = ProjectTransaction::restore()
                     return EXIT_SECURITY
                 return EXIT_SECURITY if not ProjectTransaction::commit()
-                write_ok("added ")
-                write_ok("local " if local_form else "registry ")
-                write_ok("dependency ")
-                write_bytes(1, &alias)
+                CliOutput::write_ok("added ")
+                CliOutput::write_ok("local " if local_form else "registry ")
+                CliOutput::write_ok("dependency ")
+                CliOutput::write_bytes(1, &alias)
                 if local_form:
-                    write_ok(" from ")
-                    write_bytes(1, &dependency_path)
+                    CliOutput::write_ok(" from ")
+                    CliOutput::write_bytes(1, &dependency_path)
                 else:
-                    write_ok(" with requirement ")
-                    write_bytes(1, &requirement)
-                write_ok("\n")
+                    CliOutput::write_ok(" with requirement ")
+                    CliOutput::write_bytes(1, &requirement)
+                CliOutput::write_ok("\n")
                 return EXIT_OK
 
         def load_package(start: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -1855,14 +1816,14 @@ module Cli:
         def run_check(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
                 if not load_package(start):
-                    write_error("error: invalid or missing elisapkg.json (schema-version, package.name, package.version, and targets are required)\n")
+                    CliOutput::write_error("error: invalid or missing elisapkg.json (schema-version, package.name, package.version, and targets are required)\n")
                     return EXIT_USAGE
                 if options.json:
-                    write_ok("{\"schema-version\":1,\"valid\":true,\"manifest\":\"elisapkg.json\"}\n")
+                    CliOutput::write_ok("{\"schema-version\":1,\"valid\":true,\"manifest\":\"elisapkg.json\"}\n")
                     return EXIT_OK
-                write_ok("manifest valid: ")
-                write_ok("elisapkg.json")
-                write_ok("\n")
+                CliOutput::write_ok("manifest valid: ")
+                CliOutput::write_ok("elisapkg.json")
+                CliOutput::write_ok("\n")
                 return EXIT_OK
 
         def print_lock_packages(raw: darray[u8]&) -> bool can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic]:
@@ -1875,17 +1836,17 @@ module Cli:
                     package_name: mutable darray[u8] = []
                     package_version: mutable darray[u8] = []
                     if Json::object_string_value(raw, index, object_end, "name", &package_name) and Json::object_string_value(raw, index, object_end, "version", &package_version):
-                        write_bytes(1, &package_name)
-                        write_ok(" ")
-                        write_bytes(1, &package_version)
-                        write_ok("\n")
+                        CliOutput::write_bytes(1, &package_name)
+                        CliOutput::write_ok(" ")
+                        CliOutput::write_bytes(1, &package_version)
+                        CliOutput::write_ok("\n")
                         found <- found + 1.usize()
                 return found > 0.usize()
 
         def print_lock_packages_json(raw: darray[u8]&) -> bool can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic]:
             can Global.Read:
                 found: mutable usize = 0.usize()
-                write_ok("{\"schema-version\":1,\"packages\":[")
+                CliOutput::write_ok("{\"schema-version\":1,\"packages\":[")
                 for index in 0..<raw.count |raw, found|:
                     continue if raw[index] != 123
                     object_end: usize = Json::object_end(raw, index)
@@ -1893,31 +1854,31 @@ module Cli:
                     package_name: mutable darray[u8] = []
                     package_version: mutable darray[u8] = []
                     if Json::object_string_value(raw, index, object_end, "name", &package_name) and Json::object_string_value(raw, index, object_end, "version", &package_version):
-                        write_ok(",") if found > 0.usize()
-                        write_ok("{\"name\":\"")
-                        write_bytes(1, &package_name)
-                        write_ok("\",\"version\":\"")
-                        write_bytes(1, &package_version)
-                        write_ok("\"}")
+                        CliOutput::write_ok(",") if found > 0.usize()
+                        CliOutput::write_ok("{\"name\":\"")
+                        CliOutput::write_bytes(1, &package_name)
+                        CliOutput::write_ok("\",\"version\":\"")
+                        CliOutput::write_bytes(1, &package_version)
+                        CliOutput::write_ok("\"}")
                         found <- found + 1.usize()
                 return false if found == 0.usize()
-                write_ok("]}\n")
+                CliOutput::write_ok("]}\n")
                 return true
 
         def write_resolved_text(name: cstr, version: cstr, options: Model::CommandOptions) -> void can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
                 if options.json:
-                    write_ok("{\"schema-version\":1,\"resolved\":true,\"package\":{\"name\":\"")
-                    write_text(1, name)
-                    write_ok("\",\"version\":\"")
-                    write_text(1, version)
-                    write_ok("\"}}\n")
+                    CliOutput::write_ok("{\"schema-version\":1,\"resolved\":true,\"package\":{\"name\":\"")
+                    CliOutput::write_text(1, name)
+                    CliOutput::write_ok("\",\"version\":\"")
+                    CliOutput::write_text(1, version)
+                    CliOutput::write_ok("\"}}\n")
                     return
-                write_ok("resolved ")
-                write_text(1, name)
-                write_ok(" ")
-                write_text(1, version)
-                write_ok("\n")
+                CliOutput::write_ok("resolved ")
+                CliOutput::write_text(1, name)
+                CliOutput::write_ok(" ")
+                CliOutput::write_text(1, version)
+                CliOutput::write_ok("\n")
 
         def registry_conflict_field(raw: darray[u8]&, wanted: usize, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
             out.resize(0)
@@ -1943,13 +1904,13 @@ module Cli:
                 second_requirement: mutable darray[u8] = []
                 return if not registry_conflict_field(raw, 0, &package) or not registry_conflict_field(raw, 1, &first_requirement) or not registry_conflict_field(raw, 2, &second_requirement)
                 return if package.count == 0.usize() or first_requirement.count == 0.usize() or second_requirement.count == 0.usize()
-                write_error(" (package ")
-                write_bytes(2, &package)
-                write_error("; requirements ")
-                write_bytes(2, &first_requirement)
-                write_error(" and ")
-                write_bytes(2, &second_requirement)
-                write_error(")")
+                CliOutput::write_error(" (package ")
+                CliOutput::write_bytes(2, &package)
+                CliOutput::write_error("; requirements ")
+                CliOutput::write_bytes(2, &first_requirement)
+                CliOutput::write_error(" and ")
+                CliOutput::write_bytes(2, &second_requirement)
+                CliOutput::write_error(")")
 
         def lock_contains_package(raw: darray[u8]&, wanted: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
             for index in 0..<raw.count |raw, wanted|:
@@ -2094,22 +2055,22 @@ module Cli:
                 return EXIT_RESOLVE if not find_dependency_span(raw, wanted, &dependency_start, &dependency_end)
                 return EXIT_RESOLVE if not lock_contains_package(lock, wanted)
                 if options.json:
-                    write_ok("{\"schema-version\":1,\"root\":\"")
-                    write_bytes(1, &root_name)
-                    write_ok("\",\"package\":\"")
-                    write_bytes(1, &wanted)
-                    write_ok("\"}\n")
+                    CliOutput::write_ok("{\"schema-version\":1,\"root\":\"")
+                    CliOutput::write_bytes(1, &root_name)
+                    CliOutput::write_ok("\",\"package\":\"")
+                    CliOutput::write_bytes(1, &wanted)
+                    CliOutput::write_ok("\"}\n")
                     return EXIT_OK
-                write_bytes(1, &root_name)
-                write_ok(" -> ")
-                write_bytes(1, &wanted)
-                write_ok("\n")
+                CliOutput::write_bytes(1, &root_name)
+                CliOutput::write_ok(" -> ")
+                CliOutput::write_bytes(1, &wanted)
+                CliOutput::write_ok("\n")
                 return EXIT_OK
 
         def run_resolve(start: darray[u8]&, options: Model::CommandOptions, transaction_owned: bool, emit_result: bool) -> i64 can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global{Read,Write}:
                 if not project_manifest_exists():
-                    write_error("error: could not find elisapkg.json in the current directory\n")
+                    CliOutput::write_error("error: could not find elisapkg.json in the current directory\n")
                     return EXIT_USAGE
                 raw: mutable darray[u8] = []
                 # Read up to the manifest policy limit. A smaller buffer would silently
@@ -2148,7 +2109,7 @@ module Cli:
                     # An existing lock that cannot be opened is not equivalent to an
                     # absent lock. Refusing to replace it preserves the operator's ability
                     # to investigate permissions, corruption, or a hostile filesystem.
-                    write_error("error: existing elisapkg.lock is unreadable; refusing to replace it\n")
+                    CliOutput::write_error("error: existing elisapkg.lock is unreadable; refusing to replace it\n")
                     return EXIT_RESOLVE
                 # Locked and frozen resolution is a read-only contract. Require the lock
                 # before consulting any provider so a missing lock cannot trigger metadata
@@ -2209,16 +2170,16 @@ module Cli:
                     code <- Registry::ResultCode.ExpiryHorizon if lock[0] == 20
                     code <- Registry::ResultCode.TrustRootChanged if lock[0] == 21
                     code <- Registry::ResultCode.TufEquivocationDetected if lock[0] == 22
-                    write_error("error: ")
-                    write_error(Registry::result_message(code))
+                    CliOutput::write_error("error: ")
+                    CliOutput::write_error(Registry::result_message(code))
                     if code == Registry::ResultCode.Unsatisfiable:
                         write_registry_conflict(lock)
-                        write_error("\n")
+                        CliOutput::write_error("\n")
                         return EXIT_RESOLVE
                     if code == Registry::ResultCode.TrustStateUnavailable or code == Registry::ResultCode.TrustStateMalformed or code == Registry::ResultCode.ClockRollback:
-                        write_error(" while recording registry trust state\n")
+                        CliOutput::write_error(" while recording registry trust state\n")
                     else:
-                        write_error("\n")
+                        CliOutput::write_error("\n")
                     return EXIT_SECURITY
 
                 return EXIT_RESOLVE if lock.count == 0.usize()
@@ -2231,7 +2192,7 @@ module Cli:
                 if not (options.locked or options.frozen):
                     if not transaction_owned:
                         if not ProjectTransaction::begin_with_lock(raw, lock_state, preferred_lock):
-                            write_error("error: could not claim the package transaction; another edit may be active or the manifest or lockfile may have changed\n")
+                            CliOutput::write_error("error: could not claim the package transaction; another edit may be active or the manifest or lockfile may have changed\n")
                             return EXIT_SECURITY
                     # Record the exact replacement before publishing it. Recovery
                     # can then distinguish our new lock from an unrelated edit if
@@ -2255,7 +2216,7 @@ module Cli:
         def run_tree(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
                 if not project_manifest_exists():
-                    write_error("error: could not find elisapkg.json in the current directory\n")
+                    CliOutput::write_error("error: could not find elisapkg.json in the current directory\n")
                     return EXIT_RESOLVE
                 raw: mutable darray[u8] = []
                 raw.resize(1048577)
@@ -2277,7 +2238,7 @@ module Cli:
         def run_metadata(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
                 if not project_manifest_exists():
-                    write_error("error: could not find elisapkg.json in the current directory\n")
+                    CliOutput::write_error("error: could not find elisapkg.json in the current directory\n")
                     return EXIT_USAGE
                 raw: mutable darray[u8] = []
                 raw.resize(1048577)
@@ -2286,26 +2247,26 @@ module Cli:
                 version: mutable darray[u8] = []
                 return EXIT_USAGE if not validate_manifest(raw, &name, &version)
                 return EXIT_USAGE if not options.json
-                write_ok("{\"schema-version\":1,\"package\":{\"name\":\"")
-                write_bytes(1, &name)
-                write_ok("\",\"version\":\"")
-                write_bytes(1, &version)
-                write_ok("\"}}\n")
+                CliOutput::write_ok("{\"schema-version\":1,\"package\":{\"name\":\"")
+                CliOutput::write_bytes(1, &name)
+                CliOutput::write_ok("\",\"version\":\"")
+                CliOutput::write_bytes(1, &version)
+                CliOutput::write_ok("\"}}\n")
                 return EXIT_OK
 
         def run_doctor() -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
-                write_ok("elisapkg doctor\n")
-                write_ok("manifest: JSON schema v1\n")
-                write_ok("resolver: deterministic local v1\n")
-                write_ok("source integrity: local file verification\n")
-                write_ok("metadata signatures: Ed25519 verification requires a fixed trusted local OpenSSL candidate; checked during verification; network transport disabled\n")
+                CliOutput::write_ok("elisapkg doctor\n")
+                CliOutput::write_ok("manifest: JSON schema v1\n")
+                CliOutput::write_ok("resolver: deterministic local v1\n")
+                CliOutput::write_ok("source integrity: local file verification\n")
+                CliOutput::write_ok("metadata signatures: Ed25519 verification requires a fixed trusted local OpenSSL candidate; checked during verification; network transport disabled\n")
                 if Sandbox::build_sandbox_available():
-                    write_ok("build sandbox: sandbox-exec is present; compiler builds apply a deny-default profile and fail closed if it is rejected\n")
+                    CliOutput::write_ok("build sandbox: sandbox-exec is present; compiler builds apply a deny-default profile and fail closed if it is rejected\n")
                 else:
-                    write_ok("build sandbox: sandbox-exec is unavailable; builds fail closed on this platform\n")
-                write_ok("child environment: scrubbed; only compiler bootstrap variables are retained\n")
-                write_ok("compiler: set ELISAPKG_COMPILER to an audited compiler adapter\n")
+                    CliOutput::write_ok("build sandbox: sandbox-exec is unavailable; builds fail closed on this platform\n")
+                CliOutput::write_ok("child environment: scrubbed; only compiler bootstrap variables are retained\n")
+                CliOutput::write_ok("compiler: set ELISAPKG_COMPILER to an audited compiler adapter\n")
                 return EXIT_OK
 
         def run_test(argc: i64, slots: mutable cstr&&, start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -2515,7 +2476,7 @@ module Cli:
                 return EXIT_RESOLVE if not registry_lock_record_starts(lock, packages_start, packages_end, &starts)
                 closure_status: i64 = registry_offline_graph_closure(manifest, lock, starts)
                 if closure_status != EXIT_OK:
-                    write_error("error: offline registry lock does not match its signed dependency graph\n") if closure_status == EXIT_RESOLVE
+                    CliOutput::write_error("error: offline registry lock does not match its signed dependency graph\n") if closure_status == EXIT_RESOLVE
                     return closure_status
                 cursor: mutable usize = packages_start + 1.usize()
                 fetched: mutable usize = 0.usize()
@@ -2574,19 +2535,19 @@ module Cli:
                     # archive validation so rejected cache data cannot update it.
                     trust_status: Registry::ResultCode = Registry::verify_trusted(package, version_text, digest, metadata_digest, metadata_expires)
                     if trust_status != Registry::ResultCode.Ok:
-                        write_error("error: ")
-                        write_error(Registry::result_message(trust_status))
-                        write_error(" while using cached ")
-                        write_bytes(2, &package)
-                        write_error("\n")
+                        CliOutput::write_error("error: ")
+                        CliOutput::write_error(Registry::result_message(trust_status))
+                        CliOutput::write_error(" while using cached ")
+                        CliOutput::write_bytes(2, &package)
+                        CliOutput::write_error("\n")
                         return EXIT_SECURITY
-                    write_ok("verified cached registry artifact ")
-                    write_bytes(1, &package)
-                    write_ok(" ")
-                    write_bytes(1, &version_text)
-                    write_ok(" sha256:")
-                    write_bytes(1, &digest)
-                    write_ok(" (offline)\n")
+                    CliOutput::write_ok("verified cached registry artifact ")
+                    CliOutput::write_bytes(1, &package)
+                    CliOutput::write_ok(" ")
+                    CliOutput::write_bytes(1, &version_text)
+                    CliOutput::write_ok(" sha256:")
+                    CliOutput::write_bytes(1, &digest)
+                    CliOutput::write_ok(" (offline)\n")
                     fetched <- fetched + 1.usize()
                     return EXIT_RESOLVE if fetched > 4096.usize()
                     cursor <- record_end + 1.usize()
@@ -2674,29 +2635,29 @@ module Cli:
                     selected_index_identity: mutable darray[u8] = []
                     registry_status: Registry::ResultCode = Registry::resolve_with_index_evidence(package, exact, Model::Version{major:0,minor:0,patch:0,prerelease:false}, &selected, &resolved_archive, &resolved_digest, &resolved_size, &metadata, &selected_index_generation, &selected_index_digest, &selected_index_identity)
                     if registry_status != Registry::ResultCode.Ok:
-                        write_error("error: ")
-                        write_error(Registry::result_message(registry_status))
-                        write_error(" while verifying locked ")
-                        write_bytes(2, &package)
-                        write_error("\n")
+                        CliOutput::write_error("error: ")
+                        CliOutput::write_error(Registry::result_message(registry_status))
+                        CliOutput::write_error(" while verifying locked ")
+                        CliOutput::write_bytes(2, &package)
+                        CliOutput::write_error("\n")
                         return EXIT_SECURITY if registry_security_status(registry_status)
                         return EXIT_SOURCE
                     if not ByteText::equal(selected, version_text):
-                        write_error("error: locked registry version does not match signed metadata\n")
+                        CliOutput::write_error("error: locked registry version does not match signed metadata\n")
                         return EXIT_SECURITY
                     if not ByteText::equal(resolved_archive, archive):
-                        write_error("error: locked registry archive name does not match signed metadata\n")
+                        CliOutput::write_error("error: locked registry archive name does not match signed metadata\n")
                         return EXIT_SECURITY
                     if not ByteText::equal(resolved_digest, digest):
-                        write_error("error: locked registry archive digest does not match signed metadata\n")
+                        CliOutput::write_error("error: locked registry archive digest does not match signed metadata\n")
                         return EXIT_SECURITY
                     if resolved_size != archive_size:
-                        write_error("error: locked registry archive size does not match signed metadata\n")
+                        CliOutput::write_error("error: locked registry archive size does not match signed metadata\n")
                         return EXIT_SECURITY
                     metadata_digest_bytes: mutable darray[u8] = []
                     computed_metadata_digest: mutable darray[u8] = []
                     if Integrity::sha256(metadata, &metadata_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(metadata_digest_bytes, &computed_metadata_digest) or not ByteText::equal(computed_metadata_digest, metadata_digest):
-                        write_error("error: locked metadata digest does not match signed metadata\n")
+                        CliOutput::write_error("error: locked metadata digest does not match signed metadata\n")
                         return EXIT_SECURITY
                     metadata_expires: mutable u64 = 0
                     return EXIT_SECURITY if not Json::object_unsigned_value(metadata, 0, Json::object_end(metadata, 0), "expires", &metadata_expires)
@@ -2713,30 +2674,30 @@ module Cli:
                     archive_bytes: mutable darray[u8] = []
                     archive_status: Registry::ResultCode = Registry::read_archive(package, version_text, metadata, archive, digest, archive_size, &archive_bytes)
                     if archive_status != Registry::ResultCode.Ok:
-                        write_error("error: ")
-                        write_error(Registry::result_message(archive_status))
-                        write_error(" for locked ")
-                        write_bytes(2, &package)
-                        write_error("\n")
+                        CliOutput::write_error("error: ")
+                        CliOutput::write_error(Registry::result_message(archive_status))
+                        CliOutput::write_error(" for locked ")
+                        CliOutput::write_bytes(2, &package)
+                        CliOutput::write_error("\n")
                         return EXIT_SECURITY if registry_security_status(archive_status)
                         return EXIT_SOURCE
                     trust_status: Registry::ResultCode = Registry::record_trusted_at_index(package, version_text, digest, metadata_digest, snapshot_expires, selected_index_generation, selected_index_digest, selected_index_identity)
                     if trust_status != Registry::ResultCode.Ok:
-                        write_error("error: ")
-                        write_error(Registry::result_message(trust_status))
-                        write_error(" while recording locked ")
-                        write_bytes(2, &package)
-                        write_error("\n")
+                        CliOutput::write_error("error: ")
+                        CliOutput::write_error(Registry::result_message(trust_status))
+                        CliOutput::write_error(" while recording locked ")
+                        CliOutput::write_bytes(2, &package)
+                        CliOutput::write_error("\n")
                         return EXIT_SECURITY
                     return EXIT_SOURCE if not cache_store_verified_blob(digest, archive_bytes)
                     return EXIT_SECURITY if not registry_cache_store_receipt(package, version_text, archive, archive_size, digest, metadata_digest, metadata_expires)
-                    write_ok("verified locked registry artifact ")
-                    write_bytes(1, &package)
-                    write_ok(" ")
-                    write_bytes(1, &version_text)
-                    write_ok(" sha256:")
-                    write_bytes(1, &digest)
-                    write_ok(" (cached)\n")
+                    CliOutput::write_ok("verified locked registry artifact ")
+                    CliOutput::write_bytes(1, &package)
+                    CliOutput::write_ok(" ")
+                    CliOutput::write_bytes(1, &version_text)
+                    CliOutput::write_ok(" sha256:")
+                    CliOutput::write_bytes(1, &digest)
+                    CliOutput::write_ok(" (cached)\n")
                     fetched <- fetched + 1.usize()
                     return EXIT_RESOLVE if fetched > 4096.usize()
                     cursor <- record_end + 1.usize()
@@ -2760,27 +2721,27 @@ module Cli:
                         return EXIT_USAGE if index < argc
                         break
                     if Platform::pkg_strlen(argument) == 0.usize():
-                        write_error("error: fetch does not accept empty arguments\n")
+                        CliOutput::write_error("error: fetch does not accept empty arguments\n")
                         return EXIT_USAGE
                     if argument[0].u8() == 45:
-                        write_error("error: fetch does not accept command-specific options\n")
+                        CliOutput::write_error("error: fetch does not accept command-specific options\n")
                         return EXIT_USAGE
                     if positional_count == 0:
                         ByteText::append_bounded_text(&package, argument)
                     elif positional_count == 1:
                         ByteText::append_bounded_text(&requirement, argument)
                     else:
-                        write_error("error: fetch accepts at most PACKAGE REQUIREMENT\n")
+                        CliOutput::write_error("error: fetch accepts at most PACKAGE REQUIREMENT\n")
                         return EXIT_USAGE
                     positional_count <- positional_count + 1
                     index <- index + 1
                 if positional_count > 0:
                     return EXIT_USAGE if positional_count != 2
                     if options.offline or options.frozen:
-                        write_error("error: offline fetch requires an existing lockfile; package-specific registry fetch is unavailable\n")
+                        CliOutput::write_error("error: offline fetch requires an existing lockfile; package-specific registry fetch is unavailable\n")
                         return EXIT_RESOLVE
                     if requirement.count == 0:
-                        write_error("error: fetch PACKAGE requires an exact SemVer requirement\n")
+                        CliOutput::write_error("error: fetch PACKAGE requires an exact SemVer requirement\n")
                         return EXIT_USAGE
                     exact_version: mutable Model::Version = Model::Version{major: 0,minor: 0,patch: 0,prerelease: false}
                     return EXIT_USAGE if not SemVer::parse(requirement, &exact_version) or exact_version.prerelease
@@ -2795,9 +2756,9 @@ module Cli:
                     selected_index_identity: mutable darray[u8] = []
                     registry_status: Registry::ResultCode = Registry::resolve_with_index_evidence(package, requirement, previous_version, &selected, &archive, &digest, &archive_size, &metadata, &selected_index_generation, &selected_index_digest, &selected_index_identity)
                     if registry_status != Registry::ResultCode.Ok:
-                        write_error("error: ")
-                        write_error(Registry::result_message(registry_status))
-                        write_error("\n")
+                        CliOutput::write_error("error: ")
+                        CliOutput::write_error(Registry::result_message(registry_status))
+                        CliOutput::write_error("\n")
                         return EXIT_SECURITY if registry_security_status(registry_status)
                         return EXIT_RESOLVE
                     metadata_digest_bytes: mutable darray[u8] = []
@@ -2818,34 +2779,34 @@ module Cli:
                     archive_bytes: mutable darray[u8] = []
                     archive_status: Registry::ResultCode = Registry::read_archive(package, selected, metadata, archive, digest, archive_size, &archive_bytes)
                     if archive_status != Registry::ResultCode.Ok:
-                        write_error("error: ")
-                        write_error(Registry::result_message(archive_status))
-                        write_error("\n")
+                        CliOutput::write_error("error: ")
+                        CliOutput::write_error(Registry::result_message(archive_status))
+                        CliOutput::write_error("\n")
                         return EXIT_SECURITY if registry_security_status(archive_status)
                         return EXIT_SOURCE
                     trust_status: Registry::ResultCode = Registry::record_trusted_at_index(package, selected, digest, metadata_digest, snapshot_expires, selected_index_generation, selected_index_digest, selected_index_identity)
                     if trust_status != Registry::ResultCode.Ok:
-                        write_error("error: ")
-                        write_error(Registry::result_message(trust_status))
-                        write_error(" while recording ")
-                        write_bytes(2, &package)
-                        write_error("\n")
+                        CliOutput::write_error("error: ")
+                        CliOutput::write_error(Registry::result_message(trust_status))
+                        CliOutput::write_error(" while recording ")
+                        CliOutput::write_bytes(2, &package)
+                        CliOutput::write_error("\n")
                         return EXIT_SECURITY
                     return EXIT_SOURCE if not cache_store_verified_blob(digest, archive_bytes)
                     return EXIT_SECURITY if not registry_cache_store_receipt(package, selected, archive, archive_size, digest, metadata_digest, metadata_expires)
-                    write_ok("verified registry artifact ")
-                    write_bytes(1, &package)
-                    write_ok(" ")
-                    write_bytes(1, &selected)
-                    write_ok(" sha256:")
-                    write_bytes(1, &digest)
-                    write_ok(" (cached)\n")
+                    CliOutput::write_ok("verified registry artifact ")
+                    CliOutput::write_bytes(1, &package)
+                    CliOutput::write_ok(" ")
+                    CliOutput::write_bytes(1, &selected)
+                    CliOutput::write_ok(" sha256:")
+                    CliOutput::write_bytes(1, &digest)
+                    CliOutput::write_ok(" (cached)\n")
                     _ = start
                     _ = options
                     return EXIT_OK
                 _ = options
                 if not project_manifest_exists():
-                    write_error("error: could not find elisapkg.json in the current directory\n")
+                    CliOutput::write_error("error: could not find elisapkg.json in the current directory\n")
                     return EXIT_USAGE
                 raw: mutable darray[u8] = []
                 raw.resize(1048577)
@@ -2860,7 +2821,7 @@ module Cli:
                     return fetch_registry_lock_offline(raw, lock, name, version, start) if options.offline or options.frozen else fetch_registry_lock(raw, lock, name, version, start)
                 expected: darray[u8] = canonical_lock_for_manifest(name, version, raw, start)
                 return EXIT_RESOLVE if expected.count == 0.usize() or not ByteText::equal(expected, lock)
-                write_ok("verified local locked sources\n")
+                CliOutput::write_ok("verified local locked sources\n")
                 return EXIT_OK
 
         def run_publish_dry_run(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -2869,7 +2830,7 @@ module Cli:
                 # or contacting a registry. Publication itself remains trust-gated,
                 # but callers still need a useful preflight command.
                 if not project_manifest_exists():
-                    write_error("error: could not find elisapkg.json in the current directory\n")
+                    CliOutput::write_error("error: could not find elisapkg.json in the current directory\n")
                     return EXIT_USAGE
                 raw: mutable darray[u8] = []
                 raw.resize(1048577)
@@ -2907,21 +2868,21 @@ module Cli:
                 if options.json:
                     size_text: mutable darray[u8] = []
                     registry_append_decimal(&size_text, archive.count.u64())
-                    write_ok("{\"schema-version\":1,\"command\":\"publish\",\"dry-run\":true,\"valid\":true,\"source-tree-digest\":\"sha256:")
-                    write_bytes(1, &source_digest)
-                    write_ok("\",\"archive-size\":")
-                    write_bytes(1, &size_text)
-                    write_ok(",\"archive-digest\":\"sha256:")
-                    write_bytes(1, &archive_digest)
-                    write_ok("\"}\n")
+                    CliOutput::write_ok("{\"schema-version\":1,\"command\":\"publish\",\"dry-run\":true,\"valid\":true,\"source-tree-digest\":\"sha256:")
+                    CliOutput::write_bytes(1, &source_digest)
+                    CliOutput::write_ok("\",\"archive-size\":")
+                    CliOutput::write_bytes(1, &size_text)
+                    CliOutput::write_ok(",\"archive-digest\":\"sha256:")
+                    CliOutput::write_bytes(1, &archive_digest)
+                    CliOutput::write_ok("\"}\n")
                     return EXIT_OK
-                write_ok("publish dry-run: manifest, lockfile, source tree, and package file selection are valid\n")
-                write_error("note: signing and authenticated publication are still required\n")
+                CliOutput::write_ok("publish dry-run: manifest, lockfile, source tree, and package file selection are valid\n")
+                CliOutput::write_error("note: signing and authenticated publication are still required\n")
                 return EXIT_OK
 
         def run_publish() -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
-                write_error(Security::publish_message())
+                CliOutput::write_error(Security::publish_message())
                 return Security::publish_status()
 
         def release_install_lock(lock_fd: i64) -> bool:
@@ -3098,9 +3059,9 @@ module Cli:
         def finish_local_install_error(lock_fd: i64, message: cstr) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
                 if Platform::pkg_strlen(message) > 0.usize():
-                    write_error(message)
+                    CliOutput::write_error(message)
                 if not release_install_lock(lock_fd):
-                    write_error("error: could not close the local installation lock descriptor\n")
+                    CliOutput::write_error("error: could not close the local installation lock descriptor\n")
                 return 7
 
         def run_install_local(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -3108,7 +3069,7 @@ module Cli:
                 prefix: mutable darray[u8] = []
                 return EXIT_USAGE if not InstallPrefix::read_configured(&prefix)
                 if not InstallPrefix::trusted_existing_ancestor(prefix):
-                    write_error("error: install prefix directories must be owned by root or the current user, without group or other write permission\n")
+                    CliOutput::write_error("error: install prefix directories must be owned by root or the current user, without group or other write permission\n")
                     return 7
                 root: mutable darray[u8] = [46]
                 resolved: i64 = run_resolve(&root, options, false, false)
@@ -3121,13 +3082,13 @@ module Cli:
                 target_entry: mutable darray[u8] = []
                 return EXIT_BUILD if not ManifestTargets::select_target(manifest_raw, options.target_name, options.target_kind, &target_name, &target_kind, &target_entry)
                 if not ByteText::equal_text(target_kind, "bin"):
-                    write_error("error: install --local requires a binary target\n")
+                    CliOutput::write_error("error: install --local requires a binary target\n")
                     return 7
                 name: mutable darray[u8] = []
                 version: mutable darray[u8] = []
                 return EXIT_USAGE if not load_package_at(&root, &name, &version)
                 if version.count > MAX_INSTALL_VERSION_BYTES:
-                    write_error("error: local install package versions exceed the bounded receipt limit\n")
+                    CliOutput::write_error("error: local install package versions exceed the bounded receipt limit\n")
                     return EXIT_USAGE
                 use_prebuilt_artifact: bool = InstallFaults::use_test_prebuilt_artifact()
                 expected_build_digest: mutable darray[u8] = []
@@ -3145,7 +3106,7 @@ module Cli:
                 digest: mutable darray[u8] = []
                 return 7 if Integrity::sha256(artifact_bytes, &digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(digest_bytes, &digest)
                 if not use_prebuilt_artifact and (expected_build_digest.count != 64.usize() or not ByteText::equal(digest, expected_build_digest)):
-                    write_error("error: build output changed after compilation; refusing to install an unverified artifact\n")
+                    CliOutput::write_error("error: build output changed after compilation; refusing to install an unverified artifact\n")
                     return EXIT_BUILD
                 bin_dir: mutable darray[u8] = []
                 receipt_dir: mutable darray[u8] = []
@@ -3153,7 +3114,7 @@ module Cli:
                 path_join_into(prefix, "share/elisapkg/receipts", &receipt_dir)
                 return 7 if not InstallPrefix::ensure_trusted_directory(bin_dir) or not InstallPrefix::ensure_trusted_directory(receipt_dir)
                 if not InstallPrefix::trusted_directory(bin_dir) or not InstallPrefix::trusted_directory(receipt_dir):
-                    write_error("error: install directories are not trusted; refusing publication\n")
+                    CliOutput::write_error("error: install directories are not trusted; refusing publication\n")
                     return 7
                 name_c: mutable darray[u8] = []
                 ProjectFiles::path_with_nul_into(&name, &name_c)
@@ -3171,7 +3132,7 @@ module Cli:
                 prefix_name: cstr = (&prefix_c[0]).cast[cstr] can Unsafe.PointerCast
                 lock_fd: i64 = Platform::pkg_acquire_install_lock(prefix_name)
                 if lock_fd < 0:
-                    write_error("error: could not acquire the local installation lock; check the prefix and any legacy lock path\n")
+                    CliOutput::write_error("error: could not acquire the local installation lock; check the prefix and any legacy lock path\n")
                     return 7
                 recovered_operation: mutable darray[u8] = []
                 recovered_name: mutable darray[u8] = []
@@ -3184,11 +3145,11 @@ module Cli:
                 ByteText::append(&destination, destination_snapshot)
                 if recovered_install_published and ByteText::equal_text(recovered_operation, "install") and ByteText::equal(recovered_name, name) and ByteText::equal(recovered_version, version) and ByteText::equal(recovered_digest, digest):
                     return finish_local_install_error(lock_fd, "error: could not close the recovered local installation lock descriptor\n") if not release_install_lock(lock_fd)
-                    write_ok("already installed ")
-                    write_bytes(1, &name)
-                    write_ok(" to ")
-                    write_bytes(1, &destination)
-                    write_ok("\n")
+                    CliOutput::write_ok("already installed ")
+                    CliOutput::write_bytes(1, &name)
+                    CliOutput::write_ok(" to ")
+                    CliOutput::write_bytes(1, &destination)
+                    CliOutput::write_ok("\n")
                     return EXIT_OK
                 if file_exists(&destination):
                     return finish_local_install_error(lock_fd, "error: install destination or receipt already exists; refusing to overwrite\n")
@@ -3237,11 +3198,11 @@ module Cli:
                 InstallFaults::transaction_boundary("install.targets.synced")
                 return finish_local_install_error(lock_fd, "error: the local installation was published but its transaction journal could not be retired\n") if not retire_local_install_transaction(transaction_path)
                 return 7 if not release_install_lock(lock_fd)
-                write_ok("installed ")
-                write_bytes(1, &name)
-                write_ok(" to ")
-                write_bytes(1, &destination)
-                write_ok("\n")
+                CliOutput::write_ok("installed ")
+                CliOutput::write_bytes(1, &name)
+                CliOutput::write_ok(" to ")
+                CliOutput::write_bytes(1, &destination)
+                CliOutput::write_ok("\n")
                 return EXIT_OK
 
         def run_install(argc: i64, slots: mutable cstr&&, start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -3269,7 +3230,7 @@ module Cli:
                 return EXIT_USAGE if not local_seen and not package_seen
                 if local_seen:
                     return run_install_local(start, options)
-                write_error(Security::install_message())
+                CliOutput::write_error(Security::install_message())
                 return Security::install_status()
 
         def run_uninstall_local(name_raw_input: cstr) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -3283,7 +3244,7 @@ module Cli:
                 path_join_into(prefix, "bin", &bin_dir)
                 path_join_into(prefix, "share/elisapkg/receipts", &receipt_dir)
                 if not InstallPrefix::trusted_directory(bin_dir) or not InstallPrefix::trusted_directory(receipt_dir):
-                    write_error("error: install directories are not trusted; refusing removal\n")
+                    CliOutput::write_error("error: install directories are not trusted; refusing removal\n")
                     return 7
                 name_c: mutable darray[u8] = []
                 ProjectFiles::path_with_nul_into(&name, &name_c)
@@ -3301,7 +3262,7 @@ module Cli:
                 prefix_name: cstr = (&prefix_c[0]).cast[cstr] can Unsafe.PointerCast
                 lock_fd: i64 = Platform::pkg_acquire_install_lock(prefix_name)
                 if lock_fd < 0:
-                    write_error("error: could not acquire the local installation lock; check the prefix and any legacy lock path\n")
+                    CliOutput::write_error("error: could not acquire the local installation lock; check the prefix and any legacy lock path\n")
                     return 7
                 recovered_operation: mutable darray[u8] = []
                 recovered_name: mutable darray[u8] = []
@@ -3312,9 +3273,9 @@ module Cli:
                     return finish_local_install_error(lock_fd, "error: an interrupted local installation could not be safely recovered; preserve the journal and files for review\n")
                 if ByteText::equal_text(recovered_operation, "uninstall") and ByteText::equal(recovered_name, name):
                     return finish_local_install_error(lock_fd, "error: could not close the recovered local installation lock\n") if not release_install_lock(lock_fd)
-                    write_ok("uninstalled ")
-                    write_bytes(1, &name)
-                    write_ok("\n")
+                    CliOutput::write_ok("uninstalled ")
+                    CliOutput::write_bytes(1, &name)
+                    CliOutput::write_ok("\n")
                     return EXIT_OK
                 destination.resize(0)
                 ByteText::append(&destination, destination_snapshot)
@@ -3399,9 +3360,9 @@ module Cli:
                 if not retire_local_install_transaction(transaction_path):
                     return finish_local_install_error(lock_fd, "error: the local installation was removed but its transaction journal could not be retired\n")
                 return 7 if not release_install_lock(lock_fd)
-                write_ok("uninstalled ")
-                write_bytes(1, &name)
-                write_ok("\n")
+                CliOutput::write_ok("uninstalled ")
+                CliOutput::write_bytes(1, &name)
+                CliOutput::write_ok("\n")
                 return EXIT_OK
 
         def run_uninstall(argc: i64, slots: mutable cstr&&) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -3415,7 +3376,7 @@ module Cli:
                         return EXIT_USAGE if local_seen
                         local_seen <- true
                     elif Platform::pkg_cstr_equal(argument, "--") or Platform::pkg_strlen(argument) == 0.usize() or argument[0].u8() == 45 or Platform::pkg_strlen(name) != 0.usize():
-                        write_error("error: invalid uninstall arguments\n")
+                        CliOutput::write_error("error: invalid uninstall arguments\n")
                         return EXIT_USAGE
                     else:
                         name <- argument
@@ -3443,7 +3404,7 @@ module Cli:
                 return EXIT_USAGE if not validate_manifest_at(raw, &root, &root_name, &root_version)
                 updated: darray[u8] = remove_local_dependency(raw, alias)
                 if updated.count == 0.usize():
-                    write_error("error: dependency is not declared; no manifest or lockfile mutation was performed\n")
+                    CliOutput::write_error("error: dependency is not declared; no manifest or lockfile mutation was performed\n")
                     return EXIT_RESOLVE
                 return EXIT_SECURITY if not ProjectTransaction::begin(raw)
                 if not ProjectTransaction::stage_manifest(updated) or not ProjectFiles::write_cstr_file("elisapkg.json", &updated):
@@ -3454,16 +3415,16 @@ module Cli:
                 if resolved != EXIT_OK:
                     restored: bool = ProjectTransaction::restore()
                     if not restored:
-                        write_error("error: dependency removal failed and the original manifest could not be restored\n")
+                        CliOutput::write_error("error: dependency removal failed and the original manifest could not be restored\n")
                         return EXIT_SECURITY
                     return resolved
                 if not ProjectTransaction::mark_lock():
                     _ = ProjectTransaction::restore()
                     return EXIT_SECURITY
                 return EXIT_SECURITY if not ProjectTransaction::commit()
-                write_ok("removed dependency ")
-                write_bytes(1, &alias)
-                write_ok("\n")
+                CliOutput::write_ok("removed dependency ")
+                CliOutput::write_bytes(1, &alias)
+                CliOutput::write_ok("\n")
                 return EXIT_OK
 
         def run_update(argc: i64, slots: mutable cstr&&) -> i64 can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -3490,7 +3451,7 @@ module Cli:
                 if resolved != EXIT_OK:
                     restored: bool = ProjectTransaction::restore()
                     if not restored:
-                        write_error("error: update failed and the original manifest or lockfile could not be restored\n")
+                        CliOutput::write_error("error: update failed and the original manifest or lockfile could not be restored\n")
                         return EXIT_SECURITY
                     return resolved
                 if wanted.count > 0.usize():
@@ -3503,7 +3464,7 @@ module Cli:
                     _ = ProjectTransaction::restore()
                     return EXIT_SECURITY
                 return EXIT_SECURITY if not ProjectTransaction::commit()
-                write_ok("updated dependency lock\n")
+                CliOutput::write_ok("updated dependency lock\n")
                 return EXIT_OK
 
         def remove_target_outputs(leaves: darray[darray[u8]]&, build_dir: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -3556,7 +3517,7 @@ module Cli:
                 # traversed or recursively deleted by clean. A retained cache makes this
                 # directory intentionally non-empty, which is a successful clean result.
                 return EXIT_BUILD if not remove_state_directory(&state)
-                write_ok("cleaned known .elisapkg outputs\n")
+                CliOutput::write_ok("cleaned known .elisapkg outputs\n")
                 return EXIT_OK
 
         def run_cache_verify(start: darray[u8]&) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -3622,19 +3583,19 @@ module Cli:
                     return EXIT_SECURITY if Integrity::sha256(archive_bytes, &archive_after_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(archive_after_digest_bytes, &archive_after_digest)
                     return EXIT_SECURITY if not ByteText::equal(archive_after_digest, archive_digest) or not ByteText::equal(receipt_after, receipt)
                     return EXIT_SECURITY if not Cache::verify_blob(archive_digest)
-                write_ok("cache: local lock and manifest digests verified\n")
+                CliOutput::write_ok("cache: local lock and manifest digests verified\n")
                 if archive_present:
-                    write_ok("cache: deterministic package archive and receipt verified\n")
-                write_ok("cache: no shared remote cache configured\n")
+                    CliOutput::write_ok("cache: deterministic package archive and receipt verified\n")
+                CliOutput::write_ok("cache: no shared remote cache configured\n")
                 return EXIT_OK
 
         def run_cache_gc(argc: i64, slots: mutable cstr&&) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
                 if argc == 4 and Platform::pkg_cstr_equal(slots[2].cast[cstr], "gc") and Platform::pkg_cstr_equal(slots[3].cast[cstr], "--dry-run"):
-                    write_ok("cache: no shared cache configured; nothing would be collected\n")
+                    CliOutput::write_ok("cache: no shared cache configured; nothing would be collected\n")
                     return EXIT_OK
                 if argc == 3 and Platform::pkg_cstr_equal(slots[2].cast[cstr], "gc"):
-                    write_error("error: cache garbage collection is disabled until a verified cache store is configured; use `cache gc --dry-run`\n")
+                    CliOutput::write_error("error: cache garbage collection is disabled until a verified cache store is configured; use `cache gc --dry-run`\n")
                     return 7
                 return EXIT_USAGE
 
@@ -3776,12 +3737,12 @@ module Cli:
                     required: bool = ByteText::equal_text(path, "elisapkg.json") or ByteText::equal_text(path, "elisapkg.lock")
                     include_selected: mutable bool = required or PackageSelection::include_allows_path(raw, include_start, include_end, path, &glob_work_remaining, &glob_rows_remaining, &glob_budget_exhausted)
                     if glob_budget_exhausted:
-                        write_error("error: package include/exclude patterns exceeded the bounded matching budget\n")
+                        CliOutput::write_error("error: package include/exclude patterns exceeded the bounded matching budget\n")
                         return false
                     if include_selected and not required and PackageSelection::exclude_allows_path(raw, exclude_start, exclude_end, path, &glob_work_remaining, &glob_rows_remaining, &glob_budget_exhausted):
                         include_selected <- false
                     if glob_budget_exhausted:
-                        write_error("error: package include/exclude patterns exceeded the bounded matching budget\n")
+                        CliOutput::write_error("error: package include/exclude patterns exceeded the bounded matching budget\n")
                         return false
                     if include_selected:
                         return false if selected >= PackagePathPolicy::max_package_archive_entries
@@ -3802,7 +3763,7 @@ module Cli:
         def run_package(argc: i64, slots: mutable cstr&&, start: darray[u8]&) -> i64 can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global{Read,Write}:
                 if not project_manifest_exists():
-                    write_error("error: could not find elisapkg.json in the current directory\n")
+                    CliOutput::write_error("error: could not find elisapkg.json in the current directory\n")
                     return EXIT_USAGE
                 list_only: mutable bool = false
                 for index in 2..<argc |slots, list_only|:
@@ -3818,18 +3779,18 @@ module Cli:
                 paths: mutable darray[u8] = []
                 return EXIT_USAGE if not collect_package_paths(raw, entry, &paths)
                 if list_only:
-                    write_ok("package files:\n")
+                    CliOutput::write_ok("package files:\n")
                     cursor: mutable usize = 0.usize()
                     while cursor < paths.count:
                         path: mutable darray[u8] = []
-                        write_ok("  ")
+                        CliOutput::write_ok("  ")
                         while cursor < paths.count and paths[cursor] != 0 |paths, cursor, path|:
                             path.push(paths[cursor])
                             cursor <- cursor + 1.usize()
-                        write_bytes(1, &path)
-                        write_ok("\n")
+                        CliOutput::write_bytes(1, &path)
+                        CliOutput::write_ok("\n")
                         cursor <- cursor + 1.usize()
-                    write_error("note: signing is required before publish; this command only previews files\n")
+                    CliOutput::write_error("note: signing is required before publish; this command only previews files\n")
                     return EXIT_OK
                 lock_options: Model::CommandOptions = Model::CommandOptions{locked: true, offline: true, frozen: true, json: false, verbose: false, profile: "debug", target_name: "", target_kind: "", update_name: ""}
                 return EXIT_RESOLVE if run_resolve(start, lock_options, false, false) != EXIT_OK
@@ -3918,15 +3879,15 @@ module Cli:
                 ProjectFiles::path_with_nul_into(&receipt_path, &receipt_c)
                 receipt_name: cstr = (&receipt_c[0]).cast[cstr] can Unsafe.PointerCast
                 return 7 if not ProjectFiles::write_cstr_file(receipt_name, receipt)
-                write_ok("packaged ")
-                write_bytes(1, &package_name)
-                write_ok(" ")
-                write_bytes(1, &package_version)
-                write_ok(" -> ")
-                write_bytes(1, &archive_path)
-                write_ok(" sha256:")
-                write_bytes(1, &digest)
-                write_ok("\n")
+                CliOutput::write_ok("packaged ")
+                CliOutput::write_bytes(1, &package_name)
+                CliOutput::write_ok(" ")
+                CliOutput::write_bytes(1, &package_version)
+                CliOutput::write_ok(" -> ")
+                CliOutput::write_bytes(1, &archive_path)
+                CliOutput::write_ok(" sha256:")
+                CliOutput::write_bytes(1, &digest)
+                CliOutput::write_ok("\n")
                 return EXIT_OK
 
         def sandbox_dependency_roots(lock: darray[u8]&, start: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -4323,7 +4284,7 @@ module Cli:
                 compiler_dependency_aggregate: mutable darray[u8] = []
                 snapshot_total_bytes: mutable usize = 0.usize()
                 if not Sandbox::build_sandbox_available():
-                    write_error("error: compiler builds require the macOS Seatbelt sandbox; builds fail closed on this platform\n")
+                    CliOutput::write_error("error: compiler builds require the macOS Seatbelt sandbox; builds fail closed on this platform\n")
                     return EXIT_BUILD
                 return EXIT_USAGE if not Platform::pkg_cstr_equal(options.profile, "debug") and not Platform::pkg_cstr_equal(options.profile, "release")
                 return EXIT_BUILD if not load_package(start)
@@ -4368,7 +4329,7 @@ module Cli:
                 return EXIT_BUILD if not ByteText::equal(manifest_after_resolve, manifest_raw)
                 return EXIT_BUILD if not lock_matches_manifest(manifest_raw, lock_raw, root_name, root_version, start)
                 if lock_version_is(lock_raw, 3):
-                    write_error("error: builds with registry dependencies are not supported; local dependency builds require a version 2 local lock\n")
+                    CliOutput::write_error("error: builds with registry dependencies are not supported; local dependency builds require a version 2 local lock\n")
                     return EXIT_BUILD
                 lock_digest_bytes: mutable darray[u8] = []
                 lock_digest: mutable darray[u8] = []
@@ -4377,7 +4338,7 @@ module Cli:
                 source_tree_digest: mutable darray[u8] = []
                 source_tree_bytes: mutable usize = 0.usize()
                 if not source_tree_digest_into_bounded(&source_tree_digest, MAX_BUILD_SNAPSHOT_BYTES, &source_tree_bytes):
-                    write_error("error: package source tree is unreadable, unsafe, or exceeds the supported source-size limits; refusing to build\n")
+                    CliOutput::write_error("error: package source tree is unreadable, unsafe, or exceeds the supported source-size limits; refusing to build\n")
                     return EXIT_BUILD
                 dependency_aggregate: mutable darray[u8] = []
                 dependency_aggregate_digest: mutable darray[u8] = []
@@ -4390,15 +4351,15 @@ module Cli:
                     source_snapshot_container_storage: mutable darray[u8] @build_state = []
                     source_snapshot_container_name: mutable cstr = ""
                     if source_tree_bytes > MAX_BUILD_SNAPSHOT_BYTES or not build_local_dependency_aggregate(lock_raw, start, target_entry_name, MAX_BUILD_SNAPSHOT_BYTES - source_tree_bytes, &dependency_aggregate, &has_local_build_dependencies, dependency_packages, dependency_order):
-                        write_error("error: local dependency graph is invalid, unreadable, or exceeds the combined source-size limits; refusing to compile an incomplete graph\n")
+                        CliOutput::write_error("error: local dependency graph is invalid, unreadable, or exceeds the combined source-size limits; refusing to compile an incomplete graph\n")
                         return EXIT_BUILD
                     if has_local_build_dependencies:
                         dependency_aggregate_digest_bytes: mutable darray[u8] = []
                         if Integrity::sha256(dependency_aggregate, &dependency_aggregate_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(dependency_aggregate_digest_bytes, &dependency_aggregate_digest):
-                            write_error("error: unable to fingerprint the verified dependency aggregate\n")
+                            CliOutput::write_error("error: unable to fingerprint the verified dependency aggregate\n")
                             return EXIT_BUILD
                     if PackageSelection::publish_path_forbidden(target_entry):
-                        write_error("error: selected target entry is not a safe package source path\n")
+                        CliOutput::write_error("error: selected target entry is not a safe package source path\n")
                         return EXIT_BUILD
                     target_source: mutable darray[u8] = []
                     target_source_size: i64 = Platform::pkg_package_file_size(target_entry_raw)
@@ -4435,7 +4396,7 @@ module Cli:
                     return EXIT_BUILD if not Toolchain::valid_compiler_argument(compiler)
                     resolved_compiler_path: mutable darray[u8] = []
                     if not Toolchain::resolve_build_compiler(compiler, &resolved_compiler_path):
-                        write_error("error: selected compiler was not found as an executable on the isolated build PATH\n")
+                        CliOutput::write_error("error: selected compiler was not found as an executable on the isolated build PATH\n")
                         return EXIT_BUILD
                     resolved_compiler_storage: mutable darray[u8] = []
                     ProjectFiles::path_with_nul_into(resolved_compiler_path, &resolved_compiler_storage)
@@ -4464,7 +4425,7 @@ module Cli:
                     if Platform::pkg_getenv("HOME") is configured_home:
                         home_name <- configured_home.cast[cstr]
                     else:
-                        write_error("error: HOME must name an existing directory to construct the build sandbox\n")
+                        CliOutput::write_error("error: HOME must name an existing directory to construct the build sandbox\n")
                         return EXIT_BUILD
                     dependency_roots: mutable darray[u8] = []
                     return EXIT_BUILD if not sandbox_dependency_roots(lock_raw, start, &dependency_roots)
@@ -4505,7 +4466,7 @@ module Cli:
                     sdk_root: mutable darray[u8] = []
                     developer_dir: mutable darray[u8] = []
                     if not Platform::pkg_macos_toolchain_paths(&sdk_root, &developer_dir):
-                        write_error("error: could not locate a supported macOS SDK and developer directory for the compiler sandbox\n")
+                        CliOutput::write_error("error: could not locate a supported macOS SDK and developer directory for the compiler sandbox\n")
                         return EXIT_BUILD
                     sdk_settings_path: mutable darray[u8] = []
                     sdk_settings_path_c: mutable darray[u8] = []
@@ -4533,7 +4494,7 @@ module Cli:
                             ByteText::append_text(&developer_linker_path, "/Toolchains/XcodeDefault.xctoolchain/usr/bin/ld")
                             ByteText::append_text(&developer_assembler_path, "/Toolchains/XcodeDefault.xctoolchain/usr/bin/as")
                         else:
-                            write_error("error: unsupported macOS developer toolchain directory\n")
+                            CliOutput::write_error("error: unsupported macOS developer toolchain directory\n")
                             return EXIT_BUILD
                         ProjectFiles::path_with_nul_into(developer_linker_path, &developer_linker_path_c)
                         developer_linker_name <- (&developer_linker_path_c[0]).cast[cstr] can Unsafe.PointerCast
@@ -4558,7 +4519,7 @@ module Cli:
                     ByteText::append_text(&snapshot_template, ".source-snapshots-XXXXXX")
                     snapshot_template.push(0)
                     if Platform::pkg_mkdtemp(&snapshot_template) != 0:
-                        write_error("error: unable to create the private build source snapshot directory\n")
+                        CliOutput::write_error("error: unable to create the private build source snapshot directory\n")
                         return EXIT_BUILD
                     snapshot_container_length: usize = Platform::pkg_strlen((&snapshot_template[0]).cast[cstr] can Unsafe.PointerCast)
                     for index in 0..<snapshot_container_length |source_snapshot_container_storage, snapshot_template|:
@@ -4570,7 +4531,7 @@ module Cli:
                         snapshot_container_path.push(source_snapshot_container_storage[index])
                     if not canonical_existing_path(snapshot_container_path, &source_snapshot_root):
                         _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
-                        write_error("error: unable to resolve the private build source snapshot directory\n")
+                        CliOutput::write_error("error: unable to resolve the private build source snapshot directory\n")
                         return EXIT_BUILD
                     root_source_root: mutable darray[u8] = []
                     project_snapshot_status: mutable i64 = -1
@@ -4579,26 +4540,26 @@ module Cli:
                     if project_snapshot_status != 0:
                         _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
                         if project_snapshot_status == -87:
-                            write_error("error: project source changed while creating the verified build snapshot\n")
+                            CliOutput::write_error("error: project source changed while creating the verified build snapshot\n")
                         elif project_snapshot_status == -75:
-                            write_error("error: project source exceeds the configured build snapshot limit\n")
+                            CliOutput::write_error("error: project source exceeds the configured build snapshot limit\n")
                         elif project_snapshot_status == -22:
-                            write_error("error: source snapshot path is invalid or overlaps package source data\n")
+                            CliOutput::write_error("error: source snapshot path is invalid or overlaps package source data\n")
                         elif project_snapshot_status == -13:
-                            write_error("error: source snapshot was rejected by package path or ownership policy\n")
+                            CliOutput::write_error("error: source snapshot was rejected by package path or ownership policy\n")
                         elif project_snapshot_status == -86:
-                            write_error("error: unable to fingerprint the copied project source snapshot\n")
+                            CliOutput::write_error("error: unable to fingerprint the copied project source snapshot\n")
                         elif project_snapshot_status == -88:
-                            write_error("error: selected target is missing from the copied project source snapshot\n")
+                            CliOutput::write_error("error: selected target is missing from the copied project source snapshot\n")
                         elif project_snapshot_status == -84:
-                            write_error("error: selected target path is unsafe for a package source snapshot\n")
+                            CliOutput::write_error("error: selected target path is unsafe for a package source snapshot\n")
                         else:
                             snapshot_error: mutable darray[u8] = []
                             ByteText::append_text(&snapshot_error, "error: project source could not be copied into the verified build snapshot (status ")
                             ByteText::append_signed_decimal(&snapshot_error, project_snapshot_status)
                             ByteText::append_text(&snapshot_error, ")\n")
                             snapshot_error.push(0)
-                            write_error((&snapshot_error[0]).cast[cstr] can Unsafe.PointerCast)
+                            CliOutput::write_error((&snapshot_error[0]).cast[cstr] can Unsafe.PointerCast)
                         return EXIT_BUILD
                     dependency_snapshots_ok: mutable bool = true
                     for order_index in 0..<dependency_order.count |dependency_order, dependency_packages, source_snapshot_root, source_snapshot_roots, snapshot_total_bytes, dependency_snapshots_ok|:
@@ -4614,18 +4575,18 @@ module Cli:
                             break
                     if not dependency_snapshots_ok:
                         _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
-                        write_error("error: local dependency changed or could not be copied into the verified build snapshot\n")
+                        CliOutput::write_error("error: local dependency changed or could not be copied into the verified build snapshot\n")
                         return EXIT_BUILD
                     snapshot_target_source: mutable darray[u8] = []
                     if not read_package_file_into(root_snapshot_entry, &snapshot_target_source):
                         _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
-                        write_error("error: selected target is missing from the verified source snapshot\n")
+                        CliOutput::write_error("error: selected target is missing from the verified source snapshot\n")
                         return EXIT_BUILD
                     snapshot_source_digest_bytes: mutable darray[u8] = []
                     snapshot_source_digest: mutable darray[u8] = []
                     if Integrity::sha256(snapshot_target_source, &snapshot_source_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(snapshot_source_digest_bytes, &snapshot_source_digest) or not ByteText::equal(snapshot_source_digest, source_digest):
                         _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
-                        write_error("error: selected target changed while creating the verified source snapshot\n")
+                        CliOutput::write_error("error: selected target changed while creating the verified source snapshot\n")
                         return EXIT_BUILD
                     source_digest <- snapshot_source_digest
                     if has_local_build_dependencies:
@@ -4637,7 +4598,7 @@ module Cli:
                                 break
                         if not dependency_aggregate_ok or not Build::append_include_path(root_snapshot_entry, &compiler_dependency_aggregate) or compiler_dependency_aggregate.count > MAX_BUILD_AGGREGATE_BYTES:
                             _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
-                            write_error("error: verified dependency aggregate exceeds the configured build limit\n")
+                            CliOutput::write_error("error: verified dependency aggregate exceeds the configured build limit\n")
                             return EXIT_BUILD
                     receipt: mutable darray[u8] = []
                     ByteText::append_text(&receipt, "elisapkg-build-receipt:12\nentry:")
@@ -4718,11 +4679,11 @@ module Cli:
                                 ByteText::append_text(&expected_receipt, "\n")
                                 if ByteText::equal(cached_receipt, expected_receipt):
                                     if not remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots):
-                                        write_error("error: unable to remove the verified build source snapshots\n")
+                                        CliOutput::write_error("error: unable to remove the verified build source snapshots\n")
                                         return EXIT_BUILD
-                                    write_ok("built .elisapkg/build/")
-                                    write_bytes(1, &artifact_label)
-                                    write_ok(" (cached)\n")
+                                    CliOutput::write_ok("built .elisapkg/build/")
+                                    CliOutput::write_bytes(1, &artifact_label)
+                                    CliOutput::write_ok(" (cached)\n")
                                     for digest_index in 0..<cached_digest.count |out_artifact_digest, cached_digest|:
                                         out_artifact_digest[digest_index] <- cached_digest[digest_index]
                                     _ = options
@@ -4741,7 +4702,7 @@ module Cli:
                     sandbox_template.push(0)
                     if Platform::pkg_mkdtemp(&sandbox_template) != 0:
                         _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
-                        write_error("error: unable to create the private compiler scratch directory\n")
+                        CliOutput::write_error("error: unable to create the private compiler scratch directory\n")
                         return EXIT_BUILD
                     sandbox_work_length: usize = Platform::pkg_strlen((&sandbox_template[0]).cast[cstr] can Unsafe.PointerCast)
                     sandbox_work_dir: mutable darray[u8] = []
@@ -4759,7 +4720,7 @@ module Cli:
                         _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
                         _ = remove_optional_build_aggregate(aggregate_source_name)
                         _ = Platform::pkg_rmdir(sandbox_work_name)
-                        write_error("error: unable to resolve the private compiler scratch directory\n")
+                        CliOutput::write_error("error: unable to resolve the private compiler scratch directory\n")
                         return EXIT_BUILD
                     compiler_source_c: mutable darray[u8] = []
                     ProjectFiles::path_with_nul_into(root_snapshot_entry, &compiler_source_c)
@@ -4779,7 +4740,7 @@ module Cli:
                             _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
                             _ = remove_optional_build_aggregate(aggregate_source_name)
                             _ = Platform::pkg_rmdir(sandbox_work_name)
-                            write_error("error: unable to create the private dependency aggregate source\n")
+                            CliOutput::write_error("error: unable to create the private dependency aggregate source\n")
                             return EXIT_BUILD
                         aggregate_source_name <- (&aggregate_source_template[0]).cast[cstr] can Unsafe.PointerCast
                         aggregate_path_length: usize = Platform::pkg_strlen(aggregate_source_name)
@@ -4792,7 +4753,7 @@ module Cli:
                             _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
                             _ = remove_optional_build_aggregate(aggregate_source_name)
                             _ = Platform::pkg_rmdir(sandbox_work_name)
-                            write_error("error: unable to write the private dependency aggregate source\n")
+                            CliOutput::write_error("error: unable to write the private dependency aggregate source\n")
                             return EXIT_BUILD
                         aggregate_flush_status: i64 = Platform::pkg_fsync(aggregate_fd)
                         aggregate_close_status: i64 = Platform::pkg_close(aggregate_fd)
@@ -4802,7 +4763,7 @@ module Cli:
                             _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
                             _ = remove_optional_build_aggregate(aggregate_source_name)
                             _ = Platform::pkg_rmdir(sandbox_work_name)
-                            write_error("error: unable to flush the private dependency aggregate source\n")
+                            CliOutput::write_error("error: unable to flush the private dependency aggregate source\n")
                             return EXIT_BUILD
                         canonical_aggregate_source: mutable darray[u8] = []
                         if not canonical_existing_path(aggregate_source_path, &canonical_aggregate_source):
@@ -4811,7 +4772,7 @@ module Cli:
                             _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
                             _ = remove_optional_build_aggregate(aggregate_source_name)
                             _ = Platform::pkg_rmdir(sandbox_work_name)
-                            write_error("error: unable to resolve the private dependency aggregate source\n")
+                            CliOutput::write_error("error: unable to resolve the private dependency aggregate source\n")
                             return EXIT_BUILD
                         ProjectFiles::path_with_nul_into(canonical_aggregate_source, &aggregate_compile_source_c)
                         compiler_source_name <- (&aggregate_compile_source_c[0]).cast[cstr] can Unsafe.PointerCast
@@ -4831,7 +4792,7 @@ module Cli:
                         _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
                         _ = remove_optional_build_aggregate(aggregate_source_name)
                         _ = Platform::pkg_rmdir(sandbox_work_name)
-                        write_error("error: unable to create the exclusive compiler output file\n")
+                        CliOutput::write_error("error: unable to create the exclusive compiler output file\n")
                         return EXIT_BUILD
                     temp_name: cstr = (&temp_template[0]).cast[cstr] can Unsafe.PointerCast
                     if Platform::pkg_close(temp_fd) != 0:
@@ -4839,7 +4800,7 @@ module Cli:
                         _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
                         _ = remove_optional_build_aggregate(aggregate_source_name)
                         _ = Platform::pkg_rmdir(sandbox_work_name)
-                        write_error("error: unable to close the exclusive compiler output file\n")
+                        CliOutput::write_error("error: unable to close the exclusive compiler output file\n")
                         return EXIT_BUILD
                     sandbox_profile: mutable darray[u8] = Sandbox::darwin_build_profile(home_name, start, sandbox_work_dir, source_snapshot_root, dependency_roots, tool_paths, executable_paths, temp_name)
                     if sandbox_profile.count == 0.usize():
@@ -4847,7 +4808,7 @@ module Cli:
                         _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
                         _ = remove_optional_build_aggregate(aggregate_source_name)
                         _ = Platform::pkg_rmdir(sandbox_work_name)
-                        write_error("error: could not construct the mandatory compiler sandbox profile\n")
+                        CliOutput::write_error("error: could not construct the mandatory compiler sandbox profile\n")
                         return EXIT_BUILD
                     sandbox_profile.push(0)
                     sandbox_profile_name: cstr = (&sandbox_profile[0]).cast[cstr] can Unsafe.PointerCast
@@ -4956,7 +4917,7 @@ module Cli:
                         _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
                         _ = remove_optional_build_aggregate(aggregate_source_name)
                         _ = Platform::pkg_rmdir(sandbox_work_name)
-                        write_error("error: unable to create the private compiler stdout capture\n")
+                        CliOutput::write_error("error: unable to create the private compiler stdout capture\n")
                         return EXIT_BUILD
                     if compiler_stdout_fd < 3:
                         raised_stdout_fd: i64 = Platform::pkg_dup_fd_min(compiler_stdout_fd, 3)
@@ -4967,7 +4928,7 @@ module Cli:
                             _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
                             _ = remove_optional_build_aggregate(aggregate_source_name)
                             _ = Platform::pkg_rmdir(sandbox_work_name)
-                            write_error("error: unable to secure the compiler stdout capture descriptor\n")
+                            CliOutput::write_error("error: unable to secure the compiler stdout capture descriptor\n")
                             return EXIT_BUILD
                         _ = Platform::pkg_close(compiler_stdout_fd)
                         compiler_stdout_fd <- raised_stdout_fd
@@ -4986,7 +4947,7 @@ module Cli:
                         _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
                         _ = remove_optional_build_aggregate(aggregate_source_name)
                         _ = Platform::pkg_rmdir(sandbox_work_name)
-                        write_error("error: unable to create the private compiler stderr capture\n")
+                        CliOutput::write_error("error: unable to create the private compiler stderr capture\n")
                         return EXIT_BUILD
                     if compiler_stderr_fd < 3:
                         raised_stderr_fd: i64 = Platform::pkg_dup_fd_min(compiler_stderr_fd, 3)
@@ -4999,7 +4960,7 @@ module Cli:
                             _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
                             _ = remove_optional_build_aggregate(aggregate_source_name)
                             _ = Platform::pkg_rmdir(sandbox_work_name)
-                            write_error("error: unable to secure the compiler stderr capture descriptor\n")
+                            CliOutput::write_error("error: unable to secure the compiler stderr capture descriptor\n")
                             return EXIT_BUILD
                         _ = Platform::pkg_close(compiler_stderr_fd)
                         compiler_stderr_fd <- raised_stderr_fd
@@ -5017,7 +4978,7 @@ module Cli:
                         _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
                         _ = remove_optional_build_aggregate(aggregate_source_name)
                         _ = Platform::pkg_rmdir(sandbox_work_name)
-                        write_error("error: unable to open the private compiler scratch directory\n")
+                        CliOutput::write_error("error: unable to open the private compiler scratch directory\n")
                         return EXIT_BUILD
                     child_argv: mutable cstr&& = (&args[0]).cast[mutable cstr&&] can Unsafe.PointerCast
                     pid: i64 = Platform::pkg_fork()
@@ -5053,7 +5014,7 @@ module Cli:
                         _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
                         _ = remove_optional_build_aggregate(aggregate_source_name)
                         _ = Platform::pkg_rmdir(sandbox_work_name)
-                        write_error("error: unable to start the sandboxed compiler process\n")
+                        CliOutput::write_error("error: unable to start the sandboxed compiler process\n")
                         return EXIT_BUILD
                     status: mutable i32 = 0
                     if not set_callback_path_pid(&callback_parameter, callback_digits_offset, pid):
@@ -5064,7 +5025,7 @@ module Cli:
                         if stop_status != pid and stop_status != Platform::pkg_timeout_error():
                             _ = Platform::pkg_close(compiler_stdout_fd)
                             _ = Platform::pkg_close(compiler_stderr_fd)
-                            write_error("error: unable to confirm compiler process termination; retained its scratch files\n")
+                            CliOutput::write_error("error: unable to confirm compiler process termination; retained its scratch files\n")
                             return EXIT_BUILD
                         _ = Platform::pkg_close(compiler_stdout_fd)
                         _ = Platform::pkg_close(compiler_stderr_fd)
@@ -5074,7 +5035,7 @@ module Cli:
                         _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
                         _ = remove_optional_build_aggregate(aggregate_source_name)
                         _ = Platform::pkg_rmdir(sandbox_work_name)
-                        write_error("error: unable to name the stage1 callback file safely\n")
+                        CliOutput::write_error("error: unable to name the stage1 callback file safely\n")
                         return EXIT_BUILD
                     callback_file_name: cstr = (&callback_parameter[14]).cast[cstr] can Unsafe.PointerCast
                     waited: i64 = Platform::pkg_waitpid_timeout(pid, &status, BUILD_TIMEOUT_MS)
@@ -5089,7 +5050,7 @@ module Cli:
                         _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
                         _ = remove_optional_build_aggregate(aggregate_source_name)
                         _ = Platform::pkg_rmdir(sandbox_work_name)
-                        write_error("error: unable to stop the compiler process group before output validation\n")
+                        CliOutput::write_error("error: unable to stop the compiler process group before output validation\n")
                         return EXIT_BUILD
                     replay_stdout_ok: bool = forward_fd_output(compiler_stdout_fd, 1)
                     replay_stderr_ok: bool = forward_fd_output(compiler_stderr_fd, 2)
@@ -5102,21 +5063,21 @@ module Cli:
                         _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
                         _ = remove_optional_build_aggregate(aggregate_source_name)
                         _ = Platform::pkg_rmdir(sandbox_work_name)
-                        write_error("error: unable to safely collect compiler output\n")
+                        CliOutput::write_error("error: unable to safely collect compiler output\n")
                         return EXIT_BUILD
                     if waited == Platform::pkg_timeout_error():
                         _ = Platform::pkg_unlink(temp_name)
                         _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
                         _ = remove_optional_build_aggregate(aggregate_source_name)
                         _ = Platform::pkg_rmdir(sandbox_work_name)
-                        write_error("error: compiler exceeded the 10-minute execution limit\n")
+                        CliOutput::write_error("error: compiler exceeded the 10-minute execution limit\n")
                         return EXIT_CANCEL
                     if waited < 0 or status != 0:
                         _ = Platform::pkg_unlink(temp_name)
                         _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
                         _ = remove_optional_build_aggregate(aggregate_source_name)
                         _ = Platform::pkg_rmdir(sandbox_work_name)
-                        write_error("error: sandboxed compiler process failed or could not be reaped\n")
+                        CliOutput::write_error("error: sandboxed compiler process failed or could not be reaped\n")
                         return EXIT_BUILD
                     temporary_size: i64 = Platform::pkg_package_file_size(temp_name)
                     if temporary_size <= 0:
@@ -5155,7 +5116,7 @@ module Cli:
                         _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
                         _ = remove_optional_build_aggregate(aggregate_source_name)
                         _ = Platform::pkg_rmdir(sandbox_work_name)
-                        write_error("error: unable to detach compiler-owned output before validation\n")
+                        CliOutput::write_error("error: unable to detach compiler-owned output before validation\n")
                         return EXIT_BUILD
                     # Do not publish an artifact whose compiler input tree changed while
                     # the child was running. The receipt records the pre-build digest;
@@ -5193,7 +5154,7 @@ module Cli:
                             _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
                             _ = remove_optional_build_aggregate(aggregate_source_name)
                             _ = Platform::pkg_rmdir(sandbox_work_name)
-                            write_error("error: private dependency aggregate changed during compilation\n")
+                            CliOutput::write_error("error: private dependency aggregate changed during compilation\n")
                             return EXIT_BUILD
                     toolchain_unchanged: mutable bool = true
                     post_tool_identity: mutable darray[u8] = []
@@ -5215,21 +5176,21 @@ module Cli:
                         _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
                         _ = remove_optional_build_aggregate(aggregate_source_name)
                         _ = Platform::pkg_rmdir(sandbox_work_name)
-                        write_error("error: compiler toolchain changed during the build; refusing to publish the artifact\n")
+                        CliOutput::write_error("error: compiler toolchain changed during the build; refusing to publish the artifact\n")
                         return EXIT_BUILD
                     if not remove_optional_build_aggregate(aggregate_source_name):
                         _ = Platform::pkg_unlink(temp_name)
                         _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
-                        write_error("error: unable to remove the private dependency aggregate source\n")
+                        CliOutput::write_error("error: unable to remove the private dependency aggregate source\n")
                         return EXIT_BUILD
                     if Platform::pkg_rmdir(sandbox_work_name) != 0:
                         _ = Platform::pkg_unlink(temp_name)
                         _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
-                        write_error("error: compiler left files in its private scratch directory; refusing to publish the build result\n")
+                        CliOutput::write_error("error: compiler left files in its private scratch directory; refusing to publish the build result\n")
                         return EXIT_BUILD
                     if not remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots):
                         _ = Platform::pkg_unlink(temp_name)
-                        write_error("error: unable to remove the verified build source snapshots\n")
+                        CliOutput::write_error("error: unable to remove the verified build source snapshots\n")
                         return EXIT_BUILD
                     # Never publish the compiler-owned inode directly. A descendant can
                     # leave its process group and retain an already-open descriptor even
@@ -5256,7 +5217,7 @@ module Cli:
                     if not publish_ok or publish_close_status != 0:
                         _ = Platform::pkg_unlink(publish_name)
                         _ = Platform::pkg_unlink(temp_name)
-                        write_error("error: unable to create a normalized parent-owned build artifact\n")
+                        CliOutput::write_error("error: unable to create a normalized parent-owned build artifact\n")
                         return EXIT_BUILD
                     if Platform::pkg_rename(publish_name, artifact_name) != 0:
                         _ = Platform::pkg_unlink(publish_name)
@@ -5273,9 +5234,9 @@ module Cli:
                         # The missing or stale receipt makes the next build reject the cache
                         # and re-establish the pair before reuse.
                         return EXIT_BUILD
-                    write_ok("built .elisapkg/build/")
-                    write_bytes(1, &artifact_label)
-                    write_ok("\n")
+                    CliOutput::write_ok("built .elisapkg/build/")
+                    CliOutput::write_bytes(1, &artifact_label)
+                    CliOutput::write_ok("\n")
                     for digest_index in 0..<artifact_digest.count |out_artifact_digest, artifact_digest|:
                         out_artifact_digest[digest_index] <- artifact_digest[digest_index]
                     _ = options
@@ -5311,7 +5272,7 @@ module Cli:
                     return false if amount < 0 or amount > capacity.i64()
                     break if amount == 0
                     buffer.resize(amount.usize())
-                    write_bytes(target, &buffer)
+                    CliOutput::write_bytes(target, &buffer)
                     total <- total + amount
                     buffer.resize(8192)
                 return true
@@ -5326,7 +5287,7 @@ module Cli:
                 target_entry: mutable darray[u8] = []
                 return EXIT_BUILD if not ManifestTargets::select_target(manifest_raw, options.target_name, options.target_kind, &target_name, &target_kind, &target_entry)
                 if not ByteText::equal_text(target_kind, expected_kind):
-                    write_error("error: selected target does not produce an executable\n")
+                    CliOutput::write_error("error: selected target does not produce an executable\n")
                     return EXIT_BUILD
                 artifact_label: darray[u8] = ManifestTargets::artifact_leaf(target_name, false)
                 artifact_leaf_storage: mutable darray[u8] = []
@@ -5382,23 +5343,22 @@ module Cli:
         def cli_main(argc: i64, argv: mutable void&) -> i64 can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global{Read,Write}:
                 slots: mutable cstr&& = argv.cast[mutable cstr&&]
-                cli_quiet <- false
-                cli_json_output <- false
+                CliOutput::configure(false, false)
+                quiet: mutable bool = false
                 if argc <= 1:
-                    usage()
+                    CliOutput::usage()
                     return EXIT_USAGE
                 command: cstr = slots[1].cast[cstr]
                 if Platform::pkg_cstr_equal(command, "--help") or Platform::pkg_cstr_equal(command, "-h"):
-                    usage()
+                    CliOutput::usage()
                     return EXIT_OK
                 if Platform::pkg_cstr_equal(command, "--version"):
-                    write_ok("elisapkg 0.1.0\n")
+                    CliOutput::write_ok("elisapkg 0.1.0\n")
                     return EXIT_OK
                 if Platform::pkg_cstr_equal(command, "init"):
                     init_slots: mutable darray[cstr] = []
-                    quiet: mutable bool = cli_quiet
                     init_argc: i64 = CliArguments::compact_output_modes(argc, slots, &init_slots, &quiet)
-                    cli_quiet <- quiet
+                    CliOutput::configure(quiet, false)
                     return EXIT_USAGE if init_argc < 0
                     return run_init(init_argc, (&init_slots[0]).cast[mutable cstr&&] can Unsafe.PointerCast)
                 manifest_path: mutable darray[u8] = []
@@ -5421,16 +5381,14 @@ module Cli:
                 effective_slots: mutable cstr&& = slots
                 compacted: mutable darray[cstr] = []
                 if has_manifest_path:
-                    quiet: mutable bool = cli_quiet
                     effective_argc <- CliArguments::compact_manifest_args(argc, slots, &compacted, &quiet)
-                    cli_quiet <- quiet
+                    CliOutput::configure(quiet, false)
                     return EXIT_USAGE if effective_argc <= 0
                     effective_slots <- (&compacted[0]).cast[mutable cstr&&] can Unsafe.PointerCast
                 if Platform::pkg_cstr_equal(command, "add") or Platform::pkg_cstr_equal(command, "remove") or Platform::pkg_cstr_equal(command, "update"):
                     mutation_slots: mutable darray[cstr] = []
-                    quiet: mutable bool = cli_quiet
                     mutation_argc: i64 = CliArguments::compact_manifest_args(argc, slots, &mutation_slots, &quiet)
-                    cli_quiet <- quiet
+                    CliOutput::configure(quiet, false)
                     return EXIT_USAGE if mutation_argc < 0
                     mutation_effective_slots: mutable cstr&& = (&mutation_slots[0]).cast[mutable cstr&&] can Unsafe.PointerCast
                     return run_add(mutation_argc, mutation_effective_slots) if Platform::pkg_cstr_equal(command, "add")
@@ -5441,13 +5399,11 @@ module Cli:
                 # non-empty, well-defined byte buffer.
                 start: mutable darray[u8] = [46]
                 options: mutable Model::CommandOptions = Model::CommandOptions{locked: false, offline: false, frozen: false, json: false, verbose: false, profile: "debug", target_name: "", target_kind: "", update_name: ""}
-                quiet: mutable bool = cli_quiet
                 publish_dry_run: mutable bool = false
                 flags_ok: bool = CliArguments::read_common_flags(effective_argc, effective_slots, command, &options, &quiet, &publish_dry_run)
-                cli_quiet <- quiet
-                cli_json_output <- options.json
+                CliOutput::configure(quiet, options.json)
                 if not flags_ok:
-                    write_error("error: unknown option; run `elisapkg --help`\n")
+                    CliOutput::write_error("error: unknown option; run `elisapkg --help`\n")
                     return EXIT_USAGE
                 parsed_options: mutable darray[cstr] = []
                 parsed_argc: i64 = CliArguments::compact_validated_global_options(effective_argc, effective_slots, &parsed_options)
@@ -5491,7 +5447,7 @@ module Cli:
                         return build_status if build_status != EXIT_OK
                         return run_program(effective_argc, dispatch_slots, options, "bin")
                     return run_test(effective_argc, dispatch_slots, &start, options)
-                write_error("error: unknown command; run `elisapkg --help`\n")
+                CliOutput::write_error("error: unknown command; run `elisapkg --help`\n")
                 return EXIT_USAGE
 
     public:
