@@ -61,21 +61,23 @@ module LockValidation:
                 return false if packages_start >= lock.count or packages_end <= packages_start or packages_end >= lock.count
                 cursor: mutable usize = packages_start + 1.usize()
                 record_starts: mutable darray[usize] = []
-                previous_package: mutable darray[u8] = []
+                previous_start: mutable usize = 0
+                previous_end: mutable usize = 0
                 while cursor < packages_end:
                     cursor <- Json::skip_whitespace(lock, cursor, packages_end)
                     break if cursor == packages_end
                     return false if lock[cursor] != 123 or record_starts.count >= LocalBuildPlan::maximum_packages
                     record_end: usize = Json::object_end(lock, cursor)
                     return false if record_end <= cursor or record_end >= packages_end or not SchemaFields::valid(lock, cursor, record_end, SchemaFields::Kind.RegistryLockRecord)
-                    package: mutable darray[u8] = []
-                    return false if not Json::object_string_value(lock, cursor, record_end, "name", &package) or not PackageIdentity::valid_name(package)
-                    # Canonical registry locks sort package records by name and never
-                    # serialize the root package itself. Enforce both properties before
-                    # trusting any receipt-backed record in an offline build.
+                    name_start: mutable usize = 0
+                    name_end: mutable usize = 0
+                    # The root package is never a dependency record, and dependency
+                    # names must appear in strictly increasing order.
                     return false if:
-                        ByteText::equal(package, name)
-                        previous_package.count > 0.usize() and not ByteText::less(previous_package, package)
+                        not Json::object_string_span(lock, cursor, record_end, "name", &name_start, &name_end)
+                        not PackageIdentity::valid_name_segment(lock, name_start, name_end)
+                        ByteText::range_equals(lock, name_start, name_end, name)
+                        previous_end > previous_start and not Lockfile::name_precedes(lock, previous_start, previous_end, name_start, name_end)
                     parsed_version: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
                     return false if not Lockfile::read_registry_version(lock, cursor, record_end, &parsed_version)
                     archive: mutable darray[u8] = []
@@ -85,8 +87,8 @@ module LockValidation:
                     return false if:
                         not Lockfile::has_sha256_field(lock, cursor, record_end, "archive-digest")
                         not Lockfile::has_sha256_field(lock, cursor, record_end, "metadata-digest")
-                    previous_package <- previous_package.resize(0)
-                    ByteText::append(&previous_package, package)
+                    previous_start <- name_start
+                    previous_end <- name_end
                     record_starts <- record_starts.push(cursor)
                     cursor <- record_end + 1.usize()
                     cursor <- Json::skip_whitespace(lock, cursor, packages_end)
