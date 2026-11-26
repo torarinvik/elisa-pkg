@@ -1,6 +1,9 @@
 # Compiler argument policy and toolchain path identification.
 
 include "./platform.elisa"
+include "./integrity.elisa"
+include "./project/files.elisa"
+include "./text/bytes.elisa"
 
 module Toolchain:
     private:
@@ -31,6 +34,49 @@ module Toolchain:
             return true
 
     public:
+        # Build receipt identities bind both the selected path and executable
+        # bytes. Resolve symlinks first so toolchain paths such as Homebrew's
+        # `opt/llvm/bin/clang` identify the actual file that will be read.
+        # An unavailable identity is never represented as a reusable value.
+        def file_identity(path: cstr, optional: bool, executable: bool, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            out.resize(0)
+            if path[0].u8() == 0:
+                ByteText::append_text(out, "none" if optional else "unavailable")
+                return optional
+            resolved_path: mutable darray[u8] = []
+            if not canonical_path_bytes(path, &resolved_path):
+                ByteText::append_text(out, "unavailable")
+                return false
+            for index in 0..<resolved_path.count |resolved_path|:
+                byte: u8 = resolved_path[index]
+                if byte < 32 or byte == 127:
+                    out.resize(0)
+                    ByteText::append_text(out, "unavailable")
+                    return false
+            if executable:
+                resolved_path_c: mutable darray[u8] = []
+                ProjectFiles::path_with_nul_into(&resolved_path, &resolved_path_c)
+                resolved_path_name: cstr = (&resolved_path_c[0]).cast[cstr] can Unsafe.PointerCast
+                if Platform::pkg_access(resolved_path_name, 1) != 0:
+                    ByteText::append_text(out, "unavailable")
+                    return false
+            content: mutable darray[u8] = []
+            if not Platform::pkg_read_bounded_file(resolved_path, Integrity::max_input, &content):
+                ByteText::append_text(out, "unavailable")
+                return false
+            digest_bytes: mutable darray[u8] = []
+            digest: mutable darray[u8] = []
+            if Integrity::sha256(content, &digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(digest_bytes, &digest):
+                ByteText::append_text(out, "unavailable")
+                return false
+            location: sview = sview((&resolved_path[0]).cast[cstr], 0, resolved_path.count)
+            sha256: sview = sview((&digest[0]).cast[cstr], 0, digest.count)
+            identity: dstr = f"path:{location};sha256:{sha256}"
+            for index in 0..<identity.count |out, identity|:
+                byte: u8 = identity[index].u8()
+                out.push(byte)
+            return true
+
         # Use the same search order for lookup and for the child environment.
         const isolated_path_environment: cstr = "PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"
 

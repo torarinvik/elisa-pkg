@@ -63,47 +63,6 @@ module Cli:
         def read_package_file_into(path: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return Platform::pkg_read_bounded_file(path, Integrity::max_input, out)
 
-        # Build receipt identities bind both the selected path and executable
-        # bytes. Resolve symlinks first so toolchain paths such as Homebrew's
-        # `opt/llvm/bin/clang` identify the actual file that will be read.
-        # An unavailable identity is never represented as a reusable value.
-        def tool_file_identity(path: cstr, optional: bool, executable: bool, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            out.resize(0)
-            if path[0].u8() == 0:
-                ByteText::append_text(out, "none" if optional else "unavailable")
-                return optional
-            resolved_path: mutable darray[u8] = []
-            if not Toolchain::canonical_path_bytes(path, &resolved_path):
-                ByteText::append_text(out, "unavailable")
-                return false
-            for index in 0..<resolved_path.count |resolved_path, out|:
-                byte: u8 = resolved_path[index]
-                if byte < 32 or byte == 127:
-                    out.resize(0)
-                    ByteText::append_text(out, "unavailable")
-                    return false
-            if executable:
-                resolved_path_c: mutable darray[u8] = []
-                ProjectFiles::path_with_nul_into(&resolved_path, &resolved_path_c)
-                resolved_path_name: cstr = (&resolved_path_c[0]).cast[cstr] can Unsafe.PointerCast
-                if Platform::pkg_access(resolved_path_name, 1) != 0:
-                    ByteText::append_text(out, "unavailable")
-                    return false
-            content: mutable darray[u8] = []
-            if not read_package_file_into(&resolved_path, &content):
-                ByteText::append_text(out, "unavailable")
-                return false
-            digest_bytes: mutable darray[u8] = []
-            digest: mutable darray[u8] = []
-            if Integrity::sha256(content, &digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(digest_bytes, &digest):
-                ByteText::append_text(out, "unavailable")
-                return false
-            ByteText::append_text(out, "path:")
-            ByteText::append(out, resolved_path)
-            ByteText::append_text(out, ";sha256:")
-            ByteText::append(out, digest)
-            return true
-
         # Return zero when this call publishes the destination, -17 when an
         # existing destination wins the exclusive link, and another negative
         # value for an I/O or durability failure. Callers that tolerate a
@@ -3637,10 +3596,10 @@ module Cli:
                     stage1_identity: mutable darray[u8] = []
                     runtime_identity: mutable darray[u8] = []
                     clang_identity: mutable darray[u8] = []
-                    compiler_identity_ok: bool = tool_file_identity(compiler, true, true, &compiler_identity)
-                    stage1_identity_ok: bool = tool_file_identity(stage1_bin, false, true, &stage1_identity)
-                    runtime_identity_ok: bool = tool_file_identity(runtime_obj, false, false, &runtime_identity)
-                    clang_identity_ok: bool = tool_file_identity(clang_tool, false, true, &clang_identity)
+                    compiler_identity_ok: bool = Toolchain::file_identity(compiler, true, true, &compiler_identity)
+                    stage1_identity_ok: bool = Toolchain::file_identity(stage1_bin, false, true, &stage1_identity)
+                    runtime_identity_ok: bool = Toolchain::file_identity(runtime_obj, false, false, &runtime_identity)
+                    clang_identity_ok: bool = Toolchain::file_identity(clang_tool, false, true, &clang_identity)
                     sdk_root: mutable darray[u8] = []
                     developer_dir: mutable darray[u8] = []
                     if not Platform::pkg_macos_toolchain_paths(&sdk_root, &developer_dir):
@@ -3655,7 +3614,7 @@ module Cli:
                         ProjectFiles::path_with_nul_into(sdk_settings_path, &sdk_settings_path_c)
                         sdk_settings_name <- (&sdk_settings_path_c[0]).cast[cstr] can Unsafe.PointerCast
                     sdk_identity: mutable darray[u8] = []
-                    sdk_identity_ok: bool = tool_file_identity(sdk_settings_name, sdk_root.count == 0.usize(), false, &sdk_identity)
+                    sdk_identity_ok: bool = Toolchain::file_identity(sdk_settings_name, sdk_root.count == 0.usize(), false, &sdk_identity)
                     developer_linker_path: mutable darray[u8] = []
                     developer_linker_path_c: mutable darray[u8] = []
                     developer_linker_name: mutable cstr = ""
@@ -3682,8 +3641,8 @@ module Cli:
                         executable_paths.push(developer_assembler_name)
                     developer_linker_identity: mutable darray[u8] = []
                     developer_assembler_identity: mutable darray[u8] = []
-                    developer_linker_identity_ok: bool = tool_file_identity(developer_linker_name, sdk_root.count == 0.usize(), true, &developer_linker_identity)
-                    developer_assembler_identity_ok: bool = tool_file_identity(developer_assembler_name, sdk_root.count == 0.usize(), true, &developer_assembler_identity)
+                    developer_linker_identity_ok: bool = Toolchain::file_identity(developer_linker_name, sdk_root.count == 0.usize(), true, &developer_linker_identity)
+                    developer_assembler_identity_ok: bool = Toolchain::file_identity(developer_assembler_name, sdk_root.count == 0.usize(), true, &developer_assembler_identity)
                     toolchain_identity_ok: bool = compiler_identity_ok and stage1_identity_ok and runtime_identity_ok and clang_identity_ok and sdk_identity_ok and developer_linker_identity_ok and developer_assembler_identity_ok
 
                     # Take one private, bounded snapshot after validating the lock and
@@ -4336,19 +4295,19 @@ module Cli:
                     toolchain_unchanged: mutable bool = true
                     post_tool_identity: mutable darray[u8] = []
                     if compiler_identity_ok:
-                        toolchain_unchanged <- tool_file_identity(compiler, true, true, &post_tool_identity) and ByteText::equal(post_tool_identity, compiler_identity)
+                        toolchain_unchanged <- Toolchain::file_identity(compiler, true, true, &post_tool_identity) and ByteText::equal(post_tool_identity, compiler_identity)
                     if toolchain_unchanged and stage1_identity_ok:
-                        toolchain_unchanged <- tool_file_identity(stage1_bin, false, true, &post_tool_identity) and ByteText::equal(post_tool_identity, stage1_identity)
+                        toolchain_unchanged <- Toolchain::file_identity(stage1_bin, false, true, &post_tool_identity) and ByteText::equal(post_tool_identity, stage1_identity)
                     if toolchain_unchanged and runtime_identity_ok:
-                        toolchain_unchanged <- tool_file_identity(runtime_obj, false, false, &post_tool_identity) and ByteText::equal(post_tool_identity, runtime_identity)
+                        toolchain_unchanged <- Toolchain::file_identity(runtime_obj, false, false, &post_tool_identity) and ByteText::equal(post_tool_identity, runtime_identity)
                     if toolchain_unchanged and clang_identity_ok:
-                        toolchain_unchanged <- tool_file_identity(clang_tool, false, true, &post_tool_identity) and ByteText::equal(post_tool_identity, clang_identity)
+                        toolchain_unchanged <- Toolchain::file_identity(clang_tool, false, true, &post_tool_identity) and ByteText::equal(post_tool_identity, clang_identity)
                     if toolchain_unchanged and sdk_identity_ok:
-                        toolchain_unchanged <- tool_file_identity(sdk_settings_name, sdk_root.count == 0.usize(), false, &post_tool_identity) and ByteText::equal(post_tool_identity, sdk_identity)
+                        toolchain_unchanged <- Toolchain::file_identity(sdk_settings_name, sdk_root.count == 0.usize(), false, &post_tool_identity) and ByteText::equal(post_tool_identity, sdk_identity)
                     if toolchain_unchanged and developer_linker_identity_ok:
-                        toolchain_unchanged <- tool_file_identity(developer_linker_name, sdk_root.count == 0.usize(), true, &post_tool_identity) and ByteText::equal(post_tool_identity, developer_linker_identity)
+                        toolchain_unchanged <- Toolchain::file_identity(developer_linker_name, sdk_root.count == 0.usize(), true, &post_tool_identity) and ByteText::equal(post_tool_identity, developer_linker_identity)
                     if toolchain_unchanged and developer_assembler_identity_ok:
-                        toolchain_unchanged <- tool_file_identity(developer_assembler_name, sdk_root.count == 0.usize(), true, &post_tool_identity) and ByteText::equal(post_tool_identity, developer_assembler_identity)
+                        toolchain_unchanged <- Toolchain::file_identity(developer_assembler_name, sdk_root.count == 0.usize(), true, &post_tool_identity) and ByteText::equal(post_tool_identity, developer_assembler_identity)
                     if not toolchain_unchanged:
                         _ = BuildSnapshots::remove_all(source_snapshot_container_name, source_snapshot_roots)
                         _ = BuildSnapshots::remove_aggregate(aggregate_source_name)
