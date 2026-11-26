@@ -7,6 +7,7 @@ include "../platform.elisa"
 include "../resolution/semver.elisa"
 include "../resolution/solver.elisa"
 include "../text/bytes.elisa"
+include "../project/schema_fields.elisa"
 
 module ReleaseMetadata:
     public:
@@ -99,49 +100,9 @@ module ReleaseMetadata:
             size_out <- parsed_size
             return true
 
-        def allowed_fields(raw: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            first: mutable usize = 0
-            last: mutable usize = raw.count
-            while first < last and is_json_space(raw[first]) |raw, first|:
-                first <- first + 1
-            while last > first and is_json_space(raw[last - 1]) |raw, last|:
-                last <- last - 1
-            return false if first >= last or raw[first] != 123 or raw[last - 1] != 125
-            in_string: mutable bool = false
-            escaped: mutable bool = false
-            string_start: mutable usize = 0
-            braces: mutable i64 = 1
-            brackets: mutable i64 = 0
-            for index in (first + 1)..<last |raw, in_string, escaped, string_start, braces, brackets|:
-                byte: u8 = raw[index]
-                if not in_string:
-                    if byte == 34:
-                        in_string <- true
-                        string_start <- index + 1
-                    elif byte == 123:
-                        braces <- braces + 1
-                    elif byte == 125:
-                        braces <- braces - 1
-                    elif byte == 91:
-                        brackets <- brackets + 1
-                    elif byte == 93:
-                        brackets <- brackets - 1
-                elif escaped:
-                    escaped <- false
-                elif byte == 92:
-                    escaped <- true
-                elif byte == 34:
-                    after: mutable usize = index + 1
-                    while after < last and is_json_space(raw[after]) |raw, after|:
-                        after <- after + 1
-                    if braces == 1 and brackets == 0 and after < last and raw[after] == 58:
-                        key: mutable darray[u8] = []
-                        for item in string_start..<index |raw, key|:
-                            key.push(raw[item])
-                        allowed: bool = ByteText::equal_text(key, "schema-version") or ByteText::equal_text(key, "algorithm") or ByteText::equal_text(key, "registry") or ByteText::equal_text(key, "package") or ByteText::equal_text(key, "version") or ByteText::equal_text(key, "archive") or ByteText::equal_text(key, "archive-size") or ByteText::equal_text(key, "archive-digest") or ByteText::equal_text(key, "expires") or ByteText::equal_text(key, "dependencies")
-                        return false if not allowed
-                    in_string <- false
-            return not in_string and not escaped and braces == 0 and brackets == 0
+        def allowed_fields(raw: darray[u8]&) -> bool:
+            start: usize = Json::root_start(raw)
+            return SchemaFields::valid(raw, start, Json::root_object_end(raw, start), SchemaFields::Kind.RegistryRelease)
 
         def unsigned_field(raw: darray[u8]&, wanted: cstr, out: mutable u64&) -> bool:
             start: usize = Json::root_start(raw)
@@ -217,7 +178,7 @@ module ReleaseMetadata:
                         return false if after >= dependency_end or raw[after] != 123
                         value_end: usize = Json::object_end(raw, after)
                         return false if value_end <= after or value_end > dependency_end
-                        return false if not dependency_allowed_fields(raw, after, value_end)
+                        return false if not SchemaFields::valid(raw, after, value_end, SchemaFields::Kind.RegistryDependency)
                         requirement: mutable darray[u8] = []
                         return false if not Json::object_string_value(raw, after, value_end, "version", &requirement)
                         parsed: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
@@ -235,40 +196,3 @@ module ReleaseMetadata:
         def string_field(raw: darray[u8]&, wanted: cstr, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
             start: usize = Json::root_start(raw)
             return Json::object_string_value(raw, start, Json::root_object_end(raw, start), wanted, out)
-
-        def dependency_allowed_fields(raw: darray[u8]&, start: usize, finish: usize) -> bool can[Memory.Allocate, Abort.Panic]:
-            return false if start >= finish or raw[start] != 123
-            in_string: mutable bool = false
-            escaped: mutable bool = false
-            string_start: mutable usize = 0
-            braces: mutable i64 = 1
-            brackets: mutable i64 = 0
-            for index in (start + 1)..<finish |raw, in_string, escaped, string_start, braces, brackets|:
-                byte: u8 = raw[index]
-                if not in_string:
-                    if byte == 34:
-                        in_string <- true
-                        string_start <- index + 1
-                    elif byte == 123:
-                        braces <- braces + 1
-                    elif byte == 125:
-                        braces <- braces - 1
-                    elif byte == 91:
-                        brackets <- brackets + 1
-                    elif byte == 93:
-                        brackets <- brackets - 1
-                elif escaped:
-                    escaped <- false
-                elif byte == 92:
-                    escaped <- true
-                elif byte == 34:
-                    after: mutable usize = index + 1
-                    while after < finish and is_json_space(raw[after]) |raw, after|:
-                        after <- after + 1
-                    if braces == 1 and brackets == 0 and after < finish and raw[after] == 58:
-                        key: mutable darray[u8] = []
-                        for item in string_start..<index |raw, key|:
-                            key.push(raw[item])
-                        return false if not ByteText::equal_text(key, "registry") and not ByteText::equal_text(key, "version")
-                    in_string <- false
-            return not in_string and not escaped and braces == 1 and brackets == 0
