@@ -210,34 +210,7 @@ extend PlatformNative:
 
     public:
         def open_directory_path(path: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            length: usize = native_strlen(path)
-            return -22 if length == 0 or length > 4096
-            path_copy: mutable darray[u8] = [path[index].u8() for index in 0..<length]
-            path_copy <- path_copy.push(0)
-            directory: mutable i64 =
-                absolute: bool = path_copy[0] == 47
-                native_open("/" if absolute else ".", flags_directory())
-            return -NativeErrors::error_code() if directory < 0
-            start: mutable usize = 0.usize()
-            while start < length and path_copy[start] == 47 |path_copy, start|:
-                start <- start + 1.usize()
-            while start < length:
-                finish: mutable usize = start
-                while finish < length and path_copy[finish] != 47 |path_copy, finish|:
-                    finish <- finish + 1.usize()
-                path_copy[finish] <- 0
-                region part_scope:
-                    part: cstr = (&path_copy[start]).cast[cstr] can Unsafe.PointerCast
-                    if not c_string_equal(part, "."):
-                        return close_error(directory, -22) if c_string_equal(part, "..")
-                        next: i64 = native_openat(directory, part, flags_directory() + flag_no_follow)
-                        return close_error(directory, -NativeErrors::error_code()) if next < 0
-                        return close_error(next, -5) if native_close(directory) != 0
-                        directory <- next
-                start <- finish + 1.usize()
-                while start < length and path_copy[start] == 47 |path_copy, start|:
-                    start <- start + 1.usize()
-            return directory
+            return walk_directory_path(path, false)
 
     public:
         def open_package_directory_component(directory: i64, component: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -268,15 +241,20 @@ extend PlatformNative:
 
     public:
         def open_package_directory_path(path: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return walk_directory_path(path, true)
+
+    private:
+        # Open `path` one no-follow component at a time from `/` or the
+        # current directory. `package_policy` applies the package source
+        # ownership checks to every directory on the way.
+        def walk_directory_path(path: cstr, package_policy: bool) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             length: usize = native_strlen(path)
             return -22 if length == 0 or length > 4096
             path_copy: mutable darray[u8] = [path[index].u8() for index in 0..<length]
             path_copy <- path_copy.push(0)
-            directory: mutable i64 =
-                absolute: bool = path_copy[0] == 47
-                native_open("/" if absolute else ".", flags_directory())
+            directory: mutable i64 = native_open("/" if path_copy[0] == 47 else ".", flags_directory())
             return -NativeErrors::error_code() if directory < 0
-            return close_error(directory, -13) if not package_source_directory_file_descriptor(directory)
+            return close_error(directory, -13) if package_policy and not package_source_directory_file_descriptor(directory)
             start: mutable usize = 0.usize()
             while start < length and path_copy[start] == 47 |path_copy, start|:
                 start <- start + 1.usize()
@@ -288,7 +266,7 @@ extend PlatformNative:
                 region component_scope:
                     component: cstr = (&path_copy[start]).cast[cstr] can Unsafe.PointerCast
                     if not c_string_equal(component, "."):
-                        next: i64 = open_package_directory_component(directory, component)
+                        next: i64 = open_package_directory_component(directory, component) if package_policy else open_plain_directory_component(directory, component)
                         return close_error(directory, next) if next < 0
                         return close_error(next, -5) if native_close(directory) != 0
                         directory <- next
@@ -296,6 +274,12 @@ extend PlatformNative:
                 while start < length and path_copy[start] == 47 |path_copy, start|:
                     start <- start + 1.usize()
             return directory
+
+        def open_plain_directory_component(directory: i64, component: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return -22 if c_string_equal(component, "..")
+            next: i64 = native_openat(directory, component, flags_directory() + flag_no_follow)
+            return -NativeErrors::error_code() if next < 0
+            return next
 
     public:
         def open_package_file(path: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
