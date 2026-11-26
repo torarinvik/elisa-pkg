@@ -15,6 +15,7 @@ include "./security.elisa"
 include "./archive.elisa"
 include "./package/manifest.elisa"
 include "./package/selection.elisa"
+include "./package/ustar_fields.elisa"
 include "./resolution/semver.elisa"
 include "./package/package_identity.elisa"
 include "./integrity.elisa"
@@ -5296,14 +5297,16 @@ module Cli:
                 path_with_nul_into(entry, &entry_c)
                 entry_name: cstr = (&entry_c[0]).cast[cstr] can Unsafe.PointerCast
                 entry_size: i64 = Platform::pkg_package_file_size(entry_name)
-                return false if entry_size < 0 or entry_size > 67108864
+                return false if entry_size < 0 or entry_size > UstarFields::max_payload_bytes.i64()
                 content.resize(entry_size.usize() + 1.usize())
                 content_raw: mutable u8& = (&content[0]).cast[mutable u8&] can Unsafe.PointerCast
                 read_size: i64 = Platform::pkg_read_package_file(entry_name, content_raw, content.count)
                 return false if read_size < 0 or read_size != entry_size
                 content.resize(read_size.usize())
-                return false if content.count > 67108864.usize() - 1024.usize() - 512.usize() - 511.usize()
-                return false if out.count > 67108864.usize() - 1024.usize() - 512.usize() - 511.usize() - content.count
+                padding: usize = UstarFields::padding_bytes(content.count)
+                padded_payload: usize = content.count + padding
+                return false if padded_payload > UstarFields::max_payload_bytes
+                return false if out.count > UstarFields::max_payload_bytes - padded_payload
                 header: darray[u8] = Archive::tar_file_header(entry, content.count)
                 return false if header.count != 512.usize()
                 header_start: usize = out.count
@@ -5312,10 +5315,9 @@ module Cli:
                     out[header_start + header_index] <- header[header_index]
                 for content_index in 0..<content.count |out, content|:
                     out.push(content[content_index])
-                padding: usize = (512.usize() - (content.count % 512.usize())) % 512.usize()
                 out.resize(out.count + padding)
             out.resize(out.count + 1024.usize())
-            return out.count <= 67108864.usize()
+            return out.count <= UstarFields::max_archive_bytes
 
         def run_package(argc: i64, slots: mutable cstr&&, start: darray[u8]&) -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             if not project_manifest_exists():
