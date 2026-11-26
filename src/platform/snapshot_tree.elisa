@@ -219,39 +219,7 @@ module NativeSnapshotTree:
                 copied_paths.push(relative[index])
             copied_paths.push(0)
 
-            buffer: mutable darray[u8] = []
-            buffer <- buffer.resize(snapshot_io_buffer_bytes)
-            buffer_raw: mutable void& = (&buffer[0]).cast[mutable void&] can Unsafe.PointerCast
-            failed: mutable i64 = 0
-            while true |buffer_raw, source_file, destination_file, total_bytes, byte_limit, failed|:
-                amount: i64 = native_read(source_file, buffer_raw, buffer.count)
-                if amount < 0:
-                    errno_value: i64 = NativeErrors::current_errno()
-                    continue if errno_value == 4
-                    failed <- NativeErrors::negative_value(errno_value)
-                    break
-                break if amount == 0
-                if amount > buffer.count.i64() or amount.usize() > byte_limit - total_bytes:
-                    failed <- -75
-                    break
-                region written_scope:
-                    written: mutable usize = 0.usize()
-                    while written < amount.usize() |buffer_raw, destination_file, written, amount|:
-                        wrote: i64 =
-                            raw: void& = (&buffer[written]).cast[void&] can Unsafe.PointerCast
-                            native_write(destination_file, raw, amount.usize() - written)
-                        if wrote < 0:
-                            errno_value: i64 = NativeErrors::current_errno()
-                            continue if errno_value == 4
-                            failed <- NativeErrors::negative_value(errno_value)
-                            break
-                        if wrote == 0 or wrote > amount - written.i64():
-                            failed <- -5
-                            break
-                        written <- written + wrote.usize()
-                break if failed != 0
-                total_bytes <- total_bytes + amount.usize()
-
+            failed: mutable i64 = copy_file_contents(source_file, destination_file, total_bytes, byte_limit)
             if failed == 0 and native_fsync(destination_file) != 0:
                 failed <- NativeErrors::negative_errno()
             source_close: i32 = native_close(source_file)
@@ -267,6 +235,41 @@ module NativeSnapshotTree:
                 if source_parent_close != 0 or destination_parent_close != 0:
                     failed <- -5 if failed == 0
             return failed
+
+        # Copy a source descriptor to a destination descriptor, retrying on
+        # EINTR and refusing to pass `byte_limit` in total. Returns 0 or a
+        # negative errno (-75 when the limit is exceeded).
+        def copy_file_contents(source_file: i64, destination_file: i64, total_bytes: mutable usize&, byte_limit: usize) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            buffer: mutable darray[u8] = []
+            buffer <- buffer.resize(snapshot_io_buffer_bytes)
+            buffer_raw: mutable void& = (&buffer[0]).cast[mutable void&] can Unsafe.PointerCast
+            while true |buffer_raw, source_file, destination_file, total_bytes, byte_limit|:
+                amount: i64 = native_read(source_file, buffer_raw, buffer.count)
+                if amount < 0:
+                    errno_value: i64 = NativeErrors::current_errno()
+                    continue if errno_value == 4
+                    return NativeErrors::negative_value(errno_value)
+                return 0 if amount == 0
+                return -75 if amount > buffer.count.i64() or amount.usize() > byte_limit - total_bytes
+                region write_status_scope:
+                    write_status: i64 = write_all(destination_file, buffer, amount.usize())
+                    return write_status if write_status != 0
+                total_bytes <- total_bytes + amount.usize()
+            return 0
+
+        # Write the first `amount` bytes of `buffer`, retrying on EINTR.
+        def write_all(destination_file: i64, buffer: darray[u8]&, amount: usize) -> i64 can[Unsafe.PointerCast]:
+            while written < amount |written: usize = 0.usize()|:
+                wrote: i64 =
+                    raw: void& = (&buffer[written]).cast[void&] can Unsafe.PointerCast
+                    native_write(destination_file, raw, amount - written)
+                if wrote < 0:
+                    errno_value: i64 = NativeErrors::current_errno()
+                    continue if errno_value == 4
+                    return NativeErrors::negative_value(errno_value)
+                return -5 if wrote == 0 or wrote > (amount - written).i64()
+                written <- written + wrote.usize()
+            return 0
 
         def snapshot_copy_failure(source_root: i64, destination_root: i64, copied_paths: darray[u8]&, created_directories: darray[u8]&, original_error: i64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             cleanup_status: mutable i64 = 0
