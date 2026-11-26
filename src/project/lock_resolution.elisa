@@ -38,6 +38,18 @@ module LockResolution:
                 return LocalLock::canonical(name, version, raw, root)
 
     private:
+        def registry_dependency_record(name: darray[u8]&, version: darray[u8]&, archive: darray[u8]&, archive_size: u64, archive_digest: darray[u8]&, metadata_digest: darray[u8]&) -> dstr can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            requires name.count > 0 and version.count > 0 and archive.count > 0 and archive_digest.count > 0 and metadata_digest.count > 0
+            name_text: sview = sview((&name[0]).cast[cstr], 0, name.count)
+            version_text: sview = sview((&version[0]).cast[cstr], 0, version.count)
+            archive_text: sview = sview((&archive[0]).cast[cstr], 0, archive.count)
+            archive_hex: sview = sview((&archive_digest[0]).cast[cstr], 0, archive_digest.count)
+            metadata_hex: sview = sview((&metadata_digest[0]).cast[cstr], 0, metadata_digest.count)
+            size_bytes: mutable darray[u8] = []
+            ByteText::append_decimal(&size_bytes, archive_size)
+            size_text: sview = sview((&size_bytes[0]).cast[cstr], 0, size_bytes.count)
+            return f"\n    {{\"name\":\"{name_text}\",\"version\":\"{version_text}\",\"source\":{{\"type\":\"registry\",\"registry\":\"primary\",\"archive\":\"{archive_text}\"}},\"archive-size\":{size_text},\"archive-digest\":\"sha256:{archive_hex}\",\"metadata-digest\":\"sha256:{metadata_hex}\"}}"
+
         def provider_failure(code: Registry::ResultCode, report_failure: bool) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
             return [] if not report_failure
             return [code.u8() + 1.u8()]
@@ -308,19 +320,9 @@ module LockResolution:
                         if trust_status != Registry::ResultCode.Ok:
                             return provider_failure(trust_status, true)
                     out <- out.push(44) if not first
-                    ByteText::append_text(&out, "\n    {\"name\":\"")
-                    ByteText::append(&out, selected_name)
-                    ByteText::append_text(&out, "\",\"version\":\"")
-                    ByteText::append(&out, selected_text)
-                    ByteText::append_text(&out, "\",\"source\":{\"type\":\"registry\",\"registry\":\"primary\",\"archive\":\"")
-                    ByteText::append(&out, archive)
-                    ByteText::append_text(&out, "\"},\"archive-size\":")
-                    ByteText::append_decimal(&out, archive_size)
-                    ByteText::append_text(&out, ",\"archive-digest\":\"sha256:")
-                    ByteText::append(&out, digest)
-                    ByteText::append_text(&out, "\",\"metadata-digest\":\"sha256:")
-                    ByteText::append(&out, metadata_digest)
-                    ByteText::append_text(&out, "\"}")
+                    record: dstr = registry_dependency_record(selected_name, selected_text, archive, archive_size, digest, metadata_digest)
+                    for index in 0..<record.count |out, record|:
+                        out <- out.push(record[index].u8())
                     # Reserve seven bytes for the closing array, object, and line endings.
                     return provider_failure(Registry::ResultCode.ResourceLimit, persist_trust) if out.count > Json::max_document_bytes - 7.usize()
                     for byte_index in 0..<selected_name.count |emitted, selected_name|:
