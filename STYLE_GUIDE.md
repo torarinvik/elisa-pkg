@@ -1,0 +1,572 @@
+# Elisa style guide: expression-based, scope-minimal code
+
+Two principles, one idea:
+
+1. **Every name should end where its job ends.** A local must not stay visible (or mutable)
+   after its last use.
+2. **Avoid plain statements whenever possible.** Prefer forms that produce a value over void
+   statements whose effect is invisible at the use site.
+
+This guide aligns with `docs/119_expression_unification.md` (value blocks, loop values,
+captures); that document is the language reference, this one is the house style. The lint that
+enforces principle 1 is `-Wnever-leak` (section 7).
+
+Status key: **[working]** examples compile with stage1 today; **[in progress]** and
+**[planned]** sections are design, not yet usable.
+
+1. [Plain statements are the fallback](#1-plain-statements-are-the-fallback)
+2. [Block expressions](#2-block-expressions)
+3. [region blocks](#3-region-blocks)
+4. [Loop header captures](#4-loop-header-captures)
+5. [Loop expressions](#5-loop-expressions)
+6. [Value-threading](#6-value-threading)
+7. [Borrow exclusivity](#7-borrow-exclusivity)
+8. [Compiler flags and reading a diagnostic](#8-compiler-flags-and-reading-a-diagnostic)
+9. [When not to apply the style](#9-when-not-to-apply-the-style)
+10. [Adoption](#10-adoption)
+
+## 1. Plain statements are the fallback
+
+A plain statement (a call or assignment with no value to bind) changes state somewhere the
+reader cannot see. Reach for a value form first: a block expression, a loop expression, a tuple
+yield, or `x <- f(x)`. Use a plain statement only when no value form fits: side-effect-only
+calls (`print`, `sink`), arenas, globals, data behind borrows. Then wrap it in
+`region NAME_scope:` so its locals end with it.
+
+Prefer (value form, nothing leaks):
+
+```elisa
+lol: i64 =
+    bar: i64 = seed + 1
+    baz(bar)
+sink(lol)
+```
+
+Instead of (`bar` stays visible, and the real work hides in a call statement):
+
+```elisa
+bar: i64 = seed + 1
+sink(baz(bar))
+sink(seed)
+```
+
+Prefer, when the plain statement is unavoidable:
+
+```elisa
+region bar_scope:
+    bar: i64 = seed + 1
+    sink(baz(bar))
+sink(seed)
+```
+
+The never-leak finding kind **plain** is the compiler's pointer to exactly these sites: a
+local whose last use is a statement with no value to bind.
+
+When consecutive statements update fields of the same record, group them with the
+record update syntax. Name the record once and use field names relative to it:
+
+```elisa
+state.bindings with {
+    names <- [],
+    slots <- [],
+    types <- []
+}
+```
+
+Keep the update at the scope where those changes occur; use `state.bindings` as the
+base when updating its fields, rather than mixing paths from different records.
+
+## 2. Block expressions
+
+A binding whose initializer is an indented block; the last line is the value, and locals
+declared inside vanish afterwards. **[working]**
+
+Prefer:
+
+```elisa
+lol: i64 =
+    bar: i64 = seed + 1
+    baz(bar)
+sink(lol)
+```
+
+Instead of:
+
+```elisa
+bar: i64 = seed + 1
+lol: i64 = baz(bar)
+sink(lol)
+```
+
+Rationale: `bar` has one job, feeding `lol`. After `lol` exists nothing can misuse it.
+
+When the block updates an outer variable, list it in a `|count|` capture (it must be mutable):
+
+```elisa
+total: i64 = |count|
+    step: i64 = seed * 3
+    count <- count + 1
+    step + count
+```
+
+To yield several values, bind a tuple and end the block with a tuple:
+
+```elisa
+lo, hi =
+    base: i64 = seed * 2
+    (base - 1, base + 1)
+```
+
+Reading outer bindings needs no capture; mutating one does. A trivial initializer needs no block.
+
+**Early exits.** **[working]** (stage1) A `break` or `continue` inside a block leaves it for the
+enclosing loop, so a guard can sit next to the local it tests. On that path the binding is never
+made, exactly as in the statement form, and the block compiles to the same machine code
+(`test/parity/early_exit_codegen_smoke.sh`):
+
+```elisa
+for value in values |sum| -> sum:
+    doubled: i64 =
+        tmp: i64 = value * 2
+        continue if tmp < 0
+        tmp + 1
+    sum += doubled
+```
+
+The one block a jump may not leave is one with a `|capture|` header: it writes the captured
+values back only when it ends. stage0 rejects every jump out of a block, so this is stage1 only.
+
+## 3. region blocks
+
+For statements that bind nothing, `region NAME_scope:` is the scope. Name it `<local>_scope`
+after what it contains. **[working]**
+
+Prefer:
+
+```elisa
+region bar_scope:
+    bar: i64 = seed + 1
+    sink(baz(bar))
+sink(seed)
+```
+
+Instead of:
+
+```elisa
+bar: i64 = seed + 1
+sink(baz(bar))
+sink(seed)
+```
+
+A `region` also frees what its statements allocate when it ends. If something allocated inside
+must outlive it, bind it with a block expression instead, or move the code into a helper.
+
+## 4. Loop header captures
+
+A counter belongs to its loop, so declare it in the loop header. **[working]**
+
+Prefer:
+
+```elisa
+while index < limit |index: i64 = 0|:
+    sink(index)
+    index <- index + 1
+```
+
+Instead of:
+
+```elisa
+index: mutable i64 = 0
+while index < limit:
+    sink(index)
+    index <- index + 1
+```
+
+The header binding is mutable inside the loop and invisible after it.
+
+## 5. Loop expressions
+
+A loop with a `-> yield` header is an expression; its result is the captures at loop exit, and
+zero iterations yield the initial values. A bare `for`/`while` in value position is an error.
+Loop expressions exist on main (see `test/differential/cases/loop_break_value.elisa`).
+**[working]** The never-leak *accumulator* finding kind points you to these sites, and the
+scoped form compiles to the same machine code as the `mutable` + loop form at -O0 and -O2
+(`test/parity/loop_value_codegen_smoke.sh`). Gentle mode and `-Werror=never-leak` report only
+accumulators with a rewrite; `-Wnever-leak=strict` also lists candidates no rewrite fits, with the
+exact reason (read inside the loop, changed after it, not a scalar, outer `break`/`continue`).
+
+Prefer:
+
+```elisa
+sum: usize =
+    for num in numbers |sum: usize = 0| -> sum:
+        sum += num
+```
+
+Instead of:
+
+```elisa
+sum: mutable usize = 0
+for num in numbers:
+    sum += num
+```
+
+Several accumulators yield a tuple:
+
+```elisa
+total, count =
+    for x in xs |total: i64 = 0, count: usize = 0| -> (total, count):
+        total += x
+        count += 1
+```
+
+A search loop uses `break VALUE if COND`, which assigns the capture and exits. Optionals are
+written `T?`:
+
+```elisa
+found: usize? =
+    for i in 0..<xs.count |hit: usize? = null| -> hit:
+        break i if xs[i] == want
+```
+
+If the loop finishes without breaking, `found` is `null`, the initial value.
+
+**Labelled loops.** **[working]** (stage1) `'name:` before a `for` or `while` labels it, and
+`break 'name` / `continue 'name` reach it from any depth, including from a block inside an
+inner loop. On a loop expression, `break 'name VALUE [if COND]` sets its `-> accumulator` and
+leaves it, so a nested search needs no flag:
+
+```elisa
+found: i64 =
+    'rows: for row in 0..<height |hit: i64 = -1| -> hit:
+        for col in 0..<width:
+            break 'rows row * width + col if grid[row][col] == want
+
+'rows: for row in 0..<height:
+    for col in 0..<width:
+        continue 'rows if grid[row][col] == 0
+        sink(grid[row][col])
+```
+
+The label sits on the loop's own line; only loops take one. Both forms compile to the same
+machine code as the `mutable` local with a labelled statement loop
+(`test/fixtures/early_exit_pairs/`).
+
+### Comprehensions
+
+**[working]** A list, dict or set built by one loop is a comprehension. Clauses nest left to
+right, each with an optional `if` filter; later clauses may read earlier binders. Nested clauses
+are stage1 only.
+
+```elisa
+squares: darray[i64] = [num * num for num in numbers if num > 3]
+sums: darray[i64] = [x * 10 + y for x in xs if x > 1 for y in ys]
+lookup: dict[i64, i64] = {x: x * x for x in xs}
+parity: set[i64] = {x % 2 for x in xs}
+pairs = [(x, x * 2) for x in xs]            # unlabeled tuples: fields `_0`, `_1`
+for a, b in pairs:                          # tuples destructure by position
+    sink(a + b)
+```
+
+Prefer a comprehension to an empty `mutable` darray filled by a push loop (the never-leak
+*push loop* kind, section 8, prints the rewrite). It is one immutable binding, and with no filter
+over a range or a darray it allocates the result once instead of growing it push by push.
+Tuple types are named (`darray[(a: i64, b: i64)]`); `darray[(i64, i64)]` is an error, as in
+stage0. Dicts and sets need the stage1 runtime (`include "elisacore_std/elisacore_runtime.elisa"`).
+Bracket-free generators (`sum(x for x in xs)`) do not exist; write a loop expression.
+
+## 6. Value-threading
+
+**[working]** (stage1). For an owned value, thread it through the call instead of lending it:
+the function takes the value by value and hands it back, and the caller puts it back in the
+same statement.
+
+```elisa
+def push_one(arr: darray[i64], x: i64) -> darray[i64]:
+    arr.push(x)
+    return arr
+
+def main() -> i64:
+    arr: mutable darray[i64] = []
+    arr <- push_one(arr, 4)
+    arr <- arr.push_one(5)
+    return 0 if arr.count == 2 else 1
+```
+
+```text
+Prefer:      arr <- arr.push_one(4)          def push_one(arr: darray[i64], x: i64) -> darray[i64]
+Instead of:  push_one(&arr, 4)                def push_one(arr: mutable darray[i64]&, x: i64) -> void
+```
+
+This is a readability and exclusivity win, not an optimisation: the two spellings compile to
+identical machine code at `-O0` and `-O2` (`test/parity/value_threading_codegen_smoke.sh`
+holds a darray push and pop, a small and a 72-byte struct, an owned struct's field, and a
+collection threaded through a loop, both as a capture and as a loop value). The compiler
+rewrites the value form into the `&` form before code generation
+(`src/backend/codegen_value_threading*.elisa`).
+
+**The signature.** A parameter is threaded ("owned in, owned out") when it is a by-value
+parameter of an owning type (a `darray`/`dict`/`set`, a struct; never a scalar or a view),
+written WITHOUT `mutable`; the result type is that same type; every `return` hands it back;
+and the body writes it. Writing a by-value parameter is an error everywhere else, so the
+signature itself is the opt-in. A second result rides along as a two-element tuple, with the
+threaded value in one slot:
+
+```elisa
+def pop_one(arr: darray[i64]) -> (rest: darray[i64], last: i64):
+    v: i64 = arr.pop()
+    return arr, v
+
+def main() -> i64:
+    a: mutable darray[i64] = [1, 2, 3]
+    last: mutable i64 = 0
+    a, last <- pop_one(a)
+    return 0 if last == 3 and a.count == 2 else 1
+```
+
+**The call.** The argument is moved into the call, so put the result back in the same
+statement:
+
+- `x <- f(x, ..)` or `x <- x.f(..)` on a local: `x` is never observably moved out;
+- `s.items <- f(s.items, ..)` on an OWNED `s` (a field is briefly empty within one statement);
+- `y = f(x, ..)` moves `x` into `y`: `x` cannot be used afterwards;
+- `return f(x, ..)`, and a threaded function passing its own parameter on
+  (`arr <- push_one(arr, i)` inside another threaded function).
+
+A loop threads a collection through its header, either as a capture or as a loop value:
+
+```elisa
+def push_one(arr: darray[i64], x: i64) -> darray[i64]:
+    arr.push(x)
+    return arr
+
+def main() -> i64:
+    filled: darray[i64] =
+        for i in 0..<4 |filled: darray[i64] = []| -> filled:
+            filled <- push_one(filled, i)
+    grown = for i in 0..<4 |grown: darray[i64] = []| -> grown:
+        grown <- grown.push_one(i)
+    return 0 if filled.count == 4 and grown.count == 4 else 1
+```
+
+**Builtin containers.** The in-place container methods have value forms too. Each compiles
+to the same machine code as the in-place statement (the builtin pairs in
+`test/fixtures/value_threading_pairs/`):
+
+| Value form | In-place form |
+|---|---|
+| `xs <- xs.push(v)` | `xs.push(v)` |
+| `xs <- xs.clear()` | `xs.clear()` |
+| `xs, last <- xs.pop()` | `last <- xs.pop()` |
+| `xs, item <- xs.remove_at(i)` | `item <- xs.remove_at(i)` |
+| `d <- d.put(k, v)` | `d.put(k, v)` |
+| `d, found <- d.remove(k)` | `found <- d.remove(k)` |
+
+```elisa
+def main() -> i64:
+    xs: mutable darray[i64] = []
+    for i in 0..<5 |xs|:
+        xs <- xs.push(i)
+    last: mutable i64 = 0
+    xs, last <- xs.pop()
+    return 0 if last == 4 and xs.count == 4 else 1
+```
+
+The two-result forms need the container itself as the first target: `ys, last <- xs.pop()`
+is rejected with both spellings (the last error below). `remove_at` and dicts need the stage1 runtime
+(`include "elisacore_std/elisacore_runtime.elisa"`). stage1 has no in-place `insert` on a
+`darray` yet, so it has no value form either.
+
+**The errors.** Each names the rewrite in your own names
+(`test/fixtures/value_threading/expected.txt`):
+
+```text
+illegal.elisa:15:5-13: the result of "push_one" is the updated "arr" (it takes "arr" by value and hands it back), and this statement drops it, so the call changes nothing; put it back: arr <- push_one(arr, 1)
+illegal.elisa:19:35-42: "s.items" is reached through the borrow "s" (s: State&), so it cannot be moved into "push_one", which takes it by value and hands it back; keep the & form, push_one(&s.items, 2) with a mutable & parameter, or own "s" by value and write s.items <- push_one(s.items, 2)
+illegal.elisa:24:35-42: "s.items" is a field of "s"; moving it into "push_one", which takes it by value and hands it back, would leave "s" incomplete; put the result back in the same statement: s.items <- push_one(s.items, 3)
+illegal.elisa:28:35-43: global "registry" cannot be moved into "push_one", which takes it by value and hands it back; put the result back in the same statement: registry <- push_one(registry, 4)
+illegal.elisa:34:12-15: "arr" was moved into "push_one" at illegal.elisa:33:35-38 (which takes it by value and hands back the updated value) and cannot be used afterwards; use the call's result, or keep "arr" by writing arr <- push_one(arr, 5)
+illegal.elisa:40:5-7: `ys, last <- xs.pop()` would update "xs" in place and leave its first target unchanged: the two-result form threads the container itself, so its first target must be "xs"; write xs, last <- xs.pop(), or last <- xs.pop()
+```
+
+`&` stays for data reached through borrows (`s: State&`), arenas, side-effect-only functions,
+and a function you also call in expression position or pass as a value: such a call keeps the
+threaded function by value (a copy, the same meaning), so its other calls are no longer
+in-place either. `g <- f(g, ..)` on a global threads through a local copy (the callee may read
+`g` by name). stage0 has no value-threading: it rejects writing a by-value parameter, so
+threaded code builds with stage1 only.
+
+**The lint.** `-Wnever-leak` (section 8) points at the sites. It never forces the form. Gentle
+mode reports only an owned local `darray`/`dict` changed by a statement-level `push`, `clear`
+or `put`. Those sites have a paste-ready rebinding with the same machine code, and both
+compilers build it. `-Wnever-leak=strict` also lists the in-place calls no rewrite fits, each
+with the reason: a borrow, a field of a borrow, a global, a local of a `region`/`in` block's
+arena, or a side-effect-only call of your own `-> void` function that takes an owned local as
+`mutable T&`. From `test/fixtures/never_leak/expected-strict.txt`:
+
+```text
+illegal.elisa:128: warning: owned local `xs` is changed in place by a statement that drops the call's result [-Wnever-leak]
+  `xs`: declared on line 127; changed in place on line 128 by `xs.push(seed)`
+  kind: value-threading (an owned local that a statement changes through an in-place call whose result it drops)
+  why: the line reads as a call made for its effect, and nothing at its start says that `xs` changes; as a rebinding, `xs <- ...` names the value the line changes, the way every other update of a local does
+  fix: thread the value through the call (same machine code as the in-place form at -O0 and -O2):
+          xs <- xs.push(seed)
+illegal.elisa:129: warning: owned local `xs` is changed in place by a statement that drops the call's result [-Wnever-leak]
+  `xs`: declared on line 127; changed in place on line 129 by `fill(&xs, seed)`
+  kind: value-threading candidate (an in-place call no value-threading rewrite fits; reported by -Wnever-leak=strict only)
+  no value-threading rewrite applies: `fill` takes `xs` as `mutable darray[i64]&` and returns nothing, so the call is there only for its effect and has no value form to call; give `fill` one that takes `out: darray[i64]` by value and returns it (`-> darray[i64]`, STYLE_GUIDE.md section 6), and the call becomes `xs <- fill(xs, seed)`
+```
+
+Measured with `-Wnever-leak=strict` (rewritable sites, then candidates by reason):
+
+| Corpus | Rewritable | Borrow | Field of a borrow | Global | Arena | Side-effect-only | Multi-line |
+|---|---|---|---|---|---|---|---|
+| compiler (`src/driver/elisac.elisa`) | 2418 | 3033 | 369 | 0 | 4 | 2030 | 1 |
+| `test/fixtures` (1305 files) | 246 | 953 | 1503 | 4 | 69 | 379 | 0 |
+| `test/differential` (171 files) | 67 | 19 | 17 | 0 | 10 | 16 | 0 |
+| `test/breadth` (56 files) | 39659 | 18643 | 5871 | 0 | 0 | 1476 | 0 |
+| `test/bench` (21 files) | 41 | 50 | 85 | 0 | 1 | 5 | 0 |
+
+## 7. Borrow exclusivity
+
+The compiler now enforces (`src/semantic/check_call_argument_exclusivity*.elisa`) that no two
+borrows overlap across one call, whether they come from direct `&place` arguments, ref locals,
+call results returning `T&`, conditional refs (`&x if c else &y`), borrows stored in
+structs/arrays/dicts, or fn values. `Unsafe.*` code is opaque to the check. Fixtures:
+`test/fixtures/borrow_exclusivity/`.
+
+Lending a global to a callee that writes it is an error:
+
+```text
+def f(a: mutable i64&) -> i64:   # also writes `g` by name
+f(&g)                            # rejected
+```
+
+The message ends "pass the value and assign the result (g <- f(g))". Rewrite as value
+threading. **[working]**
+
+```elisa
+def f(n: i64) -> i64:
+    return n + 1
+
+global mutable g: i64 = 0
+
+def thread_global() -> void:
+    can Global.Write, Global.Read:
+        g <- f(g)
+```
+
+For two borrows, split them onto disjoint fields, or pass one by value.
+
+### Mutable global grants
+
+Access to a `global mutable` binding requires an explicit capability by default: reads need
+`Global.Read`, writes need `Global.Write`, and read-modify-write needs both. Declare the grant
+on the function or around the access with a `can` block; callers must also have the capability
+when they invoke a function that accesses the global. Immutable `global` and `const` bindings
+do not require these grants. `-permissive` bypasses mutable-global grant checks for diagnostic
+and migration workflows.
+
+```elisa
+global mutable count: i64 = 0
+
+def read_count() -> i64 can[Global.Read]:
+    return count
+
+def increment() -> void can[Global.Read, Global.Write]:
+    count <- count + 1
+```
+
+## 8. Compiler flags and reading a diagnostic
+
+`-Wnever-leak` is opt-in and stage1 only.
+
+| Flag | Effect |
+| --- | --- |
+| `-Wnever-leak`, `-Wnever-leak=gentle` | warn at the default (gentle) level |
+| `-Wnever-leak=strict` | warn, and also flag the gentle exemption below |
+| `-Werror=never-leak[=gentle\|strict]` | same, but findings are errors |
+| `-permissive` | turns the lint off |
+
+The `-W GROUP` spelling also works (`-W never-leak=strict`). A bare `-Werror=never-leak` keeps
+the level set by an earlier flag. Gentle accepts a local whose last use is the statement right
+after its declaration; strict flags it too. Exempt in both: parameters, `_`-prefixed names,
+pattern and loop binders, borrow-exempt locals.
+
+Finding kinds:
+
+| Kind | Meaning | Fix |
+| --- | --- | --- |
+| chain | last use binds another local | nest in a block expression |
+| chain with a loop jump | as chain, but a `break`/`continue` lies between | nest in a block expression (the jump may leave it); a helper only if the block needs a `|capture|` |
+| plain | last use is a statement with no value | `region` block (section 1) |
+| overlap | a later local declared in the range is needed after it | reorder, then nest |
+| loop | last use is a loop it feeds | move into the loop header |
+| accumulator | a `mutable` local only a loop writes and only later code reads | loop expression (section 5) |
+| value-thread | an owned local changed by a statement-level `push`/`clear`/`put` | `xs <- xs.push(v)` (section 6) |
+| push loop | an empty `mutable` darray only a loop fills with `push` and only later code reads | comprehension (section 5) |
+
+A real diagnostic (`test/fixtures/never_leak/expected-strict.txt`):
+
+```text
+illegal.elisa:12: warning: local `bar` stays visible after its last use [-Wnever-leak]
+  declared on line 12, last used on line 13; still visible across 1 later statement (line 14, starting with `sink(lol)`)
+  kind: chain (its last use binds another local, so that binding can take the statements as a block expression)
+  note: -Wnever-leak=gentle (the default) accepts this local: its last use is the statement right after its declaration
+  fix: nest it in a block expression that ends with its last use:
+          lol: i64 =
+              bar: i64 = seed + 1
+              baz(bar)
+          sink(lol)
+```
+
+Read it as: first line says which name and where; "kind" says why; "fix" is built from your
+own lines, so paste it. The `note:` line appears only in strict mode. Now a `plain` one:
+
+```text
+  kind: plain (its last use is a statement with no value to bind)
+  fix: the last use `sink(total)` is a plain statement, which cannot end a block expression, and Elisa has no bare statement block; scope the statements in a `region` block:
+          region total_scope:
+              total: i64 = step + count
+              sink(total)
+          return count
+```
+
+A `push loop` one (both levels; `test/fixtures/never_leak/expected-gentle.txt`). The fix replaces
+the named lines, here the declaration and the loop, with the one line it prints:
+
+```text
+illegal.elisa:95: warning: local `squares` is filled by a push loop and stays mutable after it [-Wnever-leak]
+  `squares`: declared `mutable` and empty on line 95; filled only by the loop on lines 96-98, one `squares.push` per element that passes its filter; read only after it (first read: line 99)
+  kind: push loop (a `mutable` darray that starts empty, that only a loop fills with `push`, and that only code after the loop reads)
+  why: once the loop ends `squares` is complete, yet it stays `mutable` and in scope, so any later line could still change it; a comprehension builds the same elements in the same order as one immutable binding, in one expression (over a range or a darray with no filter it also allocates the array once, instead of growing it push by push)
+  fix: replace lines 95-98 with:
+          squares: darray[i64] = [num * num for num in numbers if num > 3]
+```
+
+## 9. When not to apply the style
+
+- **Borrow-exempt sites.** A buffer backing a live view must stay visible; nesting it would
+  dangle the view. The lint records these and does not warn:
+
+  ```elisa
+  buffer: darray[u8] = [104, 105]
+  view: sview = view_of(buffer)
+  return view.len
+  ```
+
+- **Arenas.** A `region` frees what it allocates; do not wrap code whose allocations must
+  outlive the scope.
+- **Loop jumps into a capture block.** A `break`/`continue` may leave a block expression, but
+  not one with a `|capture|` header (section 2). When nesting would need one, extract a helper
+  function instead of contorting the loop.
+- **Side-effect-only calls and globals** stay plain statements (section 1), in a `region` when
+  they have locals.
+
+## 10. Adoption
+
+- New code follows the guide by default.
+- Port a file when you are already touching it; do not make style-only sweeps of whole files.
+- Turn on `-Werror=never-leak=strict` per directory once it is clean (`test/fixtures/never_leak/
+  legal.elisa` is clean under both levels; `fixed.elisa` is clean under gentle, and strict lists
+  only the candidates no rewrite fits).
