@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path
 import subprocess
@@ -11,6 +12,10 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD_ROOT = ROOT / "build"
+
+CACHED_ARTIFACT = b"compiled artifact fixture\n"
+RECEIPT_PREFIX = b"toolchain-identity:" + b"a" * 5000
+ARTIFACT_DIGEST = hashlib.sha256(CACHED_ARTIFACT).hexdigest()
 
 
 def byte_list(value: bytes) -> str:
@@ -36,7 +41,9 @@ def probe_source() -> str:
     module_path = ROOT / "src" / "resolution" / "local_build_graph.elisa"
     safe_path = b"/tmp/package root/src/main.elisa"
     expected = b"x\ninclude \"" + safe_path + b"\"\n"
+    cache_path = ROOT / "src" / "project" / "build_cache.elisa"
     return f'''include "{module_path}"
+include "{cache_path}"
 
 def same_bytes(left: darray[u8]&, right: darray[u8]&) -> bool:
     return false if left.count != right.count
@@ -65,6 +72,22 @@ def cyclic_graph_is_rejected() -> bool can[Memory.Allocate, Abort.Panic]:
         aggregate: mutable darray[u8] @plan = []
 {graph_records({"a": "b", "b": "a", "c": ""})}
         return not LocalBuildGraph::write_ordered_includes(packages, order, "/root.elisa", &aggregate)
+
+def cached_artifact_matches() -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    artifact: mutable darray[u8] = []
+    receipt: mutable darray[u8] = []
+    prefix: mutable darray[u8] = []
+    digest: mutable darray[u8] = []
+    ByteText::append_text(&artifact, "artifact")
+    ByteText::append_text(&receipt, "receipt")
+    ByteText::append_text(&prefix, "{RECEIPT_PREFIX.decode("ascii")}")
+    return false if not BuildCache::verified_digest(artifact, receipt, prefix, 0, &digest)
+    return false if not ByteText::equal_text(digest, "{ARTIFACT_DIGEST}")
+    prefix[0] <- 88
+    return false if BuildCache::verified_digest(artifact, receipt, prefix, 0, &digest) or digest.count != 0
+    prefix[0] <- 116
+    ByteText::append_text(&artifact, "-different")
+    return not BuildCache::verified_digest(artifact, receipt, prefix, 0, &digest) and digest.count == 0
 
 def main() -> i64 can[Memory.Allocate, Abort.Panic]:
     safe_path: mutable darray[u8] = [{byte_list(safe_path)}]
@@ -108,6 +131,7 @@ def main() -> i64 can[Memory.Allocate, Abort.Panic]:
     return 14 if not rejected_without_change(over_limit)
     return 15 if not graph_order_is_stable()
     return 16 if not cyclic_graph_is_rejected()
+    return 17 if not cached_artifact_matches()
     return 0
 '''
 
@@ -143,6 +167,10 @@ def main() -> int:
         source = work / "build_include_probe.elisa"
         binary = work / "build_include_probe"
         source.write_text(probe_source(), encoding="utf-8")
+        (work / "artifact").write_bytes(CACHED_ARTIFACT)
+        (work / "artifact-different").write_bytes(b"different artifact\n")
+        receipt_suffix = f"\nartifact-digest:sha256:{ARTIFACT_DIGEST}\n".encode("ascii")
+        (work / "receipt").write_bytes(RECEIPT_PREFIX + receipt_suffix)
         compile_result = subprocess.run(
             [str(wrapper), "-emit", "exe", "-o", str(binary), str(source)],
             cwd=work,
@@ -165,7 +193,7 @@ def main() -> int:
         if result.returncode != 0:
             raise SystemExit(f"error: include-emission probe returned status {result.returncode}")
 
-    print("Elisa aggregate-source include regression passed")
+    print("Elisa build includes, graph ordering, and cache regression passed")
     return 0
 
 
