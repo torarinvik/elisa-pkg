@@ -17,7 +17,7 @@ module ProjectTransaction:
 
         def transaction_lock_acquire() -> bool can[Global{Read,Write}, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global{Read,Write}:
-                return true if transaction_lock_fd >= 0
+                return false if transaction_lock_fd >= 0
                 lock_path: mutable darray[u8] = []
                 ByteText::append_text(&lock_path, ".elisapkg/transaction.flock")
                 lock_path_c: mutable darray[u8] = []
@@ -167,23 +167,28 @@ module ProjectTransaction:
                 no_expected_lock: mutable darray[u8] = []
                 return begin_with_lock(original_manifest, -3, no_expected_lock)
 
-        def stage_manifest(new_manifest: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+        def stage_manifest(new_manifest: darray[u8]&) -> bool can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             # Persist the exact intended content and publish a recovery phase
             # before replacing the live manifest. Recovery can then distinguish
             # the old, new, and externally edited states even across a crash at
             # either atomic rename boundary.
+            can Global.Read:
+                return false if transaction_lock_fd < 0
             return false if not ProjectFiles::write_cstr_file(".elisapkg/transaction.new-manifest", new_manifest)
             state: mutable darray[u8] = []
             ByteText::append_text(&state, manifest_pending)
             return ProjectFiles::write_cstr_file(".elisapkg/transaction.state", &state)
 
-        def stage_lock(new_lock: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+        def stage_lock(new_lock: darray[u8]&) -> bool can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             # Record the intended bytes before replacing the live lockfile so
             # recovery can distinguish publication from an external edit.
+            can Global.Read:
+                return false if transaction_lock_fd < 0
             return ProjectFiles::write_cstr_file(".elisapkg/transaction.new-lock", new_lock)
 
         def restore() -> bool can[Global{Read,Write}, Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             can Global{Read,Write}:
+                return false if transaction_lock_fd < 0
                 restored: bool = restore_journal()
                 released: bool = transaction_lock_release()
                 return restored and released
@@ -269,6 +274,7 @@ module ProjectTransaction:
     public:
         def recover() -> bool can[Global{Read,Write}, Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             can Global{Read,Write}:
+                return false if transaction_lock_fd >= 0
                 transaction_state: mutable i64 = Platform::pkg_package_file_size(".elisapkg/transaction.state")
                 return false if transaction_state < 0 and transaction_state != -2
                 guard_state: mutable i64 = transaction_guard_state()
