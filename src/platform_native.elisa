@@ -275,90 +275,6 @@ module PlatformNative:
             return close_two_result(fd, directory, 0) if sync_status == 0
             return close_two_error(fd, directory, NativeErrors::negative_value(sync_errno))
 
-        def acquire_install_lock(prefix: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            # Use one persistent inode for every installer process. Never unlink
-            # this file: doing so could split advisory locks across old and new
-            # inodes while another process still holds the previous one.
-            expected_uid: u64 = native_geteuid().u64()
-            directory: i64 = open_trusted_directory(prefix, expected_uid)
-            return directory if directory < 0
-            flags: i64 = flag_read_write + flag_create + flag_no_follow + flag_close_on_exec + flag_nonblock
-            fd: i64 = native_openat(directory, ".elisapkg-install.lock", flags, 384)
-            open_errno: i64 = NativeErrors::current_errno()
-            directory_close: i64 = native_close(directory)
-            if fd < 0:
-                return NativeErrors::negative_value(open_errno)
-            return close_error(fd, -5) if directory_close != 0
-            return close_error(fd, -13) if not trusted_regular_fd(fd, expected_uid)
-            if native_flock(fd, lock_operation_exclusive + lock_operation_nonblocking) != 0:
-                lock_errno: i64 = NativeErrors::current_errno()
-                return close_error(fd, NativeErrors::negative_value(lock_errno))
-            return fd
-
-        # Hold a persistent project-local advisory lock across the complete
-        # manifest/lock transaction. Unlike the guard directory, flock is
-        # released by the kernel when a process exits, so recovery can safely
-        # distinguish an active writer from a guard left by a crash.
-        def acquire_project_transaction_lock(path: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            expected_uid: u64 = native_geteuid().u64()
-            parent: mutable darray[u8] = []
-            leaf: mutable darray[u8] = []
-            return -22 if not split_parent_leaf(path, &parent, &leaf)
-            leaf_snapshot: mutable darray[u8] = []
-            for index in 0..<leaf.count |leaf_snapshot, leaf|:
-                leaf_snapshot.push(leaf[index])
-            parent_name: cstr = (&parent[0]).cast[cstr] can Unsafe.PointerCast
-            directory: i64 = open_package_directory_path(parent_name)
-            return directory if directory < 0
-            leaf_buffer: mutable darray[u8] = []
-            for index in 0..<leaf_snapshot.count |leaf_buffer, leaf_snapshot|:
-                leaf_buffer.push(leaf_snapshot[index])
-            leaf_name: cstr = (&leaf_buffer[0]).cast[cstr] can Unsafe.PointerCast
-            flags: i64 = flag_read_write + flag_create + flag_no_follow + flag_close_on_exec + flag_nonblock
-            fd: i64 = native_openat(directory, leaf_name, flags, 384)
-            open_errno: i64 = NativeErrors::current_errno()
-            directory_close: i64 = native_close(directory)
-            if fd < 0:
-                return NativeErrors::negative_value(open_errno)
-            return close_error(fd, -5) if directory_close != 0
-            return close_error(fd, -13) if not trusted_regular_fd(fd, expected_uid)
-            if native_flock(fd, lock_operation_exclusive + lock_operation_nonblocking) != 0:
-                lock_errno: i64 = NativeErrors::current_errno()
-                return close_error(fd, NativeErrors::negative_value(lock_errno))
-            return fd
-
-        def acquire_trust_state_lock(path: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            # Trust-state locks use a persistent regular-file inode just like
-            # install locks. The kernel releases flock ownership after process
-            # death, while retaining the inode prevents stale directory locks
-            # and lock splitting across concurrent readers and writers.
-            expected_uid: u64 = native_geteuid().u64()
-            parent: mutable darray[u8] = []
-            leaf: mutable darray[u8] = []
-            return -22 if not split_parent_leaf(path, &parent, &leaf)
-            leaf_snapshot: mutable darray[u8] = []
-            for index in 0..<leaf.count |leaf_snapshot, leaf|:
-                leaf_snapshot.push(leaf[index])
-            parent_name: cstr = (&parent[0]).cast[cstr] can Unsafe.PointerCast
-            directory: i64 = open_trusted_directory(parent_name, expected_uid)
-            return directory if directory < 0
-            leaf_buffer: mutable darray[u8] = []
-            for index in 0..<leaf_snapshot.count |leaf_buffer, leaf_snapshot|:
-                leaf_buffer.push(leaf_snapshot[index])
-            leaf_name: cstr = (&leaf_buffer[0]).cast[cstr] can Unsafe.PointerCast
-            flags: i64 = flag_read_write + flag_create + flag_no_follow + flag_close_on_exec + flag_nonblock
-            fd: i64 = native_openat(directory, leaf_name, flags, 384)
-            open_errno: i64 = NativeErrors::current_errno()
-            directory_close: i64 = native_close(directory)
-            if fd < 0:
-                return NativeErrors::negative_value(open_errno)
-            return close_error(fd, -5) if directory_close != 0
-            return close_error(fd, -13) if not trusted_regular_fd(fd, expected_uid)
-            if native_flock(fd, lock_operation_exclusive + lock_operation_nonblocking) != 0:
-                lock_errno: i64 = NativeErrors::current_errno()
-                return close_error(fd, NativeErrors::negative_value(lock_errno))
-            return fd
-
         def unlink(path: cstr) -> i64:
             return unlink_kind(path, 0)
 
@@ -892,6 +808,7 @@ module PlatformNative:
             return flag_write_only + flag_create + flag_exclusive + flag_no_follow + flag_close_on_exec
 
     private:
+    public:
         def split_parent_leaf(path: cstr, parent: mutable darray[u8]&, leaf: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             parent.resize(0)
             leaf.resize(0)
@@ -917,6 +834,7 @@ module PlatformNative:
             parent.push(0)
             return true
 
+    private:
     public:
         def open_directory_path(path: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             length: usize = native_strlen(path)
@@ -1304,9 +1222,11 @@ module PlatformNative:
             return -13 if not NativeStat::same_identity(path_stat, fd_stat)
             return 0
 
+    public:
         def trusted_regular_fd(fd: i64, expected_uid: u64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return trusted_fd(fd, expected_uid, regular_mode) and trusted_acl_fd(fd, false)
 
+    private:
         def trusted_directory_fd(fd: i64, expected_uid: u64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return trusted_fd(fd, expected_uid, directory_mode) and trusted_acl_fd(fd, true)
 
@@ -1400,9 +1320,11 @@ module PlatformNative:
                 out.resize(loaded.usize())
                 return 1
 
+    public:
         def open_trusted_directory(path: cstr, expected_uid: u64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return walk_trusted_directory(path, expected_uid, false)
 
+    private:
         def walk_trusted_directory(path: cstr, expected_uid: u64, create_missing: bool) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             length: usize = native_strlen(path)
             return -22 if length == 0 or length > 4096 or path[0].u8() != 47
