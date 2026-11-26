@@ -11,13 +11,11 @@ module NativeStagingTree:
 
         def open_archive_parent(root: i64, name: darray[u8]&, copy_out: mutable darray[u8]&, leaf_offset: mutable usize&, create_missing: bool, created_directories: mutable darray[u8]&, extracted_nodes: mutable usize&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             copy_out.resize(0)
-            for index in 0..<name.count |copy_out, name|:
-                copy_out.push(name[index])
+            ByteText::append(copy_out, name)
             copy_out.push(0)
-            slash: mutable usize = 0.usize()
-            for index in 0..<name.count |copy_out, slash|:
-                slash <- index + 1.usize() if copy_out[index] == 47
-            leaf_offset <- slash
+            # The leaf starts after the last slash.
+            leaf_offset <- for index in 0..<name.count |slash: usize = 0.usize()| -> slash:
+                slash <- index + 1.usize() if name[index] == 47
             return -22 if leaf_offset >= name.count
             directory: mutable i64 = native_dup(root)
             return NativeErrors::negative_errno() if directory < 0
@@ -36,10 +34,7 @@ module NativeStagingTree:
                     # operations. The extractor rolls back on this error.
                     return PlatformNative::close_error(directory, -75) if extracted_nodes >= maximum_archive_extracted_nodes
                     mkdir_status: i64 =
-                        mkdir_part: mutable darray[u8] = []
-                        for index in start..<finish |mkdir_part, name|:
-                            mkdir_part <- mkdir_part.push(name[index])
-                        mkdir_part <- mkdir_part.push(0)
+                        mkdir_part: darray[u8] = component_name(name, start, finish)
                         mkdir_name: cstr = (&mkdir_part[0]).cast[cstr] can Unsafe.PointerCast
                         native_mkdirat(directory, mkdir_name, 493)
                     region mkdir_errno_scope:
@@ -48,26 +43,7 @@ module NativeStagingTree:
                             return PlatformNative::close_error(directory, NativeErrors::negative_errno())
                     created <- mkdir_status == 0
                     next <- PlatformNative::open_package_directory_component(directory, part)
-                if next < 0:
-                    # If this call created the directory, do not leave an
-                    # untracked staging entry behind when reopening it fails.
-                    # AT_REMOVEDIR only removes an empty directory, so a
-                    # replacement file or symlink cannot be removed through
-                    # this cleanup path. Preserve the original open error
-                    # unless cleanup or closing the parent also fails.
-                    open_errno: i64 = next
-                    cleanup_status: mutable i64 = 0
-                    if created:
-                        cleanup_part: mutable darray[u8] = []
-                        for index in start..<finish |cleanup_part, name|:
-                            cleanup_part <- cleanup_part.push(name[index])
-                        cleanup_part <- cleanup_part.push(0)
-                        cleanup_name: cstr = (&cleanup_part[0]).cast[cstr] can Unsafe.PointerCast
-                        cleanup_status <- native_unlinkat(directory, cleanup_name, at_remove_directory)
-                    region close_status_scope:
-                        close_status: i64 = native_close(directory)
-                        return -5 if cleanup_status != 0 or close_status != 0
-                    return open_errno
+                return open_component_failure(directory, next, created, name, start, finish) if next < 0
                 if created:
                     for index in 0..<finish |created_directories, name|:
                         created_directories.push(name[index])
@@ -80,6 +56,26 @@ module NativeStagingTree:
                 directory <- next
                 start <- finish + 1.usize()
             return directory
+
+        # If this call created the directory, do not leave an untracked
+        # staging entry behind when reopening it fails. AT_REMOVEDIR only
+        # removes an empty directory, so a replacement file or symlink cannot
+        # be removed through this cleanup path. Preserve the original open
+        # error unless cleanup or closing the parent also fails.
+        def open_component_failure(directory: i64, open_errno: i64, created: bool, name: darray[u8]&, start: usize, finish: usize) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            cleanup_status: i64 =
+                cleanup_part: darray[u8] = component_name(name, start, finish)
+                cleanup_name: cstr = (&cleanup_part[0]).cast[cstr] can Unsafe.PointerCast
+                native_unlinkat(directory, cleanup_name, at_remove_directory) if created else 0
+            close_status: i64 = native_close(directory)
+            return -5 if cleanup_status != 0 or close_status != 0
+            return open_errno
+
+        # The path component `name[start..<finish]` as a terminated string.
+        def component_name(name: darray[u8]&, start: usize, finish: usize) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
+            component: mutable darray[u8] = [name[index] for index in start..<finish]
+            component <- component.push(0)
+            return component
 
         def remove_files(root: i64, seen: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             cleanup_ok: mutable bool = true
