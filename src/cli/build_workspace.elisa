@@ -1,0 +1,155 @@
+# Private scratch files of one sandboxed build: source snapshots, the compiler's
+# writable directory, the dependency aggregate source, and the output file.
+include "../platform.elisa"
+include "../project/files.elisa"
+include "../source/snapshots.elisa"
+include "../text/bytes.elisa"
+include "./compiler_process.elisa"
+include "./output.elisa"
+include "./status.elisa"
+
+module BuildWorkspace:
+    public:
+        # Every buffer that backs a C string stays in this record, so pointers
+        # derived from it stay valid for as long as the caller keeps the record.
+        struct Workspace:
+            snapshot_template: mutable darray[u8]
+            snapshot_root: mutable darray[u8]
+            snapshot_roots: mutable darray[u8]
+            snapshot_total_bytes: mutable usize
+            root_snapshot_entry: mutable darray[u8]
+            directory_template: mutable darray[u8]
+            directory: mutable darray[u8]
+            directory_c_string: mutable darray[u8]
+            canonical_directory: mutable darray[u8]
+            aggregate_template: mutable darray[u8]
+            aggregate_path: mutable darray[u8]
+            aggregate_name: mutable cstr
+            compile_source: mutable darray[u8]
+            output_template: mutable darray[u8]
+            output_name: mutable cstr
+
+        def empty() -> Workspace:
+            return Workspace{snapshot_template: [], snapshot_root: [], snapshot_roots: [], snapshot_total_bytes: 0.usize(),
+                             root_snapshot_entry: [], directory_template: [], directory: [], directory_c_string: [],
+                             canonical_directory: [], aggregate_template: [], aggregate_path: [], aggregate_name: "",
+                             compile_source: [], output_template: [], output_name: ""}
+
+        def snapshot_container_name(workspace: Workspace&) -> cstr can[Unsafe.PointerCast]:
+            return (&workspace.snapshot_template[0]).cast[cstr] can Unsafe.PointerCast
+
+        def directory_name(workspace: Workspace&) -> cstr can[Unsafe.PointerCast]:
+            return (&workspace.directory_c_string[0]).cast[cstr] can Unsafe.PointerCast
+
+        def canonical_directory_name(workspace: Workspace&) -> cstr can[Unsafe.PointerCast]:
+            return (&workspace.canonical_directory[0]).cast[cstr] can Unsafe.PointerCast
+
+        def compile_source_name(workspace: Workspace&) -> cstr can[Unsafe.PointerCast]:
+            return (&workspace.compile_source[0]).cast[cstr] can Unsafe.PointerCast
+
+        # Remove every scratch file. The output file is removed only when
+        # `include_output` is set, because callers detach it themselves once its
+        # bytes have been captured.
+        def discard(workspace: Workspace&, include_output: bool) -> void can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            CompilerProcess::discard_scratch(directory_name(workspace), workspace.output_name if include_output else "",
+                                             workspace.aggregate_name, snapshot_container_name(workspace), workspace.snapshot_roots)
+
+        # Remove every scratch file before publication and return the first
+        # failure message, or an empty string on success.
+        def retire(workspace: Workspace&) -> cstr can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return CompilerProcess::retire_scratch_for_publication(directory_name(workspace), workspace.output_name, workspace.aggregate_name,
+                                                                   snapshot_container_name(workspace), workspace.snapshot_roots)
+
+        # Each compiler gets a distinct private scratch directory for HOME,
+        # TMPDIR, and caches. It is the only writable subtree; the final
+        # artifact and its receipt stay outside the child's writable set.
+        def create_directory(build_directory: darray[u8]&, workspace: mutable Workspace&) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                ByteText::append(&workspace.directory_template, build_directory)
+                append_separator(&workspace.directory_template)
+                ByteText::append_text(&workspace.directory_template, ".sandbox-XXXXXX")
+                workspace.directory_template.push(0)
+                if Platform::make_temporary_directory(&workspace.directory_template) != 0:
+                    _ = BuildSnapshots::remove_all(snapshot_container_name(workspace), workspace.snapshot_roots)
+                    CliOutput::write_error("error: unable to create the private compiler scratch directory\n")
+                    return CliStatus::build_failed
+                region directory_length_scope:
+                    directory_length: usize = Platform::c_string_length((&workspace.directory_template[0]).cast[cstr] can Unsafe.PointerCast)
+                    ByteText::append_range(&workspace.directory, workspace.directory_template, 0.usize(), directory_length)
+                ProjectFiles::path_with_null_terminator_into(workspace.directory, &workspace.directory_c_string)
+                workspace.canonical_directory.resize(4096)
+                if Platform::resolve_real_path(directory_name(workspace), &workspace.canonical_directory) == null:
+                    discard(workspace, false)
+                    CliOutput::write_error("error: unable to resolve the private compiler scratch directory\n")
+                    return CliStatus::build_failed
+                ProjectFiles::path_with_null_terminator_into(workspace.root_snapshot_entry, &workspace.compile_source)
+                return CliStatus::success
+
+        # Write the verified dependency aggregate into the scratch directory and
+        # make it the compiler's source file.
+        def write_aggregate(aggregate: darray[u8]&, workspace: mutable Workspace&) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                ByteText::append(&workspace.aggregate_template, workspace.directory)
+                append_separator(&workspace.aggregate_template)
+                ByteText::append_text(&workspace.aggregate_template, "dependency-aggregate.XXXXXX")
+                workspace.aggregate_template.push(0)
+                aggregate_file_descriptor: i64 = Platform::make_temporary_file(&workspace.aggregate_template)
+                return fail(workspace, "error: unable to create the private dependency aggregate source\n") if aggregate_file_descriptor < 0
+                workspace.aggregate_name <- (&workspace.aggregate_template[0]).cast[cstr] can Unsafe.PointerCast
+                region aggregate_path_length_scope:
+                    aggregate_path_length: usize = Platform::c_string_length(workspace.aggregate_name)
+                    ByteText::append_range(&workspace.aggregate_path, workspace.aggregate_template, 0.usize(), aggregate_path_length)
+                if not ProjectFiles::write_file_descriptor_all(aggregate_file_descriptor, aggregate):
+                    _ = Platform::close_file_descriptor(aggregate_file_descriptor)
+                    return fail_after_aggregate(workspace, "error: unable to write the private dependency aggregate source\n")
+                region flush_status_scope:
+                    flush_status: i64 = Platform::synchronize_file(aggregate_file_descriptor)
+                    close_status: i64 = Platform::close_file_descriptor(aggregate_file_descriptor)
+                    return fail_after_aggregate(workspace, "error: unable to flush the private dependency aggregate source\n") if flush_status != 0 or close_status != 0
+                canonical_aggregate: mutable darray[u8] = []
+                return fail_after_aggregate(workspace, "error: unable to resolve the private dependency aggregate source\n") if not ProjectFiles::canonical_existing_path(workspace.aggregate_path, &canonical_aggregate)
+                ProjectFiles::path_with_null_terminator_into(canonical_aggregate, &workspace.compile_source)
+                return CliStatus::success
+
+        # Keep every compiler-created output, including stage1's adjacent
+        # object file, inside the private scratch subtree. The parent copies
+        # only the validated final bytes into the public cache after teardown.
+        def create_output_file(artifact_label: darray[u8]&, workspace: mutable Workspace&) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                ByteText::append(&workspace.output_template, workspace.directory)
+                append_separator(&workspace.output_template)
+                ByteText::append(&workspace.output_template, artifact_label)
+                ByteText::append_text(&workspace.output_template, ".tmp.XXXXXX")
+                workspace.output_template.push(0)
+                region output_file_descriptor_scope:
+                    output_file_descriptor: i64 = Platform::make_temporary_file(&workspace.output_template)
+                    return fail(workspace, "error: unable to create the exclusive compiler output file\n") if output_file_descriptor < 0
+                    workspace.output_name <- (&workspace.output_template[0]).cast[cstr] can Unsafe.PointerCast
+                    return fail_with_output(workspace, "error: unable to close the exclusive compiler output file\n") if Platform::close_file_descriptor(output_file_descriptor) != 0
+                return CliStatus::success
+
+        # Report a scratch failure after discarding every scratch file.
+        def fail_with_output(workspace: Workspace&, message: cstr) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                discard(workspace, true)
+                CliOutput::write_error(message)
+                return CliStatus::build_failed
+
+    private:
+        def append_separator(path: mutable darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
+            if path.count == 0.usize() or path[path.count - 1.usize()] != 47:
+                path.push(47)
+
+        def fail(workspace: Workspace&, message: cstr) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                discard(workspace, false)
+                CliOutput::write_error(message)
+                return CliStatus::build_failed
+
+        # Remove the aggregate source first so the shared cleanup does not see
+        # a half-written file, then discard the remaining scratch files.
+        def fail_after_aggregate(workspace: mutable Workspace&, message: cstr) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                _ = Platform::unlink_path(workspace.aggregate_name)
+                workspace.aggregate_name <- ""
+                return fail(workspace, message)

@@ -1,0 +1,210 @@
+# Run the sandboxed compiler of one build and publish its verified output.
+include "../build.elisa"
+include "../integrity.elisa"
+include "../package/model.elisa"
+include "../platform.elisa"
+include "../project/build_publication.elisa"
+include "../project/files.elisa"
+include "../project/lock_validation.elisa"
+include "../sandbox.elisa"
+include "../source/fingerprint.elisa"
+include "../text/bytes.elisa"
+include "./build_target.elisa"
+include "./build_toolchain_setup.elisa"
+include "./build_workspace.elisa"
+include "./compiler_process.elisa"
+include "./output.elisa"
+include "./status.elisa"
+
+module BuildExecution:
+    public:
+        # Fingerprints of everything the compiler reads, recorded in the receipt
+        # and rechecked before publication.
+        struct Inputs:
+            lock: mutable darray[u8]
+            lock_digest: mutable darray[u8]
+            source_tree_digest: mutable darray[u8]
+            source_tree_bytes: mutable usize
+            source_digest: mutable darray[u8]
+            dependency_aggregate: mutable darray[u8]
+            dependency_aggregate_digest: mutable darray[u8]
+            compiler_dependency_aggregate: mutable darray[u8]
+            has_local_build_dependencies: mutable bool
+
+        # Where the artifact and its receipt are published.
+        struct Destination:
+            build_directory: mutable darray[u8]
+            artifact_label: mutable darray[u8]
+            artifact: mutable darray[u8]
+            artifact_c_string: mutable darray[u8]
+            receipt_path: mutable darray[u8]
+
+        # What the build sandbox may see besides the private scratch directory.
+        struct SandboxAccess:
+            home_name: mutable cstr
+            dependency_roots: mutable darray[u8]
+
+        # Start the compiler inside its sandbox and wait for it. Logs are
+        # collected and every failure discards the scratch files.
+        def compile(options: Model::CommandOptions, target: BuildTarget::Selection&, toolchain: BuildToolchainSetup::Setup&, access: SandboxAccess&, start: darray[u8]&, workspace: BuildWorkspace::Workspace&) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                sandbox_profile: mutable darray[u8] = Sandbox::darwin_build_profile(access.home_name, start, workspace.directory, workspace.snapshot_root, access.dependency_roots, toolchain.tool_paths, toolchain.executable_paths, workspace.output_name)
+                return BuildWorkspace::fail_with_output(workspace, "error: could not construct the mandatory compiler sandbox profile\n") if sandbox_profile.count == 0.usize()
+                sandbox_profile.push(0)
+                sandbox_profile_name: cstr = (&sandbox_profile[0]).cast[cstr] can Unsafe.PointerCast
+                stdout_template: mutable darray[u8] = []
+                stdout_capture: CompilerProcess::LogCapture = CompilerProcess::open_log_capture(workspace.directory, true, &stdout_template)
+                return BuildWorkspace::fail_with_output(workspace, stdout_capture.diagnostic) if stdout_capture.descriptor < 0
+                stderr_template: mutable darray[u8] = []
+                stderr_capture: CompilerProcess::LogCapture = CompilerProcess::open_log_capture(workspace.directory, false, &stderr_template)
+                if stderr_capture.descriptor < 0:
+                    _ = Platform::close_file_descriptor(stdout_capture.descriptor)
+                    _ = Platform::unlink_path((&stdout_template[0]).cast[cstr] can Unsafe.PointerCast)
+                    return BuildWorkspace::fail_with_output(workspace, stderr_capture.diagnostic)
+                logs: Logs =
+                    stdout_name: cstr = (&stdout_template[0]).cast[cstr] can Unsafe.PointerCast
+                    stderr_name: cstr = (&stderr_template[0]).cast[cstr] can Unsafe.PointerCast
+                    Logs{stdout_descriptor: stdout_capture.descriptor, stderr_descriptor: stderr_capture.descriptor, stdout_name: stdout_name, stderr_name: stderr_name}
+                # Pin the private scratch directory by descriptor before fork.
+                # The compiler child must not inherit the package checkout as its
+                # cwd because Seatbelt deliberately denies that live tree.
+                directory_file_descriptor: i64 = Platform::open_directory(BuildWorkspace::canonical_directory_name(workspace))
+                if directory_file_descriptor < 0:
+                    discard_logs(logs)
+                    return BuildWorkspace::fail_with_output(workspace, "error: unable to open the private compiler scratch directory\n")
+                # The stage1 wrapper polls with setuid ps, which Seatbelt refuses.
+                # The parent already enforces the compiler deadline and resource limits.
+                child_process_identifier: i64 =
+                    invocation: CompilerProcess::Invocation = CompilerProcess::Invocation{profile: sandbox_profile_name, scratch_directory: BuildWorkspace::canonical_directory_name(workspace), stage1_binary: toolchain.environment.stage1_binary, runtime_object: toolchain.environment.runtime_object, allow_stale: toolchain.environment.allow_stale, clang: toolchain.clang, executable: toolchain.environment.stage1_binary if toolchain.is_stage1_wrapper else toolchain.compiler_executable, release: Platform::c_string_equal(options.profile, "release"), emit_kind: BuildTarget::emit_kind(target), output_path: workspace.output_name, source_path: BuildWorkspace::compile_source_name(workspace)}
+                    CompilerProcess::spawn(invocation, toolchain.sdk_root, toolchain.developer_directory, directory_file_descriptor, logs.stdout_descriptor, logs.stderr_descriptor)
+                _ = Platform::close_file_descriptor(directory_file_descriptor)
+                if child_process_identifier < 0:
+                    discard_logs(logs)
+                    return BuildWorkspace::fail_with_output(workspace, "error: unable to start the sandboxed compiler process\n")
+                return await_compiler(child_process_identifier, logs, workspace)
+
+        # Copy the compiler's output, then refuse to publish it if any input,
+        # the lock, or the toolchain changed while the compiler ran.
+        def verify_and_publish(start: darray[u8]&, target: BuildTarget::Selection&, inputs: Inputs&, destination: Destination&, toolchain: BuildToolchainSetup::Setup&, workspace: mutable BuildWorkspace::Workspace&, receipt: mutable darray[u8]&, out_artifact_digest: mutable darray[u8]&) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                artifact_content: mutable darray[u8] = []
+                artifact_digest: mutable darray[u8] = []
+                if not capture_compiler_output(workspace.output_name, &artifact_content, &artifact_digest):
+                    BuildWorkspace::discard(workspace, true)
+                    return CliStatus::build_failed
+                # Detach the compiler-owned output inode before validating the source
+                # tree or publishing. A session-escaping child may retain a file
+                # descriptor, but it cannot change the bytes already copied into
+                # artifact_content.
+                if Platform::unlink_path(workspace.output_name) != 0:
+                    BuildWorkspace::discard(workspace, false)
+                    CliOutput::write_error("error: unable to detach compiler-owned output before validation\n")
+                    return CliStatus::build_failed
+                region status_scope:
+                    status: i64 = verify_inputs_unchanged(start, target, inputs, workspace)
+                    return status if status != CliStatus::success
+                if not BuildToolchainSetup::all_unchanged(&toolchain.identities):
+                    BuildWorkspace::discard(workspace, false)
+                    CliOutput::write_error("error: compiler toolchain changed during the build; refusing to publish the artifact\n")
+                    return CliStatus::build_failed
+                region cleanup_error_scope:
+                    cleanup_error: cstr = BuildWorkspace::retire(workspace)
+                    if cleanup_error[0].u8() != 0:
+                        CliOutput::write_error(cleanup_error)
+                        return CliStatus::build_failed
+                region artifact_name_scope:
+                    artifact_name: cstr = (&destination.artifact_c_string[0]).cast[cstr] can Unsafe.PointerCast
+                    return CliStatus::build_failed if not BuildPublication::publish(destination.build_directory, destination.artifact_label, BuildTarget::emit_kind(target), BuildTarget::artifact_access_mode(target), workspace.output_name, artifact_name, destination.receipt_path, artifact_content, artifact_digest, receipt)
+                report_built(destination, "\n", artifact_digest, out_artifact_digest)
+                return CliStatus::success
+
+        def report_built(destination: Destination&, suffix: cstr, digest: darray[u8]&, out_artifact_digest: mutable darray[u8]&) -> void can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic]:
+            can Global.Read:
+                CliOutput::write_ok("built .elisapkg/build/")
+                CliOutput::write_bytes(1, &destination.artifact_label)
+                CliOutput::write_ok(suffix)
+                for digest_index in 0..<digest.count |out_artifact_digest, digest|:
+                    out_artifact_digest[digest_index] <- digest[digest_index]
+
+    private:
+        const build_timeout_milliseconds: i64 = 600000
+
+        # The compiler's captured standard output and error streams.
+        struct Logs:
+            stdout_descriptor: i64
+            stderr_descriptor: i64
+            stdout_name: cstr
+            stderr_name: cstr
+
+        def discard_logs(logs: Logs) -> void:
+            CompilerProcess::discard_logs(logs.stdout_descriptor, logs.stderr_descriptor, logs.stdout_name, logs.stderr_name)
+
+        def await_compiler(child_process_identifier: i64, logs: Logs, workspace: BuildWorkspace::Workspace&) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                region completion_scope:
+                    completion: CompilerProcess::Completion = CompilerProcess::await_exit(child_process_identifier, build_timeout_milliseconds)
+                    return retain_scratch_after_unconfirmed_exit(logs) if not completion.group_stopped
+                    if not CompilerProcess::remove_callback_file(child_process_identifier):
+                        discard_logs(logs)
+                        return BuildWorkspace::fail_with_output(workspace, "error: unable to remove the compiler callback file before output validation\n")
+                    if not CompilerProcess::collect_logs(logs.stdout_descriptor, logs.stderr_descriptor, logs.stdout_name, logs.stderr_name):
+                        return BuildWorkspace::fail_with_output(workspace, "error: unable to safely collect compiler output\n")
+                    if completion.wait_status == Platform::timeout_error():
+                        BuildWorkspace::discard(workspace, true)
+                        CliOutput::write_error("error: compiler exceeded the 10-minute execution limit\n")
+                        return CliStatus::cancelled
+                    return BuildWorkspace::fail_with_output(workspace, "error: sandboxed compiler process failed or could not be reaped\n") if completion.wait_status < 0 or completion.exit_status != 0
+                return CliStatus::success
+
+        def retain_scratch_after_unconfirmed_exit(logs: Logs) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                _ = Platform::close_file_descriptor(logs.stdout_descriptor)
+                _ = Platform::close_file_descriptor(logs.stderr_descriptor)
+                CliOutput::write_error("error: unable to confirm compiler process termination; retained its scratch files\n")
+                return CliStatus::build_failed
+
+        # Do not publish an artifact whose compiler input tree changed while
+        # the child was running. The receipt records the pre-build digest;
+        # rechecking immediately before publication keeps that identity bound
+        # to the inputs that were presented to the compiler. Revalidate the
+        # exact manifest and lock too: local lock validation recomputes every
+        # transitive dependency source digest, including paths outside the root.
+        def verify_inputs_unchanged(start: darray[u8]&, target: BuildTarget::Selection&, inputs: Inputs&, workspace: BuildWorkspace::Workspace&) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                if not project_inputs_unchanged(target.manifest, inputs.lock, target.root_name, target.root_version, start):
+                    BuildWorkspace::discard(workspace, true)
+                    return CliStatus::build_failed
+                region current_source_tree_digest_scope:
+                    current_source_tree_digest: mutable darray[u8] = []
+                    if not SourceFingerprint::current(&current_source_tree_digest) or not ByteText::equal(current_source_tree_digest, inputs.source_tree_digest):
+                        BuildWorkspace::discard(workspace, true)
+                        return CliStatus::build_failed
+                if inputs.has_local_build_dependencies:
+                    region aggregate_after_build_scope:
+                        aggregate_after_build: mutable darray[u8] = []
+                        if not read_package_file(workspace.aggregate_path, &aggregate_after_build) or not ByteText::equal(aggregate_after_build, inputs.compiler_dependency_aggregate):
+                            return BuildWorkspace::fail_with_output(workspace, "error: private dependency aggregate changed during compilation\n")
+                return CliStatus::success
+
+        def capture_compiler_output(path: cstr, content: mutable darray[u8]&, digest: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return false if Platform::package_file_size(path) <= 0
+            path_bytes: mutable darray[u8] = []
+            ByteText::append_bounded_text(&path_bytes, path)
+            return read_package_file(&path_bytes, content) and Integrity::sha256_hex(content, digest)
+
+        def project_inputs_unchanged(manifest: darray[u8]&, lock: darray[u8]&, root_name: darray[u8]&, root_version: darray[u8]&, start: darray[u8]&) -> bool can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                current_manifest: mutable darray[u8] = []
+                current_manifest <- current_manifest.resize(ProjectFiles::project_document_limit)
+                region current_lock_scope:
+                    current_lock: mutable darray[u8] = []
+                    current_lock <- current_lock.resize(ProjectFiles::project_document_limit)
+                    return false if not:
+                        ProjectFiles::read_c_string_into("elisapkg.json", &current_manifest)
+                        ProjectFiles::read_c_string_into("elisapkg.lock", &current_lock)
+                        ByteText::equal(current_manifest, manifest)
+                        ByteText::equal(current_lock, lock)
+                return LockValidation::matches_manifest(manifest, lock, root_name, root_version, start) can Global.Read
+
+        def read_package_file(path: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return Platform::read_bounded_file(path, Integrity::maximum_input, out)

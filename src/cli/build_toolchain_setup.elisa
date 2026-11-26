@@ -1,0 +1,136 @@
+# Resolve the compiler toolchain of a sandboxed build and fingerprint every
+# file it runs, so the build can prove the toolchain did not change.
+include "../platform.elisa"
+include "../project/build_toolchain.elisa"
+include "../project/files.elisa"
+include "../toolchain.elisa"
+include "./output.elisa"
+include "./status.elisa"
+
+module BuildToolchainSetup:
+    public:
+        struct Identities:
+            compiler: mutable BuildToolchain::FileIdentity
+            stage1: mutable BuildToolchain::FileIdentity
+            runtime: mutable BuildToolchain::FileIdentity
+            clang: mutable BuildToolchain::FileIdentity
+            sdk_settings: mutable BuildToolchain::FileIdentity
+            developer_linker: mutable BuildToolchain::FileIdentity
+            developer_assembler: mutable BuildToolchain::FileIdentity
+
+        # Every buffer that backs a C string stays in this record, so pointers
+        # derived from it stay valid for as long as the caller keeps the record.
+        struct Setup:
+            compiler_storage: mutable darray[u8]
+            compiler: mutable cstr
+            compiler_executable: mutable cstr
+            environment: mutable BuildToolchain::Environment
+            clang: mutable cstr
+            is_stage1_wrapper: mutable bool
+            tool_paths: mutable darray[cstr]
+            executable_paths: mutable darray[cstr]
+            sdk_root: mutable darray[u8]
+            developer_directory: mutable darray[u8]
+            sdk_settings_path: mutable darray[u8]
+            developer_linker_path: mutable darray[u8]
+            developer_assembler_path: mutable darray[u8]
+            identities: mutable Identities
+
+        def empty() -> Setup:
+            unidentified: BuildToolchain::FileIdentity = BuildToolchain::FileIdentity{path: "", optional: true, executable: false, available: false, bytes: []}
+            identities: Identities = Identities{compiler: unidentified, stage1: unidentified, runtime: unidentified, clang: unidentified,
+                                                sdk_settings: unidentified, developer_linker: unidentified, developer_assembler: unidentified}
+            return Setup{compiler_storage: [], compiler: "", compiler_executable: "",
+                         environment: BuildToolchain::Environment{stage1_binary: "", runtime_object: "", allow_stale: "", clang: ""},
+                         clang: "", is_stage1_wrapper: false, tool_paths: [], executable_paths: [], sdk_root: [], developer_directory: [],
+                         sdk_settings_path: [], developer_linker_path: [], developer_assembler_path: [], identities: identities}
+
+        def prepare(setup: mutable Setup&) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                region status_scope:
+                    status: i64 = select_compiler(setup)
+                    return status if status != CliStatus::success
+                return CliStatus::build_failed if not BuildToolchain::read_environment(&setup.environment)
+                setup.clang <- BuildToolchain::select_clang(setup.environment.clang)
+                setup.is_stage1_wrapper <- Toolchain::stage1_wrapper_pair_matches(setup.compiler, setup.environment.stage1_binary)
+                setup.compiler_executable <- setup.compiler
+                if setup.is_stage1_wrapper and setup.environment.stage1_binary[0].u8() != 0:
+                    setup.compiler_executable <- setup.environment.stage1_binary
+                collect_tool_paths(setup)
+                if not Platform::macos_toolchain_paths(&setup.sdk_root, &setup.developer_directory):
+                    CliOutput::write_error("error: could not locate a supported macOS SDK and developer directory for the compiler sandbox\n")
+                    return CliStatus::build_failed
+                if not BuildToolchain::developer_paths(setup.sdk_root, setup.developer_directory, &setup.sdk_settings_path,
+                                                       &setup.developer_linker_path, &setup.developer_assembler_path):
+                    CliOutput::write_error("error: unsupported macOS developer toolchain directory\n")
+                    return CliStatus::build_failed
+                if setup.developer_directory.count > 0.usize():
+                    setup.executable_paths.push(developer_linker_name(setup))
+                    setup.executable_paths.push(developer_assembler_name(setup))
+                identify(setup)
+                return CliStatus::success
+
+        # Unavailable identities disable cache reuse.
+        def all_available(identities: Identities&) -> bool:
+            return identities.compiler.available and identities.stage1.available and identities.runtime.available and identities.clang.available and
+                   identities.sdk_settings.available and identities.developer_linker.available and identities.developer_assembler.available
+
+        def all_unchanged(identities: Identities&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return BuildToolchain::file_unchanged(&identities.compiler) and
+                   BuildToolchain::file_unchanged(&identities.stage1) and
+                   BuildToolchain::file_unchanged(&identities.runtime) and
+                   BuildToolchain::file_unchanged(&identities.clang) and
+                   BuildToolchain::file_unchanged(&identities.sdk_settings) and
+                   BuildToolchain::file_unchanged(&identities.developer_linker) and
+                   BuildToolchain::file_unchanged(&identities.developer_assembler)
+
+    private:
+        # `ELISAPKG_COMPILER` may name the compiler; it must resolve to an
+        # executable on the isolated build PATH.
+        def select_compiler(setup: mutable Setup&) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                setup.compiler <- "elisac-stage1"
+                if Platform::environment_variable("ELISAPKG_COMPILER") is configured:
+                    setup.compiler <- configured.cast[cstr]
+                return CliStatus::build_failed if not Toolchain::valid_compiler_argument(setup.compiler)
+                region resolved_compiler_path_scope:
+                    resolved_compiler_path: mutable darray[u8] = []
+                    if not Toolchain::resolve_build_compiler(setup.compiler, &resolved_compiler_path):
+                        CliOutput::write_error("error: selected compiler was not found as an executable on the isolated build PATH\n")
+                        return CliStatus::build_failed
+                    ProjectFiles::path_with_null_terminator_into(resolved_compiler_path, &setup.compiler_storage)
+                setup.compiler <- (&setup.compiler_storage[0]).cast[cstr] can Unsafe.PointerCast
+                return CliStatus::success
+
+        # The sandbox may read every tool and execute only the executables.
+        def collect_tool_paths(setup: mutable Setup&) -> void can[Memory.Allocate, Abort.Panic]:
+            if not setup.is_stage1_wrapper:
+                setup.tool_paths.push(setup.compiler)
+                setup.executable_paths.push(setup.compiler)
+            setup.tool_paths.push(setup.environment.stage1_binary)
+            setup.tool_paths.push(setup.environment.runtime_object)
+            setup.executable_paths.push(setup.environment.stage1_binary)
+            if setup.clang[0].u8() != 0:
+                setup.tool_paths.push(setup.clang)
+                setup.executable_paths.push(setup.clang)
+
+        def identify(setup: mutable Setup&) -> void can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            sdk_optional: bool = setup.sdk_root.count == 0.usize()
+            setup.identities with {
+                compiler <- BuildToolchain::identify_file(setup.compiler, true, true),
+                stage1 <- BuildToolchain::identify_file(setup.environment.stage1_binary, false, true),
+                runtime <- BuildToolchain::identify_file(setup.environment.runtime_object, false, false),
+                clang <- BuildToolchain::identify_file(setup.clang, false, true),
+                sdk_settings <- BuildToolchain::identify_file(sdk_settings_name(setup), sdk_optional, false),
+                developer_linker <- BuildToolchain::identify_file(developer_linker_name(setup), sdk_optional, true),
+                developer_assembler <- BuildToolchain::identify_file(developer_assembler_name(setup), sdk_optional, true)
+            }
+
+        def sdk_settings_name(setup: Setup&) -> cstr can[Unsafe.PointerCast]:
+            return (&setup.sdk_settings_path[0]).cast[cstr] can Unsafe.PointerCast
+
+        def developer_linker_name(setup: Setup&) -> cstr can[Unsafe.PointerCast]:
+            return (&setup.developer_linker_path[0]).cast[cstr] can Unsafe.PointerCast
+
+        def developer_assembler_name(setup: Setup&) -> cstr can[Unsafe.PointerCast]:
+            return (&setup.developer_assembler_path[0]).cast[cstr] can Unsafe.PointerCast

@@ -21,8 +21,12 @@ include "../source/fingerprint.elisa"
 include "../source/snapshots.elisa"
 include "../text/bytes.elisa"
 include "../toolchain.elisa"
+include "./build_execution.elisa"
 include "./build_inputs.elisa"
 include "./build_sources.elisa"
+include "./build_target.elisa"
+include "./build_toolchain_setup.elisa"
+include "./build_workspace.elisa"
 include "./compiler_process.elisa"
 include "./output.elisa"
 include "./project_context.elisa"
@@ -44,438 +48,139 @@ module BuildCommand:
                 return status
 
     private:
-        const BUILD_TIMEOUT_MS: i64 = 600000
-
         def build_into_digest(start: darray[u8]&, options: Model::CommandOptions, out_artifact_digest: mutable darray[u8]&) -> i64 can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global{Read,Write}:
-                aggregate_source_name: mutable cstr = ""
-                source_snapshot_roots: mutable darray[u8] = []
-                source_snapshot_root: mutable darray[u8] = []
-                root_snapshot_entry: mutable darray[u8] = []
-                compiler_dependency_aggregate: mutable darray[u8] = []
-                snapshot_total_bytes: mutable usize = 0.usize()
                 if not Sandbox::build_sandbox_available():
                     CliOutput::write_error("error: compiler builds require the macOS Seatbelt sandbox; builds fail closed on this platform\n")
                     return CliStatus::build_failed
                 return CliStatus::usage if not Platform::c_string_equal(options.profile, "debug") and not Platform::c_string_equal(options.profile, "release")
                 return CliStatus::build_failed if not ProjectContext::load_package(start)
-                manifest_raw: mutable darray[u8] = []
-                manifest_raw <- manifest_raw.resize(ProjectFiles::project_document_limit)
-                return CliStatus::build_failed if not ProjectFiles::read_c_string_into("elisapkg.json", &manifest_raw)
-                root_name: mutable darray[u8] = []
-                root_version: mutable darray[u8] = []
-                return CliStatus::build_failed if not ProjectManifest::validate_at(manifest_raw, start, &root_name, &root_version)
-                manifest_digest: mutable darray[u8] = []
-                return CliStatus::build_failed if not Integrity::sha256_hex(manifest_raw, &manifest_digest)
-                target_name: mutable darray[u8] = []
-                target_kind: mutable darray[u8] = []
-                target_entry: mutable darray[u8] = []
-                return CliStatus::build_failed if not ManifestTargets::select_target(manifest_raw, options.target_name, options.target_kind, &target_name, &target_kind, &target_entry)
-                is_library: bool = ByteText::equal_text(target_kind, "lib")
-                return CliStatus::build_failed if not (is_library or ByteText::equal_text(target_kind, "bin") or ByteText::equal_text(target_kind, "test"))
-                target_entry_c: mutable darray[u8] = []
-                ProjectFiles::path_with_null_terminator_into(&target_entry, &target_entry_c)
-                target_resolved_buffer: mutable darray[u8] = []
-                target_resolved_buffer <- target_resolved_buffer.resize(4096)
-                target_entry_raw: cstr = (&target_entry_c[0]).cast[cstr] can Unsafe.PointerCast
-                target_entry_name: mutable cstr = ""
-                if Platform::resolve_real_path(target_entry_raw, &target_resolved_buffer) is resolved_target:
-                    target_entry_name <- resolved_target
-                else:
-                    return CliStatus::build_failed
-                lock_raw: mutable darray[u8] = []
-                lock_digest: mutable darray[u8] = []
-                region lock_status_scope:
-                    lock_status: i64 = BuildInputs::resolve_local_lock(start, options, manifest_raw, root_name, root_version, &lock_raw, &lock_digest)
-                    return lock_status if lock_status != CliStatus::success
-                source_tree_digest: mutable darray[u8] = []
-                source_tree_bytes: mutable usize = 0.usize()
-                return CliStatus::build_failed if not BuildInputs::fingerprint_source(&source_tree_digest, &source_tree_bytes)
-                dependency_aggregate: mutable darray[u8] = []
-                dependency_aggregate_digest: mutable darray[u8] = []
-                has_local_build_dependencies: mutable bool = false
+                target: mutable BuildTarget::Selection = BuildTarget::empty()
+                inputs: mutable BuildExecution::Inputs = BuildExecution::Inputs{lock: [], lock_digest: [], source_tree_digest: [], source_tree_bytes: 0.usize(), source_digest: [],
+                                                dependency_aggregate: [], dependency_aggregate_digest: [], compiler_dependency_aggregate: [],
+                                                has_local_build_dependencies: false}
+                region status_scope:
+                    status: i64 = read_project(start, options, &target, &inputs)
+                    return status if status != CliStatus::success
                 region build_state(67108864):
                     # Infer both arrays' storage from this enclosing region so the
                     # planner can allocate nested package buffers in the same scope.
                     dependency_packages: mutable darray[LocalBuildGraph::Package] = []
                     dependency_order: mutable darray[usize] = []
-                    if source_tree_bytes > SourceFingerprint::maximum_snapshot_bytes or not LocalBuildPlan::read_ordered_includes(lock_raw, start, target_entry_name, SourceFingerprint::maximum_snapshot_bytes - source_tree_bytes, &dependency_aggregate, &has_local_build_dependencies, dependency_packages, dependency_order):
+                    if inputs.source_tree_bytes > SourceFingerprint::maximum_snapshot_bytes or not LocalBuildPlan::read_ordered_includes(inputs.lock, start, BuildTarget::resolved_entry_name(target), SourceFingerprint::maximum_snapshot_bytes - inputs.source_tree_bytes, &inputs.dependency_aggregate, &inputs.has_local_build_dependencies, dependency_packages, dependency_order):
                         CliOutput::write_error("error: local dependency graph is invalid, unreadable, or exceeds the combined source-size limits; refusing to compile an incomplete graph\n")
                         return CliStatus::build_failed
-                    if has_local_build_dependencies:
-                        dependency_aggregate_digest_bytes: mutable darray[u8] = []
-                        if Integrity::sha256(dependency_aggregate, &dependency_aggregate_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(dependency_aggregate_digest_bytes, &dependency_aggregate_digest):
-                            CliOutput::write_error("error: unable to fingerprint the verified dependency aggregate\n")
-                            return CliStatus::build_failed
-                    if PackageSelection::publish_path_forbidden(target_entry):
-                        CliOutput::write_error("error: selected target entry is not a safe package source path\n")
+                    destination: mutable BuildExecution::Destination = BuildExecution::Destination{build_directory: [], artifact_label: [], artifact: [], artifact_c_string: [], receipt_path: []}
+                    toolchain: mutable BuildToolchainSetup::Setup = BuildToolchainSetup::empty()
+                    access: mutable BuildExecution::SandboxAccess = BuildExecution::SandboxAccess{home_name: "", dependency_roots: []}
+                    region status_scope:
+                        status: i64 = prepare_build(start, options, target, &inputs, &destination, &toolchain, &access)
+                        return status if status != CliStatus::success
+                    workspace: mutable BuildWorkspace::Workspace = BuildWorkspace::empty()
+                    return CliStatus::build_failed if not BuildSources::prepare_root(destination.build_directory, start, inputs.source_tree_digest, target.entry, &workspace.snapshot_template, &workspace.snapshot_root, &workspace.snapshot_roots, &workspace.snapshot_total_bytes, &workspace.root_snapshot_entry)
+                    if not BuildSnapshots::create_dependencies(&dependency_packages, dependency_order, workspace.snapshot_root, &workspace.snapshot_roots, &workspace.snapshot_total_bytes):
+                        _ = BuildSnapshots::remove_all(BuildWorkspace::snapshot_container_name(workspace), workspace.snapshot_roots)
+                        CliOutput::write_error("error: local dependency changed or could not be copied into the verified build snapshot\n")
                         return CliStatus::build_failed
-                    source_digest: mutable darray[u8] = []
-                    return CliStatus::build_failed if not BuildInputs::fingerprint_target(target_entry_raw, &source_digest)
-                    build_directory: mutable darray[u8] = []
-                    artifact: mutable darray[u8] = []
-                    receipt_path: mutable darray[u8] = []
-                    build_directory <- Build::output_directory(start, Platform::c_string_equal(options.profile, "release"))
-                    artifact_label: darray[u8] = ManifestTargets::artifact_leaf(target_name, is_library)
-                    emit_kind: cstr = "obj" if is_library else "exe"
-                    artifact_access_mode: i64 = 0 if is_library else 1
-                    ProjectFiles::path_join_bytes_into(build_directory, artifact_label, &artifact)
-                    region receipt_label_scope:
-                        receipt_label: darray[u8] = ManifestTargets::receipt_leaf(target_name)
-                        ProjectFiles::path_join_bytes_into(build_directory, receipt_label, &receipt_path)
-                    return CliStatus::build_failed if not ProjectFiles::make_directory(&build_directory)
-                    compiler: mutable cstr = "elisac-stage1"
-                    if Platform::environment_variable("ELISAPKG_COMPILER") is configured:
-                        compiler <- configured.cast[cstr]
-                    return CliStatus::build_failed if not Toolchain::valid_compiler_argument(compiler)
-                    resolved_compiler_path: mutable darray[u8] = []
-                    if not Toolchain::resolve_build_compiler(compiler, &resolved_compiler_path):
-                        CliOutput::write_error("error: selected compiler was not found as an executable on the isolated build PATH\n")
+                    if not BuildSources::target_matches(workspace.root_snapshot_entry, inputs.source_digest):
+                        _ = BuildSnapshots::remove_all(BuildWorkspace::snapshot_container_name(workspace), workspace.snapshot_roots)
                         return CliStatus::build_failed
-                    resolved_compiler_storage: mutable darray[u8] = []
-                    ProjectFiles::path_with_null_terminator_into(resolved_compiler_path, &resolved_compiler_storage)
-                    compiler <- (&resolved_compiler_storage[0]).cast[cstr] can Unsafe.PointerCast
-                    environment: mutable BuildToolchain::Environment = BuildToolchain::Environment{stage1_binary: "", runtime_object: "", allow_stale: "", clang: ""}
-                    return CliStatus::build_failed if not BuildToolchain::read_environment(&environment)
-                    stage1_binary: cstr = environment.stage1_binary
-                    runtime_object: cstr = environment.runtime_object
-                    allow_stale: cstr = environment.allow_stale
-                    clang_tool: cstr = BuildToolchain::select_clang(environment.clang)
-                    compiler_executable: mutable cstr = compiler
-                    compiler_is_stage1_wrapper: bool = Toolchain::stage1_wrapper_pair_matches(compiler, stage1_binary)
-                    if compiler_is_stage1_wrapper and stage1_binary[0].u8() != 0:
-                        compiler_executable <- stage1_binary
-                    home_name: mutable cstr = ""
-                    if Platform::environment_variable("HOME") is configured_home:
-                        home_name <- configured_home.cast[cstr]
-                    else:
-                        CliOutput::write_error("error: HOME must name an existing directory to construct the build sandbox\n")
+                    if inputs.has_local_build_dependencies and not LocalBuildGraph::write_snapshot_includes(dependency_packages, dependency_order, workspace.root_snapshot_entry, &inputs.compiler_dependency_aggregate):
+                        _ = BuildSnapshots::remove_all(BuildWorkspace::snapshot_container_name(workspace), workspace.snapshot_roots)
+                        CliOutput::write_error("error: verified dependency aggregate exceeds the configured build limit\n")
                         return CliStatus::build_failed
-                    dependency_roots: mutable darray[u8] = []
-                    return CliStatus::build_failed if not BuildPaths::sandbox_dependency_roots(lock_raw, start, &dependency_roots)
-                    tool_paths: mutable darray[cstr] = []
-                    if not compiler_is_stage1_wrapper:
-                        tool_paths <- tool_paths.push(compiler)
-                    tool_paths <- tool_paths.push(stage1_binary)
-                    tool_paths <- tool_paths.push(runtime_object)
-                    executable_paths: mutable darray[cstr] = []
-                    if not compiler_is_stage1_wrapper:
-                        executable_paths <- executable_paths.push(compiler)
-                    executable_paths <- executable_paths.push(stage1_binary)
-                    if clang_tool[0].u8() != 0:
-                        tool_paths <- tool_paths.push(clang_tool)
-                        executable_paths <- executable_paths.push(clang_tool)
-                    compiler_identity: BuildToolchain::FileIdentity = BuildToolchain::identify_file(compiler, true, true)
-                    stage1_identity: BuildToolchain::FileIdentity = BuildToolchain::identify_file(stage1_binary, false, true)
-                    runtime_identity: BuildToolchain::FileIdentity = BuildToolchain::identify_file(runtime_object, false, false)
-                    clang_identity: BuildToolchain::FileIdentity = BuildToolchain::identify_file(clang_tool, false, true)
-                    sdk_root: mutable darray[u8] = []
-                    developer_directory: mutable darray[u8] = []
-                    if not Platform::macos_toolchain_paths(&sdk_root, &developer_directory):
-                        CliOutput::write_error("error: could not locate a supported macOS SDK and developer directory for the compiler sandbox\n")
-                        return CliStatus::build_failed
-                    sdk_settings_path: mutable darray[u8] = []
-                    developer_linker_path: mutable darray[u8] = []
-                    developer_assembler_path: mutable darray[u8] = []
-                    if not BuildToolchain::developer_paths(sdk_root, developer_directory, &sdk_settings_path, &developer_linker_path, &developer_assembler_path):
-                        CliOutput::write_error("error: unsupported macOS developer toolchain directory\n")
-                        return CliStatus::build_failed
-                    sdk_settings_name: cstr = (&sdk_settings_path[0]).cast[cstr] can Unsafe.PointerCast
-                    developer_linker_name: cstr = (&developer_linker_path[0]).cast[cstr] can Unsafe.PointerCast
-                    developer_assembler_name: cstr = (&developer_assembler_path[0]).cast[cstr] can Unsafe.PointerCast
-                    if developer_directory.count > 0.usize():
-                        executable_paths <- executable_paths.push(developer_linker_name)
-                        executable_paths <- executable_paths.push(developer_assembler_name)
-                    sdk_identity: BuildToolchain::FileIdentity = BuildToolchain::identify_file(sdk_settings_name, sdk_root.count == 0.usize(), false)
-                    developer_linker_identity: BuildToolchain::FileIdentity = BuildToolchain::identify_file(developer_linker_name, sdk_root.count == 0.usize(), true)
-                    developer_assembler_identity: BuildToolchain::FileIdentity = BuildToolchain::identify_file(developer_assembler_name, sdk_root.count == 0.usize(), true)
-                    toolchain_identity_ok: bool = compiler_identity.available and stage1_identity.available and runtime_identity.available and clang_identity.available and sdk_identity.available and developer_linker_identity.available and developer_assembler_identity.available
-
-                    snapshot_template: mutable darray[u8] = []
-                    return CliStatus::build_failed if not BuildSources::prepare_root(build_directory, start, source_tree_digest, target_entry, &snapshot_template, &source_snapshot_root, &source_snapshot_roots, &snapshot_total_bytes, &root_snapshot_entry)
-                    source_snapshot_container_name: cstr = (&snapshot_template[0]).cast[cstr] can Unsafe.PointerCast
-                    region dependency_snapshots_valid_scope:
-                        dependency_snapshots_valid: bool = BuildSnapshots::create_dependencies(&dependency_packages, dependency_order, source_snapshot_root, &source_snapshot_roots, &snapshot_total_bytes)
-                        if not dependency_snapshots_valid:
-                            _ = BuildSnapshots::remove_all(source_snapshot_container_name, source_snapshot_roots)
-                            CliOutput::write_error("error: local dependency changed or could not be copied into the verified build snapshot\n")
-                            return CliStatus::build_failed
-                    if not BuildSources::target_matches(root_snapshot_entry, source_digest):
-                        _ = BuildSnapshots::remove_all(source_snapshot_container_name, source_snapshot_roots)
-                        return CliStatus::build_failed
-                    if has_local_build_dependencies:
-                        if not LocalBuildGraph::write_snapshot_includes(dependency_packages, dependency_order, root_snapshot_entry, &compiler_dependency_aggregate):
-                            _ = BuildSnapshots::remove_all(source_snapshot_container_name, source_snapshot_roots)
-                            CliOutput::write_error("error: verified dependency aggregate exceeds the configured build limit\n")
-                            return CliStatus::build_failed
-                    receipt: mutable darray[u8] = []
-                    BuildReceipt::append_target(&receipt, target_entry, target_kind, artifact_label, options.profile)
-                    BuildReceipt::append_input_digests(&receipt, source_tree_digest, source_digest, manifest_digest, lock_digest, has_local_build_dependencies, dependency_aggregate_digest)
-                    BuildReceipt::append_toolchain(&receipt, compiler, compiler_executable, stage1_binary, runtime_object,
-                                                  compiler_identity.bytes, stage1_identity.bytes, runtime_identity.bytes, clang_tool, clang_identity.bytes)
-                    BuildReceipt::append_sandbox(&receipt, sdk_root, developer_directory, developer_linker_identity.bytes,
-                                                developer_assembler_identity.bytes, sdk_identity.bytes, allow_stale)
-                    artifact_c: mutable darray[u8] = []
-                    ProjectFiles::path_with_null_terminator_into(&artifact, &artifact_c)
-                    artifact_name: cstr = (&artifact_c[0]).cast[cstr] can Unsafe.PointerCast
-                    region cached_digest_scope:
-                        cached_digest: mutable darray[u8] = []
-                        if toolchain_identity_ok and BuildCache::verified_digest(artifact, receipt_path, receipt, artifact_access_mode, &cached_digest):
-                            if not BuildSnapshots::remove_all(source_snapshot_container_name, source_snapshot_roots):
-                                CliOutput::write_error("error: unable to remove the verified build source snapshots\n")
-                                return CliStatus::build_failed
-                            CliOutput::write_ok("built .elisapkg/build/")
-                            CliOutput::write_bytes(1, &artifact_label)
-                            CliOutput::write_ok(" (cached)\n")
-                            for digest_index in 0..<cached_digest.count |out_artifact_digest, cached_digest|:
-                                out_artifact_digest[digest_index] <- cached_digest[digest_index]
-                            _ = options
-                            return CliStatus::success
+                    receipt: mutable darray[u8] = build_receipt(target, inputs, toolchain, options)
                     # The lock digest includes every resolved local dependency identity and
                     # source digest. Recompile whenever that graph changes instead of reusing a
                     # root-only artifact.
-                    # Each compiler gets a distinct private scratch directory for HOME,
-                    # TMPDIR, and caches. It is the only writable subtree; the final
-                    # artifact and its receipt stay outside the child's writable set.
-                    sandbox_template: mutable darray[u8] = []
-                    ByteText::append(&sandbox_template, build_directory)
-                    if sandbox_template.count == 0.usize() or sandbox_template[sandbox_template.count - 1.usize()] != 47:
-                        sandbox_template <- sandbox_template.push(47)
-                    ByteText::append_text(&sandbox_template, ".sandbox-XXXXXX")
-                    sandbox_template <- sandbox_template.push(0)
-                    if Platform::make_temporary_directory(&sandbox_template) != 0:
-                        _ = BuildSnapshots::remove_all(source_snapshot_container_name, source_snapshot_roots)
-                        CliOutput::write_error("error: unable to create the private compiler scratch directory\n")
-                        return CliStatus::build_failed
-                    sandbox_work_length: usize = Platform::c_string_length((&sandbox_template[0]).cast[cstr] can Unsafe.PointerCast)
-                    sandbox_work_directory: mutable darray[u8] = []
-                    for index in 0..<sandbox_work_length |sandbox_work_directory, sandbox_template|:
-                        sandbox_work_directory <- sandbox_work_directory.push(sandbox_template[index])
-                    sandbox_work_c: mutable darray[u8] = []
-                    ProjectFiles::path_with_null_terminator_into(sandbox_work_directory, &sandbox_work_c)
-                    sandbox_work_name: cstr = (&sandbox_work_c[0]).cast[cstr] can Unsafe.PointerCast
-                    canonical_sandbox_work: mutable darray[u8] = []
-                    canonical_sandbox_work <- canonical_sandbox_work.resize(4096)
-                    canonical_sandbox_work_name: mutable cstr = ""
-                    if Platform::resolve_real_path(sandbox_work_name, &canonical_sandbox_work) is resolved_sandbox_work:
-                        canonical_sandbox_work_name <- resolved_sandbox_work
-                    else:
-                        CompilerProcess::discard_scratch(sandbox_work_name, "", aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
-                        CliOutput::write_error("error: unable to resolve the private compiler scratch directory\n")
-                        return CliStatus::build_failed
-                    compiler_source_c: mutable darray[u8] = []
-                    ProjectFiles::path_with_null_terminator_into(root_snapshot_entry, &compiler_source_c)
-                    compiler_source_name: mutable cstr = (&compiler_source_c[0]).cast[cstr] can Unsafe.PointerCast
-                    aggregate_source_path: mutable darray[u8] = []
-                    aggregate_source_template: mutable darray[u8] = []
-                    aggregate_source_path_c: mutable darray[u8] = []
-                    aggregate_compile_source_c: mutable darray[u8] = []
-                    if has_local_build_dependencies:
-                        ByteText::append(&aggregate_source_template, sandbox_work_directory)
-                        if aggregate_source_template.count == 0.usize() or aggregate_source_template[aggregate_source_template.count - 1.usize()] != 47:
-                            aggregate_source_template <- aggregate_source_template.push(47)
-                        ByteText::append_text(&aggregate_source_template, "dependency-aggregate.XXXXXX")
-                        aggregate_source_template <- aggregate_source_template.push(0)
-                        aggregate_file_descriptor: i64 = Platform::make_temporary_file(&aggregate_source_template)
-                        if aggregate_file_descriptor < 0:
-                            CompilerProcess::discard_scratch(sandbox_work_name, "", aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
-                            CliOutput::write_error("error: unable to create the private dependency aggregate source\n")
-                            return CliStatus::build_failed
-                        aggregate_source_name <- (&aggregate_source_template[0]).cast[cstr] can Unsafe.PointerCast
-                        aggregate_path_length: usize = Platform::c_string_length(aggregate_source_name)
-                        for index in 0..<aggregate_path_length |aggregate_source_path, aggregate_source_template|:
-                            aggregate_source_path <- aggregate_source_path.push(aggregate_source_template[index])
-                        if not ProjectFiles::write_file_descriptor_all(aggregate_file_descriptor, compiler_dependency_aggregate):
-                            _ = Platform::close_file_descriptor(aggregate_file_descriptor)
-                            _ = Platform::unlink_path(aggregate_source_name)
-                            aggregate_source_name <- ""
-                            CompilerProcess::discard_scratch(sandbox_work_name, "", aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
-                            CliOutput::write_error("error: unable to write the private dependency aggregate source\n")
-                            return CliStatus::build_failed
-                        aggregate_flush_status: i64 = Platform::synchronize_file(aggregate_file_descriptor)
-                        region aggregate_close_status_scope:
-                            aggregate_close_status: i64 = Platform::close_file_descriptor(aggregate_file_descriptor)
-                            if aggregate_flush_status != 0 or aggregate_close_status != 0:
-                                _ = Platform::unlink_path(aggregate_source_name)
-                                aggregate_source_name <- ""
-                                CompilerProcess::discard_scratch(sandbox_work_name, "", aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
-                                CliOutput::write_error("error: unable to flush the private dependency aggregate source\n")
-                                return CliStatus::build_failed
-                        canonical_aggregate_source: mutable darray[u8] = []
-                        if not ProjectFiles::canonical_existing_path(aggregate_source_path, &canonical_aggregate_source):
-                            _ = Platform::unlink_path(aggregate_source_name)
-                            aggregate_source_name <- ""
-                            CompilerProcess::discard_scratch(sandbox_work_name, "", aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
-                            CliOutput::write_error("error: unable to resolve the private dependency aggregate source\n")
-                            return CliStatus::build_failed
-                        ProjectFiles::path_with_null_terminator_into(canonical_aggregate_source, &aggregate_compile_source_c)
-                        compiler_source_name <- (&aggregate_compile_source_c[0]).cast[cstr] can Unsafe.PointerCast
-                    # Keep every compiler-created output, including stage1's adjacent
-                    # object file, inside the private scratch subtree. The parent copies
-                    # only the validated final bytes into the public cache after teardown.
-                    temporary_template: mutable darray[u8] = []
-                    for index in 0..<sandbox_work_directory.count |temporary_template, sandbox_work_directory|:
-                        temporary_template <- temporary_template.push(sandbox_work_directory[index])
-                    if temporary_template.count == 0.usize() or temporary_template[temporary_template.count - 1.usize()] != 47:
-                        temporary_template <- temporary_template.push(47)
-                    ByteText::append(&temporary_template, artifact_label)
-                    ByteText::append_text(&temporary_template, ".tmp.XXXXXX")
-                    temporary_template <- temporary_template.push(0)
-                    temporary_file_descriptor: i64 = Platform::make_temporary_file(&temporary_template)
-                    if temporary_file_descriptor < 0:
-                        CompilerProcess::discard_scratch(sandbox_work_name, "", aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
-                        CliOutput::write_error("error: unable to create the exclusive compiler output file\n")
-                        return CliStatus::build_failed
-                    temporary_name: cstr = (&temporary_template[0]).cast[cstr] can Unsafe.PointerCast
-                    if Platform::close_file_descriptor(temporary_file_descriptor) != 0:
-                        CompilerProcess::discard_scratch(sandbox_work_name, temporary_name, aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
-                        CliOutput::write_error("error: unable to close the exclusive compiler output file\n")
-                        return CliStatus::build_failed
-                    sandbox_profile: mutable darray[u8] = Sandbox::darwin_build_profile(home_name, start, sandbox_work_directory, source_snapshot_root, dependency_roots, tool_paths, executable_paths, temporary_name)
-                    if sandbox_profile.count == 0.usize():
-                        CompilerProcess::discard_scratch(sandbox_work_name, temporary_name, aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
-                        CliOutput::write_error("error: could not construct the mandatory compiler sandbox profile\n")
-                        return CliStatus::build_failed
-                    sandbox_profile <- sandbox_profile.push(0)
-                    sandbox_profile_name: cstr = (&sandbox_profile[0]).cast[cstr] can Unsafe.PointerCast
-                    stdout_template: mutable darray[u8] = []
-                    stdout_capture: CompilerProcess::LogCapture = CompilerProcess::open_log_capture(sandbox_work_directory, true, &stdout_template)
-                    compiler_stdout_file_descriptor: i64 = stdout_capture.descriptor
-                    if compiler_stdout_file_descriptor < 0:
-                        CompilerProcess::discard_scratch(sandbox_work_name, temporary_name, aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
-                        CliOutput::write_error(stdout_capture.diagnostic)
-                        return CliStatus::build_failed
-                    compiler_stdout_name: cstr = (&stdout_template[0]).cast[cstr] can Unsafe.PointerCast
-                    stderr_template: mutable darray[u8] = []
-                    stderr_capture: CompilerProcess::LogCapture = CompilerProcess::open_log_capture(sandbox_work_directory, false, &stderr_template)
-                    compiler_stderr_file_descriptor: i64 = stderr_capture.descriptor
-                    if compiler_stderr_file_descriptor < 0:
-                        _ = Platform::close_file_descriptor(compiler_stdout_file_descriptor)
-                        _ = Platform::unlink_path(compiler_stdout_name)
-                        CompilerProcess::discard_scratch(sandbox_work_name, temporary_name, aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
-                        CliOutput::write_error(stderr_capture.diagnostic)
-                        return CliStatus::build_failed
-                    compiler_stderr_name: cstr = (&stderr_template[0]).cast[cstr] can Unsafe.PointerCast
-                    # Pin the private scratch directory by descriptor before fork.
-                    # The compiler child must not inherit the package checkout as its
-                    # cwd because Seatbelt deliberately denies that live tree.
-                    sandbox_work_directory_file_descriptor: i64 = Platform::open_directory(canonical_sandbox_work_name)
-                    if sandbox_work_directory_file_descriptor < 0:
-                        CompilerProcess::discard_logs(compiler_stdout_file_descriptor, compiler_stderr_file_descriptor, compiler_stdout_name, compiler_stderr_name)
-                        CompilerProcess::discard_scratch(sandbox_work_name, temporary_name, aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
-                        CliOutput::write_error("error: unable to open the private compiler scratch directory\n")
-                        return CliStatus::build_failed
-                    # The stage1 wrapper polls with setuid ps, which Seatbelt refuses.
-                    # The parent already enforces the compiler deadline and resource limits.
-                    child_process_identifier: i64 =
-                        invocation: CompilerProcess::Invocation = CompilerProcess::Invocation{profile: sandbox_profile_name, scratch_directory: canonical_sandbox_work_name, stage1_binary: stage1_binary, runtime_object: runtime_object, allow_stale: allow_stale, clang: clang_tool, executable: stage1_binary if compiler_is_stage1_wrapper else compiler_executable, release: Platform::c_string_equal(options.profile, "release"), emit_kind: emit_kind, output_path: temporary_name, source_path: compiler_source_name}
-                        CompilerProcess::spawn(invocation, sdk_root, developer_directory, sandbox_work_directory_file_descriptor, compiler_stdout_file_descriptor, compiler_stderr_file_descriptor)
-                    _ = Platform::close_file_descriptor(sandbox_work_directory_file_descriptor)
-                    if child_process_identifier < 0:
-                        CompilerProcess::discard_logs(compiler_stdout_file_descriptor, compiler_stderr_file_descriptor, compiler_stdout_name, compiler_stderr_name)
-                        CompilerProcess::discard_scratch(sandbox_work_name, temporary_name, aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
-                        CliOutput::write_error("error: unable to start the sandboxed compiler process\n")
-                        return CliStatus::build_failed
-                    region completion_scope:
-                        completion: CompilerProcess::Completion = CompilerProcess::await_exit(child_process_identifier, BUILD_TIMEOUT_MS)
-                        return retain_scratch_after_unconfirmed_exit(compiler_stdout_file_descriptor, compiler_stderr_file_descriptor) if not completion.group_stopped
-                        if not CompilerProcess::remove_callback_file(child_process_identifier):
-                            CompilerProcess::discard_logs(compiler_stdout_file_descriptor, compiler_stderr_file_descriptor, compiler_stdout_name, compiler_stderr_name)
-                            CompilerProcess::discard_scratch(sandbox_work_name, temporary_name, aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
-                            CliOutput::write_error("error: unable to remove the compiler callback file before output validation\n")
-                            return CliStatus::build_failed
-                        if not CompilerProcess::collect_logs(compiler_stdout_file_descriptor, compiler_stderr_file_descriptor, compiler_stdout_name, compiler_stderr_name):
-                            CompilerProcess::discard_scratch(sandbox_work_name, temporary_name, aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
-                            CliOutput::write_error("error: unable to safely collect compiler output\n")
-                            return CliStatus::build_failed
-                        if completion.wait_status == Platform::timeout_error():
-                            CompilerProcess::discard_scratch(sandbox_work_name, temporary_name, aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
-                            CliOutput::write_error("error: compiler exceeded the 10-minute execution limit\n")
-                            return CliStatus::cancelled
-                        if completion.wait_status < 0 or completion.exit_status != 0:
-                            CompilerProcess::discard_scratch(sandbox_work_name, temporary_name, aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
-                            CliOutput::write_error("error: sandboxed compiler process failed or could not be reaped\n")
-                            return CliStatus::build_failed
-                    artifact_content: mutable darray[u8] = []
-                    artifact_digest: mutable darray[u8] = []
-                    if not capture_compiler_output(temporary_name, &artifact_content, &artifact_digest):
-                        CompilerProcess::discard_scratch(sandbox_work_name, temporary_name, aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
-                        return CliStatus::build_failed
-                    # Detach the compiler-owned output inode before validating the source
-                    # tree or publishing. A session-escaping child may retain an file_descriptor, but
-                    # it cannot change the bytes already copied into artifact_content.
-                    if Platform::unlink_path(temporary_name) != 0:
-                        CompilerProcess::discard_scratch(sandbox_work_name, "", aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
-                        CliOutput::write_error("error: unable to detach compiler-owned output before validation\n")
-                        return CliStatus::build_failed
-                    # Do not publish an artifact whose compiler input tree changed while
-                    # the child was running. The receipt records the pre-build digest;
-                    # rechecking immediately before publication keeps that identity bound
-                    # to the inputs that were presented to the compiler. Revalidate the
-                    # exact manifest and lock too: local lock validation recomputes every
-                    # transitive dependency source digest, including paths outside the root.
-                    if not project_inputs_unchanged(manifest_raw, lock_raw, root_name, root_version, start):
-                        CompilerProcess::discard_scratch(sandbox_work_name, temporary_name, aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
-                        return CliStatus::build_failed
-                    region post_source_tree_digest_scope:
-                        post_source_tree_digest: mutable darray[u8] = []
-                        if not SourceFingerprint::current(&post_source_tree_digest) or not ByteText::equal(post_source_tree_digest, source_tree_digest):
-                            CompilerProcess::discard_scratch(sandbox_work_name, temporary_name, aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
-                            return CliStatus::build_failed
-                    if has_local_build_dependencies:
-                        aggregate_after_build: mutable darray[u8] = []
-                        if not read_package_file(aggregate_source_path, &aggregate_after_build) or not ByteText::equal(aggregate_after_build, compiler_dependency_aggregate):
-                            CompilerProcess::discard_scratch(sandbox_work_name, temporary_name, aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
-                            CliOutput::write_error("error: private dependency aggregate changed during compilation\n")
-                            return CliStatus::build_failed
-                    if not (BuildToolchain::file_unchanged(&compiler_identity) and
-                            BuildToolchain::file_unchanged(&stage1_identity) and
-                            BuildToolchain::file_unchanged(&runtime_identity) and
-                            BuildToolchain::file_unchanged(&clang_identity) and
-                            BuildToolchain::file_unchanged(&sdk_identity) and
-                            BuildToolchain::file_unchanged(&developer_linker_identity) and
-                            BuildToolchain::file_unchanged(&developer_assembler_identity)):
-                        CompilerProcess::discard_scratch(sandbox_work_name, "", aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
-                        CliOutput::write_error("error: compiler toolchain changed during the build; refusing to publish the artifact\n")
-                        return CliStatus::build_failed
-                    region cleanup_error_scope:
-                        cleanup_error: cstr = CompilerProcess::retire_scratch_for_publication(sandbox_work_name, temporary_name, aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
-                        if cleanup_error[0].u8() != 0:
-                            CliOutput::write_error(cleanup_error)
-                            return CliStatus::build_failed
-                    return CliStatus::build_failed if not BuildPublication::publish(build_directory, artifact_label, emit_kind, artifact_access_mode, temporary_name, artifact_name, receipt_path, artifact_content, artifact_digest, &receipt)
-                    CliOutput::write_ok("built .elisapkg/build/")
-                    CliOutput::write_bytes(1, &artifact_label)
-                    CliOutput::write_ok("\n")
-                    for digest_index in 0..<artifact_digest.count |out_artifact_digest, artifact_digest|:
-                        out_artifact_digest[digest_index] <- artifact_digest[digest_index]
-                    _ = options
-                    return CliStatus::success
+                    if reuse_cached_artifact(target, destination, toolchain, workspace, receipt, out_artifact_digest) is cached_status:
+                        return cached_status
+                    region status_scope:
+                        status: i64 = prepare_workspace(inputs, destination, &workspace)
+                        return status if status != CliStatus::success
+                    region status_scope:
+                        status: i64 = BuildExecution::compile(options, target, toolchain, access, start, &workspace)
+                        return status if status != CliStatus::success
+                    return BuildExecution::verify_and_publish(start, target, inputs, destination, toolchain, &workspace, &receipt, out_artifact_digest)
 
-        def retain_scratch_after_unconfirmed_exit(stdout_descriptor: i64, stderr_descriptor: i64) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            _ = Platform::close_file_descriptor(stdout_descriptor)
-            _ = Platform::close_file_descriptor(stderr_descriptor)
-            CliOutput::write_error("error: unable to confirm compiler process termination; retained its scratch files\n") can Global.Read
-            return CliStatus::build_failed
+        # Read the manifest, select the target, resolve the lock, and fingerprint the source tree.
+        def read_project(start: darray[u8]&, options: Model::CommandOptions, target: mutable BuildTarget::Selection&, inputs: mutable BuildExecution::Inputs&) -> i64 can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global{Read,Write}:
+                region status_scope:
+                    status: i64 = BuildTarget::select(start, options, target)
+                    return status if status != CliStatus::success
+                region status_scope:
+                    status: i64 = BuildInputs::resolve_local_lock(start, options, target.manifest, target.root_name, target.root_version, &inputs.lock, &inputs.lock_digest)
+                    return status if status != CliStatus::success
+                return CliStatus::build_failed if not BuildInputs::fingerprint_source(&inputs.source_tree_digest, &inputs.source_tree_bytes)
+                return CliStatus::success
 
-        def capture_compiler_output(path: cstr, content: mutable darray[u8]&, digest: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            return false if Platform::package_file_size(path) <= 0
-            path_bytes: mutable darray[u8] = []
-            ByteText::append_bounded_text(&path_bytes, path)
-            return read_package_file(&path_bytes, content) and Integrity::sha256_hex(content, digest)
+        # Fingerprint the dependency graph and target, choose the output paths,
+        # resolve the toolchain, and find what the sandbox must be allowed to read.
+        def prepare_build(start: darray[u8]&, options: Model::CommandOptions, target: BuildTarget::Selection&, inputs: mutable BuildExecution::Inputs&, destination: mutable BuildExecution::Destination&, toolchain: mutable BuildToolchainSetup::Setup&, access: mutable BuildExecution::SandboxAccess&) -> i64 can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global{Read,Write}:
+                if inputs.has_local_build_dependencies:
+                    region aggregate_digest_bytes_scope:
+                        aggregate_digest_bytes: mutable darray[u8] = []
+                        if Integrity::sha256(inputs.dependency_aggregate, &aggregate_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(aggregate_digest_bytes, &inputs.dependency_aggregate_digest):
+                            CliOutput::write_error("error: unable to fingerprint the verified dependency aggregate\n")
+                            return CliStatus::build_failed
+                if PackageSelection::publish_path_forbidden(target.entry):
+                    CliOutput::write_error("error: selected target entry is not a safe package source path\n")
+                    return CliStatus::build_failed
+                return CliStatus::build_failed if not BuildInputs::fingerprint_target(BuildTarget::entry_name(target), &inputs.source_digest)
+                destination.build_directory <- Build::output_directory(start, Platform::c_string_equal(options.profile, "release"))
+                destination.artifact_label <- ManifestTargets::artifact_leaf(target.name, target.is_library)
+                ProjectFiles::path_join_bytes_into(destination.build_directory, destination.artifact_label, &destination.artifact)
+                ProjectFiles::path_with_null_terminator_into(&destination.artifact, &destination.artifact_c_string)
+                region receipt_label_scope:
+                    receipt_label: darray[u8] = ManifestTargets::receipt_leaf(target.name)
+                    ProjectFiles::path_join_bytes_into(destination.build_directory, receipt_label, &destination.receipt_path)
+                return CliStatus::build_failed if not ProjectFiles::make_directory(&destination.build_directory)
+                region status_scope:
+                    status: i64 = BuildToolchainSetup::prepare(toolchain)
+                    return status if status != CliStatus::success
+                if Platform::environment_variable("HOME") is configured_home:
+                    access.home_name <- configured_home.cast[cstr]
+                else:
+                    CliOutput::write_error("error: HOME must name an existing directory to construct the build sandbox\n")
+                    return CliStatus::build_failed
+                return CliStatus::build_failed if not BuildPaths::sandbox_dependency_roots(inputs.lock, start, &access.dependency_roots)
+                return CliStatus::success
 
-        def project_inputs_unchanged(manifest: darray[u8]&, lock: darray[u8]&, root_name: darray[u8]&, root_version: darray[u8]&, start: darray[u8]&) -> bool can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            current_manifest: mutable darray[u8] = []
-            current_manifest <- current_manifest.resize(ProjectFiles::project_document_limit)
-            region current_lock_scope:
-                current_lock: mutable darray[u8] = []
-                current_lock <- current_lock.resize(ProjectFiles::project_document_limit)
-                return false if not:
-                    ProjectFiles::read_c_string_into("elisapkg.json", &current_manifest)
-                    ProjectFiles::read_c_string_into("elisapkg.lock", &current_lock)
-                    ByteText::equal(current_manifest, manifest)
-                    ByteText::equal(current_lock, lock)
-            return LockValidation::matches_manifest(manifest, lock, root_name, root_version, start) can Global.Read
+        def build_receipt(target: BuildTarget::Selection&, inputs: BuildExecution::Inputs&, toolchain: BuildToolchainSetup::Setup&, options: Model::CommandOptions) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
+            receipt: mutable darray[u8] = []
+            region identities_scope:
+                identities: BuildToolchainSetup::Identities& = &toolchain.identities
+                BuildReceipt::append_target(&receipt, target.entry, target.kind, ManifestTargets::artifact_leaf(target.name, target.is_library), options.profile)
+                BuildReceipt::append_input_digests(&receipt, inputs.source_tree_digest, inputs.source_digest, target.manifest_digest, inputs.lock_digest, inputs.has_local_build_dependencies, inputs.dependency_aggregate_digest)
+                BuildReceipt::append_toolchain(&receipt, toolchain.compiler, toolchain.compiler_executable, toolchain.environment.stage1_binary, toolchain.environment.runtime_object,
+                                              identities.compiler.bytes, identities.stage1.bytes, identities.runtime.bytes, toolchain.clang, identities.clang.bytes)
+                BuildReceipt::append_sandbox(&receipt, toolchain.sdk_root, toolchain.developer_directory, identities.developer_linker.bytes,
+                                            identities.developer_assembler.bytes, identities.sdk_settings.bytes, toolchain.environment.allow_stale)
+            return receipt
 
-        def read_package_file(path: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            return Platform::read_bounded_file(path, Integrity::maximum_input, out)
+        # Reuse a published artifact whose receipt matches this build exactly.
+        # Returns null when there is no such artifact and it must be rebuilt.
+        def reuse_cached_artifact(target: BuildTarget::Selection&, destination: BuildExecution::Destination&, toolchain: BuildToolchainSetup::Setup&, workspace: BuildWorkspace::Workspace&, receipt: darray[u8]&, out_artifact_digest: mutable darray[u8]&) -> i64? can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                cached_digest: mutable darray[u8] = []
+                return null if not:
+                    BuildToolchainSetup::all_available(&toolchain.identities)
+                    BuildCache::verified_digest(destination.artifact, destination.receipt_path, receipt, BuildTarget::artifact_access_mode(target), &cached_digest)
+                if not BuildSnapshots::remove_all(BuildWorkspace::snapshot_container_name(workspace), workspace.snapshot_roots):
+                    CliOutput::write_error("error: unable to remove the verified build source snapshots\n")
+                    return CliStatus::build_failed
+                BuildExecution::report_built(destination, " (cached)\n", cached_digest, out_artifact_digest)
+                return CliStatus::success
+
+        def prepare_workspace(inputs: BuildExecution::Inputs&, destination: BuildExecution::Destination&, workspace: mutable BuildWorkspace::Workspace&) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                region status_scope:
+                    status: i64 = BuildWorkspace::create_directory(destination.build_directory, workspace)
+                    return status if status != CliStatus::success
+                if inputs.has_local_build_dependencies:
+                    region status_scope:
+                        status: i64 = BuildWorkspace::write_aggregate(inputs.compiler_dependency_aggregate, workspace)
+                        return status if status != CliStatus::success
+                return BuildWorkspace::create_output_file(destination.artifact_label, workspace)

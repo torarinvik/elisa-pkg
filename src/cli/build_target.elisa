@@ -1,0 +1,58 @@
+# Read the manifest and select the target a build compiles.
+include "../integrity.elisa"
+include "../package/model.elisa"
+include "../package/targets.elisa"
+include "../platform.elisa"
+include "../project/files.elisa"
+include "../project/manifest.elisa"
+include "../text/bytes.elisa"
+include "./status.elisa"
+
+module BuildTarget:
+    public:
+        # Every buffer that backs a C string stays in this record, so pointers
+        # derived from it stay valid for as long as the caller keeps the record.
+        struct Selection:
+            manifest: mutable darray[u8]
+            root_name: mutable darray[u8]
+            root_version: mutable darray[u8]
+            manifest_digest: mutable darray[u8]
+            name: mutable darray[u8]
+            kind: mutable darray[u8]
+            entry: mutable darray[u8]
+            entry_c_string: mutable darray[u8]
+            resolved_entry: mutable darray[u8]
+            is_library: mutable bool
+
+        def empty() -> Selection:
+            return Selection{manifest: [], root_name: [], root_version: [], manifest_digest: [], name: [], kind: [],
+                             entry: [], entry_c_string: [], resolved_entry: [], is_library: false}
+
+        # Read and validate `elisapkg.json`, then resolve the selected target's
+        # entry file to its canonical path.
+        def select(start: darray[u8]&, options: Model::CommandOptions, out: mutable Selection&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            out.manifest <- out.manifest.resize(ProjectFiles::project_document_limit)
+            return CliStatus::build_failed if not:
+                ProjectFiles::read_c_string_into("elisapkg.json", &out.manifest)
+                ProjectManifest::validate_at(out.manifest, start, &out.root_name, &out.root_version)
+                Integrity::sha256_hex(out.manifest, &out.manifest_digest)
+                ManifestTargets::select_target(out.manifest, options.target_name, options.target_kind, &out.name, &out.kind, &out.entry)
+            out.is_library <- ByteText::equal_text(out.kind, "lib")
+            return CliStatus::build_failed if not (out.is_library or ByteText::equal_text(out.kind, "bin") or ByteText::equal_text(out.kind, "test"))
+            ProjectFiles::path_with_null_terminator_into(&out.entry, &out.entry_c_string)
+            out.resolved_entry <- out.resolved_entry.resize(4096)
+            return CliStatus::build_failed if Platform::resolve_real_path(entry_name(out), &out.resolved_entry) == null
+            return CliStatus::success
+
+        def entry_name(selection: Selection&) -> cstr can[Unsafe.PointerCast]:
+            return (&selection.entry_c_string[0]).cast[cstr] can Unsafe.PointerCast
+
+        def resolved_entry_name(selection: Selection&) -> cstr can[Unsafe.PointerCast]:
+            return (&selection.resolved_entry[0]).cast[cstr] can Unsafe.PointerCast
+
+        def emit_kind(selection: Selection&) -> cstr:
+            return "obj" if selection.is_library else "exe"
+
+        # Libraries are linked later, so only executables must carry the execute bit.
+        def artifact_access_mode(selection: Selection&) -> i64:
+            return 0 if selection.is_library else 1
