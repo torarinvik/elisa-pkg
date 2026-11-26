@@ -1,0 +1,186 @@
+# Native process lifecycle, resource limits, and clocks.
+include "./abi.elisa"
+include "./errors.elisa"
+include "./libc.elisa"
+include "./process_values.elisa"
+
+module NativeProcess:
+    public:
+        def waitpid(pid: i64, status: mutable i32&, options: i64) -> i64:
+            return -1 if pid < -2147483648 or pid > 2147483647 or options < 0 or options > 2147483647
+            return native_waitpid(pid.i32(), status, options.i32())
+
+        def fork() -> i64:
+            return native_fork()
+
+        def execvp(path: cstr, argv: mutable cstr&&) -> i64 can[Unsafe.PointerCast]:
+            raw_argv: void& = argv.cast[void&] can Unsafe.PointerCast
+            return native_execvp(path, raw_argv)
+
+        def process_exit(code: i64):
+            native_exit(code.i32())
+
+        def wall_clock_seconds() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            stamp: mutable darray[u8] = []
+            stamp.resize(16)
+            raw: mutable void& = (&stamp[0]).cast[mutable void&] can Unsafe.PointerCast
+            return -1 if native_clock_gettime(0, raw) != 0
+            seconds: i64 = NativeProcessValues::seconds(stamp)
+            return -1 if seconds < 0
+            return seconds
+
+        def set_process_group() -> i64:
+            result: i64 = native_setpgid(0, 0)
+            return 0 if result == 0 else NativeErrors::negative_errno()
+
+        def monotonic_clock_milliseconds() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return monotonic_milliseconds()
+
+        def sleep_milliseconds(duration: i64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return -22 if duration <= 0
+            request: mutable darray[u8] = NativeProcessValues::timespec_bytes(duration / 1000, (duration % 1000) * 1000000)
+            remaining: mutable darray[u8] = NativeProcessValues::timespec_bytes(0, 0)
+            request_raw: void& = (&request[0]).cast[void&] can Unsafe.PointerCast
+            remaining_raw: mutable void& = (&remaining[0]).cast[mutable void&] can Unsafe.PointerCast
+            while true |request, remaining, request_raw, remaining_raw|:
+                return 0 if native_nanosleep(request_raw, remaining_raw) == 0
+                errno_value: i64 = NativeErrors::current_errno()
+                return NativeErrors::negative_value(errno_value) if errno_value != 4
+                for index in 0..<16 |request, remaining|:
+                    request[index] <- remaining[index]
+            return -5
+
+        def process_id() -> i64:
+            return native_getpid()
+
+        def terminate_process_group(process_group: i64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return -22 if not valid_child_process_id(process_group)
+            if native_kill((-process_group).i32(), 9) != 0:
+                kill_errno: i64 = NativeErrors::current_errno()
+                return 0 if kill_errno == 3
+                return NativeErrors::negative_value(kill_errno)
+            clock_buffer: mutable darray[u8] = []
+            clock_buffer.resize(NativeProcessValues::record_bytes)
+            started: i64 = monotonic_milliseconds_into(&clock_buffer)
+            return -5 if started < 0
+            deadline: i64 = started + 5000 if started <= 9223372036854770807 else 9223372036854775807
+            pause: mutable darray[u8] = NativeProcessValues::timespec_bytes(0, 10000000)
+            pause_raw: void& = (&pause[0]).cast[void&] can Unsafe.PointerCast
+            remaining: mutable darray[u8] = NativeProcessValues::timespec_bytes(0, 0)
+            remaining_raw: mutable void& = (&remaining[0]).cast[mutable void&] can Unsafe.PointerCast
+            while true |process_group, deadline, clock_buffer, pause, pause_raw, remaining, remaining_raw|:
+                probe: i64 = native_kill((-process_group).i32(), 0)
+                if probe != 0:
+                    probe_errno: i64 = NativeErrors::current_errno()
+                    return 0 if probe_errno == 3
+                    return NativeErrors::negative_value(probe_errno)
+                now: i64 = monotonic_milliseconds_into(&clock_buffer)
+                return -5 if now < 0
+                return -110 if now >= deadline
+                if native_nanosleep(pause_raw, remaining_raw) != 0 and NativeErrors::current_errno() != 4:
+                    return NativeErrors::negative_errno()
+            return -5
+
+        def set_process_limits(profile: i64) -> i64 can[Memory.Allocate, Unsafe.PointerCast]:
+            cpu: mutable i64 = 0
+            file_size: mutable i64 = 0
+            if profile == 1:
+                cpu <- 600
+                file_size <- 134217728
+            elif profile == 2:
+                cpu <- 120
+                file_size <- 67108864
+            return -22 if cpu == 0 or file_size == 0
+            cpu_limit: mutable darray[u8] = NativeProcessValues::limit_bytes(cpu)
+            file_limit: mutable darray[u8] = NativeProcessValues::limit_bytes(file_size)
+            cpu_raw: void& = (&cpu_limit[0]).cast[void&] can Unsafe.PointerCast
+            file_raw: void& = (&file_limit[0]).cast[void&] can Unsafe.PointerCast
+            return NativeErrors::negative_errno() if native_setrlimit(0, cpu_raw) != 0
+            return NativeErrors::negative_errno() if native_setrlimit(1, file_raw) != 0
+            core_limit: mutable darray[u8] = NativeProcessValues::limit_bytes(0)
+            core_raw: void& = (&core_limit[0]).cast[void&] can Unsafe.PointerCast
+            return NativeErrors::negative_errno() if native_setrlimit(4, core_raw) != 0
+            return 0
+
+        # Return zero after reaping the child and put its wait status in status.
+        def waitpid_timeout(pid: i64, status: mutable i32&, timeout_ms: i64) -> i64 can[Memory.Allocate, Unsafe.PointerCast]:
+            status <- 0
+            return -22 if not valid_child_process_id(pid) or timeout_ms <= 0
+            clock_buffer: mutable darray[u8] = []
+            clock_buffer.resize(NativeProcessValues::record_bytes)
+            started: i64 = monotonic_milliseconds_into(&clock_buffer)
+            if started < 0:
+                reap_status: i64 = terminate_and_reap(pid, status)
+                return reap_status if reap_status != 0 else -5
+            deadline: i64 = started + timeout_ms if started <= 9223372036854775807 - timeout_ms else 9223372036854775807
+            pause: mutable darray[u8] = NativeProcessValues::timespec_bytes(0, 10000000)
+            pause_raw: void& = (&pause[0]).cast[void&] can Unsafe.PointerCast
+            remaining: mutable darray[u8] = NativeProcessValues::timespec_bytes(0, 0)
+            remaining_raw: mutable void& = (&remaining[0]).cast[mutable void&] can Unsafe.PointerCast
+            while true |status, pid, deadline, clock_buffer, pause, pause_raw, remaining, remaining_raw|:
+                waited: i64 = native_waitpid(pid.i32(), status, 1)
+                if waited == pid:
+                    return 0
+                interrupted: bool = waited < 0 and NativeErrors::current_errno() == 4
+                if waited < 0 and not interrupted:
+                    wait_error: i64 = NativeErrors::negative_errno()
+                    reap_status: i64 = terminate_and_reap(pid, status)
+                    return reap_status if reap_status != 0 else wait_error
+                now: i64 = monotonic_milliseconds_into(&clock_buffer)
+                if now < 0:
+                    reap_status: i64 = terminate_and_reap(pid, status)
+                    return reap_status if reap_status != 0 else -5
+                if now >= deadline:
+                    reap_status: i64 = terminate_and_reap(pid, status)
+                    return reap_status if reap_status != 0 else -110
+                # A stream of signals must not bypass the deadline check.
+                continue if interrupted
+                sleep_status: i64 = native_nanosleep(pause_raw, remaining_raw)
+                if sleep_status != 0 and NativeErrors::current_errno() != 4:
+                    sleep_errno: i64 = NativeErrors::current_errno()
+                    reap_status: i64 = terminate_and_reap(pid, status)
+                    return reap_status if reap_status != 0 else NativeErrors::negative_value(sleep_errno)
+            return -110
+
+        # Waiting for the group leader alone can leave a same-group descendant
+        # running after its parent exits. Reap the direct child under the normal
+        # deadline, then kill and drain the whole isolated group on every result.
+        def waitpid_group_timeout(pid: i64, status: mutable i32&, timeout_ms: i64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            status <- 0
+            return -22 if not valid_child_process_id(pid) or timeout_ms <= 0
+            waited: i64 = waitpid_timeout(pid, status, timeout_ms)
+            group_cleanup: i64 = terminate_process_group(pid)
+            return -5 if group_cleanup != 0
+            return waited
+
+        def timeout_error() -> i64:
+            return -110
+
+    private:
+        # The supported pid_t ABI is signed 32-bit. A group identifier of
+        # one is also invalid here because kill(-1, ...) signals broadly.
+        def valid_child_process_id(pid: i64) -> bool:
+            return pid > 1 and pid <= 2147483647
+
+        def terminate_and_reap(pid: i64, status: mutable i32&) -> i64:
+            _ = native_kill((-pid).i32(), 9)
+            _ = native_kill(pid.i32(), 9)
+            while true |pid, status|:
+                waited: i64 = native_waitpid(pid.i32(), status, 0)
+                return 0 if waited == pid
+                if waited < 0:
+                    errno_value: i64 = NativeErrors::current_errno()
+                    return 0 if errno_value == 10
+                    continue if errno_value == 4
+                    return NativeErrors::negative_value(errno_value)
+            return -5
+
+        def monotonic_milliseconds() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            stamp: mutable darray[u8] = []
+            stamp.resize(NativeProcessValues::record_bytes)
+            return monotonic_milliseconds_into(&stamp)
+
+        def monotonic_milliseconds_into(stamp: mutable darray[u8]&) -> i64 can[Unsafe.PointerCast]:
+            raw: mutable void& = (&stamp[0]).cast[mutable void&] can Unsafe.PointerCast
+            return -1 if native_clock_gettime(monotonic_clock_id, raw) != 0
+            return NativeProcessValues::milliseconds(stamp)

@@ -7,7 +7,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 FFI_DECLARATIONS = (ROOT / "src/platform/libc.elisa").resolve()
-NATIVE_MODULE = (ROOT / "src/platform_native.elisa").resolve()
+NATIVE_MODULES = {
+    (ROOT / path).resolve()
+    for path in ("src/platform_native.elisa", "src/platform/errors.elisa", "src/platform/process.elisa")
+}
 GENERATED_DIRECTORIES = {".git", ".elisapkg", ".ruff_cache", "build"}
 FORBIDDEN_NATIVE_SUFFIXES = {".c", ".h", ".cc", ".cpp", ".cxx", ".hpp"}
 FOREIGN_DECLARATION = re.compile(r"^\s*(?:@link_name\b|extern\b)")
@@ -134,7 +137,7 @@ def main() -> int:
         resolved = path.resolve()
         for line_number, line in enumerate(text.splitlines(), 1):
             foreign_declaration = resolved != FFI_DECLARATIONS and FOREIGN_DECLARATION.search(line)
-            foreign_call = resolved not in {FFI_DECLARATIONS, NATIVE_MODULE} and NATIVE_SYMBOL.search(line)
+            foreign_call = resolved not in NATIVE_MODULES | {FFI_DECLARATIONS} and NATIVE_SYMBOL.search(line)
             if foreign_declaration or foreign_call:
                 violations.append((path.relative_to(ROOT), line_number, line.strip()))
     if violations:

@@ -7,6 +7,8 @@ include "./package_path_policy.elisa"
 include "./package/ustar_fields.elisa"
 
 include "./platform/libc.elisa"
+include "./platform/errors.elisa"
+include "./platform/process.elisa"
 
 include "./platform/abi.elisa"
 include "./platform/stat.elisa"
@@ -34,7 +36,7 @@ module PlatformNative:
         def write(fd: i64, buffer: void&, count: usize) -> i64 can[Console.Write]:
             while true |fd, buffer, count|:
                 result: i64 = native_write(fd, buffer, count) can Console.Write
-                continue if result < 0 and current_errno() == 4
+                continue if result < 0 and NativeErrors::current_errno() == 4
                 return result
             return -5
         def read_fd(fd: i64, buffer: mutable u8&, capacity: usize) -> i64 can[Unsafe.PointerCast]:
@@ -42,9 +44,9 @@ module PlatformNative:
             raw: mutable void& = buffer.cast[mutable void&] can Unsafe.PointerCast
             while true |fd, raw, capacity|:
                 result: i64 = native_read(fd, raw, capacity)
-                continue if result < 0 and current_errno() == 4
+                continue if result < 0 and NativeErrors::current_errno() == 4
                 return result if result >= 0
-                return negative_errno()
+                return NativeErrors::negative_errno()
             return -5
         def seek_fd(fd: i64, offset: i64, origin: i64) -> i64:
             return native_lseek(fd, offset, origin)
@@ -63,18 +65,15 @@ module PlatformNative:
                 while true:
                     close_status: i64 = native_syscall(linux_close_range_syscall, 3, 4294967295, 0)
                     return 0 if close_status == 0
-                    errno_value: i64 = current_errno()
+                    errno_value: i64 = NativeErrors::current_errno()
                     continue if errno_value == 4
-                    return negative_value(errno_value)
+                    return NativeErrors::negative_value(errno_value)
                 return -5
             static else:
                 return close_macos_inherited_descriptors()
 
         def fsync(fd: i64) -> i64:
             return native_fsync(fd)
-        def waitpid(pid: i64, status: mutable i32&, options: i64) -> i64:
-            return -1 if pid < -2147483648 or pid > 2147483647 or options < 0 or options > 2147483647
-            return native_waitpid(pid.i32(), status, options.i32())
         def read_package_file(path: cstr, output: mutable u8&, capacity: usize) -> i64 can[Unsafe.PointerCast]:
             return -22 if capacity == 0.usize()
             fd: i64 = open_package_file(path)
@@ -144,8 +143,8 @@ module PlatformNative:
             stat.resize(stat_buffer_bytes)
             raw_stat: mutable void& = (&stat[0]).cast[mutable void&] can Unsafe.PointerCast
             if native_fstat(fd, raw_stat) != 0:
-                errno_value: i64 = current_errno()
-                return close_two_error(directory, fd, negative_value(errno_value))
+                errno_value: i64 = NativeErrors::current_errno()
+                return close_two_error(directory, fd, NativeErrors::negative_value(errno_value))
             file_device: u64 = NativeStat::device(stat)
             file_inode: u64 = NativeStat::inode(stat)
             read_size: i64 = read_regular_descriptor(fd, output, capacity)
@@ -250,7 +249,7 @@ module PlatformNative:
                     return extraction_failure(root, seen, created_directories, -5 if parent_close_status != 0 else -75)
                 file: i64 = native_openat(parent, leaf, flags_write_create_exclusive(), 420)
                 if file < 0:
-                    file_errno: i64 = negative_errno()
+                    file_errno: i64 = NativeErrors::negative_errno()
                     parent_close_status: i64 = native_close(parent)
                     return extraction_failure(root, seen, created_directories, -5 if parent_close_status != 0 else file_errno)
                 for index in 0..<name.count |seen, name|:
@@ -262,7 +261,7 @@ module PlatformNative:
                 while written < size |archive, data_start, file, written, size, write_failed|:
                     data: void& = (&archive[data_start + written]).cast[void&] can Unsafe.PointerCast
                     amount: i64 = native_write(file, data, size - written)
-                    continue if amount < 0 and current_errno() == 4
+                    continue if amount < 0 and NativeErrors::current_errno() == 4
                     if amount <= 0:
                         write_failed <- true
                         break
@@ -305,13 +304,13 @@ module PlatformNative:
                 leaf_c.push(leaf_snapshot[index])
             leaf_name: cstr = (&leaf_c[0]).cast[cstr] can Unsafe.PointerCast
             result: i64 = native_mkdirat(directory, leaf_name, mode.i64())
-            errno_value: i64 = current_errno()
+            errno_value: i64 = NativeErrors::current_errno()
             if result == 0:
                 sync_status: i64 = native_fsync(directory)
-                sync_errno: i64 = current_errno()
+                sync_errno: i64 = NativeErrors::current_errno()
                 return close_result(directory, 0) if sync_status == 0
-                return close_error(directory, negative_value(sync_errno))
-            return close_error(directory, negative_value(errno_value))
+                return close_error(directory, NativeErrors::negative_value(sync_errno))
+            return close_error(directory, NativeErrors::negative_value(errno_value))
 
         # Flushing the containing directory completes the durability contract
         # for an atomic file replacement. The caller never receives the raw
@@ -324,9 +323,9 @@ module PlatformNative:
             directory: i64 = open_directory_path(parent_name)
             return directory if directory < 0
             result: i64 = native_fsync(directory)
-            errno_value: i64 = current_errno()
+            errno_value: i64 = NativeErrors::current_errno()
             return close_result(directory, 0) if result == 0
-            return close_error(directory, negative_value(errno_value))
+            return close_error(directory, NativeErrors::negative_value(errno_value))
 
         def access(path: cstr, mode: i64) -> i64:
             return -22 if mode != 0 and mode != 1
@@ -370,12 +369,12 @@ module PlatformNative:
                 return close_error(directory, fd)
             return close_two_error(directory, fd, -21) if not regular_fd(fd)
             result: i64 = native_fchmod(fd, mode.i64())
-            errno_value: i64 = current_errno()
-            return close_two_error(fd, directory, negative_value(errno_value)) if result != 0
+            errno_value: i64 = NativeErrors::current_errno()
+            return close_two_error(fd, directory, NativeErrors::negative_value(errno_value)) if result != 0
             sync_status: i64 = native_fsync(fd)
-            sync_errno: i64 = current_errno()
+            sync_errno: i64 = NativeErrors::current_errno()
             return close_two_result(fd, directory, 0) if sync_status == 0
-            return close_two_error(fd, directory, negative_value(sync_errno))
+            return close_two_error(fd, directory, NativeErrors::negative_value(sync_errno))
 
         def acquire_install_lock(prefix: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             # Use one persistent inode for every installer process. Never unlink
@@ -386,15 +385,15 @@ module PlatformNative:
             return directory if directory < 0
             flags: i64 = flag_read_write + flag_create + flag_no_follow + flag_close_on_exec + flag_nonblock
             fd: i64 = native_openat(directory, ".elisapkg-install.lock", flags, 384)
-            open_errno: i64 = current_errno()
+            open_errno: i64 = NativeErrors::current_errno()
             directory_close: i64 = native_close(directory)
             if fd < 0:
-                return negative_value(open_errno)
+                return NativeErrors::negative_value(open_errno)
             return close_error(fd, -5) if directory_close != 0
             return close_error(fd, -13) if not trusted_regular_fd(fd, expected_uid)
             if native_flock(fd, lock_operation_exclusive + lock_operation_nonblocking) != 0:
-                lock_errno: i64 = current_errno()
-                return close_error(fd, negative_value(lock_errno))
+                lock_errno: i64 = NativeErrors::current_errno()
+                return close_error(fd, NativeErrors::negative_value(lock_errno))
             return fd
 
         # Hold a persistent project-local advisory lock across the complete
@@ -418,15 +417,15 @@ module PlatformNative:
             leaf_name: cstr = (&leaf_buffer[0]).cast[cstr] can Unsafe.PointerCast
             flags: i64 = flag_read_write + flag_create + flag_no_follow + flag_close_on_exec + flag_nonblock
             fd: i64 = native_openat(directory, leaf_name, flags, 384)
-            open_errno: i64 = current_errno()
+            open_errno: i64 = NativeErrors::current_errno()
             directory_close: i64 = native_close(directory)
             if fd < 0:
-                return negative_value(open_errno)
+                return NativeErrors::negative_value(open_errno)
             return close_error(fd, -5) if directory_close != 0
             return close_error(fd, -13) if not trusted_regular_fd(fd, expected_uid)
             if native_flock(fd, lock_operation_exclusive + lock_operation_nonblocking) != 0:
-                lock_errno: i64 = current_errno()
-                return close_error(fd, negative_value(lock_errno))
+                lock_errno: i64 = NativeErrors::current_errno()
+                return close_error(fd, NativeErrors::negative_value(lock_errno))
             return fd
 
         def acquire_trust_state_lock(path: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -450,15 +449,15 @@ module PlatformNative:
             leaf_name: cstr = (&leaf_buffer[0]).cast[cstr] can Unsafe.PointerCast
             flags: i64 = flag_read_write + flag_create + flag_no_follow + flag_close_on_exec + flag_nonblock
             fd: i64 = native_openat(directory, leaf_name, flags, 384)
-            open_errno: i64 = current_errno()
+            open_errno: i64 = NativeErrors::current_errno()
             directory_close: i64 = native_close(directory)
             if fd < 0:
-                return negative_value(open_errno)
+                return NativeErrors::negative_value(open_errno)
             return close_error(fd, -5) if directory_close != 0
             return close_error(fd, -13) if not trusted_regular_fd(fd, expected_uid)
             if native_flock(fd, lock_operation_exclusive + lock_operation_nonblocking) != 0:
-                lock_errno: i64 = current_errno()
-                return close_error(fd, negative_value(lock_errno))
+                lock_errno: i64 = NativeErrors::current_errno()
+                return close_error(fd, NativeErrors::negative_value(lock_errno))
             return fd
 
         def unlink(path: cstr) -> i64:
@@ -483,14 +482,14 @@ module PlatformNative:
             directory: i64 = open_directory_path(path)
             return directory if directory < 0
             result: i64 = native_fchdir(directory)
-            errno_value: i64 = current_errno()
+            errno_value: i64 = NativeErrors::current_errno()
             return close_result(directory, 0) if result == 0
-            return close_error(directory, negative_value(errno_value))
+            return close_error(directory, NativeErrors::negative_value(errno_value))
 
         def fchdir(fd: i64) -> i64:
             result: i64 = native_fchdir(fd)
             return 0 if result == 0
-            return -error_code()
+            return -NativeErrors::error_code()
 
         def realpath(path: cstr, resolved: mutable darray[u8]&) -> cstr? can[Unsafe.PointerCast]:
             resolved[0] <- 0 if resolved.count > 0.usize()
@@ -597,7 +596,7 @@ module PlatformNative:
                         _ = unlink_kind(cleanup_name, 0)
                         return -5
                     return fd
-                return close_error(directory, negative_errno()) if current_errno() != 17
+                return close_error(directory, NativeErrors::negative_errno()) if NativeErrors::current_errno() != 17
             return close_error(directory, -17)
 
         # Reserve a caller-selected name without following a pre-planted symlink.
@@ -647,27 +646,8 @@ module PlatformNative:
                         _ = unlink_kind(cleanup_name, at_remove_directory)
                         return -5
                     return 0
-                return close_error(directory, negative_value(current_errno())) if current_errno() != 17
+                return close_error(directory, NativeErrors::negative_value(NativeErrors::current_errno())) if NativeErrors::current_errno() != 17
             return close_error(directory, -17)
-
-        def fork() -> i64:
-            return native_fork()
-
-        def execvp(path: cstr, argv: mutable cstr&&) -> i64 can[Unsafe.PointerCast]:
-            raw_argv: void& = argv.cast[void&] can Unsafe.PointerCast
-            return native_execvp(path, raw_argv)
-
-        def process_exit(code: i64):
-            native_exit(code.i32())
-
-        def wall_clock_seconds() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            stamp: mutable darray[u8] = []
-            stamp.resize(16)
-            raw: mutable void& = (&stamp[0]).cast[mutable void&] can Unsafe.PointerCast
-            return -1 if native_clock_gettime(0, raw) != 0
-            seconds: i64 = NativeProcessValues::seconds(stamp)
-            return -1 if seconds < 0
-            return seconds
 
         def verify_ed25519(public_key: darray[u8]&, message: darray[u8]&, signature: darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return -22 if public_key.count != 32.usize() or signature.count != 64.usize() or message.count > 1048576.usize()
@@ -735,11 +715,11 @@ module PlatformNative:
             raw_child_argv: void& = child_argv.cast[void&] can Unsafe.PointerCast
             raw_child_environment: void& = child_environment.cast[void&] can Unsafe.PointerCast
             pid: i64 = native_fork()
-            result: mutable i64 = negative_errno() if pid < 0 else -1
+            result: mutable i64 = NativeErrors::negative_errno() if pid < 0 else -1
             if pid == 0:
-                if set_process_group() != 0:
+                if NativeProcess::set_process_group() != 0:
                     native_exit(126)
-                if set_process_limits(2) != 0:
+                if NativeProcess::set_process_limits(2) != 0:
                     native_exit(126)
                 # OpenSSL writes a success sentence to stdout and diagnostics
                 # to stderr. Keep helper output from corrupting CLI JSON or
@@ -753,7 +733,7 @@ module PlatformNative:
                 native_exit(127)
             elif pid > 0:
                 status: mutable i32 = 0
-                waited: i64 = waitpid_group_timeout(pid, &status, 10000)
+                waited: i64 = NativeProcess::waitpid_group_timeout(pid, &status, 10000)
                 result <- waited if waited < 0
                 result <- 0 if waited == 0 and status == 0
                 result <- -38 if waited == 0 and (status == 126 * 256 or status == 127 * 256)
@@ -774,13 +754,13 @@ module PlatformNative:
                 native_errno()[0] <- 0
                 received: i32 = native_proc_pidinfo(process, descriptor_list_flavor, 0.u64(), buffer, capacity)
                 return -5 if received < 0 or received >= capacity or received % 8 != 0
-                return negative_errno() if received == 0 and current_errno() != 0
+                return NativeErrors::negative_errno() if received == 0 and NativeErrors::current_errno() != 0
                 for index in 0..<(received.usize() / entry_bytes) |entries, entry_bytes|:
                     offset: usize = index * entry_bytes
                     descriptor: i64 = NativeProcessValues::descriptor_number(entries, offset)
                     return -5 if descriptor < 0
                     if descriptor >= 3 and native_close(descriptor) != 0:
-                        return negative_errno()
+                        return NativeErrors::negative_errno()
                 return 0
 
         def read_regular_descriptor(fd: i64, output: mutable u8&, capacity: usize) -> i64 can[Unsafe.PointerCast]:
@@ -789,9 +769,9 @@ module PlatformNative:
                 raw: mutable void& = (&output[used]).cast[mutable void&] can Unsafe.PointerCast
                 amount: i64 = native_read(fd, raw, capacity - used)
                 if amount < 0:
-                    errno_value: i64 = current_errno()
+                    errno_value: i64 = NativeErrors::current_errno()
                     continue if errno_value == 4
-                    return negative_value(errno_value)
+                    return NativeErrors::negative_value(errno_value)
                 break if amount == 0
                 if amount > (capacity - used).i64():
                     return -75
@@ -822,7 +802,7 @@ module PlatformNative:
             while written < value.count |value, written, fd, failed|:
                 raw: void& = (&value[written]).cast[void&] can Unsafe.PointerCast
                 amount: i64 = native_write(fd, raw, value.count - written)
-                continue if amount < 0 and current_errno() == 4
+                continue if amount < 0 and NativeErrors::current_errno() == 4
                 if amount <= 0:
                     failed <- true
                     break
@@ -848,152 +828,6 @@ module PlatformNative:
             return unlink_kind(path_name, 0)
 
     public:
-        def set_process_group() -> i64:
-            result: i64 = native_setpgid(0, 0)
-            return 0 if result == 0 else negative_errno()
-
-        def monotonic_clock_milliseconds() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            return monotonic_milliseconds()
-
-        def sleep_milliseconds(duration: i64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            return -22 if duration <= 0
-            request: mutable darray[u8] = NativeProcessValues::timespec_bytes(duration / 1000, (duration % 1000) * 1000000)
-            remaining: mutable darray[u8] = NativeProcessValues::timespec_bytes(0, 0)
-            request_raw: void& = (&request[0]).cast[void&] can Unsafe.PointerCast
-            remaining_raw: mutable void& = (&remaining[0]).cast[mutable void&] can Unsafe.PointerCast
-            while true |request, remaining, request_raw, remaining_raw|:
-                return 0 if native_nanosleep(request_raw, remaining_raw) == 0
-                errno_value: i64 = current_errno()
-                return negative_value(errno_value) if errno_value != 4
-                for index in 0..<16 |request, remaining|:
-                    request[index] <- remaining[index]
-            return -5
-
-        def process_id() -> i64:
-            return native_getpid()
-
-        def terminate_process_group(process_group: i64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            return -22 if not valid_child_process_id(process_group)
-            if native_kill((-process_group).i32(), 9) != 0:
-                kill_errno: i64 = current_errno()
-                return 0 if kill_errno == 3
-                return negative_value(kill_errno)
-            clock_buffer: mutable darray[u8] = []
-            clock_buffer.resize(NativeProcessValues::record_bytes)
-            started: i64 = monotonic_milliseconds_into(&clock_buffer)
-            return -5 if started < 0
-            deadline: i64 = started + 5000 if started <= 9223372036854770807 else 9223372036854775807
-            pause: mutable darray[u8] = NativeProcessValues::timespec_bytes(0, 10000000)
-            pause_raw: void& = (&pause[0]).cast[void&] can Unsafe.PointerCast
-            remaining: mutable darray[u8] = NativeProcessValues::timespec_bytes(0, 0)
-            remaining_raw: mutable void& = (&remaining[0]).cast[mutable void&] can Unsafe.PointerCast
-            while true |process_group, deadline, clock_buffer, pause, pause_raw, remaining, remaining_raw|:
-                probe: i64 = native_kill((-process_group).i32(), 0)
-                if probe != 0:
-                    probe_errno: i64 = current_errno()
-                    return 0 if probe_errno == 3
-                    return negative_value(probe_errno)
-                now: i64 = monotonic_milliseconds_into(&clock_buffer)
-                return -5 if now < 0
-                return -110 if now >= deadline
-                if native_nanosleep(pause_raw, remaining_raw) != 0 and current_errno() != 4:
-                    return negative_errno()
-            return -5
-
-        def set_process_limits(profile: i64) -> i64 can[Memory.Allocate, Unsafe.PointerCast]:
-            cpu: mutable i64 = 0
-            file_size: mutable i64 = 0
-            if profile == 1:
-                cpu <- 600
-                file_size <- 134217728
-            elif profile == 2:
-                cpu <- 120
-                file_size <- 67108864
-            return -22 if cpu == 0 or file_size == 0
-            cpu_limit: mutable darray[u8] = NativeProcessValues::limit_bytes(cpu)
-            file_limit: mutable darray[u8] = NativeProcessValues::limit_bytes(file_size)
-            cpu_raw: void& = (&cpu_limit[0]).cast[void&] can Unsafe.PointerCast
-            file_raw: void& = (&file_limit[0]).cast[void&] can Unsafe.PointerCast
-            return negative_errno() if native_setrlimit(0, cpu_raw) != 0
-            return negative_errno() if native_setrlimit(1, file_raw) != 0
-            core_limit: mutable darray[u8] = NativeProcessValues::limit_bytes(0)
-            core_raw: void& = (&core_limit[0]).cast[void&] can Unsafe.PointerCast
-            return negative_errno() if native_setrlimit(4, core_raw) != 0
-            return 0
-
-        def waitpid_timeout(pid: i64, status: mutable i32&, timeout_ms: i64) -> i64 can[Memory.Allocate, Unsafe.PointerCast]:
-            status <- 0
-            return -22 if not valid_child_process_id(pid) or timeout_ms <= 0
-            clock_buffer: mutable darray[u8] = []
-            clock_buffer.resize(NativeProcessValues::record_bytes)
-            started: i64 = monotonic_milliseconds_into(&clock_buffer)
-            if started < 0:
-                reap_status: i64 = terminate_and_reap(pid, status)
-                return reap_status if reap_status != 0 else -5
-            deadline: i64 = started + timeout_ms if started <= 9223372036854775807 - timeout_ms else 9223372036854775807
-            pause: mutable darray[u8] = NativeProcessValues::timespec_bytes(0, 10000000)
-            pause_raw: void& = (&pause[0]).cast[void&] can Unsafe.PointerCast
-            remaining: mutable darray[u8] = NativeProcessValues::timespec_bytes(0, 0)
-            remaining_raw: mutable void& = (&remaining[0]).cast[mutable void&] can Unsafe.PointerCast
-            while true |status, pid, deadline, clock_buffer, pause, pause_raw, remaining, remaining_raw|:
-                waited: i64 = native_waitpid(pid.i32(), status, 1)
-                if waited == pid:
-                    return 0
-                interrupted: bool = waited < 0 and current_errno() == 4
-                if waited < 0 and not interrupted:
-                    wait_error: i64 = negative_errno()
-                    reap_status: i64 = terminate_and_reap(pid, status)
-                    return reap_status if reap_status != 0 else wait_error
-                now: i64 = monotonic_milliseconds_into(&clock_buffer)
-                if now < 0:
-                    reap_status: i64 = terminate_and_reap(pid, status)
-                    return reap_status if reap_status != 0 else -5
-                if now >= deadline:
-                    reap_status: i64 = terminate_and_reap(pid, status)
-                    return reap_status if reap_status != 0 else -110
-                # A stream of signals must not bypass the deadline check.
-                continue if interrupted
-                sleep_status: i64 = native_nanosleep(pause_raw, remaining_raw)
-                if sleep_status != 0 and current_errno() != 4:
-                    sleep_errno: i64 = current_errno()
-                    reap_status: i64 = terminate_and_reap(pid, status)
-                    return reap_status if reap_status != 0 else negative_value(sleep_errno)
-            return -110
-
-        # Waiting for the group leader alone can leave a same-group descendant
-        # running after its parent exits. Reap the direct child under the normal
-        # deadline, then kill and drain the whole isolated group on every result.
-        def waitpid_group_timeout(pid: i64, status: mutable i32&, timeout_ms: i64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            status <- 0
-            return -22 if not valid_child_process_id(pid) or timeout_ms <= 0
-            waited: i64 = waitpid_timeout(pid, status, timeout_ms)
-            group_cleanup: i64 = terminate_process_group(pid)
-            return -5 if group_cleanup != 0
-            return waited
-
-    private:
-        # The supported pid_t ABI is signed 32-bit. A group identifier of
-        # one is also invalid here because kill(-1, ...) signals broadly.
-        def valid_child_process_id(pid: i64) -> bool:
-            return pid > 1 and pid <= 2147483647
-
-        def terminate_and_reap(pid: i64, status: mutable i32&) -> i64:
-            _ = native_kill((-pid).i32(), 9)
-            _ = native_kill(pid.i32(), 9)
-            while true |pid, status|:
-                waited: i64 = native_waitpid(pid.i32(), status, 0)
-                return 0 if waited == pid
-                if waited < 0:
-                    errno_value: i64 = current_errno()
-                    return 0 if errno_value == 10
-                    continue if errno_value == 4
-                    return negative_value(errno_value)
-            return -5
-
-    public:
-        def timeout_error() -> i64:
-            return -110
-
         def directory_not_empty_error_code() -> i64:
             return directory_not_empty_error
 
@@ -1013,13 +847,13 @@ module PlatformNative:
                 leaf_c.push(leaf_snapshot[index])
             leaf_name: cstr = (&leaf_c[0]).cast[cstr] can Unsafe.PointerCast
             removed: i64 = native_unlinkat(parent_directory, leaf_name, at_remove_directory)
-            errno_value: i64 = error_code()
+            errno_value: i64 = NativeErrors::error_code()
             if removed == 0:
                 sync_status: i64 = native_fsync(parent_directory)
-                sync_errno: i64 = error_code()
+                sync_errno: i64 = NativeErrors::error_code()
                 return close_result(parent_directory, 0) if sync_status == 0
-                return close_error(parent_directory, negative_value(sync_errno))
-            return close_error(parent_directory, negative_value(errno_value))
+                return close_error(parent_directory, NativeErrors::negative_value(sync_errno))
+            return close_error(parent_directory, NativeErrors::negative_value(errno_value))
 
         def rename_secure(old_path: cstr, new_path: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             old_parent: mutable darray[u8] = []
@@ -1084,7 +918,7 @@ module PlatformNative:
             old_rename_name: cstr = (&old_rename_leaf[0]).cast[cstr] can Unsafe.PointerCast
             new_rename_name: cstr = (&new_rename_leaf[0]).cast[cstr] can Unsafe.PointerCast
             result: i64 = native_renameat(old_directory, old_rename_name, new_directory, new_rename_name)
-            result_errno: i64 = error_code()
+            result_errno: i64 = NativeErrors::error_code()
             return close_two_result(old_directory, new_directory, 0) if result == 0
             return close_two_error(old_directory, new_directory, -result_errno)
 
@@ -1109,7 +943,7 @@ module PlatformNative:
                         continue if name_is_dot(raw, dirent_name_offset, name_length)
                         _ = native_closedir(opened)
                         return false
-                    failed <- current_errno() != 0
+                    failed <- NativeErrors::current_errno() != 0
                     break
                 close_status: i32 = native_closedir(opened)
                 return not failed and close_status == 0
@@ -1127,7 +961,7 @@ module PlatformNative:
             leaf_offset <- slash
             return -22 if leaf_offset >= name.count
             directory: mutable i64 = native_dup(root)
-            return negative_errno() if directory < 0
+            return NativeErrors::negative_errno() if directory < 0
             start: mutable usize = 0.usize()
             while start < leaf_offset:
                 finish: mutable usize = start
@@ -1149,9 +983,9 @@ module PlatformNative:
                     mkdir_part.push(0)
                     mkdir_name: cstr = (&mkdir_part[0]).cast[cstr] can Unsafe.PointerCast
                     mkdir_status: i64 = native_mkdirat(directory, mkdir_name, 493)
-                    mkdir_errno: i64 = current_errno()
+                    mkdir_errno: i64 = NativeErrors::current_errno()
                     if mkdir_status != 0 and mkdir_errno != 17:
-                        return close_error(directory, negative_errno())
+                        return close_error(directory, NativeErrors::negative_errno())
                     created <- mkdir_status == 0
                     next <- open_package_directory_component(directory, part)
                 if next < 0:
@@ -1179,7 +1013,7 @@ module PlatformNative:
                     created_directories.push(0)
                     extracted_nodes <- extracted_nodes + 1.usize()
                 if native_fsync(directory) != 0:
-                    errno_value: i64 = negative_errno()
+                    errno_value: i64 = NativeErrors::negative_errno()
                     return close_two_error(directory, next, errno_value)
                 return close_error(next, -5) if native_close(directory) != 0
                 directory <- next
@@ -1212,7 +1046,7 @@ module PlatformNative:
                 if parent >= 0:
                     leaf: cstr = (&copy[leaf_offset]).cast[cstr] can Unsafe.PointerCast
                     removed: i64 = native_unlinkat(parent, leaf, 0)
-                    remove_errno: i64 = current_errno()
+                    remove_errno: i64 = NativeErrors::current_errno()
                     if removed == 0:
                         cleanup_ok <- false if native_fsync(parent) != 0
                     elif remove_errno != 2:
@@ -1254,7 +1088,7 @@ module PlatformNative:
                     continue
                 leaf: cstr = (&copy[leaf_offset]).cast[cstr] can Unsafe.PointerCast
                 removed: i64 = native_unlinkat(parent, leaf, at_remove_directory)
-                remove_errno: i64 = current_errno()
+                remove_errno: i64 = NativeErrors::current_errno()
                 if removed == 0:
                     cleanup_ok <- false if native_fsync(parent) != 0
                 elif remove_errno != 2:
@@ -1279,12 +1113,12 @@ module PlatformNative:
             return -22 if not package_leaf_component_safe(leaf_name)
             pin_flags: i64 = linux_open_path + flag_no_follow + flag_close_on_exec
             pinned: i64 = native_openat(directory, leaf_name, pin_flags)
-            return negative_errno() if pinned < 0
+            return NativeErrors::negative_errno() if pinned < 0
             pinned_stat: mutable darray[u8] = []
             pinned_stat.resize(stat_buffer_bytes)
             pinned_raw: mutable void& = (&pinned_stat[0]).cast[mutable void&] can Unsafe.PointerCast
             if native_fstat(pinned, pinned_raw) != 0:
-                errno_value: i64 = negative_errno()
+                errno_value: i64 = NativeErrors::negative_errno()
                 return close_error(pinned, errno_value)
             pinned_mode: u64 = NativeStat::file_type(pinned_stat)
             if pinned_mode != regular_mode:
@@ -1307,16 +1141,16 @@ module PlatformNative:
             descriptor_path.push(0)
             descriptor_name: cstr = (&descriptor_path[0]).cast[cstr] can Unsafe.PointerCast
             reopened: i64 = native_open(descriptor_name, flag_read_only + flag_nonblock + flag_close_on_exec)
-            reopen_errno: i64 = current_errno()
+            reopen_errno: i64 = NativeErrors::current_errno()
             if reopened < 0:
                 close_status: i32 = native_close(pinned)
                 return -5 if close_status != 0
-                return negative_value(reopen_errno)
+                return NativeErrors::negative_value(reopen_errno)
             reopened_stat: mutable darray[u8] = []
             reopened_stat.resize(stat_buffer_bytes)
             reopened_raw: mutable void& = (&reopened_stat[0]).cast[mutable void&] can Unsafe.PointerCast
             if native_fstat(reopened, reopened_raw) != 0:
-                errno_value: i64 = negative_errno()
+                errno_value: i64 = NativeErrors::negative_errno()
                 return close_two_error(pinned, reopened, errno_value)
             same: bool = (NativeStat::file_type(reopened_stat)) == regular_mode and NativeStat::same_identity(pinned_stat, reopened_stat)
             close_status: i32 = native_close(pinned)
@@ -1347,7 +1181,7 @@ module PlatformNative:
             before.resize(stat_buffer_bytes)
             before_raw: mutable void& = (&before[0]).cast[mutable void&] can Unsafe.PointerCast
             if native_fstatat(directory, leaf_name, before_raw, at_no_follow) != 0:
-                return negative_errno()
+                return NativeErrors::negative_errno()
             before_mode: u64 = NativeStat::file_type(before)
             return package_nonregular_file_error(before_mode) if before_mode != regular_mode
             if platform_is_linux:
@@ -1364,23 +1198,23 @@ module PlatformNative:
                     after.resize(stat_buffer_bytes)
                     after_raw: mutable void& = (&after[0]).cast[mutable void&] can Unsafe.PointerCast
                     if native_fstat(opened, after_raw) != 0:
-                        errno_value: i64 = negative_errno()
+                        errno_value: i64 = NativeErrors::negative_errno()
                         return close_error(opened, errno_value)
                     if (NativeStat::file_type(after)) != regular_mode or not NativeStat::same_identity(before, after):
                         return close_error(opened, -13)
                     return opened
-                open_errno: i64 = current_errno()
+                open_errno: i64 = NativeErrors::current_errno()
                 if open_errno != 38 and open_errno != 22:
-                    return negative_value(open_errno)
+                    return NativeErrors::negative_value(open_errno)
                 return open_regular_file_at_pinned(directory, leaf_name, before)
             else:
                 opened: i64 = native_openat(directory, leaf_name, flags_file_read())
-                return negative_errno() if opened < 0
+                return NativeErrors::negative_errno() if opened < 0
                 after: mutable darray[u8] = []
                 after.resize(stat_buffer_bytes)
                 after_raw: mutable void& = (&after[0]).cast[mutable void&] can Unsafe.PointerCast
                 if native_fstat(opened, after_raw) != 0:
-                    errno_value: i64 = negative_errno()
+                    errno_value: i64 = NativeErrors::negative_errno()
                     return close_error(opened, errno_value)
                 after_mode: u64 = NativeStat::file_type(after)
                 if after_mode != regular_mode:
@@ -1415,18 +1249,18 @@ module PlatformNative:
             before.resize(stat_buffer_bytes)
             before_raw: mutable void& = (&before[0]).cast[mutable void&] can Unsafe.PointerCast
             if native_fstatat(directory, component, before_raw, at_no_follow) != 0:
-                return negative_errno()
+                return NativeErrors::negative_errno()
             before_mode: u64 = NativeStat::file_type(before)
             if before_mode != directory_mode:
                 return -symlink_error if before_mode == symlink_mode
                 return -20
             next: i64 = native_openat(directory, component, flags_directory() + flag_no_follow)
-            return negative_errno() if next < 0
+            return NativeErrors::negative_errno() if next < 0
             after: mutable darray[u8] = []
             after.resize(stat_buffer_bytes)
             after_raw: mutable void& = (&after[0]).cast[mutable void&] can Unsafe.PointerCast
             if native_fstat(next, after_raw) != 0:
-                errno_value: i64 = negative_errno()
+                errno_value: i64 = NativeErrors::negative_errno()
                 return close_error(next, errno_value)
             if (NativeStat::file_type(after)) != directory_mode or not NativeStat::same_identity(before, after) or not executable_source_directory_fd(next, expected_uid):
                 return close_error(next, -13)
@@ -1442,7 +1276,7 @@ module PlatformNative:
             absolute: bool = path_copy[0] == 47
             expected_uid: u64 = native_geteuid().u64()
             directory: mutable i64 = native_open("/" if absolute else ".", flags_directory())
-            return -error_code() if directory < 0
+            return -NativeErrors::error_code() if directory < 0
             return close_error(directory, -13) if not executable_source_directory_fd(directory, expected_uid)
             start: mutable usize = 0.usize()
             while start < length and path_copy[start] == 47 |path_copy, start|:
@@ -1480,20 +1314,6 @@ module PlatformNative:
         def flags_write_create_exclusive() -> i64:
             return flag_write_only + flag_create + flag_exclusive + flag_no_follow + flag_close_on_exec
 
-        def error_code() -> i64:
-            value: i64 = current_errno()
-            return value if value > 0 else 5
-
-        def negative_errno() -> i64:
-            value: i64 = current_errno()
-            return -value if value > 0 else -5
-
-        def negative_value(value: i64) -> i64:
-            return -value if value > 0 else -5
-
-        def current_errno() -> i64:
-            return native_errno()[0].i64()
-
         def split_parent_leaf(path: cstr, parent: mutable darray[u8]&, leaf: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             parent.resize(0)
             leaf.resize(0)
@@ -1528,7 +1348,7 @@ module PlatformNative:
             path_copy.push(0)
             absolute: bool = path_copy[0] == 47
             directory: mutable i64 = native_open("/" if absolute else ".", flags_directory())
-            return -error_code() if directory < 0
+            return -NativeErrors::error_code() if directory < 0
             start: mutable usize = 0.usize()
             while start < length and path_copy[start] == 47 |path_copy, start|:
                 start <- start + 1.usize()
@@ -1541,7 +1361,7 @@ module PlatformNative:
                 if not cstr_equal(part, "."):
                     return close_error(directory, -22) if cstr_equal(part, "..")
                     next: i64 = native_openat(directory, part, flags_directory() + flag_no_follow)
-                    return close_error(directory, -error_code()) if next < 0
+                    return close_error(directory, -NativeErrors::error_code()) if next < 0
                     return close_error(next, -5) if native_close(directory) != 0
                     directory <- next
                 start <- finish + 1.usize()
@@ -1555,18 +1375,18 @@ module PlatformNative:
             before.resize(stat_buffer_bytes)
             before_raw: mutable void& = (&before[0]).cast[mutable void&] can Unsafe.PointerCast
             if native_fstatat(directory, component, before_raw, at_no_follow) != 0:
-                return negative_errno()
+                return NativeErrors::negative_errno()
             before_mode: u64 = NativeStat::file_type(before)
             if before_mode != directory_mode:
                 return -symlink_error if before_mode == symlink_mode
                 return -20
             next: i64 = native_openat(directory, component, flags_directory() + flag_no_follow)
-            return negative_errno() if next < 0
+            return NativeErrors::negative_errno() if next < 0
             after: mutable darray[u8] = []
             after.resize(stat_buffer_bytes)
             after_raw: mutable void& = (&after[0]).cast[mutable void&] can Unsafe.PointerCast
             if native_fstat(next, after_raw) != 0:
-                errno_value: i64 = negative_errno()
+                errno_value: i64 = NativeErrors::negative_errno()
                 return close_error(next, errno_value)
             if (NativeStat::file_type(after)) != directory_mode or not NativeStat::same_identity(before, after) or not package_source_directory_fd(next):
                 return close_error(next, -13)
@@ -1581,7 +1401,7 @@ module PlatformNative:
             path_copy.push(0)
             absolute: bool = path_copy[0] == 47
             directory: mutable i64 = native_open("/" if absolute else ".", flags_directory())
-            return -error_code() if directory < 0
+            return -NativeErrors::error_code() if directory < 0
             return close_error(directory, -13) if not package_source_directory_fd(directory)
             start: mutable usize = 0.usize()
             while start < length and path_copy[start] == 47 |path_copy, start|:
@@ -1611,7 +1431,7 @@ module PlatformNative:
             path_copy.push(0)
             absolute: bool = path_copy[0] == 47
             directory: mutable i64 = native_open("/" if absolute else ".", flags_directory())
-            return -error_code() if directory < 0
+            return -NativeErrors::error_code() if directory < 0
             return close_error(directory, -13) if not package_source_directory_fd(directory)
             start: mutable usize = 0.usize()
             while start < length and path_copy[start] == 47 |path_copy, start|:
@@ -1680,8 +1500,8 @@ module PlatformNative:
             fd_stat.resize(stat_buffer_bytes)
             fd_stat_raw: mutable void& = (&fd_stat[0]).cast[mutable void&] can Unsafe.PointerCast
             if native_fstat(fd, fd_stat_raw) != 0:
-                errno_value: i64 = current_errno()
-                return close_two_error(directory, fd, negative_value(errno_value))
+                errno_value: i64 = NativeErrors::current_errno()
+                return close_two_error(directory, fd, NativeErrors::negative_value(errno_value))
             fd_device: u64 = NativeStat::device(fd_stat)
             fd_inode: u64 = NativeStat::inode(fd_stat)
             return close_two_error(directory, fd, -13) if fd_device != expected_device or fd_inode != expected_inode
@@ -1689,20 +1509,20 @@ module PlatformNative:
             path_stat.resize(stat_buffer_bytes)
             path_stat_raw: mutable void& = (&path_stat[0]).cast[mutable void&] can Unsafe.PointerCast
             if native_fstatat(directory, leaf_name, path_stat_raw, at_no_follow) != 0:
-                errno_value: i64 = current_errno()
-                return close_two_error(directory, fd, negative_value(errno_value))
+                errno_value: i64 = NativeErrors::current_errno()
+                return close_two_error(directory, fd, NativeErrors::negative_value(errno_value))
             return close_two_error(directory, fd, -13) if NativeStat::file_type(path_stat) != regular_mode
             return close_two_error(directory, fd, -13) if not NativeStat::same_identity(path_stat, fd_stat)
             # POSIX has no unlink-if-inode primitive: this is the narrowest
             # descriptor-relative check available, but a same-UID actor can
             # still replace the leaf between fstatat and unlinkat.
             removed: i64 = native_unlinkat(directory, leaf_name, 0)
-            remove_errno: i64 = current_errno()
-            return close_two_error(directory, fd, negative_value(remove_errno)) if removed != 0
+            remove_errno: i64 = NativeErrors::current_errno()
+            return close_two_error(directory, fd, NativeErrors::negative_value(remove_errno)) if removed != 0
             sync_status: i64 = native_fsync(directory)
-            sync_errno: i64 = current_errno()
+            sync_errno: i64 = NativeErrors::current_errno()
             if sync_status != 0:
-                return close_two_error(directory, fd, negative_value(sync_errno))
+                return close_two_error(directory, fd, NativeErrors::negative_value(sync_errno))
             directory_close: i64 = native_close(directory)
             fd_close: i64 = native_close(fd)
             return -5 if directory_close != 0 or fd_close != 0
@@ -1724,20 +1544,20 @@ module PlatformNative:
             leaf_c.push(0)
             leaf_name: cstr = (&leaf_c[0]).cast[cstr] can Unsafe.PointerCast
             result: i64 = native_unlinkat(directory, leaf_name, flags)
-            errno_value: i64 = error_code()
+            errno_value: i64 = NativeErrors::error_code()
             if result == 0:
                 sync_status: i64 = native_fsync(directory)
-                sync_errno: i64 = error_code()
+                sync_errno: i64 = NativeErrors::error_code()
                 return close_result(directory, 0) if sync_status == 0
-                return close_error(directory, negative_value(sync_errno))
-            return close_error(directory, negative_value(errno_value))
+                return close_error(directory, NativeErrors::negative_value(sync_errno))
+            return close_error(directory, NativeErrors::negative_value(errno_value))
 
         def stat_mode(directory: i64, path: cstr, out: mutable darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out.resize(stat_buffer_bytes)
             raw: mutable void& = (&out[0]).cast[mutable void&] can Unsafe.PointerCast
             result: i64 = native_fstatat(directory, path, raw, at_no_follow)
             return 0 if result == 0
-            return -error_code()
+            return -NativeErrors::error_code()
 
         def link_or_rename(old_path: cstr, new_path: cstr, is_move: bool) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             old_parent: mutable darray[u8] = []
@@ -1785,7 +1605,7 @@ module PlatformNative:
             new_stat.resize(stat_buffer_bytes)
             new_stat_raw: mutable void& = (&new_stat[0]).cast[mutable void&] can Unsafe.PointerCast
             new_result: i64 = native_fstatat(new_directory, new_leaf_name, new_stat_raw, at_no_follow)
-            new_errno: i64 = error_code()
+            new_errno: i64 = NativeErrors::error_code()
             result: mutable i64 = 0
             if is_move:
                 if new_result == 0:
@@ -1815,9 +1635,9 @@ module PlatformNative:
                 old_link_name: cstr = (&old_link_leaf[0]).cast[cstr] can Unsafe.PointerCast
                 new_link_name: cstr = (&new_link_leaf[0]).cast[cstr] can Unsafe.PointerCast
                 result <- native_linkat(old_directory, old_link_name, new_directory, new_link_name, 0)
-            errno_value: i64 = error_code()
+            errno_value: i64 = NativeErrors::error_code()
             return close_two_result(old_directory, new_directory, 0) if result == 0
-            return close_two_error(old_directory, new_directory, negative_value(errno_value))
+            return close_two_error(old_directory, new_directory, NativeErrors::negative_value(errno_value))
 
         def close_two_error(left: i64, right: i64, errno_value: i64) -> i64:
             left_status: i64 = native_close(left)
@@ -1877,15 +1697,15 @@ module PlatformNative:
             fd_stat.resize(stat_buffer_bytes)
             fd_stat_raw: mutable void& = (&fd_stat[0]).cast[mutable void&] can Unsafe.PointerCast
             if native_fstat(fd, fd_stat_raw) != 0:
-                return negative_errno()
+                return NativeErrors::negative_errno()
             return -21 if (NativeStat::file_type(fd_stat)) != regular_mode
             access_status: i32 = native_faccessat(directory.i32(), leaf_name, 1, access_effective_ids + access_no_follow)
-            return negative_errno() if access_status != 0
+            return NativeErrors::negative_errno() if access_status != 0
             path_stat: mutable darray[u8] = []
             path_stat.resize(stat_buffer_bytes)
             path_stat_raw: mutable void& = (&path_stat[0]).cast[mutable void&] can Unsafe.PointerCast
             if native_fstatat(directory, leaf_name, path_stat_raw, at_no_follow) != 0:
-                return negative_errno()
+                return NativeErrors::negative_errno()
             return -21 if (NativeStat::file_type(path_stat)) != regular_mode
             return -13 if not NativeStat::same_identity(path_stat, fd_stat)
             return 0
@@ -1931,13 +1751,13 @@ module PlatformNative:
                             else:
                                 safe <- false
                         else:
-                            end_errno: i64 = current_errno()
+                            end_errno: i64 = NativeErrors::current_errno()
                             if entry_id == -1 and end_errno == 22:
                                 break
                             safe <- false
                     acl_value: void& = acl.cast[void&] can Unsafe.PointerCast
                     return native_acl_free(acl_value) == 0 and safe
-                return current_errno() == 2
+                return NativeErrors::current_errno() == 2
             static elif ELISA_TARGET_OS_LINUX:
                 return trusted_linux_acl_fd(fd, is_directory)
             static else:
@@ -1974,7 +1794,7 @@ module PlatformNative:
                     native_errno()[0] <- 0
                     native_fgetxattr(fd.i32(), name, raw, out.count)
                 if loaded < 0:
-                    errno_value: i64 = current_errno()
+                    errno_value: i64 = NativeErrors::current_errno()
                     out.resize(0)
                     return 0 if errno_value == 61 or errno_value == 95
                     return -1
@@ -1998,7 +1818,7 @@ module PlatformNative:
             while effective_length > 1.usize() and path_copy[effective_length - 1.usize()] == 47:
                 effective_length <- effective_length - 1.usize()
             directory: mutable i64 = native_open("/", flags_directory())
-            return -error_code() if directory < 0
+            return -NativeErrors::error_code() if directory < 0
             if not trusted_directory_fd(directory, expected_uid):
                 return close_error(directory, -13)
             start: mutable usize = 1.usize()
@@ -2014,18 +1834,18 @@ module PlatformNative:
                 part: cstr = (&part_storage[0]).cast[cstr] can Unsafe.PointerCast
                 return close_error(directory, -22) if cstr_equal(part, ".") or cstr_equal(part, "..")
                 next: mutable i64 = native_openat(directory, part, flags_directory() + flag_no_follow)
-                needs_parent_sync: bool = next < 0 and create_missing and current_errno() == 2
+                needs_parent_sync: bool = next < 0 and create_missing and NativeErrors::current_errno() == 2
                 if needs_parent_sync:
                     created: i32 = native_mkdirat(directory, part, 493)
-                    return close_error(directory, negative_errno()) if created != 0 and current_errno() != 17
+                    return close_error(directory, NativeErrors::negative_errno()) if created != 0 and NativeErrors::current_errno() != 17
                     next <- native_openat(directory, part, flags_directory() + flag_no_follow)
-                return close_error(directory, negative_errno()) if next < 0
+                return close_error(directory, NativeErrors::negative_errno()) if next < 0
                 if not trusted_directory_fd(next, expected_uid):
                     return close_two_error(directory, next, -13)
                 # An EEXIST result may come from another installer that
                 # created the directory but has not synced the parent yet.
                 if needs_parent_sync and native_fsync(directory) != 0:
-                    return close_two_error(directory, next, negative_errno())
+                    return close_two_error(directory, next, NativeErrors::negative_errno())
                 return close_error(next, -5) if native_close(directory) != 0
                 directory <- next
                 break if finish == effective_length
@@ -2083,7 +1903,7 @@ module PlatformNative:
             while effective_length > 1.usize() and path_copy[effective_length - 1.usize()] == 47:
                 effective_length <- effective_length - 1.usize()
             directory: mutable i64 = native_open("/", flags_directory())
-            return -error_code() if directory < 0
+            return -NativeErrors::error_code() if directory < 0
             if not crypto_trusted_directory_fd(directory, expected_uid):
                 return close_error(directory, -13)
             start: mutable usize = 1.usize()
@@ -2099,7 +1919,7 @@ module PlatformNative:
                 part: cstr = (&part_storage[0]).cast[cstr] can Unsafe.PointerCast
                 return close_error(directory, -22) if cstr_equal(part, ".") or cstr_equal(part, "..")
                 next: i64 = native_openat(directory, part, flags_directory() + flag_no_follow)
-                return close_error(directory, -error_code()) if next < 0
+                return close_error(directory, -NativeErrors::error_code()) if next < 0
                 if not crypto_trusted_directory_fd(next, expected_uid):
                     return close_two_error(directory, next, -13)
                 return close_error(directory, -5) if native_close(directory) != 0
@@ -2114,16 +1934,6 @@ module PlatformNative:
             stat.resize(stat_buffer_bytes)
             raw: mutable void& = (&stat[0]).cast[mutable void&] can Unsafe.PointerCast
             return native_fstat(fd, raw) == 0 and (NativeStat::file_type(stat)) == regular_mode
-
-        def monotonic_milliseconds() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            stamp: mutable darray[u8] = []
-            stamp.resize(NativeProcessValues::record_bytes)
-            return monotonic_milliseconds_into(&stamp)
-
-        def monotonic_milliseconds_into(stamp: mutable darray[u8]&) -> i64 can[Unsafe.PointerCast]:
-            raw: mutable void& = (&stamp[0]).cast[mutable void&] can Unsafe.PointerCast
-            return -1 if native_clock_gettime(monotonic_clock_id, raw) != 0
-            return NativeProcessValues::milliseconds(stamp)
 
         const snapshot_max_entries: usize = 512.usize()
         const snapshot_collection_entries: usize = snapshot_max_entries + 2.usize()
@@ -2237,7 +2047,7 @@ module PlatformNative:
                     return snapshot_copy_failure(source_fd, destination_fd, copied_paths, created_directories, copy_result)
 
             if native_fsync(destination_fd) != 0:
-                return snapshot_copy_failure(source_fd, destination_fd, copied_paths, created_directories, negative_errno())
+                return snapshot_copy_failure(source_fd, destination_fd, copied_paths, created_directories, NativeErrors::negative_errno())
             source_close: i32 = native_close(source_fd)
             if source_close != 0:
                 return snapshot_copy_failure(-1, destination_fd, copied_paths, created_directories, -5)
@@ -2273,7 +2083,7 @@ module PlatformNative:
                 return destination_parent
             destination_leaf: cstr = (&destination_parent_path[destination_leaf_offset]).cast[cstr] can Unsafe.PointerCast
             destination_file: i64 = native_openat(destination_parent, destination_leaf, flags_write_create_exclusive(), 384)
-            destination_open_errno: i64 = negative_errno()
+            destination_open_errno: i64 = NativeErrors::negative_errno()
             if destination_file < 0:
                 close_status: i64 = close_three_error(source_parent, source_file, destination_parent, 0)
                 return -5 if close_status != 0
@@ -2290,9 +2100,9 @@ module PlatformNative:
             while true |buffer_raw, source_file, destination_file, total_bytes, byte_limit, failed|:
                 amount: i64 = native_read(source_file, buffer_raw, buffer.count)
                 if amount < 0:
-                    errno_value: i64 = current_errno()
+                    errno_value: i64 = NativeErrors::current_errno()
                     continue if errno_value == 4
-                    failed <- negative_value(errno_value)
+                    failed <- NativeErrors::negative_value(errno_value)
                     break
                 break if amount == 0
                 if amount > buffer.count.i64() or amount.usize() > byte_limit - total_bytes:
@@ -2303,9 +2113,9 @@ module PlatformNative:
                     raw: void& = (&buffer[written]).cast[void&] can Unsafe.PointerCast
                     wrote: i64 = native_write(destination_file, raw, amount.usize() - written)
                     if wrote < 0:
-                        errno_value: i64 = current_errno()
+                        errno_value: i64 = NativeErrors::current_errno()
                         continue if errno_value == 4
-                        failed <- negative_value(errno_value)
+                        failed <- NativeErrors::negative_value(errno_value)
                         break
                     if wrote == 0 or wrote > amount - written.i64():
                         failed <- -5
@@ -2315,13 +2125,13 @@ module PlatformNative:
                 total_bytes <- total_bytes + amount.usize()
 
             if failed == 0 and native_fsync(destination_file) != 0:
-                failed <- negative_errno()
+                failed <- NativeErrors::negative_errno()
             source_close: i32 = native_close(source_file)
             destination_close: i32 = native_close(destination_file)
             if failed == 0 and (source_close != 0 or destination_close != 0):
                 failed <- -5
             if failed == 0 and native_fsync(destination_parent) != 0:
-                failed <- negative_errno()
+                failed <- NativeErrors::negative_errno()
             source_parent_close: i32 = native_close(source_parent)
             destination_parent_close: i32 = native_close(destination_parent)
             if source_parent_close != 0 or destination_parent_close != 0:
@@ -2399,7 +2209,7 @@ module PlatformNative:
                 directory_depth <- directory_depth - 1.usize()
             return close_error(root, -5) if not directory_empty(root)
             if native_fsync(root) != 0:
-                return close_error(root, negative_errno())
+                return close_error(root, NativeErrors::negative_errno())
             return close_result(root, 0)
 
         def snapshot_open_parent(root: i64, relative: darray[u8]&, path_out: mutable darray[u8]&, leaf_offset: mutable usize&, create_missing: bool, created_directories: mutable darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -2415,7 +2225,7 @@ module PlatformNative:
             leaf_offset <- slash
             return -22 if leaf_offset >= relative.count
             directory: mutable i64 = native_dup(root)
-            return negative_errno() if directory < 0
+            return NativeErrors::negative_errno() if directory < 0
             start: mutable usize = 0.usize()
             while start < leaf_offset:
                 finish: mutable usize = start
@@ -2427,7 +2237,7 @@ module PlatformNative:
                 created: mutable bool = false
                 if create_missing:
                     mkdir_status: i32 = native_mkdirat(directory, component, 448)
-                    mkdir_errno: i64 = current_errno()
+                    mkdir_errno: i64 = NativeErrors::current_errno()
                     if mkdir_status == 0:
                         created <- true
                         for path_index in 0..<finish |created_directories, relative|:
@@ -2443,7 +2253,7 @@ module PlatformNative:
                     return -5 if cleanup_status != 0 or close_status != 0
                     return open_errno
                 if created and native_fsync(directory) != 0:
-                    return close_two_error(directory, next, negative_errno())
+                    return close_two_error(directory, next, NativeErrors::negative_errno())
                 return close_error(next, -5) if native_close(directory) != 0
                 directory <- next
                 start <- finish + 1.usize()
@@ -2517,7 +2327,7 @@ module PlatformNative:
                                 out.push(child_name[index].u8())
                             out.push(0)
                     else:
-                        return directory_failure(stream) if current_errno() != 0
+                        return directory_failure(stream) if NativeErrors::current_errno() != 0
                         break
                 return native_closedir(stream) == 0
             _ = native_close(duplicate)
