@@ -85,35 +85,53 @@ module MaintenanceCommand:
                 archive_bytes: mutable darray[u8] = []
                 receipt: mutable darray[u8] = []
                 archive_digest: mutable darray[u8] = []
+                return CliStatus::security_failed if archive_present and not verify_package_archive(raw, lock, name, version, &archive_bytes, &receipt, &archive_digest)
+                return CliStatus::security_failed if not inputs_unchanged(raw, lock, archive_present, receipt_present, &archive_bytes, archive_digest, receipt)
+                CliOutput::write_ok("cache: local lock and manifest digests verified\n")
                 if archive_present:
-                    manifest_digest: mutable darray[u8] = []
-                    lock_digest: mutable darray[u8] = []
-                    return CliStatus::security_failed if:
-                        not Integrity::sha256_hex(raw, &manifest_digest)
-                        not Integrity::sha256_hex(lock, &lock_digest)
-                    region archive_path_scope:
-                        archive_path: mutable darray[u8] = []
-                        ByteText::append_text(&archive_path, ".elisapkg/package.tar")
-                        return CliStatus::security_failed if:
-                            not read_package_file(&archive_path, &archive_bytes)
-                            not Archive::verify_ustar_archive(archive_bytes)
-                            not Integrity::sha256_hex(archive_bytes, &archive_digest)
-                    receipt <- receipt.resize(PackageReceipt::maximum_encode + 1.usize())
-                    return CliStatus::security_failed if not ProjectFiles::read_c_string_into(".elisapkg/package.receipt", &receipt)
-                    expected_receipt: darray[u8] = PackageReceipt::encode(name, version, manifest_digest, lock_digest, archive_digest)
-                    return CliStatus::security_failed if not ByteText::equal(receipt, expected_receipt)
+                    CliOutput::write_ok("cache: deterministic package archive and receipt verified\n")
+                CliOutput::write_ok("cache: no shared remote cache configured\n")
+                return CliStatus::success
+
+        # Verify the packaged archive and check that its receipt binds this
+        # manifest, lock, and archive digest.
+        def verify_package_archive(raw: darray[u8]&, lock: darray[u8]&, name: darray[u8]&, version: darray[u8]&, archive_bytes: mutable darray[u8]&, receipt: mutable darray[u8]&, archive_digest: mutable darray[u8]&) -> bool can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                manifest_digest: mutable darray[u8] = []
+                lock_digest: mutable darray[u8] = []
+                return false if:
+                    not Integrity::sha256_hex(raw, &manifest_digest)
+                    not Integrity::sha256_hex(lock, &lock_digest)
+                region archive_path_scope:
+                    archive_path: mutable darray[u8] = []
+                    ByteText::append_text(&archive_path, ".elisapkg/package.tar")
+                    return false if:
+                        not read_package_file(&archive_path, archive_bytes)
+                        not Archive::verify_ustar_archive(archive_bytes)
+                        not Integrity::sha256_hex(archive_bytes, archive_digest)
+                receipt.resize(PackageReceipt::maximum_encode + 1.usize())
+                return false if not ProjectFiles::read_c_string_into(".elisapkg/package.receipt", receipt)
+                expected_receipt: darray[u8] = PackageReceipt::encode(name, version, manifest_digest, lock_digest, archive_digest)
+                return false if not ByteText::equal(receipt, expected_receipt)
+                return true
+
+        # Re-read every input after verification so a concurrent edit cannot
+        # pass. The archive re-read reuses the first bounded buffer rather
+        # than retaining a second full-size archive copy.
+        def inputs_unchanged(raw: darray[u8]&, lock: darray[u8]&, archive_present: bool, receipt_present: bool, archive_bytes: mutable darray[u8]&, archive_digest: darray[u8]&, receipt: darray[u8]&) -> bool can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
                 manifest_after: mutable darray[u8] = []
                 manifest_after <- manifest_after.resize(ProjectFiles::project_document_limit)
                 region lock_after_scope:
                     lock_after: mutable darray[u8] = []
                     lock_after <- lock_after.resize(ProjectFiles::project_document_limit)
-                    return CliStatus::security_failed if:
+                    return false if:
                         not ProjectFiles::read_c_string_into("elisapkg.json", &manifest_after) or not ProjectFiles::read_c_string_into("elisapkg.lock", &lock_after)
                         not ByteText::equal(manifest_after, raw) or not ByteText::equal(lock_after, lock)
                 archive_state_after: i64 = Platform::package_file_size(".elisapkg/package.tar")
                 region receipt_state_after_scope:
                     receipt_state_after: i64 = Platform::package_file_size(".elisapkg/package.receipt")
-                    return CliStatus::security_failed if:
+                    return false if:
                         archive_state_after < 0 and archive_state_after != -2
                         receipt_state_after < 0 and receipt_state_after != -2
                         archive_present != (archive_state_after >= 0) or receipt_present != (receipt_state_after >= 0)
@@ -125,16 +143,12 @@ module MaintenanceCommand:
                     archive_after_digest: mutable darray[u8] = []
                     receipt_after: mutable darray[u8] = []
                     receipt_after <- receipt_after.resize(PackageReceipt::maximum_encode + 1.usize())
-                    return CliStatus::security_failed if:
-                        not read_package_file(&archive_path_after, &archive_bytes) or not ProjectFiles::read_c_string_into(".elisapkg/package.receipt", &receipt_after)
+                    return false if:
+                        not read_package_file(&archive_path_after, archive_bytes) or not ProjectFiles::read_c_string_into(".elisapkg/package.receipt", &receipt_after)
                         not Integrity::sha256_hex(archive_bytes, &archive_after_digest)
                         not ByteText::equal(archive_after_digest, archive_digest) or not ByteText::equal(receipt_after, receipt)
                         not Cache::verify_blob(archive_digest)
-                CliOutput::write_ok("cache: local lock and manifest digests verified\n")
-                if archive_present:
-                    CliOutput::write_ok("cache: deterministic package archive and receipt verified\n")
-                CliOutput::write_ok("cache: no shared remote cache configured\n")
-                return CliStatus::success
+                return true
 
         def run_cache(argument_count: i64, slots: mutable cstr&&, start: darray[u8]&) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
