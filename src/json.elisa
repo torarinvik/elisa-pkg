@@ -46,6 +46,41 @@ module Json:
             out <- value
             return true
 
+        # Field readers expect a validated object and a literal, unescaped key.
+        def object_string_value(raw: darray[u8]&, start: usize, finish: usize, wanted: cstr, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            out.resize(0)
+            value_start: usize = direct_value_offset(raw, start, finish, wanted)
+            return false if value_start >= raw.count or value_start >= finish or raw[value_start] != 34
+            content_start: usize = value_start + 1.usize()
+            content_end: mutable usize = content_start
+            while content_end < finish and raw[content_end] != 34 |raw, finish, content_end|:
+                return false if raw[content_end] == 92
+                content_end <- content_end + 1.usize()
+            return false if content_end == finish
+            for index in content_start..<content_end |raw, out|:
+                out.push(raw[index])
+            return true
+
+        def object_value_span(raw: darray[u8]&, start: usize, finish: usize, wanted: cstr, value_start_out: mutable usize&, value_end_out: mutable usize&) -> bool:
+            value_start_out <- 0.usize()
+            value_end_out <- 0.usize()
+            value_start: usize = direct_value_offset(raw, start, finish, wanted)
+            return false if value_start >= raw.count or value_start >= finish or raw[value_start] != 123
+            value_end: usize = object_end(raw, value_start)
+            return false if value_end >= finish
+            value_start_out <- value_start
+            value_end_out <- value_end
+            return true
+
+        def object_unsigned_value(raw: darray[u8]&, start: usize, finish: usize, wanted: cstr, out: mutable u64&) -> bool:
+            out <- 0.u64()
+            value_start: usize = direct_value_offset(raw, start, finish, wanted)
+            return false if value_start >= raw.count or value_start >= finish
+            value_end: mutable usize = value_start
+            while value_end < finish and raw[value_end] != 44 and raw[value_end] != 125 |raw, finish, value_end|:
+                value_end <- value_end + 1.usize()
+            return unsigned_at(raw, value_start, value_end, out)
+
         # Iterative grammar validation; stack states distinguish object keys,
         # values and separators, with a fixed maximum nesting depth.
         def valid_document(raw: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
@@ -248,6 +283,51 @@ module Json:
             return true
 
     private:
+        def direct_value_offset(raw: darray[u8]&, object_start: usize, finish: usize, wanted: cstr) -> usize:
+            return raw.count if finish >= raw.count or object_start >= finish
+            return raw.count if raw[object_start] != 123 or raw[finish] != 125
+            in_string: mutable bool = false
+            escaped: mutable bool = false
+            string_start: mutable usize = 0.usize()
+            braces: mutable i64 = 1
+            brackets: mutable i64 = 0
+            key_length: mutable usize = 0.usize()
+            while wanted[key_length].u8() != 0 |wanted, key_length|:
+                key_length <- key_length + 1.usize()
+            for index in (object_start + 1.usize())..<finish |raw, finish, wanted, key_length, in_string, escaped, string_start, braces, brackets|:
+                byte: u8 = raw[index]
+                if not in_string:
+                    if byte == 34:
+                        in_string <- true
+                        string_start <- index + 1.usize()
+                    elif byte == 123:
+                        braces <- braces + 1
+                    elif byte == 125:
+                        braces <- braces - 1
+                    elif byte == 91:
+                        brackets <- brackets + 1
+                    elif byte == 93:
+                        brackets <- brackets - 1
+                elif escaped:
+                    escaped <- false
+                elif byte == 92:
+                    escaped <- true
+                elif byte == 34:
+                    after: mutable usize = index + 1.usize()
+                    while after < finish and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
+                        after <- after + 1.usize()
+                    matched: mutable bool = braces == 1 and brackets == 0 and after < finish and raw[after] == 58 and index - string_start == key_length
+                    if matched:
+                        for key_index in 0..<key_length |raw, wanted, string_start, matched|:
+                            matched <- false if raw[string_start + key_index] != wanted[key_index].u8()
+                    if matched:
+                        after <- after + 1.usize()
+                        while after < finish and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
+                            after <- after + 1.usize()
+                        return after
+                    in_string <- false
+            return raw.count
+
         def container_end(raw: darray[u8]&, start: usize, opening: u8, closing: u8) -> usize:
             return raw.count if start >= raw.count or raw[start] != opening
             depth: mutable i64 = 0
