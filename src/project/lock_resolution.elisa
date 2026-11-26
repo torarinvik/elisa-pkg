@@ -84,8 +84,9 @@ module LockResolution:
         # that exact soft-yanked release. It is never a constraint: the solver
         # checks every active requirement and backtracks when another version
         # is required by the manifest or a selected dependency.
-        def append_registry_lock_preferences(lock: darray[u8]&, unlock: darray[u8]&, candidates: darray[Solver::Candidate]&, preferences: mutable darray[Solver::Preference]&) -> void can[Memory.Allocate, Abort.Panic]:
-            return if lock.count == 0.usize() or not Json::valid_document(lock) or not Json::unique_object_keys(lock) or not Lockfile::version_is(lock, Lockfile::registry_version)
+        def registry_lock_preferences(lock: darray[u8]&, unlock: darray[u8]&, candidates: darray[Solver::Candidate]&) -> darray[Solver::Preference] can[Memory.Allocate, Abort.Panic]:
+            return [] if lock.count == 0.usize() or not Json::valid_document(lock) or not Json::unique_object_keys(lock) or not Lockfile::version_is(lock, Lockfile::registry_version)
+            preferences: mutable darray[Solver::Preference] = []
             for index in 0..<lock.count |lock, unlock, candidates, preferences|:
                 continue if lock[index] != 123
                 object_end: usize = Json::object_end(lock, index)
@@ -98,6 +99,7 @@ module LockResolution:
                 continue if not SemVer::parse(version_text, &parsed) or parsed.prerelease
                 continue if not registry_candidate_matches(candidates, package, parsed) or registry_preference_present(preferences, package)
                 preferences <- preferences.push(Solver::Preference{package: package, version: parsed})
+            return preferences
 
         # The index evidence a candidate was read under. The final verification
         # compares it with the evidence of the release actually locked, so an
@@ -238,8 +240,7 @@ module LockResolution:
         # Solve the candidate graph, preferring releases the previous lock chose.
         def solve(candidates: darray[Solver::Candidate]&, roots: darray[Solver::Constraint]&, preferred_lock: darray[u8]&, unlock: darray[u8]&, persist_trust: bool, selected_indexes: mutable darray[usize]&) -> darray[u8]? can[Memory.Allocate, Abort.Panic]:
             solve_constraints: darray[Solver::Constraint] = [roots[index] for index in 0..<roots.count]
-            lock_preferences: mutable darray[Solver::Preference] = []
-            append_registry_lock_preferences(preferred_lock, unlock, candidates, &lock_preferences)
+            lock_preferences: darray[Solver::Preference] = registry_lock_preferences(preferred_lock, unlock, candidates)
             conflict: mutable Solver::Conflict = Solver::Conflict{package: [], first_requirement: [], second_requirement: []}
             solve_status: Solver::SolveCode =
                 Solver::solve_with_preferences_and_conflict(candidates, solve_constraints, lock_preferences, selected_indexes, &conflict) if persist_trust else Solver::solve_with_preferences(candidates, solve_constraints, lock_preferences, selected_indexes)
