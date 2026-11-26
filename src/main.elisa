@@ -37,6 +37,7 @@ include "./registry.elisa"
 include "./text/bytes.elisa"
 include "./cli/arguments.elisa"
 include "./cli/output.elisa"
+include "./cli/local_install.elisa"
 include "./source/fingerprint.elisa"
 include "./source/snapshots.elisa"
 include "./resolution/local_build_graph.elisa"
@@ -146,16 +147,6 @@ module Cli:
             return false
 
         # ---------- semantic versions ---------------------------------------------------------
-
-        def parse_version(value: darray[u8]&, out: mutable Model::Version&) -> bool:
-            out <- Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-            parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-            return false if not PackageIdentity::parse_version(value, &parsed)
-            out.major <- parsed.major
-            out.minor <- parsed.minor
-            out.patch <- parsed.patch
-            out.prerelease <- parsed.prerelease
-            return true
 
         def version_compare(left: Model::Version, right: Model::Version) -> i64:
             return SemVer::compare(left, right)
@@ -1314,14 +1305,6 @@ module Cli:
                 CliOutput::write_error(Security::publish_message())
                 return Security::publish_status()
 
-        def finish_local_install_error(lock_fd: i64, message: cstr) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            can Global.Read:
-                if Platform::pkg_strlen(message) > 0.usize():
-                    CliOutput::write_error(message)
-                if not InstallTransaction::release_install_lock(lock_fd):
-                    CliOutput::write_error("error: could not close the local installation lock descriptor\n")
-                return 7
-
         def run_install_local(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global{Read,Write}:
                 prefix: mutable darray[u8] = []
@@ -1398,11 +1381,11 @@ module Cli:
                 recovered_digest: mutable darray[u8] = []
                 recovered_install_published: mutable bool = false
                 if not InstallTransaction::recover_local_install_transaction(prefix, &recovered_operation, &recovered_name, &recovered_version, &recovered_digest, &recovered_install_published):
-                    return finish_local_install_error(lock_fd, "error: an interrupted local installation could not be safely recovered; preserve the journal and files for review\n")
+                    return LocalInstallCommand::finish_error(lock_fd, "error: an interrupted local installation could not be safely recovered; preserve the journal and files for review\n")
                 destination.resize(0)
                 ByteText::append(&destination, destination_snapshot)
                 if recovered_install_published and ByteText::equal_text(recovered_operation, "install") and ByteText::equal(recovered_name, name) and ByteText::equal(recovered_version, version) and ByteText::equal(recovered_digest, digest):
-                    return finish_local_install_error(lock_fd, "error: could not close the recovered local installation lock descriptor\n") if not InstallTransaction::release_install_lock(lock_fd)
+                    return LocalInstallCommand::finish_error(lock_fd, "error: could not close the recovered local installation lock descriptor\n") if not InstallTransaction::release_install_lock(lock_fd)
                     CliOutput::write_ok("already installed ")
                     CliOutput::write_bytes(1, &name)
                     CliOutput::write_ok(" to ")
@@ -1410,11 +1393,11 @@ module Cli:
                     CliOutput::write_ok("\n")
                     return EXIT_OK
                 if file_exists(&destination):
-                    return finish_local_install_error(lock_fd, "error: install destination or receipt already exists; refusing to overwrite\n")
+                    return LocalInstallCommand::finish_error(lock_fd, "error: install destination or receipt already exists; refusing to overwrite\n")
                 receipt_path.resize(0)
                 ByteText::append(&receipt_path, receipt_snapshot)
                 if file_exists(&receipt_path):
-                    return finish_local_install_error(lock_fd, "error: install destination or receipt already exists; refusing to overwrite\n")
+                    return LocalInstallCommand::finish_error(lock_fd, "error: install destination or receipt already exists; refusing to overwrite\n")
                 receipt: mutable darray[u8] = []
                 InstallRecords::encode_receipt(name, version, destination_snapshot, digest, &receipt)
                 transaction: mutable darray[u8] = []
@@ -1425,7 +1408,7 @@ module Cli:
                 ProjectFiles::path_with_nul_into(&transaction_path, &transaction_c)
                 transaction_name: cstr = (&transaction_c[0]).cast[cstr] can Unsafe.PointerCast
                 if not ProjectFiles::write_cstr_file_noclobber(transaction_name, &transaction):
-                    return finish_local_install_error(lock_fd, "error: could not durably record the local installation transaction\n")
+                    return LocalInstallCommand::finish_error(lock_fd, "error: could not durably record the local installation transaction\n")
                 InstallFaults::transaction_boundary("install.journal.durable")
                 destination.resize(0)
                 ByteText::append(&destination, destination_snapshot)
@@ -1433,7 +1416,7 @@ module Cli:
                 ProjectFiles::path_with_nul_into(&destination, &destination_c)
                 destination_name: mutable cstr = (&destination_c[0]).cast[cstr] can Unsafe.PointerCast
                 if not ProjectFiles::write_cstr_file_noclobber(destination_name, &artifact_bytes):
-                    return finish_local_install_error(lock_fd, "error: could not publish the local installation binary; recovery will inspect the durable transaction\n")
+                    return LocalInstallCommand::finish_error(lock_fd, "error: could not publish the local installation binary; recovery will inspect the durable transaction\n")
                 InstallFaults::transaction_boundary("install.binary.durable")
                 destination.resize(0)
                 ByteText::append(&destination, destination_snapshot)
@@ -1441,20 +1424,20 @@ module Cli:
                 ProjectFiles::path_with_nul_into(&destination, &destination_c)
                 destination_name <- (&destination_c[0]).cast[cstr] can Unsafe.PointerCast
                 if Platform::pkg_chmod(destination_name, 493.u16()) != 0:
-                    return finish_local_install_error(lock_fd, "error: could not set local installation permissions; recovery will inspect the durable transaction\n")
+                    return LocalInstallCommand::finish_error(lock_fd, "error: could not set local installation permissions; recovery will inspect the durable transaction\n")
                 InstallFaults::transaction_boundary("install.binary.mode.durable")
                 receipt_path.resize(0)
                 ByteText::append(&receipt_path, receipt_snapshot)
                 if not InstallTransaction::publish_local_install_receipt(receipt_path, receipt):
-                    return finish_local_install_error(lock_fd, "error: could not publish the local installation receipt; recovery will inspect the durable transaction\n")
+                    return LocalInstallCommand::finish_error(lock_fd, "error: could not publish the local installation receipt; recovery will inspect the durable transaction\n")
                 InstallFaults::transaction_boundary("install.receipt.durable")
                 receipt_sync_c: mutable darray[u8] = []
                 ProjectFiles::path_with_nul_into(&receipt_path, &receipt_sync_c)
                 receipt_sync_name: cstr = (&receipt_sync_c[0]).cast[cstr] can Unsafe.PointerCast
                 if not InstallTransaction::sync_local_install_entry_parents(destination_name, receipt_sync_name):
-                    return finish_local_install_error(lock_fd, "error: could not sync local installation directories; recovery will inspect the durable transaction\n")
+                    return LocalInstallCommand::finish_error(lock_fd, "error: could not sync local installation directories; recovery will inspect the durable transaction\n")
                 InstallFaults::transaction_boundary("install.targets.synced")
-                return finish_local_install_error(lock_fd, "error: the local installation was published but its transaction journal could not be retired\n") if not InstallTransaction::retire_local_install_transaction(transaction_path)
+                return LocalInstallCommand::finish_error(lock_fd, "error: the local installation was published but its transaction journal could not be retired\n") if not InstallTransaction::retire_local_install_transaction(transaction_path)
                 return 7 if not InstallTransaction::release_install_lock(lock_fd)
                 CliOutput::write_ok("installed ")
                 CliOutput::write_bytes(1, &name)
@@ -1490,160 +1473,6 @@ module Cli:
                     return run_install_local(start, options)
                 CliOutput::write_error(Security::install_message())
                 return Security::install_status()
-
-        def run_uninstall_local(name_raw_input: cstr) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            can Global.Read:
-                name: mutable darray[u8] = []
-                ByteText::append_bounded_text(&name, name_raw_input)
-                prefix: mutable darray[u8] = []
-                return EXIT_USAGE if not InstallPrefix::read_configured(&prefix)
-                bin_dir: mutable darray[u8] = []
-                receipt_dir: mutable darray[u8] = []
-                ProjectFiles::path_join_into(prefix, "bin", &bin_dir)
-                ProjectFiles::path_join_into(prefix, "share/elisapkg/receipts", &receipt_dir)
-                if not InstallPrefix::trusted_directory(bin_dir) or not InstallPrefix::trusted_directory(receipt_dir):
-                    CliOutput::write_error("error: install directories are not trusted; refusing removal\n")
-                    return 7
-                name_c: mutable darray[u8] = []
-                ProjectFiles::path_with_nul_into(&name, &name_c)
-                name_raw: cstr = (&name_c[0]).cast[cstr] can Unsafe.PointerCast
-                destination: mutable darray[u8] = []
-                receipt_path: mutable darray[u8] = []
-                ProjectFiles::path_join_into(bin_dir, name_raw, &destination)
-                ProjectFiles::path_join_into(receipt_dir, name_raw, &receipt_path)
-                destination_snapshot: mutable darray[u8] = []
-                receipt_snapshot: mutable darray[u8] = []
-                ByteText::append(&destination_snapshot, destination)
-                ByteText::append(&receipt_snapshot, receipt_path)
-                prefix_c: mutable darray[u8] = []
-                ProjectFiles::path_with_nul_into(&prefix, &prefix_c)
-                prefix_name: cstr = (&prefix_c[0]).cast[cstr] can Unsafe.PointerCast
-                lock_fd: i64 = Platform::pkg_acquire_install_lock(prefix_name)
-                if lock_fd < 0:
-                    CliOutput::write_error("error: could not acquire the local installation lock; check the prefix and any legacy lock path\n")
-                    return 7
-                recovered_operation: mutable darray[u8] = []
-                recovered_name: mutable darray[u8] = []
-                recovered_version: mutable darray[u8] = []
-                recovered_digest: mutable darray[u8] = []
-                recovered_install_published: mutable bool = false
-                if not InstallTransaction::recover_local_install_transaction(prefix, &recovered_operation, &recovered_name, &recovered_version, &recovered_digest, &recovered_install_published):
-                    return finish_local_install_error(lock_fd, "error: an interrupted local installation could not be safely recovered; preserve the journal and files for review\n")
-                if ByteText::equal_text(recovered_operation, "uninstall") and ByteText::equal(recovered_name, name):
-                    return finish_local_install_error(lock_fd, "error: could not close the recovered local installation lock\n") if not InstallTransaction::release_install_lock(lock_fd)
-                    CliOutput::write_ok("uninstalled ")
-                    CliOutput::write_bytes(1, &name)
-                    CliOutput::write_ok("\n")
-                    return EXIT_OK
-                destination.resize(0)
-                ByteText::append(&destination, destination_snapshot)
-                destination_c: mutable darray[u8] = []
-                ProjectFiles::path_with_nul_into(&destination, &destination_c)
-                destination_name: cstr = (&destination_c[0]).cast[cstr] can Unsafe.PointerCast
-                destination_state: i64 = Platform::pkg_package_file_size(destination_name)
-                if destination_state == -2:
-                    return finish_local_install_error(lock_fd, "error: no matching local installation receipt is available\n")
-                if destination_state < 0:
-                    return finish_local_install_error(lock_fd, "error: local installation is not a trusted regular file; refusing removal\n")
-                receipt_path.resize(0)
-                ByteText::append(&receipt_path, receipt_snapshot)
-                receipt_c: mutable darray[u8] = []
-                ProjectFiles::path_with_nul_into(&receipt_path, &receipt_c)
-                receipt_name: cstr = (&receipt_c[0]).cast[cstr] can Unsafe.PointerCast
-                receipt_state: i64 = Platform::pkg_package_file_size(receipt_name)
-                if receipt_state == -2:
-                    return finish_local_install_error(lock_fd, "error: no matching local installation receipt is available\n")
-                if receipt_state < 0:
-                    return finish_local_install_error(lock_fd, "error: local installation receipt is not a trusted regular file; refusing removal\n")
-                artifact_bytes: mutable darray[u8] = []
-                receipt: mutable darray[u8] = []
-                artifact_device: mutable u64 = 0.u64()
-                artifact_inode: mutable u64 = 0.u64()
-                receipt_device: mutable u64 = 0.u64()
-                receipt_inode: mutable u64 = 0.u64()
-                destination.resize(0)
-                ByteText::append(&destination, destination_snapshot)
-                if not InstallTransaction::read_trusted_install_file_identity(destination, 67108864.usize(), &artifact_bytes, &artifact_device, &artifact_inode):
-                    return finish_local_install_error(lock_fd, "error: could not read the local installation or its receipt\n")
-                receipt_path.resize(0)
-                ByteText::append(&receipt_path, receipt_snapshot)
-                if not InstallTransaction::read_trusted_install_file_identity(receipt_path, InstallRecords::max_record_bytes, &receipt, &receipt_device, &receipt_inode):
-                    return finish_local_install_error(lock_fd, "error: could not read the local installation or its receipt\n")
-                digest_bytes: mutable darray[u8] = []
-                digest: mutable darray[u8] = []
-                if Integrity::sha256(artifact_bytes, &digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(digest_bytes, &digest):
-                    return finish_local_install_error(lock_fd, "error: could not verify the local installation binary\n")
-                expected_prefix: mutable darray[u8] = []
-                expected_suffix: mutable darray[u8] = []
-                ByteText::append_text(&expected_prefix, "elisapkg-install-receipt:1\nname:")
-                ByteText::append(&expected_prefix, name)
-                ByteText::append_text(&expected_prefix, "\nversion:")
-                ByteText::append_text(&expected_suffix, "\npath:")
-                ByteText::append(&expected_suffix, destination_snapshot)
-                ByteText::append_text(&expected_suffix, "\nartifact-digest:sha256:")
-                ByteText::append(&expected_suffix, digest)
-                ByteText::append_text(&expected_suffix, "\n")
-                version_bytes: mutable darray[u8] = []
-                version_end: usize = receipt.count - expected_suffix.count if receipt.count >= expected_suffix.count else 0.usize()
-                if not ByteText::starts_with(receipt, expected_prefix) or not ByteText::ends_with(receipt, expected_suffix) or version_end <= expected_prefix.count:
-                    return finish_local_install_error(lock_fd, "error: installation receipt does not match the current file; refusing removal\n")
-                for index in expected_prefix.count..<version_end |receipt, version_bytes|:
-                    version_bytes.push(receipt[index])
-                parsed_version: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-                if not parse_version(version_bytes, &parsed_version):
-                    return finish_local_install_error(lock_fd, "error: installation receipt does not match the current file; refusing removal\n")
-                transaction: mutable darray[u8] = []
-                InstallRecords::encode_journal("uninstall", name, version_bytes, digest, &transaction)
-                transaction_path: mutable darray[u8] = []
-                InstallTransaction::local_install_transaction_path(prefix, &transaction_path)
-                transaction_c: mutable darray[u8] = []
-                ProjectFiles::path_with_nul_into(&transaction_path, &transaction_c)
-                transaction_name: cstr = (&transaction_c[0]).cast[cstr] can Unsafe.PointerCast
-                if not ProjectFiles::write_cstr_file_noclobber(transaction_name, &transaction):
-                    return finish_local_install_error(lock_fd, "error: could not durably record the local uninstallation transaction\n")
-                InstallFaults::transaction_boundary("uninstall.journal.durable")
-                destination.resize(0)
-                ByteText::append(&destination, destination_snapshot)
-                if not InstallTransaction::remove_trusted_install_file_identity(destination, artifact_device, artifact_inode):
-                    return finish_local_install_error(lock_fd, "error: could not remove the local installation; recovery will inspect the durable transaction\n")
-                InstallFaults::transaction_boundary("uninstall.binary.removed")
-                receipt_path.resize(0)
-                ByteText::append(&receipt_path, receipt_snapshot)
-                if not InstallTransaction::remove_trusted_install_file_identity(receipt_path, receipt_device, receipt_inode):
-                    return finish_local_install_error(lock_fd, "error: could not remove the local installation receipt; recovery will inspect the durable transaction\n")
-                InstallFaults::transaction_boundary("uninstall.receipt.removed")
-                if not InstallTransaction::sync_local_install_entry_parents(destination_name, receipt_name):
-                    return finish_local_install_error(lock_fd, "error: could not sync local installation directories; recovery will inspect the durable transaction\n")
-                InstallFaults::transaction_boundary("uninstall.targets.synced")
-                if not InstallTransaction::retire_local_install_transaction(transaction_path):
-                    return finish_local_install_error(lock_fd, "error: the local installation was removed but its transaction journal could not be retired\n")
-                return 7 if not InstallTransaction::release_install_lock(lock_fd)
-                CliOutput::write_ok("uninstalled ")
-                CliOutput::write_bytes(1, &name)
-                CliOutput::write_ok("\n")
-                return EXIT_OK
-
-        def run_uninstall(argc: i64, slots: mutable cstr&&) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            can Global.Read:
-                local_seen: mutable bool = false
-                name: mutable cstr = ""
-                index: mutable i64 = 2
-                while index < argc:
-                    argument: cstr = slots[index].cast[cstr]
-                    if Platform::pkg_cstr_equal(argument, "--local"):
-                        return EXIT_USAGE if local_seen
-                        local_seen <- true
-                    elif Platform::pkg_cstr_equal(argument, "--") or Platform::pkg_strlen(argument) == 0.usize() or argument[0].u8() == 45 or Platform::pkg_strlen(name) != 0.usize():
-                        CliOutput::write_error("error: invalid uninstall arguments\n")
-                        return EXIT_USAGE
-                    else:
-                        name <- argument
-                    index <- index + 1
-                return EXIT_USAGE if not local_seen or Platform::pkg_strlen(name) == 0.usize()
-                name_bytes: mutable darray[u8] = []
-                ByteText::append_bounded_text(&name_bytes, name)
-                return EXIT_USAGE if not PackageIdentity::valid_name(name_bytes)
-                return run_uninstall_local(name)
 
         def run_remove(argc: i64, slots: mutable cstr&&) -> i64 can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global{Read,Write}:
@@ -2957,7 +2786,7 @@ module Cli:
                 if Platform::pkg_cstr_equal(command, "install"):
                     return run_install(effective_argc, dispatch_slots, &start, options)
                 if Platform::pkg_cstr_equal(command, "uninstall"):
-                    return run_uninstall(effective_argc, dispatch_slots)
+                    return LocalInstallCommand::uninstall(effective_argc, dispatch_slots)
                 if Platform::pkg_cstr_equal(command, "clean"):
                     return run_clean()
                 if Platform::pkg_cstr_equal(command, "cache") and effective_argc == 3 and Platform::pkg_cstr_equal(effective_slots[2].cast[cstr], "verify"):
