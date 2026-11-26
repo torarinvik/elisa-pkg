@@ -47,6 +47,10 @@ with tempfile.TemporaryDirectory(prefix='cli-review-', dir=ROOT / 'build') as di
     result = subprocess.run([BIN, 'check-manifest'], cwd=blocked_project,
                             capture_output=True, timeout=120, check=False)
     assert result.returncode == 5, result
+    result = subprocess.run([BIN, 'doctor'], cwd=blocked_project,
+                            capture_output=True, timeout=120, check=False)
+    assert result.returncode == 0 and b'elisapkg doctor\n' in result.stdout, result
+    assert guard.read_bytes() == b'not a transaction directory'
     duplicate_manifest_path = subprocess.run([BIN, 'check-manifest', '--manifest-path', project / 'elisapkg.json', '--manifest-path', project / 'elisapkg.json'], capture_output=True, timeout=120, check=False)
     assert duplicate_manifest_path.returncode == 2, duplicate_manifest_path
     result = subprocess.run([BIN, 'update', 'missing'], cwd=project, capture_output=True, timeout=120, check=False)
