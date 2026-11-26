@@ -35,16 +35,18 @@ module PackagePathPolicy:
             length: mutable usize = path.count
             if length > 0.usize() and path[length - 1.usize()] == 0:
                 length <- length - 1.usize()
-            return true if:
-                length == 0.usize()
-                has_component(path, length, ".ssh") or has_component(path, length, ".aws") or has_component(path, length, ".gnupg") or has_component(path, length, ".kube") or has_component(path, length, ".docker") or has_component(path, length, ".azure") or has_component(path, length, ".terraform") or has_component(path, length, ".terraform.d")
-                has_adjacent_components(path, length, ".config", "gcloud") or has_adjacent_components(path, length, ".config", "gh") or has_adjacent_components(path, length, ".config", "rclone")
+            return true if length == 0.usize()
             start: mutable usize = 0.usize()
-            while start < length |path, length, start|:
+            previous_is_config: mutable bool = false
+            while start < length |path, length, start, previous_is_config|:
                 finish: mutable usize = start
                 while finish < length and path[finish] != 47 |path, length, start, finish|:
                     finish <- finish + 1.usize()
-                return true if sensitive_component(path, start, finish)
+                return true if:
+                    credential_directory(path, start, finish)
+                    previous_is_config and config_provider(path, start, finish)
+                    sensitive_component(path, start, finish)
+                previous_is_config <- range_equals(path, start, finish, ".config")
                 start <- finish + 1.usize()
             return false
 
@@ -53,11 +55,24 @@ module PackagePathPolicy:
         # exposing all of its otherwise innocently named children.
         def sensitive_component(path: darray[u8]&, start: usize, finish: usize) -> bool:
             return true if:
-                range_equals(path, start, finish, ".netrc") or range_equals(path, start, finish, ".npmrc") or range_equals(path, start, finish, ".pypirc") or range_equals(path, start, finish, ".git-credentials")
-                range_equals(path, start, finish, "id_rsa") or range_equals(path, start, finish, "id_ed25519") or range_equals(path, start, finish, "id_ecdsa") or range_equals(path, start, finish, "id_dsa")
-                begins_with(path, start, finish, ".env") or ends_with(path, start, finish, ".env") or begins_with(path, start, finish, "credentials")
-                contains(path, start, finish, ".pem") or contains(path, start, finish, ".key")
-                ends_with(path, start, finish, ".p12") or ends_with(path, start, finish, ".pfx") or ends_with(path, start, finish, ".p8") or ends_with(path, start, finish, ".jks") or ends_with(path, start, finish, ".keystore")
+                range_equals(path, start, finish, ".netrc")
+                range_equals(path, start, finish, ".npmrc")
+                range_equals(path, start, finish, ".pypirc")
+                range_equals(path, start, finish, ".git-credentials")
+                range_equals(path, start, finish, "id_rsa")
+                range_equals(path, start, finish, "id_ed25519")
+                range_equals(path, start, finish, "id_ecdsa")
+                range_equals(path, start, finish, "id_dsa")
+                begins_with(path, start, finish, ".env")
+                ends_with(path, start, finish, ".env")
+                begins_with(path, start, finish, "credentials")
+                contains(path, start, finish, ".pem")
+                contains(path, start, finish, ".key")
+                ends_with(path, start, finish, ".p12")
+                ends_with(path, start, finish, ".pfx")
+                ends_with(path, start, finish, ".p8")
+                ends_with(path, start, finish, ".jks")
+                ends_with(path, start, finish, ".keystore")
             return false
 
         # A package may itself be rooted at a credential-store directory. Its
@@ -81,34 +96,29 @@ module PackagePathPolicy:
                     previous_start <- leaf_start
                     leaf_start <- index + 1.usize()
             return true if:
-                sensitive_component(path, leaf_start, length) or range_equals(path, leaf_start, length, ".config")
-                range_equals(path, leaf_start, length, ".ssh") or range_equals(path, leaf_start, length, ".aws") or range_equals(path, leaf_start, length, ".gnupg") or range_equals(path, leaf_start, length, ".kube") or range_equals(path, leaf_start, length, ".docker") or range_equals(path, leaf_start, length, ".azure") or range_equals(path, leaf_start, length, ".terraform") or range_equals(path, leaf_start, length, ".terraform.d")
-            return false if leaf_start == 0.usize()
-            return true if range_equals(path, previous_start, leaf_start - 1.usize(), ".config") and (range_equals(path, leaf_start, length, "gcloud") or range_equals(path, leaf_start, length, "gh") or range_equals(path, leaf_start, length, "rclone"))
-            return false
+                sensitive_component(path, leaf_start, length)
+                range_equals(path, leaf_start, length, ".config")
+                credential_directory(path, leaf_start, length)
+            return leaf_start > 0.usize() and range_equals(path, previous_start, leaf_start - 1.usize(), ".config") and config_provider(path, leaf_start, length)
 
     private:
-        def has_component(path: darray[u8]&, length: usize, wanted: cstr) -> bool:
-            start: mutable usize = 0.usize()
-            while start < length |path, length, wanted, start|:
-                finish: mutable usize = start
-                while finish < length and path[finish] != 47 |path, length, wanted, start, finish|:
-                    finish <- finish + 1.usize()
-                return true if range_equals(path, start, finish, wanted)
-                start <- finish + 1.usize()
+        def credential_directory(path: darray[u8]&, start: usize, finish: usize) -> bool:
+            return true if:
+                range_equals(path, start, finish, ".ssh")
+                range_equals(path, start, finish, ".aws")
+                range_equals(path, start, finish, ".gnupg")
+                range_equals(path, start, finish, ".kube")
+                range_equals(path, start, finish, ".docker")
+                range_equals(path, start, finish, ".azure")
+                range_equals(path, start, finish, ".terraform")
+                range_equals(path, start, finish, ".terraform.d")
             return false
 
-        def has_adjacent_components(path: darray[u8]&, length: usize, parent: cstr, child: cstr) -> bool:
-            start: mutable usize = 0.usize()
-            previous_parent: mutable bool = false
-            while start < length |path, length, parent, child, start, previous_parent|:
-                finish: mutable usize = start
-                while finish < length and path[finish] != 47 |path, length, parent, child, start, finish|:
-                    finish <- finish + 1.usize()
-                current_parent: bool = range_equals(path, start, finish, parent)
-                return true if previous_parent and range_equals(path, start, finish, child)
-                previous_parent <- current_parent
-                start <- finish + 1.usize()
+        def config_provider(path: darray[u8]&, start: usize, finish: usize) -> bool:
+            return true if:
+                range_equals(path, start, finish, "gcloud")
+                range_equals(path, start, finish, "gh")
+                range_equals(path, start, finish, "rclone")
             return false
 
         def range_equals(path: darray[u8]&, start: usize, finish: usize, wanted: cstr) -> bool:
