@@ -210,6 +210,17 @@ def main() -> int:
                 raise SystemExit("error: release archive verifier accepted invalid gzip or tar padding")
         invalid_archive.unlink()
 
+        with invalid_archive.open("wb") as stream:
+            stream.truncate(provenance.MAX_ARCHIVE_BYTES + 1)
+        try:
+            provenance.verify_archive(invalid_archive, artifact_digest, binary.stat().st_size, manifest_bytes)
+        except provenance.ProvenanceError as error:
+            if "compressed release archive exceeds" not in str(error):
+                raise
+        else:
+            raise SystemExit("error: release archive verifier accepted an oversized compressed file")
+        invalid_archive.unlink()
+
         provenance.generate_candidate(**inputs)
         if manifest_path.read_bytes() != manifest_bytes or archive_path.read_bytes() != archive_bytes:
             raise SystemExit("error: identical release candidate inputs produced different archive bytes")
@@ -281,6 +292,22 @@ def main() -> int:
             raise SystemExit("error: release provenance accepted an executable with noncanonical mode")
         finally:
             binary.chmod(0o755)
+
+        oversized = binary.parent / "oversized"
+        with oversized.open("wb") as stream:
+            stream.truncate(provenance.MAX_BINARY_BYTES + 1)
+        oversized.chmod(0o755)
+        try:
+            provenance.generate_candidate(**{
+                **inputs, "binary_input": oversized, "output_dir_input": unverified_output,
+            })
+        except provenance.ProvenanceError as error:
+            if "exceeds its size limit" not in str(error):
+                raise
+        else:
+            raise SystemExit("error: release provenance accepted an oversized executable")
+        if unverified_output.parent.exists():
+            raise SystemExit("error: oversized executable created an output directory")
 
         try:
             provenance.generate_candidate(**{**inputs, "output_dir_input": project_root})

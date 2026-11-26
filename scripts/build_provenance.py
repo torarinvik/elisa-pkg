@@ -22,6 +22,8 @@ import zlib
 
 GIT_SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
 MAX_MANIFEST_BYTES = 1024 * 1024
+MAX_BINARY_BYTES = 128 * 1024 * 1024
+MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
 
 
 class ProvenanceError(Exception):
@@ -105,7 +107,9 @@ class FileRecord(TypedDict):
     size_bytes: int
 
 
-def file_record(path: Path, *, expected_mode: int | None = None) -> FileRecord:
+def file_record(
+    path: Path, *, expected_mode: int | None = None, maximum_size: int | None = None
+) -> FileRecord:
     digest = hashlib.sha256()
     size = 0
     try:
@@ -114,6 +118,8 @@ def file_record(path: Path, *, expected_mode: int | None = None) -> FileRecord:
             before = os.fstat(stream.fileno())
             if not stat.S_ISREG(before.st_mode) or before.st_size <= 0:
                 raise ProvenanceError(f"provenance input must be a nonempty regular file: {path}")
+            if maximum_size is not None and before.st_size > maximum_size:
+                raise ProvenanceError(f"provenance input exceeds its size limit: {path}")
             if expected_mode is not None and stat.S_IMODE(before.st_mode) != expected_mode:
                 raise ProvenanceError(f"provenance input must have mode {expected_mode:04o}: {path}")
             while chunk := stream.read(1024 * 1024):
@@ -265,6 +271,8 @@ def verify_archive(
     # between recording its digest and opening it for packaging.
     try:
         with gzip.open(path, "rb") as expanded:
+            if os.fstat(expanded.fileno()).st_size > MAX_ARCHIVE_BYTES:
+                raise ProvenanceError("compressed release archive exceeds its size limit")
             binary_entry = archive_entry("elisapkg", expected_binary_size, 0o755)
             manifest_entry = archive_entry("elisapkg.provenance.json", len(expected_manifest), 0o644)
             verify_entry_header(expanded, binary_entry)
@@ -424,7 +432,7 @@ def generate_candidate(
 
     run_id = required_env(env, "GITHUB_RUN_ID")
     run_attempt = required_env(env, "GITHUB_RUN_ATTEMPT")
-    binary_record = file_record(binary, expected_mode=0o755)
+    binary_record = file_record(binary, expected_mode=0o755, maximum_size=MAX_BINARY_BYTES)
     binary_size = binary_record["size_bytes"]
     binary_digest = binary_record["sha256"]
     manifest: dict[str, object] = {
