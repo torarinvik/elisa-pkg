@@ -82,9 +82,12 @@ def main() -> int:
         (state / "transaction.lock").write_bytes(original_lock)
         (state / "transaction.new-manifest").write_bytes(new_manifest)
         (state / "transaction.state").write_bytes(b"manifest-pending\n")
+        original_inodes = (manifest.stat().st_ino, lock.stat().st_ino)
         run("check-manifest", cwd=project, expected=0)
-        if manifest.read_bytes() != original_manifest:
-            raise SystemExit("pending recovery before publication changed the original manifest")
+        if manifest.read_bytes() != original_manifest or lock.read_bytes() != original_lock:
+            raise SystemExit("pending recovery before publication changed the original project files")
+        if (manifest.stat().st_ino, lock.stat().st_ino) != original_inodes:
+            raise SystemExit("pending recovery replaced unchanged project files")
         if (state / "transaction.state").exists():
             raise SystemExit("pending recovery before publication retained its journal")
 
@@ -96,6 +99,8 @@ def main() -> int:
         run("check-manifest", cwd=project, expected=0)
         if manifest.read_bytes() != original_manifest:
             raise SystemExit("pending recovery after publication did not restore the original manifest")
+        if lock.read_bytes() != original_lock or lock.stat().st_ino != original_inodes[1]:
+            raise SystemExit("manifest-only recovery replaced an unchanged lockfile")
         if (state / "transaction.state").exists():
             raise SystemExit("pending recovery after publication retained its journal")
 
