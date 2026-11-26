@@ -1,16 +1,7 @@
 # Byte-level ustar validation used by native archive extraction.
 
 module UstarFields:
-    public:
-        def archive_block_zero(archive: darray[u8]&, offset: usize) -> bool:
-            return archive_range_zero(archive, offset, 512.usize())
-
-        def archive_range_zero(archive: darray[u8]&, offset: usize, length: usize) -> bool:
-            return false if offset > archive.count or length > archive.count - offset
-            for index in 0..<length |archive, offset|:
-                return false if archive[offset + index] != 0
-            return true
-
+    private:
         def archive_header_shape(archive: darray[u8]&, offset: usize) -> bool:
             return false if offset > archive.count or archive.count - offset < 512.usize()
             return archive[offset + 257] == 117 and archive[offset + 258] == 115 and archive[offset + 259] == 116 and archive[offset + 260] == 97 and archive[offset + 261] == 114 and archive[offset + 262] == 0 and archive[offset + 263] == 48 and archive[offset + 264] == 48 and archive[offset + 156] == 48
@@ -43,6 +34,33 @@ module UstarFields:
                 cursor <- cursor + 1.usize()
             out <- parsed
             return true
+
+    public:
+        def archive_block_zero(archive: darray[u8]&, offset: usize) -> bool:
+            return archive_range_zero(archive, offset, 512.usize())
+
+        def archive_range_zero(archive: darray[u8]&, offset: usize, length: usize) -> bool:
+            return false if offset > archive.count or length > archive.count - offset
+            for index in 0..<length |archive, offset|:
+                return false if archive[offset + index] != 0
+            return true
+
+        # Return the normalized header's payload size, or -1 on rejection.
+        def normalized_payload_size(archive: darray[u8]&, offset: usize, name_length: usize) -> i64:
+            return -1 if not archive_header_shape(archive, offset)
+            return -1 if not archive_metadata_zero(archive, offset, name_length)
+            mode: mutable usize = 0.usize()
+            uid: mutable usize = 0.usize()
+            gid: mutable usize = 0.usize()
+            size: mutable usize = 0.usize()
+            mtime: mutable usize = 0.usize()
+            stored_checksum: mutable usize = 0.usize()
+            return -1 if not parse_octal_raw(archive, offset + 100.usize(), 8.usize(), &mode) or not parse_octal_raw(archive, offset + 108.usize(), 8.usize(), &uid) or not parse_octal_raw(archive, offset + 116.usize(), 8.usize(), &gid) or not parse_octal_raw(archive, offset + 124.usize(), 12.usize(), &size) or not parse_octal_raw(archive, offset + 136.usize(), 12.usize(), &mtime) or not parse_octal_raw(archive, offset + 148.usize(), 8.usize(), &stored_checksum)
+            return -1 if mode != 420.usize() or uid != 0.usize() or gid != 0.usize() or mtime != 0.usize() or size > 67108864.usize() - 1024.usize()
+            checksum: mutable usize = 0.usize()
+            for index in 0..<512 |archive, offset, checksum|:
+                checksum <- checksum + (32.usize() if index >= 148.usize() and index < 156.usize() else archive[offset + index].usize())
+            return size.i64() if checksum == stored_checksum else -1
 
         def archive_entry_safe(name: darray[u8]&) -> bool:
             return false if name.count == 0.usize() or name.count >= 100.usize() or name[0] == 47 or name[0] == 92 or name[name.count - 1.usize()] == 47 or name[name.count - 1.usize()] == 92
