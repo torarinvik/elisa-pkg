@@ -131,51 +131,8 @@ module Json:
                     object_key and byte != 34
                     not object_key and not expects_value
                 if byte == 34:
-                    cursor <- cursor + 1.usize()
-                    closed: mutable bool = false
-                    while cursor < raw.count:
-                        char: u8 = raw[cursor]
-                        cursor <- cursor + 1.usize()
-                        if char == 34:
-                            closed <- true
-                            break
-                        return false if char < 32
-                        if char == 92:
-                            # Schema lookups and duplicate-key tracking use
-                            # literal UTF-8 key bytes. Reject escaped key
-                            # spellings so equivalent JSON member names cannot
-                            # bypass those checks; value escapes remain valid.
-                            return false if:
-                                object_key
-                                cursor >= raw.count
-                            escape: u8 = raw[cursor]
-                            if escape == 117:
-                                return false if cursor + 4.usize() >= raw.count
-                                code_unit: mutable u64 = 0.u64()
-                                for digit in 1..<5 |raw, cursor|:
-                                    nibble: i64 = json_hex_nibble(raw[cursor + digit])
-                                    return false if nibble < 0
-                                    code_unit <- code_unit * 16.u64() + nibble.u64()
-                                if code_unit >= 55296.u64() and code_unit <= 56319.u64():
-                                    # UTF-16 high surrogates must be followed
-                                    # immediately by one escaped low surrogate.
-                                    # Accepting isolated code units lets JSON
-                                    # consumers disagree about the signed text.
-                                    return false if cursor + 10.usize() >= raw.count or raw[cursor + 5.usize()] != 92 or raw[cursor + 6.usize()] != 117
-                                    low_surrogate: mutable u64 = 0.u64()
-                                    for digit in 7..<11 |raw, cursor|:
-                                        nibble: i64 = json_hex_nibble(raw[cursor + digit])
-                                        return false if nibble < 0
-                                        low_surrogate <- low_surrogate * 16.u64() + nibble.u64()
-                                    return false if low_surrogate < 56320.u64() or low_surrogate > 57343.u64()
-                                    cursor <- cursor + 11.usize()
-                                else:
-                                    return false if code_unit >= 56320.u64() and code_unit <= 57343.u64()
-                                    cursor <- cursor + 5.usize()
-                            else:
-                                return false if escape != 34 and escape != 92 and escape != 47 and escape != 98 and escape != 102 and escape != 110 and escape != 114 and escape != 116
-                                cursor <- cursor + 1.usize()
-                    return false if not closed
+                    cursor <- string_end(raw, cursor + 1.usize(), object_key)
+                    return false if cursor == 0.usize()
                     frames[top].state <- GrammarState.Colon if object_key else after_value(frame.kind)
                 elif byte == 123 or byte == 91:
                     return false if not expects_value or frames.count > max_container_depth
@@ -356,6 +313,46 @@ module Json:
                     cursor <- cursor + 1.usize()
                 return false if cursor == digits
             return cursor == end
+
+        # Return the offset after the closing quote, or zero on rejection.
+        def string_end(raw: darray[u8]&, start: usize, object_key: bool) -> usize:
+            cursor: mutable usize = start
+            while cursor < raw.count:
+                byte: u8 = raw[cursor]
+                cursor <- cursor + 1.usize()
+                return cursor if byte == 34
+                return 0.usize() if byte < 32
+                continue if byte != 92
+                # Escaped keys would bypass literal field lookup and duplicate checks.
+                return 0.usize() if object_key or cursor >= raw.count
+                escape: u8 = raw[cursor]
+                if escape == 117:
+                    escape_size: usize = unicode_escape_size(raw, cursor)
+                    return 0.usize() if escape_size == 0.usize()
+                    cursor <- cursor + escape_size
+                else:
+                    return 0.usize() if escape != 34 and escape != 92 and escape != 47 and escape != 98 and escape != 102 and escape != 110 and escape != 114 and escape != 116
+                    cursor <- cursor + 1.usize()
+            return 0.usize()
+
+        # The cursor points at the 'u'. A high surrogate must be followed by
+        # a low surrogate. Isolated surrogate code units are rejected.
+        def unicode_escape_size(raw: darray[u8]&, cursor: usize) -> usize:
+            return 0.usize() if cursor + 4.usize() >= raw.count
+            code_unit: i64 = hexadecimal_code_unit(raw, cursor + 1.usize())
+            return 0.usize() if code_unit < 0 or (code_unit >= 56320 and code_unit <= 57343)
+            if code_unit >= 55296 and code_unit <= 56319:
+                return 0.usize() if cursor + 10.usize() >= raw.count or raw[cursor + 5.usize()] != 92 or raw[cursor + 6.usize()] != 117
+                low_surrogate: i64 = hexadecimal_code_unit(raw, cursor + 7.usize())
+                return 0.usize() if low_surrogate < 56320 or low_surrogate > 57343
+                return 11.usize()
+            return 5.usize()
+
+        def hexadecimal_code_unit(raw: darray[u8]&, start: usize) -> i64:
+            return for index in start..<(start + 4.usize()) |code_unit: i64 = 0| -> code_unit:
+                digit: i64 = json_hex_nibble(raw[index])
+                return -1 if digit < 0
+                code_unit <- code_unit * 16 + digit
 
         def json_hex_nibble(byte: u8) -> i64:
             return (byte - 48).i64() if byte >= 48 and byte <= 57
