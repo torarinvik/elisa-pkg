@@ -11,7 +11,7 @@ import sys
 import tempfile
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 if len(sys.argv) != 4:
     raise SystemExit("usage: trust_state_lock_regression.py PROBE REGISTRY STATE")
 PROBE = Path(sys.argv[1]).resolve()

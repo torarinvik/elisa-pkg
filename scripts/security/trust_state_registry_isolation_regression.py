@@ -10,7 +10,7 @@ import time
 from typing import Optional
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 COMPILER_ROOT = os.environ.get("ELISA_COMPILER_ROOT")
 if not COMPILER_ROOT:
     raise SystemExit("error: set ELISA_COMPILER_ROOT to an Elisa compiler checkout")

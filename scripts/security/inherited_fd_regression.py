@@ -7,7 +7,7 @@ import subprocess
 import tempfile
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 compiler_root_text = os.environ.get("ELISA_COMPILER_ROOT", "")
 if not compiler_root_text:
     raise SystemExit("error: set ELISA_COMPILER_ROOT to an Elisa compiler checkout")

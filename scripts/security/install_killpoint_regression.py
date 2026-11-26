@@ -14,7 +14,7 @@ import tempfile
 import time
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 PRODUCTION_BIN = ROOT / "build" / "elisapkg"
 BUILD_ROOT = ROOT / "build"
 FAULT_MODULE = r'''module InstallFaults:

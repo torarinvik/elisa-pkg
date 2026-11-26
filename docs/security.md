@@ -63,7 +63,7 @@ locked operation validates the journal and both artifacts, then finishes or
 abandons only a state whose package identity, digest, and receipt match exactly;
 malformed or mismatched state stops with its evidence intact. The regression
 suite synthesizes reachable durable states and uses
-`scripts/install_killpoint_regression.py` to kill an instrumented copy of the
+`scripts/security/install_killpoint_regression.py` to kill an instrumented copy of the
 Elisa binary after each install and uninstall transaction boundary. It then
 checks recovery with the production binary. Test controls are inserted only in
 a temporary source copy. These tests cover process death between transaction
@@ -240,7 +240,7 @@ inherited descriptor numbered 3 or higher, preserving only standard input,
 output, and error. A close failure stops execution. This prevents a caller's
 open files, sockets, and credential-agent descriptors from becoming ambient
 capabilities in package code. The compiler and shared `run`/`test` launch paths
-are covered by `scripts/inherited_fd_regression.py`.
+are covered by `scripts/security/inherited_fd_regression.py`.
 
 Build profiles deny reads from root-level `.elisapkg`, `build`, and `target`
 directories inside the root package and every locked local dependency,
@@ -313,7 +313,7 @@ is opened relative to a trusted prefix directory with no-follow and nonblocking
 flags, then checked as a protected regular file with acceptable ownership and,
 on macOS, ACL entries. Existing legacy directory lock paths and malformed lock
 files fail closed; review and remove a legacy path manually only after ensuring
-no old installer is still running. `scripts/install_lock_regression.py` checks
+no old installer is still running. `scripts/security/install_lock_regression.py` checks
 contending processes, crash release, persistent inode behavior, and rejection of
 symlinks, FIFOs, and directories.
 
@@ -324,8 +324,8 @@ uninstall write a durable per-prefix transaction journal before
 changing a binary or receipt. The next operation recovers under the persistent
 kernel lock only when the journal, package identity, digest, receipt, and
 on-disk artifact agree; malformed or externally changed state fails closed
-with its evidence preserved. `scripts/install_transaction_regression.py`
-synthesizes recovery states; `scripts/install_killpoint_regression.py` adds
+with its evidence preserved. `scripts/security/install_transaction_regression.py`
+synthesizes recovery states; `scripts/security/install_killpoint_regression.py` adds
 process kills after each transaction-level install/uninstall operation and
 validates recovery with the production binary. Fault controls exist only in a
 temporary copied source tree. The tests do not interrupt inside FFI filesystem

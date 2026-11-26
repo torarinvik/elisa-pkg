@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 BIN = ROOT / "build/elisapkg"
 ARTIFACT = b"#!/bin/sh\nprintf '%s\\n' transaction-fixture\n"
 VERSION = b"1.2.3"

@@ -43,5 +43,5 @@ export ELISAPKG_TEST_EXECUTOR="${ELISAPKG_TEST_EXECUTOR:-$QEMU}"
 "$QEMU" "$ROOT/build/elisapkg" --version | grep -F 'elisapkg 0.1.0' >/dev/null
 "$QEMU" "$ROOT/build/elisapkg" doctor >/dev/null
 python3 "$ROOT/scripts/ffi_boundary_test.py"
-python3 "$ROOT/scripts/ffi_source_open_regression.py"
-python3 "$ROOT/scripts/linux_acl_regression.py"
+python3 "$ROOT/scripts/security/ffi_source_open_regression.py"
+python3 "$ROOT/scripts/security/linux_acl_regression.py"
