@@ -169,14 +169,10 @@ module BuildCommand:
                     if clang_tool[0].u8() != 0:
                         tool_paths.push(clang_tool)
                         executable_paths.push(clang_tool)
-                    compiler_identity: mutable darray[u8] = []
-                    stage1_identity: mutable darray[u8] = []
-                    runtime_identity: mutable darray[u8] = []
-                    clang_identity: mutable darray[u8] = []
-                    compiler_identity_ok: bool = Toolchain::file_identity(compiler, true, true, &compiler_identity)
-                    stage1_identity_ok: bool = Toolchain::file_identity(stage1_bin, false, true, &stage1_identity)
-                    runtime_identity_ok: bool = Toolchain::file_identity(runtime_obj, false, false, &runtime_identity)
-                    clang_identity_ok: bool = Toolchain::file_identity(clang_tool, false, true, &clang_identity)
+                    compiler_identity: BuildToolchain::FileIdentity = BuildToolchain::identify_file(compiler, true, true)
+                    stage1_identity: BuildToolchain::FileIdentity = BuildToolchain::identify_file(stage1_bin, false, true)
+                    runtime_identity: BuildToolchain::FileIdentity = BuildToolchain::identify_file(runtime_obj, false, false)
+                    clang_identity: BuildToolchain::FileIdentity = BuildToolchain::identify_file(clang_tool, false, true)
                     sdk_root: mutable darray[u8] = []
                     developer_dir: mutable darray[u8] = []
                     if not Platform::pkg_macos_toolchain_paths(&sdk_root, &developer_dir):
@@ -194,13 +190,10 @@ module BuildCommand:
                     if developer_dir.count > 0.usize():
                         executable_paths.push(developer_linker_name)
                         executable_paths.push(developer_assembler_name)
-                    sdk_identity: mutable darray[u8] = []
-                    sdk_identity_ok: bool = Toolchain::file_identity(sdk_settings_name, sdk_root.count == 0.usize(), false, &sdk_identity)
-                    developer_linker_identity: mutable darray[u8] = []
-                    developer_assembler_identity: mutable darray[u8] = []
-                    developer_linker_identity_ok: bool = Toolchain::file_identity(developer_linker_name, sdk_root.count == 0.usize(), true, &developer_linker_identity)
-                    developer_assembler_identity_ok: bool = Toolchain::file_identity(developer_assembler_name, sdk_root.count == 0.usize(), true, &developer_assembler_identity)
-                    toolchain_identity_ok: bool = compiler_identity_ok and stage1_identity_ok and runtime_identity_ok and clang_identity_ok and sdk_identity_ok and developer_linker_identity_ok and developer_assembler_identity_ok
+                    sdk_identity: BuildToolchain::FileIdentity = BuildToolchain::identify_file(sdk_settings_name, sdk_root.count == 0.usize(), false)
+                    developer_linker_identity: BuildToolchain::FileIdentity = BuildToolchain::identify_file(developer_linker_name, sdk_root.count == 0.usize(), true)
+                    developer_assembler_identity: BuildToolchain::FileIdentity = BuildToolchain::identify_file(developer_assembler_name, sdk_root.count == 0.usize(), true)
+                    toolchain_identity_ok: bool = compiler_identity.available and stage1_identity.available and runtime_identity.available and clang_identity.available and sdk_identity.available and developer_linker_identity.available and developer_assembler_identity.available
 
                     snapshot_template: mutable darray[u8] = []
                     return CliStatus::build_failed if not BuildSources::prepare_root(build_dir, start, source_tree_digest, target_entry, &snapshot_template, &source_snapshot_root, &source_snapshot_roots, &snapshot_total_bytes, &root_snapshot_entry)
@@ -222,9 +215,9 @@ module BuildCommand:
                     BuildReceipt::append_target(&receipt, target_entry, target_kind, artifact_leaf, options.profile)
                     BuildReceipt::append_input_digests(&receipt, source_tree_digest, source_digest, manifest_digest, lock_digest, has_local_build_dependencies, dependency_aggregate_digest)
                     BuildReceipt::append_toolchain(&receipt, compiler, compiler_executable, stage1_bin, runtime_obj,
-                                                  compiler_identity, stage1_identity, runtime_identity, clang_tool, clang_identity)
-                    BuildReceipt::append_sandbox(&receipt, sdk_root, developer_dir, developer_linker_identity,
-                                                developer_assembler_identity, sdk_identity, allow_stale)
+                                                  compiler_identity.bytes, stage1_identity.bytes, runtime_identity.bytes, clang_tool, clang_identity.bytes)
+                    BuildReceipt::append_sandbox(&receipt, sdk_root, developer_dir, developer_linker_identity.bytes,
+                                                developer_assembler_identity.bytes, sdk_identity.bytes, allow_stale)
                     artifact_c: mutable darray[u8] = []
                     receipt_c: mutable darray[u8] = []
                     ProjectFiles::path_with_nul_into(&artifact, &artifact_c)
@@ -501,23 +494,13 @@ module BuildCommand:
                             CompilerProcess::discard_scratch(sandbox_work_name, temp_name, aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
                             CliOutput::write_error("error: private dependency aggregate changed during compilation\n")
                             return CliStatus::build_failed
-                    toolchain_unchanged: mutable bool = true
-                    post_tool_identity: mutable darray[u8] = []
-                    if compiler_identity_ok:
-                        toolchain_unchanged <- Toolchain::file_identity(compiler, true, true, &post_tool_identity) and ByteText::equal(post_tool_identity, compiler_identity)
-                    if toolchain_unchanged and stage1_identity_ok:
-                        toolchain_unchanged <- Toolchain::file_identity(stage1_bin, false, true, &post_tool_identity) and ByteText::equal(post_tool_identity, stage1_identity)
-                    if toolchain_unchanged and runtime_identity_ok:
-                        toolchain_unchanged <- Toolchain::file_identity(runtime_obj, false, false, &post_tool_identity) and ByteText::equal(post_tool_identity, runtime_identity)
-                    if toolchain_unchanged and clang_identity_ok:
-                        toolchain_unchanged <- Toolchain::file_identity(clang_tool, false, true, &post_tool_identity) and ByteText::equal(post_tool_identity, clang_identity)
-                    if toolchain_unchanged and sdk_identity_ok:
-                        toolchain_unchanged <- Toolchain::file_identity(sdk_settings_name, sdk_root.count == 0.usize(), false, &post_tool_identity) and ByteText::equal(post_tool_identity, sdk_identity)
-                    if toolchain_unchanged and developer_linker_identity_ok:
-                        toolchain_unchanged <- Toolchain::file_identity(developer_linker_name, sdk_root.count == 0.usize(), true, &post_tool_identity) and ByteText::equal(post_tool_identity, developer_linker_identity)
-                    if toolchain_unchanged and developer_assembler_identity_ok:
-                        toolchain_unchanged <- Toolchain::file_identity(developer_assembler_name, sdk_root.count == 0.usize(), true, &post_tool_identity) and ByteText::equal(post_tool_identity, developer_assembler_identity)
-                    if not toolchain_unchanged:
+                    if not (BuildToolchain::file_unchanged(&compiler_identity) and
+                            BuildToolchain::file_unchanged(&stage1_identity) and
+                            BuildToolchain::file_unchanged(&runtime_identity) and
+                            BuildToolchain::file_unchanged(&clang_identity) and
+                            BuildToolchain::file_unchanged(&sdk_identity) and
+                            BuildToolchain::file_unchanged(&developer_linker_identity) and
+                            BuildToolchain::file_unchanged(&developer_assembler_identity)):
                         CompilerProcess::discard_scratch(sandbox_work_name, "", aggregate_source_name, source_snapshot_container_name, source_snapshot_roots)
                         CliOutput::write_error("error: compiler toolchain changed during the build; refusing to publish the artifact\n")
                         return CliStatus::build_failed
