@@ -11,9 +11,12 @@ NATIVE_MODULES = {
     (ROOT / path).resolve()
     for path in (
         "src/platform_native.elisa",
+        "src/platform/archive_extract.elisa",
         "src/platform/ed25519.elisa",
         "src/platform/errors.elisa",
         "src/platform/process.elisa",
+        "src/platform/snapshot_tree.elisa",
+        "src/platform/staging_tree.elisa",
     )
 }
 GENERATED_DIRECTORIES = {".git", ".elisapkg", ".ruff_cache", "build"}
