@@ -182,42 +182,6 @@ module Cli:
             # refuses to read them.
             return Platform::pkg_package_file_size(path_name) != -2
 
-        def canonical_entry_within_root(root: darray[u8]&, entry: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            root_path: mutable darray[u8] = []
-            entry_path: mutable darray[u8] = []
-            for index in 0..<root.count |root, root_path|:
-                root_path.push(root[index])
-            if root_path.count == 0.usize() or root_path[root_path.count - 1.usize()] != 47:
-                root_path.push(47)
-            for index in 0..<entry.count |entry, entry_path|:
-                entry_path.push(entry[index])
-            root_c: mutable darray[u8] = []
-            entry_c: mutable darray[u8] = []
-            ProjectFiles::path_with_nul_into(&root_path, &root_c)
-            ProjectFiles::path_with_nul_into(&entry_path, &entry_c)
-            root_resolved: mutable darray[u8] = []
-            entry_resolved: mutable darray[u8] = []
-            root_resolved.resize(4096)
-            entry_resolved.resize(4096)
-            root_name: cstr = (&root_c[0]).cast[cstr] can Unsafe.PointerCast
-            entry_name: cstr = (&entry_c[0]).cast[cstr] can Unsafe.PointerCast
-            root_real: mutable cstr = ""
-            entry_real: mutable cstr = ""
-            if Platform::pkg_realpath(root_name, &root_resolved) is resolved_root:
-                root_real <- resolved_root
-            else:
-                return false
-            if Platform::pkg_realpath(entry_name, &entry_resolved) is resolved_entry:
-                entry_real <- resolved_entry
-            else:
-                return false
-            root_length: usize = Platform::pkg_strlen(root_real)
-            entry_length: usize = Platform::pkg_strlen(entry_real)
-            return false if entry_length <= root_length
-            for index in 0..<root_length |root_real, entry_real|:
-                return false if root_real[index].u8() != entry_real[index].u8()
-            return entry_real[root_length].u8() == 47
-
         def remove_known_file(path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             path_snapshot: mutable darray[u8] = []
             ByteText::append(&path_snapshot, path)
@@ -275,7 +239,8 @@ module Cli:
                 entry_path.push(47)
             for entry_index in 0..<entry.count |entry_path, entry|:
                 entry_path.push(entry[entry_index])
-            return false if not canonical_entry_within_root(root, &entry_path)
+            canonical_entry: mutable darray[u8] = []
+            return false if not ProjectFiles::resolve_entry_beneath(root, &entry_path, &canonical_entry)
             entry_path_c: mutable darray[u8] = []
             ProjectFiles::path_with_nul_into(&entry_path, &entry_path_c)
             entry_path_name: cstr = (&entry_path_c[0]).cast[cstr] can Unsafe.PointerCast
@@ -3212,20 +3177,6 @@ module Cli:
                 CliOutput::write_ok("\n")
                 return EXIT_OK
 
-        def select_unique_library_entry(raw: darray[u8]&, package_root: darray[u8]&, out: mutable darray[u8]&, relative_out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            out.resize(0)
-            relative_out.resize(0)
-            selected_entry: mutable darray[u8] = []
-            return false if not ManifestTargets::unique_library_entry(raw, &selected_entry) or not Manifest::is_safe_relative_entry(selected_entry)
-            entry_c: mutable darray[u8] = []
-            ProjectFiles::path_with_nul_into(&selected_entry, &entry_c)
-            entry_name: cstr = (&entry_c[0]).cast[cstr] can Unsafe.PointerCast
-            joined: mutable darray[u8] = []
-            ProjectFiles::path_join_into(package_root, entry_name, &joined)
-            return false if not ProjectFiles::canonical_existing_path(joined, out)
-            ByteText::append(relative_out, selected_entry)
-            return true
-
         def build_local_dependency_aggregate[@r](lock: darray[u8]&, start: darray[u8]&, root_entry: cstr, source_byte_budget: usize, aggregate: mutable darray[u8]&, has_dependencies: mutable bool&, packages: mutable darray[LocalBuildGraph::Package]& @r, order: mutable darray[usize]& @r) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             aggregate.resize(0)
             has_dependencies <- false
@@ -3282,7 +3233,7 @@ module Cli:
                 return false if not collect_registry_roots(package_manifest, &registry_roots, &has_local_dependency) or registry_roots.count != 0.usize()
                 library_entry: mutable darray[u8] @r = []
                 relative_entry: mutable darray[u8] @r = []
-                return false if not select_unique_library_entry(package_manifest, canonical_root, &library_entry, &relative_entry)
+                return false if not BuildPaths::resolve_library_entry(package_manifest, canonical_root, &library_entry, &relative_entry)
                 dependency_names: mutable darray[u8] @r = []
                 remaining_edges: usize = MAX_BUILD_GRAPH_EDGES - total_graph_edges
                 edge_limit: usize = MAX_DEPENDENCIES if MAX_DEPENDENCIES < remaining_edges else remaining_edges
