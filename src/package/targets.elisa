@@ -1,0 +1,52 @@
+# Target selection from the manifest's direct targets array.
+
+include "../json.elisa"
+include "../platform.elisa"
+
+module ManifestTargets:
+    private:
+        def bytes_equal_view(left: darray[u8]&, right: cstr) -> bool:
+            length: usize = Platform::pkg_strlen(right)
+            false return if left.count != length
+            for index in 0..<left.count |left, right|:
+                right_byte: u8 = right[index].u8()
+                false return if left[index] != right_byte
+            return true
+
+    public:
+        def select_target(raw: darray[u8]&, requested_name: cstr, requested_kind: cstr, name_out: mutable darray[u8]&, kind_out: mutable darray[u8]&, entry_out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            name_out.resize(0)
+            kind_out.resize(0)
+            entry_out.resize(0)
+            targets_start: usize = Json::root_value_offset(raw, "targets")
+            return false if targets_start >= raw.count or raw[targets_start] != 91
+            targets_end: usize = Json::array_end(raw, targets_start)
+            return false if targets_end <= targets_start or targets_end >= raw.count
+            cursor: mutable usize = targets_start + 1.usize()
+            while cursor < targets_end:
+                while cursor < targets_end and ((raw[cursor] == 32) or (raw[cursor] == 9) or (raw[cursor] == 10) or (raw[cursor] == 13) or (raw[cursor] == 44)):
+                    cursor <- cursor + 1.usize()
+                break if cursor >= targets_end
+                return false if raw[cursor] != 123
+                object_end: usize = Json::object_end(raw, cursor)
+                return false if object_end <= cursor or object_end >= targets_end
+                candidate_name: mutable darray[u8] = []
+                candidate_kind: mutable darray[u8] = []
+                candidate_entry: mutable darray[u8] = []
+                return false if not Json::object_string_value(raw, cursor, object_end, "name", &candidate_name) or not Json::object_string_value(raw, cursor, object_end, "kind", &candidate_kind) or not Json::object_string_value(raw, cursor, object_end, "entry", &candidate_entry)
+                name_requested: bool = Platform::pkg_strlen(requested_name) != 0.usize()
+                kind_requested: bool = Platform::pkg_strlen(requested_kind) != 0.usize()
+                name_matches: bool = not name_requested or bytes_equal_view(candidate_name, requested_name)
+                kind_matches: bool = not kind_requested or bytes_equal_view(candidate_kind, requested_kind)
+                if name_matches and kind_matches:
+                    name_out <- candidate_name
+                    kind_out <- candidate_kind
+                    entry_out <- candidate_entry
+                    return true
+                cursor <- object_end + 1.usize()
+            return false
+
+        def default_entry(raw: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            name: mutable darray[u8] = []
+            kind: mutable darray[u8] = []
+            return select_target(raw, "", "", &name, &kind, out)
