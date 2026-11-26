@@ -61,12 +61,9 @@ module LockValidation:
                 return false if packages_start >= lock.count or packages_end <= packages_start
                 cursor: mutable usize = packages_start + 1.usize()
                 package_count: mutable usize = 0.usize()
-                seen: mutable darray[u8] = []
                 previous_package: mutable darray[u8] = []
-                has_previous_package: mutable bool = false
                 while cursor < packages_end:
-                    while cursor < packages_end and (lock[cursor] == 32 or lock[cursor] == 9 or lock[cursor] == 10 or lock[cursor] == 13) |lock, cursor|:
-                        cursor <- cursor + 1.usize()
+                    cursor <- Json::skip_whitespace(lock, cursor, packages_end)
                     break if cursor == packages_end
                     return false if lock[cursor] != 123 or package_count >= LocalBuildPlan::maximum_packages
                     record_end: usize = Json::object_end(lock, cursor)
@@ -78,7 +75,7 @@ module LockValidation:
                     # trusting any receipt-backed record in an offline build.
                     return false if:
                         ByteText::equal(package, name)
-                        has_previous_package and not ByteText::less(previous_package, package)
+                        previous_package.count > 0.usize() and not ByteText::less(previous_package, package)
                     version_start: mutable usize = 0
                     version_end: mutable usize = 0
                     parsed_version: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
@@ -86,7 +83,6 @@ module LockValidation:
                         not Json::object_string_span(lock, cursor, record_end, "version", &version_start, &version_end)
                         not SemVer::parse_range(lock, version_start, version_end, &parsed_version)
                         parsed_version.prerelease
-                        ByteText::contains_nul_field(seen, package)
                     archive: mutable darray[u8] = []
                     return false if not Lockfile::read_registry_archive(lock, cursor, record_end, &archive)
                     archive_size: mutable u64 = 0
@@ -94,17 +90,11 @@ module LockValidation:
                     return false if:
                         not Lockfile::has_sha256_field(lock, cursor, record_end, "archive-digest")
                         not Lockfile::has_sha256_field(lock, cursor, record_end, "metadata-digest")
-                    for index in 0..<package.count |seen, package|:
-                        seen <- seen.push(package[index])
-                    seen <- seen.push(0)
                     previous_package <- previous_package.resize(0)
-                    for index in 0..<package.count |previous_package, package|:
-                        previous_package <- previous_package.push(package[index])
-                    has_previous_package <- true
+                    ByteText::append(&previous_package, package)
                     package_count <- package_count + 1.usize()
                     cursor <- record_end + 1.usize()
-                    while cursor < packages_end and (lock[cursor] == 32 or lock[cursor] == 9 or lock[cursor] == 10 or lock[cursor] == 13) |lock, cursor|:
-                        cursor <- cursor + 1.usize()
+                    cursor <- Json::skip_whitespace(lock, cursor, packages_end)
                     if cursor < packages_end:
                         return false if lock[cursor] != 44
                         cursor <- cursor + 1.usize()
@@ -114,6 +104,4 @@ module LockValidation:
                 # edges are authenticated by the cached metadata digest when an online
                 # fetch revalidates the lock; offline mode must at least reject omission
                 # of any dependency named by the manifest itself.
-                for index in 0..<registry_roots.count |registry_roots, seen|:
-                    return false if not ByteText::contains_nul_field(seen, registry_roots[index].package)
                 return Lockfile::registry_satisfies_roots(lock, packages_start, packages_end, registry_roots)
