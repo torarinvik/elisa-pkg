@@ -185,6 +185,7 @@ jobs:
           import re
           import stat
           import tarfile
+          import zlib
 
           candidate = Path("build")
           binary = candidate / "elisapkg"
@@ -276,46 +277,35 @@ jobs:
           expected_checksum = f"{sha256(archive_path.read_bytes())}  {archive_path.name}\n"
           if checksum_path.read_text(encoding="ascii") != expected_checksum:
               fail("archive checksum does not match the candidate")
-          tar_size = (
-              512
-              + ((len(binary_bytes) + 511) // 512) * 512
-              + 512
-              + ((len(manifest_bytes) + 511) // 512) * 512
-              + 1024
-          )
-          expected_expanded_size = ((tar_size + tarfile.RECORDSIZE - 1) // tarfile.RECORDSIZE) * tarfile.RECORDSIZE
-          expanded_size = 0
-          with gzip.open(archive_path, "rb") as compressed:
-              while True:
-                  chunk = compressed.read(1024 * 1024)
-                  if not chunk:
-                      break
-                  expanded_size += len(chunk)
-                  if expanded_size > expected_expanded_size:
-                      fail("archive expands beyond the expected normalized tar size")
-          if expanded_size != expected_expanded_size:
-              fail("archive gzip stream is truncated or has an unexpected expanded size")
-          with tarfile.open(archive_path, mode="r|gz") as archive:
-              executable = archive.next()
-              if executable is None:
-                  fail("archive executable is missing")
-              if executable.name != "elisapkg" or not executable.isfile() or executable.size != len(binary_bytes):
-                  fail("archive executable entry is invalid")
-              if executable.uid != 0 or executable.gid != 0 or executable.mtime != 0 or executable.mode != 0o755:
-                  fail("archive executable metadata is not normalized")
-              executable_stream = archive.extractfile(executable)
-              if executable_stream is None or executable_stream.read(executable.size + 1) != binary_bytes:
-                  fail("archive executable differs from the tested binary")
-              metadata = archive.next()
-              if metadata is None or metadata.name != "elisapkg.provenance.json" or not metadata.isfile() or metadata.size != len(manifest_bytes):
-                  fail("archive manifest entry is invalid")
-              if metadata.uid != 0 or metadata.gid != 0 or metadata.mtime != 0 or metadata.mode != 0o644:
-                  fail("archive manifest metadata is not normalized")
-              metadata_stream = archive.extractfile(metadata)
-              if metadata_stream is None or metadata_stream.read(metadata.size + 1) != manifest_bytes:
-                  fail("archive manifest differs from the validated manifest")
-              if archive.next() is not None:
-                  fail("archive contains unexpected trailing members")
+          def verify_entry(stream, name, payload, mode):
+              entry = tarfile.TarInfo(name)
+              entry.size = len(payload)
+              entry.mode = mode
+              entry.uid = entry.gid = entry.mtime = 0
+              entry.uname = entry.gname = "root"
+              entry.type = tarfile.REGTYPE
+              if stream.read(tarfile.BLOCKSIZE) != entry.tobuf(format=tarfile.USTAR_FORMAT):
+                  fail(f"archive has a noncanonical {name} header")
+              for offset in range(0, len(payload), 1024 * 1024):
+                  expected = payload[offset:offset + 1024 * 1024]
+                  if stream.read(len(expected)) != expected:
+                      fail(f"archive {name} differs from the tested candidate")
+              verify_padding(stream, -len(payload) % tarfile.BLOCKSIZE)
+
+          def verify_padding(stream, size):
+              if stream.read(size) != bytes(size):
+                  fail("archive has missing or nonzero tar padding")
+
+          try:
+              with gzip.open(archive_path, "rb") as expanded:
+                  verify_entry(expanded, "elisapkg", binary_bytes, 0o755)
+                  verify_entry(expanded, "elisapkg.provenance.json", manifest_bytes, 0o644)
+                  verify_padding(expanded, 2 * tarfile.BLOCKSIZE)
+                  verify_padding(expanded, -expanded.tell() % tarfile.RECORDSIZE)
+                  if expanded.read(1):
+                      fail("archive expands beyond the expected tar size")
+          except (gzip.BadGzipFile, EOFError, zlib.error) as error:
+              fail(f"invalid gzip stream: {error}")
           PY
 
       - name: Attest tested executable, manifest, and archive
