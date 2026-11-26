@@ -1380,7 +1380,7 @@ module PlatformNative:
                 # each entry; O_NOFOLLOW/nonblocking checks handle symlinks
                 # and FIFOs at the leaf.
                 return false if owner != 0.u64() or (mode & 512.u64()) == 0.u64()
-            return trusted_acl_fd(fd)
+            return trusted_acl_fd(fd, true)
 
         def executable_source_directory_fd(fd: i64, expected_uid: u64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return true if package_source_directory_fd(fd)
@@ -1883,10 +1883,10 @@ module PlatformNative:
             return 0
 
         def trusted_regular_fd(fd: i64, expected_uid: u64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            return trusted_fd(fd, expected_uid, regular_mode) and trusted_acl_fd(fd)
+            return trusted_fd(fd, expected_uid, regular_mode) and trusted_acl_fd(fd, false)
 
         def trusted_directory_fd(fd: i64, expected_uid: u64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            return trusted_fd(fd, expected_uid, directory_mode) and trusted_acl_fd(fd)
+            return trusted_fd(fd, expected_uid, directory_mode) and trusted_acl_fd(fd, true)
 
         def private_staging_directory_fd(fd: i64, expected_uid: u64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             stat: mutable darray[u8] = []
@@ -1898,9 +1898,9 @@ module PlatformNative:
             # mkdtemp creates staging roots as euid-owned 0700 directories.
             # Reject special bits and every group/other permission as well.
             return false if (mode & 61440.u64()) != directory_mode or owner != expected_uid or (mode & 4095.u64()) != 448.u64()
-            return trusted_acl_fd(fd)
+            return trusted_acl_fd(fd, true)
 
-        def trusted_acl_fd(fd: i64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+        def trusted_acl_fd(fd: i64, is_directory: bool) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             static if ELISA_TARGET_OS_MACOS:
                 native_errno()[0] <- 0
                 if native_acl_get_fd_np(fd.i32(), 256) is acl:
@@ -1931,7 +1931,7 @@ module PlatformNative:
                     return native_acl_free(acl_value) == 0 and safe
                 return current_errno() == 2
             static elif ELISA_TARGET_OS_LINUX:
-                return trusted_linux_acl_fd(fd)
+                return trusted_linux_acl_fd(fd, is_directory)
             static else:
                 return true
 
@@ -1942,16 +1942,12 @@ module PlatformNative:
         # class. A default ACL can affect future children, so trusted
         # directories carrying one fail closed.
         static if ELISA_TARGET_OS_LINUX:
-            def trusted_linux_acl_fd(fd: i64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-                stat: mutable darray[u8] = []
-                stat.resize(144)
-                stat_raw: mutable void& = (&stat[0]).cast[mutable void&] can Unsafe.PointerCast
-                return false if native_fstat(fd, stat_raw) != 0
+            def trusted_linux_acl_fd(fd: i64, is_directory: bool) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
                 access_acl: mutable darray[u8] = []
                 access_status: i64 = read_linux_acl_xattr(fd, "system.posix_acl_access", &access_acl)
                 return false if access_status < 0
                 return false if access_status == 1 and not LinuxAccessAcl::is_safe(access_acl)
-                if (read_u16(stat, stat_mode_offset) & 61440.u64()) == directory_mode:
+                if is_directory:
                     default_acl: mutable darray[u8] = []
                     default_status: i64 = read_linux_acl_xattr(fd, "system.posix_acl_default", &default_acl)
                     return false if default_status < 0 or default_status == 1
@@ -1975,8 +1971,7 @@ module PlatformNative:
                     return -1
                 return -1 if loaded < 4 or loaded > LinuxAccessAcl::read_capacity.i64() or (loaded - 4) % 8 != 0
                 buffer.resize(loaded.usize())
-                for index in 0..<buffer.count |out, buffer|:
-                    out.push(buffer[index])
+                out <- buffer
                 return 1
 
         def open_trusted_directory(path: cstr, expected_uid: u64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -2057,7 +2052,7 @@ module PlatformNative:
                         return false if read_u32(stat, stat_gid_offset) != macos_admin_gid()
                     static else:
                         return false
-            return trusted_acl_fd(fd)
+            return trusted_acl_fd(fd, true)
 
         def macos_admin_gid() -> u64:
             static if ELISA_TARGET_OS_MACOS:
