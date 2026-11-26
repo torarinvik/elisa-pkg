@@ -1,0 +1,278 @@
+# Build a deterministic lockfile for the transitive local dependency graph.
+include "../integrity.elisa"
+include "../json.elisa"
+include "../package/manifest.elisa"
+include "../package/package_identity.elisa"
+include "../platform.elisa"
+include "../source/fingerprint.elisa"
+include "../text/bytes.elisa"
+include "./files.elisa"
+include "./local_build_plan.elisa"
+include "./manifest.elisa"
+
+module LocalLock:
+    public:
+        def canonical(name: darray[u8]&, version: darray[u8]&, raw: darray[u8]&, root: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            out: mutable darray[u8] = []
+            graph_source_bytes: mutable usize = 0.usize()
+            root_digest_bytes: mutable darray[u8] = []
+            root_digest: mutable darray[u8] = []
+            return [] if Integrity::sha256(raw, &root_digest_bytes) != Integrity::DigestCode.Ok
+            return [] if not Integrity::hex_digest(root_digest_bytes, &root_digest)
+            root_source_digest: mutable darray[u8] = []
+            root_source_bytes: mutable usize = 0.usize()
+            return [] if not SourceFingerprint::at_bounded(root, &root_source_digest, SourceFingerprint::maximum_snapshot_bytes, &root_source_bytes)
+            graph_source_bytes <- root_source_bytes
+            ByteText::append_text(&out, "{\n  \"lock-version\": 2,\n  \"resolver\": \"elisapkg-v2\",\n  \"package\": {\n    \"name\": \"")
+            ByteText::append(&out, name)
+            ByteText::append_text(&out, "\",\n    \"version\": \"")
+            ByteText::append(&out, version)
+            ByteText::append_text(&out, "\",\n    \"manifest-digest\": \"sha256:")
+            ByteText::append(&out, root_digest)
+            ByteText::append_text(&out, "\",\n    \"source-digest\": \"sha256:")
+            ByteText::append(&out, root_source_digest)
+            ByteText::append_text(&out, "\"\n  },\n  \"packages\": [")
+            queue: mutable darray[u8] = []
+            record_starts: mutable darray[usize] = []
+            sorted_records: mutable darray[usize] = []
+            edges: mutable darray[usize] = []
+            edge_count: mutable usize = 0.usize()
+            total: mutable usize = 0.usize()
+            return [] if not append_local_dependency_records(raw, root, &queue, &record_starts, &sorted_records, &edges, &edge_count, &total, 18446744073709551615.usize())
+            if total == 0.usize():
+                ByteText::append_text(&out, "]\n}\n")
+                return out
+            edge_offsets: mutable darray[usize] = []
+            edge_offsets.push(0.usize())
+            processed: mutable usize = 0.usize()
+            while processed < total |queue, record_starts, sorted_records, edges, edge_count, edge_offsets, processed, total, root|:
+                package_root: mutable darray[u8] = []
+                return [] if not queue_field_at(queue, record_starts, processed, 0, &package_root)
+                manifest_path: mutable darray[u8] = []
+                ProjectFiles::path_join_into(&package_root, "elisapkg.json", &manifest_path)
+                child_raw: mutable darray[u8] = []
+                return [] if not Platform::pkg_read_bounded_file(manifest_path, Json::max_document_bytes, &child_raw)
+                child_name: mutable darray[u8] = []
+                child_version: mutable darray[u8] = []
+                return [] if not ProjectManifest::validate_at(child_raw, &package_root, &child_name, &child_version)
+                return [] if ByteText::equal(child_name, name)
+                queued_name: mutable darray[u8] = []
+                queued_version: mutable darray[u8] = []
+                return [] if not queue_field_at(queue, record_starts, processed, 1, &queued_name) or not queue_field_at(queue, record_starts, processed, 2, &queued_version)
+                return [] if not ByteText::equal(queued_name, child_name) or not ByteText::equal(queued_version, child_version)
+                return [] if not append_local_dependency_records(child_raw, &package_root, &queue, &record_starts, &sorted_records, &edges, &edge_count, &total, processed)
+                processed <- processed + 1.usize()
+                edge_offsets.push(edges.count)
+            return [] if not local_dependency_graph_is_acyclic(total, edges, edge_offsets)
+            first: mutable bool = true
+            return [] if sorted_records.count != total
+            for sorted_position in 0..<total |queue, record_starts, sorted_records, out, first|:
+                selected: usize = sorted_records[sorted_position]
+                return [] if selected >= record_starts.count
+                selected_name: mutable darray[u8] = []
+                selected_path: mutable darray[u8] = []
+                selected_version: mutable darray[u8] = []
+                return [] if not queue_field_at(queue, record_starts, selected, 0, &selected_path) or not queue_field_at(queue, record_starts, selected, 1, &selected_name) or not queue_field_at(queue, record_starts, selected, 2, &selected_version)
+                selected_manifest_path: mutable darray[u8] = []
+                ProjectFiles::path_join_into(&selected_path, "elisapkg.json", &selected_manifest_path)
+                selected_manifest: mutable darray[u8] = []
+                return [] if not Platform::pkg_read_bounded_file(selected_manifest_path, Json::max_document_bytes, &selected_manifest)
+                selected_source_digest: mutable darray[u8] = []
+                selected_source_bytes: mutable usize = 0.usize()
+                return [] if graph_source_bytes > SourceFingerprint::maximum_snapshot_bytes or not SourceFingerprint::at_bounded(selected_path, &selected_source_digest, SourceFingerprint::maximum_snapshot_bytes - graph_source_bytes, &selected_source_bytes)
+                graph_source_bytes <- graph_source_bytes + selected_source_bytes
+                selected_digest: mutable darray[u8] = []
+                selected_digest_bytes: mutable darray[u8] = []
+                return [] if Integrity::sha256(selected_manifest, &selected_digest_bytes) != Integrity::DigestCode.Ok
+                return [] if not Integrity::hex_digest(selected_digest_bytes, &selected_digest)
+                out.push(44) if not first
+                ByteText::append_text(&out, "\n    {\"name\":\"")
+                ByteText::append(&out, selected_name)
+                ByteText::append_text(&out, "\",\"version\":\"")
+                ByteText::append(&out, selected_version)
+                ByteText::append_text(&out, "\",\"source\":{\"type\":\"path\",\"path\":\"")
+                ByteText::append(&out, selected_path)
+                ByteText::append_text(&out, "\"},\"manifest-digest\":\"sha256:")
+                ByteText::append(&out, selected_digest)
+                ByteText::append_text(&out, "\",\"source-digest\":\"sha256:")
+                ByteText::append(&out, selected_source_digest)
+                ByteText::append_text(&out, "\"}")
+                first <- false
+            ByteText::append_text(&out, "\n  ]\n}\n")
+            return out
+
+    private:
+        def queue_append_field(queue: mutable darray[u8]&, value: darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
+            for index in 0..<value.count |queue, value|:
+                queue.push(value[index])
+            queue.push(0)
+
+        def queue_append_record(queue: mutable darray[u8]&, record_starts: mutable darray[usize]&, path: darray[u8]&, name: darray[u8]&, version: darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
+            record_starts.push(queue.count)
+            queue_append_field(queue, path)
+            queue_append_field(queue, name)
+            queue_append_field(queue, version)
+
+        def queue_field_at(queue: darray[u8]&, record_starts: darray[usize]&, record: usize, field: usize, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            out.resize(0)
+            return false if record >= record_starts.count or field >= 3.usize()
+            cursor: mutable usize = record_starts[record]
+            for current_field in 0..<3 |queue, record_starts, record, field, current_field, cursor, out|:
+                return false if cursor >= queue.count
+                end: mutable usize = cursor
+                while end < queue.count and queue[end] != 0 |queue, end|:
+                    end <- end + 1.usize()
+                return false if end >= queue.count
+                if current_field == field:
+                    for index in cursor..<end |queue, out|:
+                        out.push(queue[index])
+                    return true
+                cursor <- end + 1.usize()
+            return false
+
+        def queue_name_record(queue: darray[u8]&, record_starts: darray[usize]&, sorted_records: darray[usize]&, total: usize, wanted: darray[u8]&, insertion_out: mutable usize&) -> usize can[Memory.Allocate, Abort.Panic]:
+            insertion_out <- total + 1.usize()
+            return total if sorted_records.count != total
+            lower: mutable usize = 0.usize()
+            upper: mutable usize = sorted_records.count
+            while lower < upper |queue, record_starts, sorted_records, wanted, lower, upper|:
+                middle: usize = lower + (upper - lower) / 2.usize()
+                record: usize = sorted_records[middle]
+                return total if record >= record_starts.count
+                candidate: mutable darray[u8] = []
+                if not queue_field_at(queue, record_starts, record, 1, &candidate):
+                    return total
+                if ByteText::less(candidate, wanted):
+                    lower <- middle + 1.usize()
+                else:
+                    upper <- middle
+            insertion_out <- lower
+            return total if lower >= sorted_records.count
+            record: usize = sorted_records[lower]
+            if record >= record_starts.count:
+                insertion_out <- total + 1.usize()
+                return total
+            candidate: mutable darray[u8] = []
+            if not queue_field_at(queue, record_starts, record, 1, &candidate):
+                insertion_out <- total + 1.usize()
+                return total
+            return record if ByteText::equal(candidate, wanted)
+            return total
+
+        def queue_insert_sorted_record(sorted_records: mutable darray[usize]&, insertion: usize, record: usize) -> bool can[Memory.Allocate, Abort.Panic]:
+            return false if insertion > sorted_records.count
+            previous_count: usize = sorted_records.count
+            sorted_records.resize(previous_count + 1.usize())
+            cursor: mutable usize = previous_count
+            while cursor > insertion |sorted_records, cursor|:
+                sorted_records[cursor] <- sorted_records[cursor - 1.usize()]
+                cursor <- cursor - 1.usize()
+            sorted_records[insertion] <- record
+            return true
+
+        def append_local_dependency_records(raw: darray[u8]&, package_root: darray[u8]&, queue: mutable darray[u8]&, record_starts: mutable darray[usize]&, sorted_records: mutable darray[usize]&, edges: mutable darray[usize]&, edge_count: mutable usize&, total: mutable usize&, parent: usize) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            dependency_start: usize = Json::root_value_offset(raw, "dependencies")
+            return true if dependency_start >= raw.count
+            dependency_end: usize = Json::object_end(raw, dependency_start)
+            return false if dependency_end <= dependency_start or raw[dependency_start] != 123
+            in_string: mutable bool = false
+            escaped: mutable bool = false
+            string_start: mutable usize = 0.usize()
+            braces: mutable i64 = 1
+            brackets: mutable i64 = 0
+            for index in (dependency_start + 1.usize())..<dependency_end |raw, package_root, queue, record_starts, sorted_records, edges, edge_count, total, in_string, escaped, string_start, braces, brackets|:
+                byte: u8 = raw[index]
+                if not in_string:
+                    if byte == 34:
+                        in_string <- true
+                        string_start <- index + 1.usize()
+                    elif byte == 123:
+                        braces <- braces + 1
+                    elif byte == 125:
+                        braces <- braces - 1
+                    elif byte == 91:
+                        brackets <- brackets + 1
+                    elif byte == 93:
+                        brackets <- brackets - 1
+                elif escaped:
+                    escaped <- false
+                elif byte == 92:
+                    escaped <- true
+                elif byte == 34:
+                    after: mutable usize = index + 1.usize()
+                    while after < dependency_end and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
+                        after <- after + 1.usize()
+                    if braces == 1 and brackets == 0 and after < dependency_end and raw[after] == 58:
+                        return false if edge_count >= LocalBuildPlan::maximum_edges
+                        edge_count <- edge_count + 1.usize()
+                        alias: mutable darray[u8] = []
+                        for key_index in string_start..<index |alias, raw|:
+                            alias.push(raw[key_index])
+                        return false if not PackageIdentity::valid_name(alias)
+                        object_start: mutable usize = after + 1.usize()
+                        while object_start < dependency_end and (raw[object_start] == 32 or raw[object_start] == 9 or raw[object_start] == 10 or raw[object_start] == 13) |raw, object_start|:
+                            object_start <- object_start + 1.usize()
+                        object_end: usize = Json::object_end(raw, object_start)
+                        return false if object_start >= dependency_end or object_end <= object_start or raw[object_start] != 123 or object_end > dependency_end
+                        dep_path: mutable darray[u8] = []
+                        return false if not Json::object_string_value(raw, object_start, object_end, "path", &dep_path)
+                        return false if not Manifest::valid_dependency_path(dep_path)
+                        parent_root: mutable darray[u8] = []
+                        if package_root.count > 0.usize() and not (package_root.count == 1.usize() and package_root[0] == 46):
+                            for root_index in 0..<package_root.count |parent_root, package_root|:
+                                parent_root.push(package_root[root_index])
+                        dep_path_c: mutable darray[u8] = []
+                        ProjectFiles::path_with_nul_into(&dep_path, &dep_path_c)
+                        dep_path_name: cstr = (&dep_path_c[0]).cast[cstr] can Unsafe.PointerCast
+                        child_root_raw: mutable darray[u8] = []
+                        ProjectFiles::path_join_into(&parent_root, dep_path_name, &child_root_raw)
+                        child_root: mutable darray[u8] = []
+                        return false if not ProjectFiles::normalize_relative_path(&child_root_raw, &child_root)
+                        child_name: mutable darray[u8] = []
+                        child_version: mutable darray[u8] = []
+                        return false if not ProjectManifest::load_at(&child_root, &child_name, &child_version)
+                        return false if not ByteText::equal(alias, child_name)
+                        insertion: mutable usize = 0.usize()
+                        existing: usize = queue_name_record(queue, record_starts, sorted_records, total, child_name, &insertion)
+                        return false if insertion > sorted_records.count
+                        if existing < total:
+                            existing_path: mutable darray[u8] = []
+                            existing_version: mutable darray[u8] = []
+                            return false if not queue_field_at(queue, record_starts, existing, 0, &existing_path) or not queue_field_at(queue, record_starts, existing, 2, &existing_version)
+                            return false if not ByteText::equal(existing_path, child_root) or not ByteText::equal(existing_version, child_version)
+                            edges.push(existing) if parent < total
+                            in_string <- false
+                            continue
+                        return false if total >= 4096.usize()
+                        queue_append_record(queue, record_starts, &child_root, child_name, child_version)
+                        return false if not queue_insert_sorted_record(sorted_records, insertion, total)
+                        edges.push(total) if parent < total
+                        total <- total + 1.usize()
+                    in_string <- false
+            return true
+
+        def local_dependency_graph_is_acyclic(total: usize, edges: darray[usize]&, edge_offsets: darray[usize]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            return false if edge_offsets.count != total + 1.usize()
+            indegrees: mutable darray[usize] = []
+            indegrees.resize(total)
+            for index in 0..<total |indegrees|:
+                indegrees[index] <- 0.usize()
+            for source in 0..<total |edge_offsets, edges, indegrees|:
+                return false if edge_offsets[source + 1.usize()] < edge_offsets[source] or edge_offsets[source + 1.usize()] > edges.count
+                for edge_index in edge_offsets[source]..<edge_offsets[source + 1.usize()] |edges, indegrees|:
+                    target: usize = edges[edge_index]
+                    return false if target >= total
+                    indegrees[target] <- indegrees[target] + 1.usize()
+            ready: mutable darray[usize] = []
+            for index in 0..<total |indegrees, ready|:
+                ready.push(index) if indegrees[index] == 0.usize()
+            ready_cursor: mutable usize = 0.usize()
+            while ready_cursor < ready.count |ready, ready_cursor, edges, edge_offsets, indegrees|:
+                source: usize = ready[ready_cursor]
+                for edge_index in edge_offsets[source]..<edge_offsets[source + 1.usize()] |edges, indegrees, ready|:
+                    target: usize = edges[edge_index]
+                    return false if indegrees[target] == 0.usize()
+                    indegrees[target] <- indegrees[target] - 1.usize()
+                    ready.push(target) if indegrees[target] == 0.usize()
+                ready_cursor <- ready_cursor + 1.usize()
+            return ready.count == total
