@@ -1,0 +1,123 @@
+# Validate project manifests and their target files as a single operation.
+include "../package/manifest.elisa"
+include "../package/targets.elisa"
+include "./files.elisa"
+include "./schema_fields.elisa"
+
+module ProjectManifest:
+    public:
+        def validate_at(raw: darray[u8]&, root: darray[u8]&, name_out: mutable darray[u8]&, version_out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            name_out.resize(0)
+            version_out.resize(0)
+            return false if not Json::valid_document(raw)
+            return false if not Json::unique_object_keys(raw)
+            return false if not Manifest::allowed_keys(raw)
+            for index in 0..<raw.count |raw|:
+                return false if raw[index] == 0
+            object_start: usize = Json::root_start(raw)
+            object_finish: usize = Json::root_object_end(raw, object_start)
+            schema_version: mutable u64 = 0.u64()
+            return false if not Json::object_unsigned_value(raw, object_start, object_finish, "schema-version", &schema_version) or schema_version != 1.u64()
+            return false if not Manifest::valid_optional_package_strings(raw)
+            return false if not Manifest::valid_pattern_array(raw, "include") or not Manifest::valid_pattern_array(raw, "exclude")
+            return false if not valid_target_objects(raw, root)
+            return false if not Manifest::valid_dependency_map(raw, "dependencies")
+            return false if not Manifest::valid_dependency_map(raw, "dev-dependencies")
+            return false if not dependency_map_empty(raw, "dev-dependencies")
+            name: mutable darray[u8] = []
+            version: mutable darray[u8] = []
+            package_start: mutable usize = 0.usize()
+            package_end: mutable usize = 0.usize()
+            return false if not Json::object_value_span(raw, object_start, object_finish, "package", &package_start, &package_end)
+            return false if not Json::object_string_value(raw, package_start, package_end, "name", &name)
+            return false if not Json::object_string_value(raw, package_start, package_end, "version", &version)
+            return false if not PackageIdentity::valid_name(name)
+            return false if not PackageIdentity::valid_version(version)
+            for index in 0..<name.count |name_out, name|:
+                name_out.push(name[index])
+            for index in 0..<version.count |version_out, version|:
+                version_out.push(version[index])
+            return true
+
+        def validate(raw: darray[u8]&, name_out: mutable darray[u8]&, version_out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            root: mutable darray[u8] = [46]
+            return validate_at(raw, &root, name_out, version_out)
+
+        def load_at(root: darray[u8]&, name_out: mutable darray[u8]&, version_out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            name_out.resize(0)
+            version_out.resize(0)
+            manifest_path: mutable darray[u8] = []
+            ProjectFiles::path_join_into(root, "elisapkg.json", &manifest_path)
+            raw: mutable darray[u8] = []
+            return false if not Platform::pkg_read_bounded_file(manifest_path, Json::max_document_bytes, &raw)
+            return false if not validate_at(raw, root, name_out, version_out)
+            return true
+
+    private:
+        def target_file_is_valid(root: darray[u8]&, entry: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            entry_path: mutable darray[u8] = []
+            ProjectFiles::path_join_bytes_into(root, entry, &entry_path)
+            canonical_entry: mutable darray[u8] = []
+            return false if not ProjectFiles::resolve_entry_beneath(root, &entry_path, &canonical_entry)
+            entry_path_c: mutable darray[u8] = []
+            ProjectFiles::path_with_nul_into(&entry_path, &entry_path_c)
+            entry_path_name: cstr = (&entry_path_c[0]).cast[cstr] can Unsafe.PointerCast
+            return false if Platform::pkg_package_file_size(entry_path_name) < 0
+            return true
+
+        def valid_target_objects(raw: darray[u8]&, root: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            targets_start: usize = Json::root_value_offset(raw, "targets")
+            return false if targets_start >= raw.count or raw[targets_start] != 91
+            targets_end: usize = Json::array_end(raw, targets_start)
+            return false if targets_end <= targets_start or targets_end >= raw.count
+            seen: mutable darray[u8] = []
+            found: mutable usize = 0.usize()
+            index: mutable usize = targets_start + 1.usize()
+            while index < targets_end |raw, root, seen, found, index|:
+                if raw[index] == 123:
+                    object_end: usize = Json::object_end(raw, index)
+                    return false if object_end <= index or object_end >= targets_end
+                    return false if not SchemaFields::valid(raw, index, object_end, SchemaFields::Kind.ManifestTarget)
+                    target_name: mutable darray[u8] = []
+                    return false if not Json::object_string_value(raw, index, object_end, "name", &target_name)
+                    return false if not PackageIdentity::valid_name(target_name)
+                    target_kind: mutable darray[u8] = []
+                    return false if not Json::object_string_value(raw, index, object_end, "kind", &target_kind)
+                    return false if not (ByteText::equal_text(target_kind, "bin") or ByteText::equal_text(target_kind, "lib") or ByteText::equal_text(target_kind, "test"))
+                    target_entry: mutable darray[u8] = []
+                    return false if not Json::object_string_value(raw, index, object_end, "entry", &target_entry)
+                    return false if not Manifest::is_safe_relative_entry(target_entry) or not target_file_is_valid(root, target_entry)
+                    return false if target_name_seen(seen, target_name)
+                    return false if found >= ManifestTargets::max_targets
+                    for name_index in 0..<target_name.count |seen, target_name|:
+                        seen.push(target_name[name_index])
+                    seen.push(0)
+                    found <- found + 1.usize()
+                    index <- object_end
+                elif raw[index] != 32 and raw[index] != 9 and raw[index] != 10 and raw[index] != 13 and raw[index] != 44:
+                    # Every array member must be a target object. Ignoring scalar or
+                    # nested members here could let a syntactically valid but
+                    # schema-invalid `targets` array influence selection indirectly.
+                    return false
+                index <- index + 1.usize()
+            return found > 0.usize()
+
+        def target_name_seen(seen: darray[u8]&, alias: darray[u8]&) -> bool:
+            cursor: mutable usize = 0.usize()
+            while cursor < seen.count:
+                segment_end: mutable usize = cursor
+                while segment_end < seen.count and seen[segment_end] != 0:
+                    segment_end <- segment_end + 1.usize()
+                return true if segment_end - cursor == alias.count and ByteText::range_equals(seen, cursor, segment_end, alias)
+                cursor <- segment_end + 1.usize()
+            return false
+
+        def dependency_map_empty(raw: darray[u8]&, wanted: cstr) -> bool:
+            start: usize = Json::root_value_offset(raw, wanted)
+            return true if start >= raw.count
+            finish: usize = Json::object_end(raw, start)
+            return false if finish <= start or finish >= raw.count
+            for index in (start + 1.usize())..<finish |raw|:
+                byte: u8 = raw[index]
+                return false if byte != 32 and byte != 9 and byte != 10 and byte != 13
+            return true

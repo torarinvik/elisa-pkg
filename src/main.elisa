@@ -43,6 +43,7 @@ include "./project/build_cache.elisa"
 include "./project/build_receipt.elisa"
 include "./project/build_paths.elisa"
 include "./project/schema_fields.elisa"
+include "./project/manifest.elisa"
 
 module Cli:
     private:
@@ -228,63 +229,6 @@ module Cli:
             return true if result == 0 or result == -2 or result == -Platform::pkg_directory_not_empty_error()
             return false
 
-        def safe_relative_entry(entry: darray[u8]&) -> bool:
-            return Manifest::is_safe_relative_entry(entry)
-
-        def target_file_is_valid(root: darray[u8]&, entry: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            entry_path: mutable darray[u8] = []
-            for root_index in 0..<root.count |entry_path, root|:
-                entry_path.push(root[root_index])
-            if entry_path.count == 0.usize() or entry_path[entry_path.count - 1.usize()] != 47:
-                entry_path.push(47)
-            for entry_index in 0..<entry.count |entry_path, entry|:
-                entry_path.push(entry[entry_index])
-            canonical_entry: mutable darray[u8] = []
-            return false if not ProjectFiles::resolve_entry_beneath(root, &entry_path, &canonical_entry)
-            entry_path_c: mutable darray[u8] = []
-            ProjectFiles::path_with_nul_into(&entry_path, &entry_path_c)
-            entry_path_name: cstr = (&entry_path_c[0]).cast[cstr] can Unsafe.PointerCast
-            return false if Platform::pkg_package_file_size(entry_path_name) < 0
-            return true
-
-        def valid_target_objects(raw: darray[u8]&, root: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            targets_start: usize = Json::root_value_offset(raw, "targets")
-            return false if targets_start >= raw.count or raw[targets_start] != 91
-            targets_end: usize = Json::array_end(raw, targets_start)
-            return false if targets_end <= targets_start or targets_end >= raw.count
-            seen: mutable darray[u8] = []
-            found: mutable usize = 0.usize()
-            index: mutable usize = targets_start + 1.usize()
-            while index < targets_end |raw, root, seen, found, index|:
-                if raw[index] == 123:
-                    object_end: usize = Json::object_end(raw, index)
-                    return false if object_end <= index or object_end >= targets_end
-                    return false if not SchemaFields::valid(raw, index, object_end, SchemaFields::Kind.ManifestTarget)
-                    target_name: mutable darray[u8] = []
-                    return false if not Json::object_string_value(raw, index, object_end, "name", &target_name)
-                    return false if not valid_package_name(target_name)
-                    target_kind: mutable darray[u8] = []
-                    return false if not Json::object_string_value(raw, index, object_end, "kind", &target_kind)
-                    return false if not (ByteText::equal_text(target_kind, "bin") or ByteText::equal_text(target_kind, "lib") or ByteText::equal_text(target_kind, "test"))
-                    target_entry: mutable darray[u8] = []
-                    return false if not Json::object_string_value(raw, index, object_end, "entry", &target_entry)
-                    return false if not safe_relative_entry(target_entry) or not target_file_is_valid(root, target_entry)
-                    return false if dependency_alias_seen(seen, target_name)
-                    return false if found >= ManifestTargets::max_targets
-                    seen.push(0) if seen.count > 0.usize()
-                    for name_index in 0..<target_name.count |seen, target_name|:
-                        seen.push(target_name[name_index])
-                    seen.push(0)
-                    found <- found + 1.usize()
-                    index <- object_end
-                elif raw[index] != 32 and raw[index] != 9 and raw[index] != 10 and raw[index] != 13 and raw[index] != 44:
-                    # Every array member must be a target object. Ignoring scalar or
-                    # nested members here could let a syntactically valid but
-                    # schema-invalid `targets` array influence selection indirectly.
-                    return false
-                index <- index + 1.usize()
-            return found > 0.usize()
-
         # ---------- semantic versions ---------------------------------------------------------
 
         def parse_version(value: darray[u8]&, out: mutable Model::Version&) -> bool:
@@ -304,54 +248,6 @@ module Cli:
 
         def valid_package_name(name: darray[u8]&) -> bool:
             return PackageIdentity::valid_name(name)
-
-        def validate_manifest_at(raw: darray[u8]&, root: darray[u8]&, name_out: mutable darray[u8]&, version_out: mutable darray[u8]&) -> bool:
-            name_out.resize(0)
-            version_out.resize(0)
-            return false if not Json::valid_document(raw)
-            return false if not Json::unique_object_keys(raw)
-            return false if not Manifest::allowed_keys(raw)
-            for index in 0..<raw.count |raw|:
-                return false if raw[index] == 0
-            object_start: usize = Json::root_start(raw)
-            object_finish: usize = Json::root_object_end(raw, object_start)
-            schema_version: mutable u64 = 0.u64()
-            return false if not Json::object_unsigned_value(raw, object_start, object_finish, "schema-version", &schema_version) or schema_version != 1.u64()
-            return false if not Manifest::valid_optional_package_strings(raw)
-            return false if not Manifest::valid_pattern_array(raw, "include") or not Manifest::valid_pattern_array(raw, "exclude")
-            return false if not valid_target_objects(raw, root)
-            return false if not Manifest::valid_dependency_map(raw, "dependencies")
-            return false if not Manifest::valid_dependency_map(raw, "dev-dependencies")
-            return false if not dependency_map_empty(raw, "dev-dependencies")
-            name: mutable darray[u8] = []
-            version: mutable darray[u8] = []
-            package_start: mutable usize = 0.usize()
-            package_end: mutable usize = 0.usize()
-            return false if not Json::object_value_span(raw, object_start, object_finish, "package", &package_start, &package_end)
-            return false if not Json::object_string_value(raw, package_start, package_end, "name", &name)
-            return false if not Json::object_string_value(raw, package_start, package_end, "version", &version)
-            return false if not valid_package_name(name)
-            parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-            return false if not parse_version(version, &parsed)
-            for index in 0..<name.count |name_out, name|:
-                name_out.push(name[index])
-            for index in 0..<version.count |version_out, version|:
-                version_out.push(version[index])
-            return true
-
-        def validate_manifest(raw: darray[u8]&, name_out: mutable darray[u8]&, version_out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            root: mutable darray[u8] = [46]
-            return validate_manifest_at(raw, &root, name_out, version_out)
-
-        def load_package_at(root: darray[u8]&, name_out: mutable darray[u8]&, version_out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            name_out.resize(0)
-            version_out.resize(0)
-            manifest_path: mutable darray[u8] = []
-            ProjectFiles::path_join_into(root, "elisapkg.json", &manifest_path)
-            raw: mutable darray[u8] = []
-            return false if not Platform::pkg_read_bounded_file(manifest_path, Json::max_document_bytes, &raw)
-            return false if not validate_manifest_at(raw, root, name_out, version_out)
-            return true
 
         def slice_less_slice(raw: darray[u8]&, left_start: usize, left_end: usize, right_start: usize, right_end: usize) -> bool:
             left_count: usize = left_end - left_start
@@ -406,13 +302,6 @@ module Cli:
                     count <- count + 1.usize() if braces == 1 and brackets == 0 and after < dependency_end and raw[after] == 58
                     in_string <- false
             return count
-
-        def dependency_map_empty(raw: darray[u8]&, wanted: cstr) -> bool can[Memory.Allocate, Abort.Panic]:
-            dependency_start: usize = Json::root_value_offset(raw, wanted)
-            return true if dependency_start >= raw.count
-            dependency_end: usize = Json::object_end(raw, dependency_start)
-            return false if dependency_end <= dependency_start or raw[dependency_start] != 123
-            return direct_dependency_count(raw, dependency_start, dependency_end) == 0.usize()
 
         def queue_append_field(queue: mutable darray[u8]&, value: darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
             for index in 0..<value.count |queue, value|:
@@ -542,7 +431,7 @@ module Cli:
                         return false if not ProjectFiles::normalize_relative_path(&child_root_raw, &child_root)
                         child_name: mutable darray[u8] = []
                         child_version: mutable darray[u8] = []
-                        return false if not load_package_at(&child_root, &child_name, &child_version)
+                        return false if not ProjectManifest::load_at(&child_root, &child_name, &child_version)
                         return false if not ByteText::equal(alias, child_name)
                         insertion: mutable usize = 0.usize()
                         existing: usize = queue_name_record(queue, record_starts, sorted_records, total, child_name, &insertion)
@@ -631,7 +520,7 @@ module Cli:
                 return [] if not Platform::pkg_read_bounded_file(manifest_path, Json::max_document_bytes, &child_raw)
                 child_name: mutable darray[u8] = []
                 child_version: mutable darray[u8] = []
-                return [] if not validate_manifest_at(child_raw, &package_root, &child_name, &child_version)
+                return [] if not ProjectManifest::validate_at(child_raw, &package_root, &child_name, &child_version)
                 return [] if ByteText::equal(child_name, name)
                 queued_name: mutable darray[u8] = []
                 queued_version: mutable darray[u8] = []
@@ -1104,16 +993,6 @@ module Cli:
                     return canonical_registry_lock(name, version, raw, root, registry_roots, preferred_lock, unlock, true)
                 return canonical_transitive_local_lock(name, version, raw, root)
 
-        def dependency_alias_seen(seen: darray[u8]&, alias: darray[u8]&) -> bool:
-            cursor: mutable usize = 0.usize()
-            while cursor < seen.count:
-                segment_end: mutable usize = cursor
-                while segment_end < seen.count and seen[segment_end] != 0:
-                    segment_end <- segment_end + 1.usize()
-                return true if segment_end - cursor == alias.count and ByteText::range_equals(seen, cursor, segment_end, alias)
-                cursor <- segment_end + 1.usize()
-            return false
-
         # ---------- project discovery and commands -------------------------------------------
 
         def project_manifest_exists() -> bool:
@@ -1225,7 +1104,7 @@ module Cli:
                 root: mutable darray[u8] = [46]
                 root_name: mutable darray[u8] = []
                 root_version: mutable darray[u8] = []
-                return EXIT_USAGE if not load_package_at(&root, &root_name, &root_version)
+                return EXIT_USAGE if not ProjectManifest::load_at(&root, &root_name, &root_version)
                 dependency_path: mutable darray[u8] = []
                 requirement: mutable darray[u8] = []
                 if local_form:
@@ -1233,7 +1112,7 @@ module Cli:
                     return EXIT_USAGE if not Manifest::valid_dependency_path(dependency_path)
                     dependency_name: mutable darray[u8] = []
                     dependency_version: mutable darray[u8] = []
-                    return EXIT_RESOLVE if not load_package_at(&dependency_path, &dependency_name, &dependency_version)
+                    return EXIT_RESOLVE if not ProjectManifest::load_at(&dependency_path, &dependency_name, &dependency_version)
                     return EXIT_RESOLVE if not ByteText::equal(alias, dependency_name) or ByteText::equal(alias, root_name)
                 else:
                     ByteText::append_bounded_text(&requirement, slots[4].cast[cstr])
@@ -1243,7 +1122,7 @@ module Cli:
                 raw: mutable darray[u8] = []
                 raw.resize(1048577)
                 return EXIT_USAGE if not ProjectFiles::read_cstr_into("elisapkg.json", &raw)
-                return EXIT_USAGE if not validate_manifest_at(raw, &root, &root_name, &root_version)
+                return EXIT_USAGE if not ProjectManifest::validate_at(raw, &root, &root_name, &root_version)
                 updated: darray[u8] = ManifestEdits::append_path(raw, alias, dependency_path) if local_form else ManifestEdits::append_registry(raw, alias, requirement)
                 if updated.count == 0.usize():
                     CliOutput::write_error("error: dependency is already declared or the manifest has no dependency object\n")
@@ -1289,7 +1168,7 @@ module Cli:
             return false if raw.count == 0.usize()
             name: mutable darray[u8] = []
             version: mutable darray[u8] = []
-            valid: bool = validate_manifest(raw, &name, &version)
+            valid: bool = ProjectManifest::validate(raw, &name, &version)
             return false if not valid
             return true
 
@@ -1500,7 +1379,7 @@ module Cli:
                 return EXIT_RESOLVE if not ProjectFiles::read_cstr_into("elisapkg.json", &raw)
                 root_name: mutable darray[u8] = []
                 root_version: mutable darray[u8] = []
-                return EXIT_RESOLVE if not validate_manifest_at(raw, start, &root_name, &root_version)
+                return EXIT_RESOLVE if not ProjectManifest::validate_at(raw, start, &root_name, &root_version)
                 return EXIT_RESOLVE if not ProjectFiles::cstr_file_exists("elisapkg.lock")
                 lock: mutable darray[u8] = []
                 lock.resize(1048577)
@@ -1539,7 +1418,7 @@ module Cli:
                 return EXIT_USAGE if not ProjectFiles::read_cstr_into("elisapkg.json", &raw)
                 name: mutable darray[u8] = []
                 version: mutable darray[u8] = []
-                return EXIT_USAGE if not validate_manifest(raw, &name, &version)
+                return EXIT_USAGE if not ProjectManifest::validate(raw, &name, &version)
                 # Keep output identity in owned buffers. The resolver walks and
                 # normalizes graph records; preserving these copies prevents an
                 # implementation detail of that traversal from emptying the
@@ -1683,7 +1562,7 @@ module Cli:
                 return EXIT_RESOLVE if not ProjectFiles::read_cstr_into("elisapkg.json", &raw)
                 name: mutable darray[u8] = []
                 version: mutable darray[u8] = []
-                return EXIT_RESOLVE if not validate_manifest(raw, &name, &version)
+                return EXIT_RESOLVE if not ProjectManifest::validate(raw, &name, &version)
                 return EXIT_RESOLVE if not ProjectFiles::cstr_file_exists("elisapkg.lock")
                 lock: mutable darray[u8] = []
                 lock.resize(1048577)
@@ -1705,7 +1584,7 @@ module Cli:
                 return EXIT_USAGE if not ProjectFiles::read_cstr_into("elisapkg.json", &raw)
                 name: mutable darray[u8] = []
                 version: mutable darray[u8] = []
-                return EXIT_USAGE if not validate_manifest(raw, &name, &version)
+                return EXIT_USAGE if not ProjectManifest::validate(raw, &name, &version)
                 return EXIT_USAGE if not options.json
                 CliOutput::write_ok("{\"schema-version\":1,\"package\":{\"name\":\"")
                 CliOutput::write_bytes(1, &name)
@@ -2196,7 +2075,7 @@ module Cli:
                 return EXIT_USAGE if not ProjectFiles::read_cstr_into("elisapkg.json", &raw)
                 name: mutable darray[u8] = []
                 version: mutable darray[u8] = []
-                return EXIT_RESOLVE if not validate_manifest_at(raw, start, &name, &version)
+                return EXIT_RESOLVE if not ProjectManifest::validate_at(raw, start, &name, &version)
                 lock: mutable darray[u8] = []
                 lock.resize(1048577)
                 return EXIT_RESOLVE if not ProjectFiles::read_cstr_into("elisapkg.lock", &lock)
@@ -2220,7 +2099,7 @@ module Cli:
                 return EXIT_USAGE if not ProjectFiles::read_cstr_into("elisapkg.json", &raw)
                 package_name: mutable darray[u8] = []
                 package_version: mutable darray[u8] = []
-                return EXIT_RESOLVE if not validate_manifest_at(raw, start, &package_name, &package_version)
+                return EXIT_RESOLVE if not ProjectManifest::validate_at(raw, start, &package_name, &package_version)
                 lock_options: Model::CommandOptions = Model::CommandOptions{locked: true, offline: true, frozen: true, json: false, verbose: false, profile: "debug", target_name: "", target_kind: "", update_name: ""}
                 return EXIT_RESOLVE if run_resolve(start, lock_options, false, false) != EXIT_OK
                 lock: mutable darray[u8] = []
@@ -2469,7 +2348,7 @@ module Cli:
                     return 7
                 name: mutable darray[u8] = []
                 version: mutable darray[u8] = []
-                return EXIT_USAGE if not load_package_at(&root, &name, &version)
+                return EXIT_USAGE if not ProjectManifest::load_at(&root, &name, &version)
                 if version.count > MAX_INSTALL_VERSION_BYTES:
                     CliOutput::write_error("error: local install package versions exceed the bounded receipt limit\n")
                     return EXIT_USAGE
@@ -2780,11 +2659,11 @@ module Cli:
                 root: mutable darray[u8] = [46]
                 root_name: mutable darray[u8] = []
                 root_version: mutable darray[u8] = []
-                return EXIT_USAGE if not load_package_at(&root, &root_name, &root_version)
+                return EXIT_USAGE if not ProjectManifest::load_at(&root, &root_name, &root_version)
                 raw: mutable darray[u8] = []
                 raw.resize(1048577)
                 return EXIT_USAGE if not ProjectFiles::read_cstr_into("elisapkg.json", &raw)
-                return EXIT_USAGE if not validate_manifest_at(raw, &root, &root_name, &root_version)
+                return EXIT_USAGE if not ProjectManifest::validate_at(raw, &root, &root_name, &root_version)
                 updated: darray[u8] = ManifestEdits::remove(raw, alias)
                 if updated.count == 0.usize():
                     CliOutput::write_error("error: dependency is not declared; no manifest or lockfile mutation was performed\n")
@@ -2824,7 +2703,7 @@ module Cli:
                 return EXIT_USAGE if not ProjectFiles::read_cstr_into("elisapkg.json", &raw)
                 root_name: mutable darray[u8] = []
                 root_version: mutable darray[u8] = []
-                return EXIT_USAGE if not validate_manifest_at(raw, &root, &root_name, &root_version)
+                return EXIT_USAGE if not ProjectManifest::validate_at(raw, &root, &root_name, &root_version)
                 return EXIT_USAGE if wanted.count > 0.usize() and ByteText::equal(wanted, root_name)
                 return EXIT_SECURITY if not ProjectTransaction::begin(raw)
                 options: Model::CommandOptions = Model::CommandOptions{locked: false, offline: false, frozen: false, json: false, verbose: false, profile: "debug", target_name: "", target_kind: "", update_name: ""}
@@ -2910,7 +2789,7 @@ module Cli:
                 return EXIT_USAGE if not ProjectFiles::read_cstr_into("elisapkg.json", &raw)
                 name: mutable darray[u8] = []
                 version: mutable darray[u8] = []
-                return EXIT_SECURITY if not validate_manifest_at(raw, start, &name, &version)
+                return EXIT_SECURITY if not ProjectManifest::validate_at(raw, start, &name, &version)
                 lock: mutable darray[u8] = []
                 lock.resize(1048577)
                 return EXIT_SECURITY if not ProjectFiles::read_cstr_into("elisapkg.lock", &lock)
@@ -3060,7 +2939,7 @@ module Cli:
                 return EXIT_USAGE if not ProjectFiles::read_cstr_into("elisapkg.json", &raw)
                 package_name: mutable darray[u8] = []
                 package_version: mutable darray[u8] = []
-                return EXIT_USAGE if not validate_manifest_at(raw, start, &package_name, &package_version)
+                return EXIT_USAGE if not ProjectManifest::validate_at(raw, start, &package_name, &package_version)
                 entry: mutable darray[u8] = []
                 return EXIT_USAGE if not ManifestTargets::default_entry(raw, &entry)
                 paths: mutable darray[u8] = []
@@ -3217,7 +3096,7 @@ module Cli:
                 return false if not Platform::pkg_read_bounded_file(manifest_path, Json::max_document_bytes, &package_manifest)
                 actual_name: mutable darray[u8] = []
                 actual_version: mutable darray[u8] = []
-                return false if not validate_manifest_at(package_manifest, canonical_root, &actual_name, &actual_version)
+                return false if not ProjectManifest::validate_at(package_manifest, canonical_root, &actual_name, &actual_version)
                 return false if not ByteText::equal(actual_name, package_name) or not ByteText::equal(actual_version, package_version)
                 manifest_digest_bytes: mutable darray[u8] = []
                 manifest_digest: mutable darray[u8] = []
@@ -3287,7 +3166,7 @@ module Cli:
                 return EXIT_BUILD if not ProjectFiles::read_cstr_into("elisapkg.json", &manifest_raw)
                 root_name: mutable darray[u8] = []
                 root_version: mutable darray[u8] = []
-                return EXIT_BUILD if not validate_manifest_at(manifest_raw, start, &root_name, &root_version)
+                return EXIT_BUILD if not ProjectManifest::validate_at(manifest_raw, start, &root_name, &root_version)
                 manifest_digest_bytes: mutable darray[u8] = []
                 manifest_digest: mutable darray[u8] = []
                 return EXIT_BUILD if Integrity::sha256(manifest_raw, &manifest_digest_bytes) != Integrity::DigestCode.Ok
