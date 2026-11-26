@@ -1,0 +1,62 @@
+# Project discovery and working directory selection.
+include "../platform.elisa"
+include "../project/files.elisa"
+include "../project/manifest.elisa"
+include "../text/bytes.elisa"
+
+module ProjectContext:
+    public:
+        def manifest_exists() -> bool:
+            current: bool = ProjectFiles::cstr_file_exists("elisapkg.json")
+            legacy: bool = ProjectFiles::cstr_file_exists("manifest.json")
+            # Two manifests would create an ambiguous authority boundary. Refuse both
+            # rather than silently preferring one based on filename order.
+            return false if legacy
+            return current
+
+        def change_to_manifest_path(path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return true if change_directory(path)
+            last_separator: mutable usize = path.count
+            for index in 0..<path.count |path, last_separator|:
+                last_separator <- index if path[index] == 47
+            # A file-form manifest path is accepted only when its basename is the
+            # package manifest. Otherwise a typo such as `--manifest-path settings.json`
+            # would silently switch to a different `elisapkg.json` in the same parent.
+            manifest_leaf: mutable darray[u8] = []
+            leaf_start: usize = 0.usize() if last_separator == path.count else last_separator + 1.usize()
+            for index in leaf_start..<path.count |manifest_leaf, path|:
+                manifest_leaf.push(path[index])
+            return false if not ByteText::equal_text(manifest_leaf, "elisapkg.json")
+            parent: mutable darray[u8] = []
+            if last_separator == path.count:
+                parent.push(46)
+            elif last_separator == 0.usize():
+                parent.push(47)
+            else:
+                for index in 0..<last_separator |parent, path|:
+                    parent.push(path[index])
+            return change_directory(&parent)
+
+        def load_package(start: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            exists: bool = manifest_exists()
+            _ = start
+            return false if not exists
+            raw: mutable darray[u8] = []
+            # One extra byte distinguishes an oversized document from a valid document
+            # that happens to end exactly at the policy limit.
+            raw.resize(1048577)
+            return false if not ProjectFiles::read_cstr_into("elisapkg.json", &raw)
+            return false if raw.count == 0.usize()
+            name: mutable darray[u8] = []
+            version: mutable darray[u8] = []
+            valid: bool = ProjectManifest::validate(raw, &name, &version)
+            return false if not valid
+            return true
+
+    private:
+        def change_directory(path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return false if not ProjectFiles::valid_path_bytes(path)
+            path_c: mutable darray[u8] = []
+            ProjectFiles::path_with_nul_into(path, &path_c)
+            path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
+            return Platform::pkg_chdir(path_name) == 0

@@ -1,0 +1,447 @@
+# Fetch registry releases or verify their authenticated offline cache.
+include "../archive.elisa"
+include "../cache.elisa"
+include "../cache/registry.elisa"
+include "../integrity.elisa"
+include "../json.elisa"
+include "../package/model.elisa"
+include "../package/package_identity.elisa"
+include "../platform.elisa"
+include "../project/files.elisa"
+include "../project/lock_resolution.elisa"
+include "../project/lock_validation.elisa"
+include "../project/lockfile.elisa"
+include "../project/manifest.elisa"
+include "../project/schema_fields.elisa"
+include "../registry.elisa"
+include "../resolution/registry_roots.elisa"
+include "../resolution/semver.elisa"
+include "../resolution/solver.elisa"
+include "../text/bytes.elisa"
+include "./output.elisa"
+include "./project_context.elisa"
+
+module FetchCommand:
+    public:
+        def run(argc: i64, slots: mutable cstr&&, start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                positional_count: mutable i64 = 0
+                package: mutable darray[u8] = []
+                requirement: mutable darray[u8] = []
+                index: mutable i64 = 2
+                while index < argc:
+                    argument: cstr = slots[index].cast[cstr]
+                    if Platform::pkg_cstr_equal(argument, "--"):
+                        index <- index + 1
+                        return EXIT_USAGE if index < argc
+                        break
+                    if Platform::pkg_strlen(argument) == 0.usize():
+                        CliOutput::write_error("error: fetch does not accept empty arguments\n")
+                        return EXIT_USAGE
+                    if argument[0].u8() == 45:
+                        CliOutput::write_error("error: fetch does not accept command-specific options\n")
+                        return EXIT_USAGE
+                    if positional_count == 0:
+                        ByteText::append_bounded_text(&package, argument)
+                    elif positional_count == 1:
+                        ByteText::append_bounded_text(&requirement, argument)
+                    else:
+                        CliOutput::write_error("error: fetch accepts at most PACKAGE REQUIREMENT\n")
+                        return EXIT_USAGE
+                    positional_count <- positional_count + 1
+                    index <- index + 1
+                if positional_count > 0:
+                    return EXIT_USAGE if positional_count != 2
+                    if options.offline or options.frozen:
+                        CliOutput::write_error("error: offline fetch requires an existing lockfile; package-specific registry fetch is unavailable\n")
+                        return EXIT_RESOLVE
+                    if requirement.count == 0:
+                        CliOutput::write_error("error: fetch PACKAGE requires an exact SemVer requirement\n")
+                        return EXIT_USAGE
+                    exact_version: mutable Model::Version = Model::Version{major: 0,minor: 0,patch: 0,prerelease: false}
+                    return EXIT_USAGE if not SemVer::parse(requirement, &exact_version) or exact_version.prerelease
+                    selected: mutable darray[u8] = []
+                    archive: mutable darray[u8] = []
+                    digest: mutable darray[u8] = []
+                    metadata: mutable darray[u8] = []
+                    archive_size: mutable u64 = 0
+                    previous_version: Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
+                    selected_index_generation: mutable u64 = 0
+                    selected_index_digest: mutable darray[u8] = []
+                    selected_index_identity: mutable darray[u8] = []
+                    registry_status: Registry::ResultCode = Registry::resolve_with_index_evidence(package, requirement, previous_version, &selected, &archive, &digest, &archive_size, &metadata, &selected_index_generation, &selected_index_digest, &selected_index_identity)
+                    if registry_status != Registry::ResultCode.Ok:
+                        CliOutput::write_error("error: ")
+                        CliOutput::write_error(Registry::result_message(registry_status))
+                        CliOutput::write_error("\n")
+                        return EXIT_SECURITY if Registry::is_security_failure(registry_status)
+                        return EXIT_RESOLVE
+                    metadata_digest_bytes: mutable darray[u8] = []
+                    metadata_digest: mutable darray[u8] = []
+                    metadata_expires: mutable u64 = 0
+                    return EXIT_SECURITY if Integrity::sha256(metadata, &metadata_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(metadata_digest_bytes, &metadata_digest) or not Json::object_unsigned_value(metadata, 0, Json::object_end(metadata, 0), "expires", &metadata_expires)
+                    metadata_signature: mutable darray[u8] = []
+                    signature_status: Registry::ResultCode = Registry::read_signature(package, selected, &metadata_signature)
+                    return EXIT_SECURITY if signature_status != Registry::ResultCode.Ok
+                    snapshot_archive: mutable darray[u8] = []
+                    snapshot_digest: mutable darray[u8] = []
+                    snapshot_size: mutable u64 = 0
+                    snapshot_expires: mutable u64 = 0
+                    snapshot_dependencies: mutable darray[Solver::Constraint] = []
+                    snapshot_status: Registry::ResultCode = Registry::verify_metadata_snapshot(package, selected, metadata_digest, metadata, metadata_signature, &snapshot_archive, &snapshot_digest, &snapshot_size, &snapshot_expires, &snapshot_dependencies)
+                    return EXIT_SECURITY if snapshot_status != Registry::ResultCode.Ok or snapshot_expires != metadata_expires or not ByteText::equal(snapshot_archive, archive) or not ByteText::equal(snapshot_digest, digest) or snapshot_size != archive_size
+                    return EXIT_SECURITY if not RegistryCache::store_metadata(metadata_digest, metadata, metadata_signature)
+                    archive_bytes: mutable darray[u8] = []
+                    archive_status: Registry::ResultCode = Registry::read_archive(package, selected, metadata, archive, digest, archive_size, &archive_bytes)
+                    if archive_status != Registry::ResultCode.Ok:
+                        CliOutput::write_error("error: ")
+                        CliOutput::write_error(Registry::result_message(archive_status))
+                        CliOutput::write_error("\n")
+                        return EXIT_SECURITY if Registry::is_security_failure(archive_status)
+                        return EXIT_SOURCE
+                    trust_status: Registry::ResultCode = Registry::record_trusted_at_index(package, selected, digest, metadata_digest, snapshot_expires, selected_index_generation, selected_index_digest, selected_index_identity)
+                    if trust_status != Registry::ResultCode.Ok:
+                        CliOutput::write_error("error: ")
+                        CliOutput::write_error(Registry::result_message(trust_status))
+                        CliOutput::write_error(" while recording ")
+                        CliOutput::write_bytes(2, &package)
+                        CliOutput::write_error("\n")
+                        return EXIT_SECURITY
+                    return EXIT_SOURCE if not RegistryCache::store_archive(digest, archive_bytes)
+                    return EXIT_SECURITY if not RegistryCache::store_receipt(package, selected, archive, archive_size, digest, metadata_digest, metadata_expires)
+                    CliOutput::write_ok("verified registry artifact ")
+                    CliOutput::write_bytes(1, &package)
+                    CliOutput::write_ok(" ")
+                    CliOutput::write_bytes(1, &selected)
+                    CliOutput::write_ok(" sha256:")
+                    CliOutput::write_bytes(1, &digest)
+                    CliOutput::write_ok(" (cached)\n")
+                    _ = start
+                    _ = options
+                    return EXIT_OK
+                _ = options
+                if not ProjectContext::manifest_exists():
+                    CliOutput::write_error("error: could not find elisapkg.json in the current directory\n")
+                    return EXIT_USAGE
+                raw: mutable darray[u8] = []
+                raw.resize(1048577)
+                return EXIT_USAGE if not ProjectFiles::read_cstr_into("elisapkg.json", &raw)
+                name: mutable darray[u8] = []
+                version: mutable darray[u8] = []
+                return EXIT_RESOLVE if not ProjectManifest::validate_at(raw, start, &name, &version)
+                lock: mutable darray[u8] = []
+                lock.resize(1048577)
+                return EXIT_RESOLVE if not ProjectFiles::read_cstr_into("elisapkg.lock", &lock)
+                if Lockfile::version_is(lock, 3):
+                    return fetch_registry_lock_offline(raw, lock, name, version, start) if options.offline or options.frozen else fetch_registry_lock(raw, lock, name, version, start)
+                expected: darray[u8] = LockResolution::canonical(name, version, raw, start)
+                return EXIT_RESOLVE if expected.count == 0.usize() or not ByteText::equal(expected, lock)
+                CliOutput::write_ok("verified local locked sources\n")
+                return EXIT_OK
+
+    private:
+        const EXIT_OK: i64 = 0
+        const EXIT_USAGE: i64 = 2
+        const EXIT_RESOLVE: i64 = 3
+        const EXIT_SOURCE: i64 = 4
+        const EXIT_SECURITY: i64 = 5
+
+        def registry_offline_graph_closure(manifest: darray[u8]&, lock: darray[u8]&, starts: darray[usize]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            roots: mutable darray[Solver::Constraint] = []
+            has_local: mutable bool = false
+            return EXIT_RESOLVE if not RegistryRoots::collect(manifest, &roots, &has_local) or has_local or roots.count == 0.usize()
+            queued: mutable darray[bool] = []
+            queued.resize(starts.count)
+            pending: mutable darray[usize] = []
+            for index in 0..<roots.count |lock, starts, roots, queued, pending|:
+                matched_record: i64 = Lockfile::matching_registry_record(lock, starts, roots[index])
+                return EXIT_SECURITY if matched_record < 0
+                record_index: usize = matched_record.usize()
+                if not queued[record_index]:
+                    queued[record_index] <- true
+                    pending.push(record_index)
+            processed: mutable usize = 0.usize()
+            while processed < pending.count:
+                record_start: usize = starts[pending[processed]]
+                record_end: usize = Json::object_end(lock, record_start)
+                package: mutable darray[u8] = []
+                version_text: mutable darray[u8] = []
+                return EXIT_SECURITY if not Json::object_string_value(lock, record_start, record_end, "name", &package) or not Json::object_string_value(lock, record_start, record_end, "version", &version_text)
+                source_start: mutable usize = 0.usize()
+                source_end: mutable usize = 0.usize()
+                return EXIT_SECURITY if not Json::object_value_span(lock, record_start, record_end, "source", &source_start, &source_end)
+                archive: mutable darray[u8] = []
+                encoded_digest: mutable darray[u8] = []
+                encoded_metadata_digest: mutable darray[u8] = []
+                digest: mutable darray[u8] = []
+                metadata_digest: mutable darray[u8] = []
+                return EXIT_SECURITY if not Json::object_string_value(lock, source_start, source_end, "archive", &archive) or not Json::object_string_value(lock, record_start, record_end, "archive-digest", &encoded_digest) or not Json::object_string_value(lock, record_start, record_end, "metadata-digest", &encoded_metadata_digest)
+                return EXIT_SECURITY if not Lockfile::valid_sha256_field(encoded_digest) or not Lockfile::valid_sha256_field(encoded_metadata_digest)
+                for digest_index in 0..<64.usize() |encoded_digest, encoded_metadata_digest, digest, metadata_digest|:
+                    digest.push(encoded_digest[7.usize() + digest_index])
+                    metadata_digest.push(encoded_metadata_digest[7.usize() + digest_index])
+                archive_size: mutable u64 = 0
+                return EXIT_SECURITY if not Json::object_unsigned_value(lock, record_start, record_end, "archive-size", &archive_size)
+                cached_metadata: mutable darray[u8] = []
+                cached_signature: mutable darray[u8] = []
+                return EXIT_SECURITY if not RegistryCache::read_metadata(metadata_digest, &cached_metadata, &cached_signature)
+                resolved_archive: mutable darray[u8] = []
+                resolved_digest: mutable darray[u8] = []
+                resolved_size: mutable u64 = 0
+                expires: mutable u64 = 0
+                dependencies: mutable darray[Solver::Constraint] = []
+                status: Registry::ResultCode = Registry::verify_metadata_snapshot(package, version_text, metadata_digest, cached_metadata, cached_signature, &resolved_archive, &resolved_digest, &resolved_size, &expires, &dependencies)
+                return EXIT_SECURITY if status != Registry::ResultCode.Ok or not ByteText::equal(resolved_archive, archive) or not ByteText::equal(resolved_digest, digest) or resolved_size != archive_size
+                for dependency_index in 0..<dependencies.count |lock, starts, dependencies, queued, pending|:
+                    matched_record: i64 = Lockfile::matching_registry_record(lock, starts, dependencies[dependency_index])
+                    return EXIT_SECURITY if matched_record < 0
+                    record_index: usize = matched_record.usize()
+                    if not queued[record_index]:
+                        queued[record_index] <- true
+                        pending.push(record_index)
+                processed <- processed + 1.usize()
+            # Only distinct authenticated records enter the queue.
+            return EXIT_RESOLVE if starts.count != pending.count
+            return EXIT_OK
+
+        def fetch_registry_lock_offline(manifest: darray[u8]&, lock: darray[u8]&, root_name: darray[u8]&, root_version: darray[u8]&, start: darray[u8]&) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                return EXIT_RESOLVE if not LockValidation::matches_manifest(manifest, lock, root_name, root_version, start)
+                packages_start: usize = Json::root_value_offset(lock, "packages")
+                packages_end: usize = Json::array_end(lock, packages_start)
+                return EXIT_RESOLVE if packages_start >= lock.count or packages_end <= packages_start
+                starts: mutable darray[usize] = []
+                return EXIT_RESOLVE if not Lockfile::registry_record_starts(lock, packages_start, packages_end, &starts)
+                closure_status: i64 = registry_offline_graph_closure(manifest, lock, starts)
+                if closure_status != EXIT_OK:
+                    CliOutput::write_error("error: offline registry lock does not match its signed dependency graph\n") if closure_status == EXIT_RESOLVE
+                    return closure_status
+                cursor: mutable usize = packages_start + 1.usize()
+                fetched: mutable usize = 0.usize()
+                now: i64 = Platform::pkg_wall_clock_seconds()
+                return EXIT_SECURITY if now < 0
+                while cursor < packages_end:
+                    while cursor < packages_end and (lock[cursor] == 32 or lock[cursor] == 9 or lock[cursor] == 10 or lock[cursor] == 13) |lock, cursor|:
+                        cursor <- cursor + 1.usize()
+                    break if cursor == packages_end
+                    return EXIT_RESOLVE if lock[cursor] != 123
+                    record_end: usize = Json::object_end(lock, cursor)
+                    return EXIT_RESOLVE if record_end <= cursor or record_end >= packages_end or not SchemaFields::valid(lock, cursor, record_end, SchemaFields::Kind.RegistryLockRecord)
+                    package: mutable darray[u8] = []
+                    version_text: mutable darray[u8] = []
+                    return EXIT_RESOLVE if not Json::object_string_value(lock, cursor, record_end, "name", &package) or not Json::object_string_value(lock, cursor, record_end, "version", &version_text) or not PackageIdentity::valid_name(package)
+                    parsed_version: mutable Model::Version = Model::Version{major: 0,minor: 0,patch: 0,prerelease:false}
+                    return EXIT_RESOLVE if not SemVer::parse(version_text, &parsed_version) or parsed_version.prerelease
+                    source_start: mutable usize = 0.usize()
+                    source_end: mutable usize = 0.usize()
+                    return EXIT_RESOLVE if not Json::object_value_span(lock, cursor, record_end, "source", &source_start, &source_end) or not SchemaFields::valid(lock, source_start, source_end, SchemaFields::Kind.RegistryLockSource)
+                    source_type: mutable darray[u8] = []
+                    registry: mutable darray[u8] = []
+                    archive: mutable darray[u8] = []
+                    return EXIT_RESOLVE if not Json::object_string_value(lock, source_start, source_end, "type", &source_type) or not ByteText::equal_text(source_type, "registry") or not Json::object_string_value(lock, source_start, source_end, "registry", &registry) or not ByteText::equal_text(registry, "primary") or not Json::object_string_value(lock, source_start, source_end, "archive", &archive) or not Archive::is_safe_entry(archive)
+                    encoded_digest: mutable darray[u8] = []
+                    encoded_metadata_digest: mutable darray[u8] = []
+                    digest: mutable darray[u8] = []
+                    metadata_digest: mutable darray[u8] = []
+                    return EXIT_RESOLVE if not Json::object_string_value(lock, cursor, record_end, "archive-digest", &encoded_digest) or not Json::object_string_value(lock, cursor, record_end, "metadata-digest", &encoded_metadata_digest) or not Lockfile::valid_sha256_field(encoded_digest) or not Lockfile::valid_sha256_field(encoded_metadata_digest)
+                    for index in 0..<64.usize() |encoded_digest, encoded_metadata_digest, digest, metadata_digest|:
+                        digest.push(encoded_digest[7.usize() + index])
+                        metadata_digest.push(encoded_metadata_digest[7.usize() + index])
+                    archive_size: mutable u64 = 0
+                    return EXIT_RESOLVE if not Json::object_unsigned_value(lock, cursor, record_end, "archive-size", &archive_size) or archive_size > Archive::max_archive_bytes.u64()
+                    receipt: mutable darray[u8] = []
+                    return EXIT_SECURITY if not Cache::read_registry_receipt(digest, metadata_digest, &receipt)
+                    expires: mutable u64 = 0
+                    return EXIT_SECURITY if not Cache::registry_receipt_matches(receipt, package, version_text, archive, archive_size, digest, metadata_digest, &expires)
+                    return EXIT_SECURITY if expires <= now.u64()
+                    cached_metadata: mutable darray[u8] = []
+                    cached_signature: mutable darray[u8] = []
+                    return EXIT_SECURITY if not RegistryCache::read_metadata(metadata_digest, &cached_metadata, &cached_signature)
+                    resolved_archive: mutable darray[u8] = []
+                    resolved_digest: mutable darray[u8] = []
+                    resolved_size: mutable u64 = 0
+                    metadata_expires: mutable u64 = 0
+                    metadata_dependencies: mutable darray[Solver::Constraint] = []
+                    metadata_status: Registry::ResultCode = Registry::verify_metadata_snapshot(package, version_text, metadata_digest, cached_metadata, cached_signature, &resolved_archive, &resolved_digest, &resolved_size, &metadata_expires, &metadata_dependencies)
+                    return EXIT_SECURITY if metadata_status != Registry::ResultCode.Ok or not ByteText::equal(resolved_archive, archive) or not ByteText::equal(resolved_digest, digest) or resolved_size != archive_size or metadata_expires != expires
+                    for dependency_index in 0..<metadata_dependencies.count |lock, starts, metadata_dependencies, dependency_index|:
+                        return EXIT_SECURITY if Lockfile::matching_registry_record(lock, starts, metadata_dependencies[dependency_index]) < 0
+                    archive_bytes: mutable darray[u8] = []
+                    return EXIT_SECURITY if not Cache::read_verified_blob(digest, archive_size.usize(), &archive_bytes) or archive_bytes.count.u64() != archive_size or not Registry::release_archive_matches_metadata(package, version_text, cached_metadata, archive_bytes)
+                    # Only authenticated cache content may advance the durable
+                    # trust clock. Do this after snapshot, dependency, expiry, and
+                    # archive validation so rejected cache data cannot update it.
+                    trust_status: Registry::ResultCode = Registry::verify_trusted(package, version_text, digest, metadata_digest, metadata_expires)
+                    if trust_status != Registry::ResultCode.Ok:
+                        CliOutput::write_error("error: ")
+                        CliOutput::write_error(Registry::result_message(trust_status))
+                        CliOutput::write_error(" while using cached ")
+                        CliOutput::write_bytes(2, &package)
+                        CliOutput::write_error("\n")
+                        return EXIT_SECURITY
+                    CliOutput::write_ok("verified cached registry artifact ")
+                    CliOutput::write_bytes(1, &package)
+                    CliOutput::write_ok(" ")
+                    CliOutput::write_bytes(1, &version_text)
+                    CliOutput::write_ok(" sha256:")
+                    CliOutput::write_bytes(1, &digest)
+                    CliOutput::write_ok(" (offline)\n")
+                    fetched <- fetched + 1.usize()
+                    return EXIT_RESOLVE if fetched > 4096.usize()
+                    cursor <- record_end + 1.usize()
+                    while cursor < packages_end and (lock[cursor] == 32 or lock[cursor] == 9 or lock[cursor] == 10 or lock[cursor] == 13) |lock, cursor|:
+                        cursor <- cursor + 1.usize()
+                    if cursor < packages_end:
+                        return EXIT_RESOLVE if lock[cursor] != 44
+                        cursor <- cursor + 1.usize()
+                return EXIT_OK
+
+        def fetch_registry_lock(manifest: darray[u8]&, lock: darray[u8]&, root_name: darray[u8]&, root_version: darray[u8]&, start: darray[u8]&) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                return EXIT_RESOLVE if not Json::valid_document(lock) or not Json::unique_object_keys(lock) or not Lockfile::version_is(lock, 3)
+                # A lockfile is a graph contract, not merely a list of independently
+                # authenticated archives. Recompute the canonical graph from the signed
+                # registry metadata and compare bytes before any cache mutation. This
+                # rejects duplicate, omitted, reordered, or otherwise hand-edited records
+                # that could make fetch operate on a graph different from resolution.
+                expected_lock: darray[u8] = LockResolution::replay_registry(root_name, root_version, manifest, start, lock)
+                return EXIT_SECURITY if expected_lock.count == 0.usize()
+                return EXIT_RESOLVE if not ByteText::equal(expected_lock, lock)
+                lock_end: usize = Json::object_end(lock, 0)
+                return EXIT_RESOLVE if lock_end >= lock.count or not SchemaFields::valid(lock, 0, lock_end, SchemaFields::Kind.RegistryLock)
+                resolver: mutable darray[u8] = []
+                return EXIT_RESOLVE if not Json::object_string_value(lock, 0, Json::object_end(lock, 0), "resolver", &resolver) or not ByteText::equal_text(resolver, "elisapkg-registry-v1")
+                package_start: usize = Json::root_value_offset(lock, "package")
+                package_end: usize = Json::object_end(lock, package_start)
+                return EXIT_RESOLVE if package_start >= lock.count or package_end <= package_start
+                return EXIT_RESOLVE if not SchemaFields::valid(lock, package_start, package_end, SchemaFields::Kind.RegistryLockPackage)
+                locked_name: mutable darray[u8] = []
+                locked_version: mutable darray[u8] = []
+                return EXIT_RESOLVE if not Json::object_string_value(lock, package_start, package_end, "name", &locked_name) or not Json::object_string_value(lock, package_start, package_end, "version", &locked_version)
+                return EXIT_RESOLVE if not ByteText::equal(locked_name, root_name) or not ByteText::equal(locked_version, root_version)
+                manifest_digest_bytes: mutable darray[u8] = []
+                manifest_digest: mutable darray[u8] = []
+                return EXIT_SECURITY if Integrity::sha256(manifest, &manifest_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(manifest_digest_bytes, &manifest_digest)
+                return EXIT_RESOLVE if not Lockfile::sha256_field_equals(lock, package_start, package_end, "manifest-digest", manifest_digest)
+                packages_start: usize = Json::root_value_offset(lock, "packages")
+                packages_end: usize = Json::array_end(lock, packages_start)
+                return EXIT_RESOLVE if packages_start >= lock.count or packages_end <= packages_start
+                cursor: mutable usize = packages_start + 1.usize()
+                fetched: mutable usize = 0.usize()
+                while cursor < packages_end:
+                    while cursor < packages_end and (lock[cursor] == 32 or lock[cursor] == 9 or lock[cursor] == 10 or lock[cursor] == 13) |lock, cursor|:
+                        cursor <- cursor + 1.usize()
+                    break if cursor == packages_end
+                    return EXIT_RESOLVE if lock[cursor] != 123
+                    record_end: usize = Json::object_end(lock, cursor)
+                    return EXIT_RESOLVE if record_end <= cursor or record_end >= packages_end
+                    return EXIT_RESOLVE if not SchemaFields::valid(lock, cursor, record_end, SchemaFields::Kind.RegistryLockRecord)
+                    package: mutable darray[u8] = []
+                    version_text: mutable darray[u8] = []
+                    return EXIT_RESOLVE if not Json::object_string_value(lock, cursor, record_end, "name", &package) or not Json::object_string_value(lock, cursor, record_end, "version", &version_text) or not PackageIdentity::valid_name(package)
+                    parsed_version: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
+                    return EXIT_RESOLVE if not SemVer::parse(version_text, &parsed_version) or parsed_version.prerelease
+                    source_start: mutable usize = 0.usize()
+                    source_end: mutable usize = 0.usize()
+                    return EXIT_RESOLVE if not Json::object_value_span(lock, cursor, record_end, "source", &source_start, &source_end)
+                    return EXIT_RESOLVE if not SchemaFields::valid(lock, source_start, source_end, SchemaFields::Kind.RegistryLockSource)
+                    source_type: mutable darray[u8] = []
+                    registry: mutable darray[u8] = []
+                    archive: mutable darray[u8] = []
+                    return EXIT_RESOLVE if not Json::object_string_value(lock, source_start, source_end, "type", &source_type) or not ByteText::equal_text(source_type, "registry") or not Json::object_string_value(lock, source_start, source_end, "registry", &registry) or not ByteText::equal_text(registry, "primary") or not Json::object_string_value(lock, source_start, source_end, "archive", &archive) or not Archive::is_safe_entry(archive)
+                    encoded_digest: mutable darray[u8] = []
+                    encoded_metadata_digest: mutable darray[u8] = []
+                    digest: mutable darray[u8] = []
+                    metadata_digest: mutable darray[u8] = []
+                    return EXIT_RESOLVE if not Json::object_string_value(lock, cursor, record_end, "archive-digest", &encoded_digest) or not Json::object_string_value(lock, cursor, record_end, "metadata-digest", &encoded_metadata_digest)
+                    return EXIT_RESOLVE if encoded_digest.count != 71.usize() or encoded_metadata_digest.count != 71.usize()
+                    return EXIT_RESOLVE if encoded_digest[0] != 115 or encoded_digest[1] != 104 or encoded_digest[2] != 97 or encoded_digest[3] != 50 or encoded_digest[4] != 53 or encoded_digest[5] != 54 or encoded_digest[6] != 58 or encoded_metadata_digest[0] != 115 or encoded_metadata_digest[1] != 104 or encoded_metadata_digest[2] != 97 or encoded_metadata_digest[3] != 50 or encoded_metadata_digest[4] != 53 or encoded_metadata_digest[5] != 54 or encoded_metadata_digest[6] != 58
+                    for digest_index in 0..<64.usize() |encoded_digest, encoded_metadata_digest, digest, metadata_digest|:
+                        digest.push(encoded_digest[7.usize() + digest_index])
+                        metadata_digest.push(encoded_metadata_digest[7.usize() + digest_index])
+                    archive_size: mutable u64 = 0
+                    return EXIT_RESOLVE if not Json::object_unsigned_value(lock, cursor, record_end, "archive-size", &archive_size)
+                    exact: mutable darray[u8] = []
+                    Registry::exact_requirement(parsed_version, &exact)
+                    selected: mutable darray[u8] = []
+                    resolved_archive: mutable darray[u8] = []
+                    resolved_digest: mutable darray[u8] = []
+                    metadata: mutable darray[u8] = []
+                    resolved_size: mutable u64 = 0
+                    selected_index_generation: mutable u64 = 0
+                    selected_index_digest: mutable darray[u8] = []
+                    selected_index_identity: mutable darray[u8] = []
+                    registry_status: Registry::ResultCode = Registry::resolve_with_index_evidence(package, exact, Model::Version{major:0,minor:0,patch:0,prerelease:false}, &selected, &resolved_archive, &resolved_digest, &resolved_size, &metadata, &selected_index_generation, &selected_index_digest, &selected_index_identity)
+                    if registry_status != Registry::ResultCode.Ok:
+                        CliOutput::write_error("error: ")
+                        CliOutput::write_error(Registry::result_message(registry_status))
+                        CliOutput::write_error(" while verifying locked ")
+                        CliOutput::write_bytes(2, &package)
+                        CliOutput::write_error("\n")
+                        return EXIT_SECURITY if Registry::is_security_failure(registry_status)
+                        return EXIT_SOURCE
+                    if not ByteText::equal(selected, version_text):
+                        CliOutput::write_error("error: locked registry version does not match signed metadata\n")
+                        return EXIT_SECURITY
+                    if not ByteText::equal(resolved_archive, archive):
+                        CliOutput::write_error("error: locked registry archive name does not match signed metadata\n")
+                        return EXIT_SECURITY
+                    if not ByteText::equal(resolved_digest, digest):
+                        CliOutput::write_error("error: locked registry archive digest does not match signed metadata\n")
+                        return EXIT_SECURITY
+                    if resolved_size != archive_size:
+                        CliOutput::write_error("error: locked registry archive size does not match signed metadata\n")
+                        return EXIT_SECURITY
+                    metadata_digest_bytes: mutable darray[u8] = []
+                    computed_metadata_digest: mutable darray[u8] = []
+                    if Integrity::sha256(metadata, &metadata_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(metadata_digest_bytes, &computed_metadata_digest) or not ByteText::equal(computed_metadata_digest, metadata_digest):
+                        CliOutput::write_error("error: locked metadata digest does not match signed metadata\n")
+                        return EXIT_SECURITY
+                    metadata_expires: mutable u64 = 0
+                    return EXIT_SECURITY if not Json::object_unsigned_value(metadata, 0, Json::object_end(metadata, 0), "expires", &metadata_expires)
+                    metadata_signature: mutable darray[u8] = []
+                    signature_status: Registry::ResultCode = Registry::read_signature(package, selected, &metadata_signature)
+                    return EXIT_SECURITY if signature_status != Registry::ResultCode.Ok
+                    snapshot_archive: mutable darray[u8] = []
+                    snapshot_digest: mutable darray[u8] = []
+                    snapshot_size: mutable u64 = 0
+                    snapshot_expires: mutable u64 = 0
+                    snapshot_dependencies: mutable darray[Solver::Constraint] = []
+                    snapshot_status: Registry::ResultCode = Registry::verify_metadata_snapshot(package, selected, metadata_digest, metadata, metadata_signature, &snapshot_archive, &snapshot_digest, &snapshot_size, &snapshot_expires, &snapshot_dependencies)
+                    return EXIT_SECURITY if snapshot_status != Registry::ResultCode.Ok or snapshot_expires != metadata_expires or not RegistryCache::store_metadata(metadata_digest, metadata, metadata_signature)
+                    archive_bytes: mutable darray[u8] = []
+                    archive_status: Registry::ResultCode = Registry::read_archive(package, version_text, metadata, archive, digest, archive_size, &archive_bytes)
+                    if archive_status != Registry::ResultCode.Ok:
+                        CliOutput::write_error("error: ")
+                        CliOutput::write_error(Registry::result_message(archive_status))
+                        CliOutput::write_error(" for locked ")
+                        CliOutput::write_bytes(2, &package)
+                        CliOutput::write_error("\n")
+                        return EXIT_SECURITY if Registry::is_security_failure(archive_status)
+                        return EXIT_SOURCE
+                    trust_status: Registry::ResultCode = Registry::record_trusted_at_index(package, version_text, digest, metadata_digest, snapshot_expires, selected_index_generation, selected_index_digest, selected_index_identity)
+                    if trust_status != Registry::ResultCode.Ok:
+                        CliOutput::write_error("error: ")
+                        CliOutput::write_error(Registry::result_message(trust_status))
+                        CliOutput::write_error(" while recording locked ")
+                        CliOutput::write_bytes(2, &package)
+                        CliOutput::write_error("\n")
+                        return EXIT_SECURITY
+                    return EXIT_SOURCE if not RegistryCache::store_archive(digest, archive_bytes)
+                    return EXIT_SECURITY if not RegistryCache::store_receipt(package, version_text, archive, archive_size, digest, metadata_digest, metadata_expires)
+                    CliOutput::write_ok("verified locked registry artifact ")
+                    CliOutput::write_bytes(1, &package)
+                    CliOutput::write_ok(" ")
+                    CliOutput::write_bytes(1, &version_text)
+                    CliOutput::write_ok(" sha256:")
+                    CliOutput::write_bytes(1, &digest)
+                    CliOutput::write_ok(" (cached)\n")
+                    fetched <- fetched + 1.usize()
+                    return EXIT_RESOLVE if fetched > 4096.usize()
+                    cursor <- record_end + 1.usize()
+                    while cursor < packages_end and (lock[cursor] == 32 or lock[cursor] == 9 or lock[cursor] == 10 or lock[cursor] == 13) |lock, cursor|:
+                        cursor <- cursor + 1.usize()
+                    if cursor < packages_end:
+                        return EXIT_RESOLVE if lock[cursor] != 44
+                        cursor <- cursor + 1.usize()
+                return EXIT_OK
