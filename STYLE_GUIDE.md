@@ -7,9 +7,7 @@ Two principles, one idea:
 2. **Avoid plain statements whenever possible.** Prefer forms that produce a value over void
    statements whose effect is invisible at the use site.
 
-This guide aligns with `docs/119_expression_unification.md` (value blocks, loop values,
-captures); that document is the language reference, this one is the house style. The lint that
-enforces principle 1 is `-Wnever-leak` (section 7).
+For language semantics, see `docs/119_expression_unification.md` in the Elisa compiler checkout. This guide describes the package manager’s house style. The `-Wnever-leak` lint checks local scope and is documented in section 8.
 
 Status key: **[working]** examples compile with stage1 today; **[in progress]** and
 **[planned]** sections are design, not yet usable.
