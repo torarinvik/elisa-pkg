@@ -17,6 +17,7 @@ import subprocess
 import tarfile
 import tempfile
 from typing import Mapping
+import zlib
 
 
 GIT_SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
@@ -234,24 +235,44 @@ def verify_archive(
     # Check the bytes actually written. The build path may have been replaced
     # between recording its digest and opening it for packaging.
     try:
-        with tarfile.open(path, mode="r|gz") as archive:
-            binary_entry = require_archive_entry(archive, "elisapkg", expected_binary_size, 0o755)
-            with archive.extractfile(binary_entry) as binary:
-                digest = hashlib.sha256()
-                for chunk in iter(lambda: binary.read(1024 * 1024), b""):
-                    digest.update(chunk)
-            manifest_entry = require_archive_entry(
-                archive, "elisapkg.provenance.json", len(expected_manifest), 0o644
-            )
-            with archive.extractfile(manifest_entry) as manifest:
-                if digest.hexdigest() != expected_binary_digest or (
-                    manifest.read(MAX_MANIFEST_BYTES + 1) != expected_manifest
-                ):
-                    raise ProvenanceError("release archive inputs changed during packaging")
-            if archive.next() is not None:
-                raise ProvenanceError("release archive contains unexpected trailing members")
-    except (tarfile.TarError, EOFError) as error:
+        with gzip.open(path, "rb") as expanded:
+            verify_gzip_size(expanded, expected_binary_size, len(expected_manifest))
+            expanded.seek(0)
+            with tarfile.open(fileobj=expanded, mode="r|") as archive:
+                binary_entry = require_archive_entry(archive, "elisapkg", expected_binary_size, 0o755)
+                with archive.extractfile(binary_entry) as binary:
+                    digest = hashlib.sha256()
+                    for chunk in iter(lambda: binary.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                manifest_entry = require_archive_entry(
+                    archive, "elisapkg.provenance.json", len(expected_manifest), 0o644
+                )
+                with archive.extractfile(manifest_entry) as manifest:
+                    if digest.hexdigest() != expected_binary_digest or (
+                        manifest.read(MAX_MANIFEST_BYTES + 1) != expected_manifest
+                    ):
+                        raise ProvenanceError("release archive inputs changed during packaging")
+                if archive.next() is not None:
+                    raise ProvenanceError("release archive contains unexpected trailing members")
+    except (tarfile.TarError, gzip.BadGzipFile, EOFError, zlib.error) as error:
         raise ProvenanceError(f"could not read release archive: {error}") from error
+
+
+def verify_gzip_size(expanded: gzip.GzipFile, binary_size: int, manifest_size: int) -> None:
+    tar_size = 2 * tarfile.BLOCKSIZE
+    for size in (binary_size, manifest_size):
+        tar_size += tarfile.BLOCKSIZE
+        tar_size += (size + tarfile.BLOCKSIZE - 1) // tarfile.BLOCKSIZE * tarfile.BLOCKSIZE
+    expected_size = (tar_size + tarfile.RECORDSIZE - 1) // tarfile.RECORDSIZE * tarfile.RECORDSIZE
+    remaining = expected_size
+    while remaining:
+        chunk = expanded.read(min(remaining, 1024 * 1024))
+        if not chunk:
+            raise ProvenanceError("release archive expands to less than the expected tar size")
+        remaining -= len(chunk)
+    # Reading through EOF validates the gzip checksum and trailer.
+    if expanded.read(1):
+        raise ProvenanceError("release archive expands beyond the expected tar size")
 
 
 def require_archive_entry(
