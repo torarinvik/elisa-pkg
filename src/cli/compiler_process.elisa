@@ -6,6 +6,9 @@ include "../text/bytes.elisa"
 include "./output.elisa"
 
 module CompilerProcess:
+    private:
+        const callback_environment_prefix: cstr = "CALLBACK_PATH="
+
     public:
         struct Invocation:
             profile: cstr
@@ -19,6 +22,42 @@ module CompilerProcess:
             emit_kind: cstr
             output_path: cstr
             source_path: cstr
+
+        def prepare_callback_parameter(parameter: mutable darray[u8]&) -> usize can[Memory.Allocate, Abort.Panic]:
+            parameter.resize(0)
+            ByteText::append_text(parameter, callback_environment_prefix)
+            ByteText::append_text(parameter, "/private/tmp/elisa-stage1-callback-")
+            digits_offset: usize = parameter.count
+            ByteText::append_text(parameter, "00000000000000000000.c")
+            parameter.push(0)
+            return digits_offset
+
+        def remove_callback_file(parameter: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            path_offset: usize = Platform::pkg_strlen(callback_environment_prefix)
+            return false if parameter.count <= path_offset
+            path: cstr = (&parameter[path_offset]).cast[cstr] can Unsafe.PointerCast
+            status: i64 = Platform::pkg_unlink(path)
+            return status == 0 or status == -2
+
+        # Fill the reserved compiler callback filename with the child's PID.
+        def set_callback_path_pid(value: mutable darray[u8]&, digits_offset: usize, process_id: i64) -> bool:
+            return false if:
+                process_id <= 0
+                digits_offset >= value.count
+                value.count - digits_offset <= 22.usize()
+            digit_count: mutable usize = 1.usize()
+            remaining: mutable u64 = process_id.u64()
+            while remaining >= 10.u64() |remaining, digit_count|:
+                digit_count <- digit_count + 1.usize()
+                remaining <- remaining / 10.u64()
+            remaining <- process_id.u64()
+            for index in 0..<digit_count |value, digits_offset, digit_count, remaining|:
+                value[digits_offset + digit_count - index - 1.usize()] <- (48.u64() + remaining % 10.u64()).u8()
+                remaining <- remaining / 10.u64()
+            value[digits_offset + digit_count] <- 46
+            value[digits_offset + digit_count + 1.usize()] <- 99
+            value[digits_offset + digit_count + 2.usize()] <- 0
+            return true
 
         # Keep the environment buffers alive in this frame through fork and exec.
         def spawn(invocation: Invocation, sdk_root: darray[u8]&, developer_dir: darray[u8]&, callback_parameter: mutable darray[u8]&, callback_digits_offset: usize, sandbox_work_directory_fd: i64, compiler_stdout_fd: i64, compiler_stderr_fd: i64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -105,9 +144,10 @@ module CompilerProcess:
             pid: i64 = Platform::pkg_fork()
             if pid == 0:
                 process_id: i64 = Platform::pkg_process_id()
-                if not Toolchain::set_callback_path_pid(callback_parameter, callback_digits_offset, process_id):
+                if not set_callback_path_pid(callback_parameter, callback_digits_offset, process_id):
                     Platform::pkg_process_exit(126)
-                callback_file_name: cstr = (&callback_parameter[14]).cast[cstr] can Unsafe.PointerCast
+                callback_path_offset: usize = Platform::pkg_strlen(callback_environment_prefix)
+                callback_file_name: cstr = (&callback_parameter[callback_path_offset]).cast[cstr] can Unsafe.PointerCast
                 if Platform::pkg_create_exclusive_file(callback_file_name) != 0:
                     Platform::pkg_process_exit(126)
                 if Platform::pkg_set_process_group() != 0:
