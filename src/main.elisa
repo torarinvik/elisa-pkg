@@ -39,6 +39,7 @@ include "./source/snapshots.elisa"
 include "./resolution/local_build_graph.elisa"
 include "./project/transaction.elisa"
 include "./project/lockfile.elisa"
+include "./project/build_cache.elisa"
 include "./project/schema_fields.elisa"
 
 module Cli:
@@ -3800,25 +3801,18 @@ module Cli:
                     ProjectFiles::path_with_nul_into(&receipt_path, &receipt_c)
                     artifact_name: cstr = (&artifact_c[0]).cast[cstr] can Unsafe.PointerCast
                     receipt_name: cstr = (&receipt_c[0]).cast[cstr] can Unsafe.PointerCast
-                    if toolchain_identity_ok and ProjectFiles::cstr_file_exists(artifact_name) and ProjectFiles::cstr_file_exists(receipt_name) and Platform::pkg_access(artifact_name, artifact_access_mode) == 0:
-                        cached_receipt: mutable darray[u8] = []
-                        cached_artifact: mutable darray[u8] = []
-                        receipt_bytes: usize = Build::receipt_size(receipt.count)
-                        if Platform::pkg_read_bounded_file(receipt_path, receipt_bytes, &cached_receipt) and Build::receipt_header_matches(cached_receipt, receipt) and read_package_file_into(&artifact, &cached_artifact):
-                            cached_digest_bytes: mutable darray[u8] = []
-                            cached_digest: mutable darray[u8] = []
-                            if Integrity::sha256(cached_artifact, &cached_digest_bytes) == Integrity::DigestCode.Ok and Integrity::hex_digest(cached_digest_bytes, &cached_digest):
-                                if Build::receipt_digest_matches(cached_receipt, cached_digest):
-                                    if not BuildSnapshots::remove_all(source_snapshot_container_name, source_snapshot_roots):
-                                        CliOutput::write_error("error: unable to remove the verified build source snapshots\n")
-                                        return EXIT_BUILD
-                                    CliOutput::write_ok("built .elisapkg/build/")
-                                    CliOutput::write_bytes(1, &artifact_label)
-                                    CliOutput::write_ok(" (cached)\n")
-                                    for digest_index in 0..<cached_digest.count |out_artifact_digest, cached_digest|:
-                                        out_artifact_digest[digest_index] <- cached_digest[digest_index]
-                                    _ = options
-                                    return EXIT_OK
+                    cached_digest: mutable darray[u8] = []
+                    if toolchain_identity_ok and BuildCache::verified_digest(artifact, receipt_path, receipt, artifact_access_mode, &cached_digest):
+                        if not BuildSnapshots::remove_all(source_snapshot_container_name, source_snapshot_roots):
+                            CliOutput::write_error("error: unable to remove the verified build source snapshots\n")
+                            return EXIT_BUILD
+                        CliOutput::write_ok("built .elisapkg/build/")
+                        CliOutput::write_bytes(1, &artifact_label)
+                        CliOutput::write_ok(" (cached)\n")
+                        for digest_index in 0..<cached_digest.count |out_artifact_digest, cached_digest|:
+                            out_artifact_digest[digest_index] <- cached_digest[digest_index]
+                        _ = options
+                        return EXIT_OK
                     # The lock digest includes every resolved local dependency identity and
                     # source digest. Recompile whenever that graph changes instead of reusing a
                     # root-only artifact.
