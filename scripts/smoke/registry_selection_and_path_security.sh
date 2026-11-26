@@ -114,6 +114,16 @@ selected = {record["name"]: record["version"] for record in lock["packages"]}
 if selected != {"bar": "1.0.0", "foo": "1.0.0"}:
     raise SystemExit(f"initial dependency graph was not locked: {selected!r}")
 PY
+(
+  cd "$REGISTRY_GRAPH_APP"
+  export ELISAPKG_REGISTRY_DIR="$REGISTRY_GRAPH_ROOT"
+  export ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_GRAPH_KEY"
+  export ELISAPKG_TRUST_STATE="$REGISTRY_GRAPH_STATE"
+  "$BIN" fetch --locked >/dev/null
+  "$BIN" fetch --offline > "$REGISTRY_GRAPH_CASE/offline.stdout"
+)
+grep -F 'verified cached registry artifact bar 1.0.0' "$REGISTRY_GRAPH_CASE/offline.stdout" >/dev/null
+grep -F 'verified cached registry artifact foo 1.0.0' "$REGISTRY_GRAPH_CASE/offline.stdout" >/dev/null
 python3 - "$REGISTRY_GRAPH_APP/elisapkg.json" <<'PY'
 from pathlib import Path
 import json, sys
