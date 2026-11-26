@@ -511,10 +511,24 @@ def generate_candidate(
     manifest_path = output_dir / "elisapkg.provenance.json"
     archive_path = output_dir / "elisapkg-macos-arm64.tar.gz"
     checksum_path = output_dir / "elisapkg-macos-arm64.tar.gz.sha256"
-    atomic_write(manifest_path, manifest_bytes)
-    create_archive(binary, manifest_path, archive_path, binary_digest, binary_size, manifest_bytes)
-    checksum = f"{sha256_file(archive_path)}  {archive_path.name}\n".encode("ascii")
-    atomic_write(checksum_path, checksum)
+    try:
+        with tempfile.TemporaryDirectory(prefix=".candidate-", dir=output_dir) as staging:
+            staged = Path(staging)
+            manifest = staged / manifest_path.name
+            archive = staged / archive_path.name
+            checksum = staged / checksum_path.name
+            atomic_write(manifest, manifest_bytes)
+            create_archive(binary, manifest, archive, binary_digest, binary_size, manifest_bytes)
+            atomic_write(checksum, f"{sha256_file(archive)}  {archive.name}\n".encode("ascii"))
+            for destination in (manifest_path, archive_path, checksum_path):
+                os.replace(staged / destination.name, destination)
+            directory_fd = os.open(output_dir, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    except OSError as error:
+        raise ProvenanceError(f"could not publish release candidate: {error}") from error
     return manifest_path, archive_path, checksum_path
 
 

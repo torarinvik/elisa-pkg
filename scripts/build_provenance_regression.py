@@ -13,6 +13,7 @@ import subprocess
 import struct
 import tarfile
 import tempfile
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -226,6 +227,23 @@ def main() -> int:
         provenance.generate_candidate(**inputs)
         if manifest_path.read_bytes() != manifest_bytes or archive_path.read_bytes() != archive_bytes:
             raise SystemExit("error: identical release candidate inputs produced different archive bytes")
+
+        next_attempt = {**env, "GITHUB_RUN_ATTEMPT": "2"}
+        with patch.object(provenance, "create_archive", side_effect=provenance.ProvenanceError("archive fixture failure")):
+            try:
+                provenance.generate_candidate(**{**inputs, "env": next_attempt})
+            except provenance.ProvenanceError as error:
+                if str(error) != "archive fixture failure":
+                    raise
+            else:
+                raise SystemExit("error: release candidate ignored archive generation failure")
+        if (
+            manifest_path.read_bytes() != manifest_bytes
+            or archive_path.read_bytes() != archive_bytes
+            or checksum_path.read_text(encoding="ascii") != expected_checksum
+            or any(archive_path.parent.glob(".candidate-*"))
+        ):
+            raise SystemExit("error: archive generation failure changed published release files or left staging files")
 
         symlink = binary.parent / "elisapkg-alias"
         symlink.symlink_to(binary)
