@@ -29,6 +29,9 @@ module RegistryIndexSnapshot:
             return mark_yanked_versions(raw, versions, yanked_versions, yanked_flags_out)
 
     private:
+        const maximum_versions: usize = 4096.usize()
+        const maximum_version_line_bytes: usize = 128.usize()
+
         struct VersionEntry:
             version: Model::Version
             start: usize
@@ -36,15 +39,13 @@ module RegistryIndexSnapshot:
 
         def read_versions(raw: darray[u8]&, start_offset: usize, versions_out: mutable darray[u8]&, versions: mutable darray[VersionEntry]&, yanked_versions: mutable darray[VersionEntry]&) -> bool can[Memory.Allocate, Abort.Panic]:
             cursor: mutable usize = start_offset
-            previous: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-            previous_yanked: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
             reading_yanked: mutable bool = false
             while cursor < raw.count:
                 start: usize = cursor
                 finish: mutable usize = start
                 while finish < raw.count and raw[finish] != 10 |raw, finish|:
                     finish <- finish + 1
-                return false if finish == raw.count or finish == start or finish - start > 128
+                return false if finish == raw.count or finish == start or finish - start > maximum_version_line_bytes
                 version: mutable darray[u8] = []
                 for index in start..<finish |version, raw|:
                     return false if raw[index] < 33 or raw[index] == 127 or raw[index] == 92
@@ -57,21 +58,23 @@ module RegistryIndexSnapshot:
                 return false if not SemVer::parse(version, &parsed) or parsed.prerelease
                 entry: VersionEntry = VersionEntry{version: parsed, start: start, finish: finish}
                 if reading_yanked:
-                    return false if yanked_versions.count > 0.usize() and SemVer::compare(parsed, previous_yanked) <= 0
+                    return false if not follows_versions(yanked_versions, parsed)
                     yanked_versions.push(entry)
-                    previous_yanked <- parsed
                     return false if yanked_versions.count > versions.count
                 else:
                     # Stable versions must have strictly increasing precedence.
                     # This also rules out duplicate spellings and build variants.
-                    return false if versions.count > 0 and SemVer::compare(parsed, previous) <= 0
-                    previous <- parsed
+                    return false if not follows_versions(versions, parsed)
                     ByteText::append(versions_out, version)
                     versions_out.push(10)
                     versions.push(entry)
-                    return false if versions.count > 4096.usize()
+                    return false if versions.count > maximum_versions
                 cursor <- finish + 1
             return versions.count > 0.usize()
+
+        def follows_versions(entries: darray[VersionEntry]&, version: Model::Version) -> bool:
+            return true if entries.count == 0.usize()
+            return SemVer::compare(version, entries[entries.count - 1.usize()].version) > 0
 
         def mark_yanked_versions(raw: darray[u8]&, versions: darray[VersionEntry]&, yanked_versions: darray[VersionEntry]&, yanked_flags_out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
             yanked_index: mutable usize = 0
