@@ -74,6 +74,17 @@ state.bindings with {
 Keep the update at the scope where those changes occur; use `state.bindings` as the
 base when updating its fields, rather than mixing paths from different records.
 
+### Consecutive return guards
+
+Group adjacent guards that return the same value with `return if:` or
+`return VALUE if:`. Put one condition on each line in evaluation order.
+
+```elisa
+return false if:
+    start >= finish
+    finish > bytes.count
+```
+
 ## 2. Block expressions
 
 A binding whose initializer is an indented block; the last line is the value, and locals
