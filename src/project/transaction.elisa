@@ -46,16 +46,21 @@ module ProjectTransaction:
 
         def transaction_cleanup() -> bool can[Global{Read,Write}]:
             can Global{Read,Write}:
-                return false if not ProjectFiles::remove_cstr_file(".elisapkg/transaction.manifest")
-                return false if not ProjectFiles::remove_cstr_file(".elisapkg/transaction.lock")
-                return false if not ProjectFiles::remove_cstr_file(".elisapkg/transaction.new-manifest")
-                return false if not ProjectFiles::remove_cstr_file(".elisapkg/transaction.new-lock")
-                return false if not ProjectFiles::remove_cstr_file(".elisapkg/transaction.new-lock-missing")
-                guard: mutable darray[u8] = []
-                ByteText::append_text(&guard, ".elisapkg/transaction.guard")
-                return false if not ProjectFiles::remove_empty_directory(&guard)
-                return false if not ProjectFiles::remove_cstr_file(".elisapkg/transaction.state")
-                return transaction_lock_release()
+                cleaned: bool = remove_transaction_files()
+                released: bool = transaction_lock_release()
+                return cleaned and released
+
+        def remove_transaction_files() -> bool:
+            return false if:
+                not ProjectFiles::remove_cstr_file(".elisapkg/transaction.manifest")
+                not ProjectFiles::remove_cstr_file(".elisapkg/transaction.lock")
+                not ProjectFiles::remove_cstr_file(".elisapkg/transaction.new-manifest")
+                not ProjectFiles::remove_cstr_file(".elisapkg/transaction.new-lock")
+                not ProjectFiles::remove_cstr_file(".elisapkg/transaction.new-lock-missing")
+            guard: mutable darray[u8] = []
+            ByteText::append_text(&guard, ".elisapkg/transaction.guard")
+            return false if not ProjectFiles::remove_empty_directory(&guard)
+            return ProjectFiles::remove_cstr_file(".elisapkg/transaction.state")
 
         def report_recovery_error(message: cstr) -> void can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             bytes: mutable darray[u8] = []
@@ -163,6 +168,13 @@ module ProjectTransaction:
 
         def restore() -> bool can[Global{Read,Write}, Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             can Global{Read,Write}:
+                restored: bool = restore_journal()
+                released: bool = transaction_lock_release()
+                return restored and released
+
+    private:
+        def restore_journal() -> bool can[Global{Read,Write}, Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            can Global{Read,Write}:
                 state: mutable darray[u8] = []
                 state.resize(128)
                 return false if not ProjectFiles::read_cstr_into(".elisapkg/transaction.state", &state)
@@ -234,8 +246,9 @@ module ProjectTransaction:
                 restored_state: mutable darray[u8] = []
                 ByteText::append_text(&restored_state, "restored\n")
                 return false if not ProjectFiles::write_cstr_file(".elisapkg/transaction.state", &restored_state)
-                return transaction_cleanup()
+                return remove_transaction_files()
 
+    public:
         def recover() -> bool can[Global{Read,Write}, Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             can Global{Read,Write}:
                 transaction_state: mutable i64 = Platform::pkg_package_file_size(".elisapkg/transaction.state")
@@ -269,10 +282,7 @@ module ProjectTransaction:
                     # A crash before the first journal state is published cannot
                     # have changed the live manifest or lock. Remove any partial
                     # backups and the stale guard while holding the kernel lock.
-                    cleaned: bool = transaction_cleanup()
-                    if not cleaned:
-                        _ = transaction_lock_release()
-                    return cleaned
+                    return transaction_cleanup()
                 guard: mutable darray[u8] = []
                 ByteText::append_text(&guard, ".elisapkg/transaction.guard")
                 guard_c: mutable darray[u8] = []
@@ -290,17 +300,13 @@ module ProjectTransaction:
                 if not recognized:
                     _ = transaction_lock_release()
                     return false
-                recovered: bool = transaction_cleanup() if ByteText::equal_text(state, "complete\n") or ByteText::equal_text(state, "restored\n") else restore()
-                if not recovered:
-                    # Retain the journal and guard, but release the OS lock so a
-                    # later invocation can retry after an external edit or I/O
-                    # failure is repaired.
-                    _ = transaction_lock_release()
-                return recovered
+                return transaction_cleanup() if ByteText::equal_text(state, "complete\n") or ByteText::equal_text(state, "restored\n") else restore()
 
         def commit() -> bool can[Global{Read,Write}, Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             can Global{Read,Write}:
                 state: mutable darray[u8] = []
                 ByteText::append_text(&state, "complete\n")
-                return false if not ProjectFiles::write_cstr_file(".elisapkg/transaction.state", &state)
+                if not ProjectFiles::write_cstr_file(".elisapkg/transaction.state", &state):
+                    _ = transaction_lock_release()
+                    return false
                 return transaction_cleanup()
