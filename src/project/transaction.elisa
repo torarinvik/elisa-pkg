@@ -81,9 +81,9 @@ module ProjectTransaction:
 
         def live_file_matches(expected_path: cstr, live_path: cstr) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             expected: mutable darray[u8] = []
-            expected.resize(1048577)
+            expected.resize(ProjectFiles::project_document_limit)
             live: mutable darray[u8] = []
-            live.resize(1048577)
+            live.resize(ProjectFiles::project_document_limit)
             return false if:
                 not ProjectFiles::read_cstr_into(expected_path, &expected)
                 not ProjectFiles::read_cstr_into(live_path, &live)
@@ -142,7 +142,7 @@ module ProjectTransaction:
                 # live manifest again while holding the exclusive guard instead of
                 # overwriting a newer dependency edit from a stale snapshot.
                 current_manifest: mutable darray[u8] = []
-                current_manifest.resize(1048577)
+                current_manifest.resize(ProjectFiles::project_document_limit)
                 if not ProjectFiles::read_cstr_into(live_manifest_path, &current_manifest) or not ByteText::equal(current_manifest, original_manifest):
                     _ = transaction_abort_begin(guard)
                     return false
@@ -153,7 +153,7 @@ module ProjectTransaction:
                         return false
                     if current_lock_state >= 0:
                         current_lock: mutable darray[u8] = []
-                        current_lock.resize(1048577)
+                        current_lock.resize(ProjectFiles::project_document_limit)
                         if not ProjectFiles::read_cstr_into(live_lock_path, &current_lock) or not ByteText::equal(current_lock, expected_lock):
                             _ = transaction_abort_begin(guard)
                             return false
@@ -164,7 +164,7 @@ module ProjectTransaction:
                 lock_state: i64 = Platform::pkg_package_file_size(live_lock_path)
                 if lock_state >= 0:
                     original_lock: mutable darray[u8] = []
-                    original_lock.resize(1048577)
+                    original_lock.resize(ProjectFiles::project_document_limit)
                     if not ProjectFiles::read_cstr_into(live_lock_path, &original_lock) or not ProjectFiles::write_cstr_file(original_lock_path, &original_lock):
                         _ = transaction_cleanup()
                         return false
@@ -191,6 +191,9 @@ module ProjectTransaction:
             # either atomic rename boundary.
             can Global.Read:
                 return false if transaction_lock_fd < 0
+            if new_manifest.count > ProjectFiles::project_document_limit:
+                report_recovery_error("error: manifest replacement exceeds the project document size limit\n")
+                return false
             if Platform::pkg_package_file_size(staged_manifest_path) != -2:
                 report_recovery_error("error: a manifest replacement is already staged or its journal entry is unreadable\n")
                 return false
@@ -208,6 +211,9 @@ module ProjectTransaction:
             # recovery can distinguish publication from an external edit.
             can Global.Read:
                 return LockPublication.JournalFailed if transaction_lock_fd < 0
+            if new_lock.count > ProjectFiles::project_document_limit:
+                report_recovery_error("error: lockfile replacement exceeds the project document size limit\n")
+                return LockPublication.WriteFailed
             if Platform::pkg_package_file_size(staged_lock_path) != -2 or Platform::pkg_package_file_size(staged_missing_lock_path) != -2:
                 report_recovery_error("error: a lockfile replacement is already staged or its journal entry is unreadable\n")
                 return LockPublication.JournalFailed
@@ -237,14 +243,14 @@ module ProjectTransaction:
                     report_recovery_error("error: unrecognized project transaction state; preserve .elisapkg/transaction.* for recovery\n")
                     return false
                 original_manifest: mutable darray[u8] = []
-                original_manifest.resize(1048577)
+                original_manifest.resize(ProjectFiles::project_document_limit)
                 return false if not ProjectFiles::read_cstr_into(original_manifest_path, &original_manifest)
                 current_manifest: mutable darray[u8] = []
-                current_manifest.resize(1048577)
+                current_manifest.resize(ProjectFiles::project_document_limit)
                 return false if not ProjectFiles::read_cstr_into(live_manifest_path, &current_manifest)
                 if has_manifest_intent(state):
                     new_manifest: mutable darray[u8] = []
-                    new_manifest.resize(1048577)
+                    new_manifest.resize(ProjectFiles::project_document_limit)
                     return false if not ProjectFiles::read_cstr_into(staged_manifest_path, &new_manifest)
                     if not ByteText::equal(current_manifest, new_manifest) and not ByteText::equal(current_manifest, original_manifest):
                         report_recovery_error("error: transaction recovery found an external manifest edit; recovery files were retained\n")
@@ -263,7 +269,7 @@ module ProjectTransaction:
                     return false
                 original_lock: mutable darray[u8] = []
                 if original_lock_present:
-                    original_lock.resize(1048577)
+                    original_lock.resize(ProjectFiles::project_document_limit)
                     return false if not ProjectFiles::read_cstr_into(original_lock_path, &original_lock)
                 current_lock_state: i64 = Platform::pkg_package_file_size(live_lock_path)
                 return false if current_lock_state < 0 and current_lock_state != -2
@@ -279,11 +285,11 @@ module ProjectTransaction:
                     return false if not ProjectFiles::read_cstr_into(staged_missing_lock_path, &missing_lock_marker) or not ByteText::equal_text(missing_lock_marker, "missing\n")
                 if current_lock_present:
                     current_lock: mutable darray[u8] = []
-                    current_lock.resize(1048577)
+                    current_lock.resize(ProjectFiles::project_document_limit)
                     return false if not ProjectFiles::read_cstr_into(live_lock_path, &current_lock)
                     if new_lock_state >= 0:
                         new_lock: mutable darray[u8] = []
-                        new_lock.resize(1048577)
+                        new_lock.resize(ProjectFiles::project_document_limit)
                         return false if not ProjectFiles::read_cstr_into(staged_lock_path, &new_lock)
                         if not ByteText::equal(current_lock, new_lock) and (not original_lock_present or not ByteText::equal(current_lock, original_lock)):
                             report_recovery_error("error: transaction recovery found an external lockfile edit; recovery files were retained\n")
