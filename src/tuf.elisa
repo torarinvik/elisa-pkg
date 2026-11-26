@@ -68,33 +68,37 @@ module Tuf:
                 while finish < batch.count and batch[finish] != 10 |batch, finish|:
                     finish <- finish + 1.usize()
                 return ValidationCode.MalformedCheckpointBatch if finish == cursor or finish == batch.count
-                first_separator: mutable usize = cursor
-                while first_separator < finish and batch[first_separator] != 32 |batch, first_separator|:
-                    first_separator <- first_separator + 1.usize()
-                second_separator: mutable usize = first_separator + 1.usize()
-                while second_separator < finish and batch[second_separator] != 32 |batch, second_separator|:
-                    second_separator <- second_separator + 1.usize()
-                return ValidationCode.MalformedCheckpointBatch if:
-                    first_separator == cursor or second_separator >= finish or first_separator + 1.usize() == second_separator or second_separator + 1.usize() == finish
-                    contains_byte_between(batch, second_separator + 1.usize(), finish, 32)
-                role: mutable darray[u8] = []
-                for index in cursor..<first_separator |role, batch|:
-                    role <- role.push(batch[index])
-                return ValidationCode.MalformedCheckpointBatch if not valid_checkpoint_role(role)
-                return ValidationCode.ResourceLimit if role_count >= maximum_checkpoint_roles
-                if role_count > 0.usize():
-                    return ValidationCode.MalformedCheckpointBatch if compare_checkpoint_role(previous_role, role) >= 0
-                version: mutable darray[u8] = []
-                for index in (first_separator + 1.usize())..<second_separator |version, batch|:
-                    version <- version.push(batch[index])
-                region parsed_version_scope:
-                    parsed_version: mutable u64 = 0.u64()
-                    return ValidationCode.MalformedCheckpointBatch if not parse_checkpoint_version(version, &parsed_version)
-                return ValidationCode.MalformedHash if not Integrity::valid_sha256_hex_range(batch, second_separator + 1.usize(), finish)
-                previous_role <- role
+                region role_scope:
+                    role: mutable darray[u8] = []
+                    region line_status_scope:
+                        line_status: ValidationCode = validate_batch_line(batch, cursor, finish, &role)
+                        return line_status if line_status != ValidationCode.WellFormed
+                    return ValidationCode.ResourceLimit if role_count >= maximum_checkpoint_roles
+                    return ValidationCode.MalformedCheckpointBatch if role_count > 0.usize() and compare_checkpoint_role(previous_role, role) >= 0
+                    ByteText::replace(&previous_role, role)
                 role_count <- role_count + 1.usize()
                 cursor <- finish + 1.usize()
             return ValidationCode.MalformedCheckpointBatch if role_count == 0.usize()
+            return ValidationCode.WellFormed
+
+        # Check one "ROLE VERSION DIGEST" batch line spanning `cursor..<finish`
+        # and return its role.
+        def validate_batch_line(batch: darray[u8]&, cursor: usize, finish: usize, role: mutable darray[u8]&) -> ValidationCode can[Memory.Allocate, Abort.Panic]:
+            requires cursor < finish and finish < batch.count
+            first_separator: usize = while position < finish and batch[position] != 32 |position: usize = cursor| -> position:
+                position <- position + 1.usize()
+            second_separator: usize = while position < finish and batch[position] != 32 |position: usize = first_separator + 1.usize()| -> position:
+                position <- position + 1.usize()
+            return ValidationCode.MalformedCheckpointBatch if:
+                first_separator == cursor or second_separator >= finish or first_separator + 1.usize() == second_separator or second_separator + 1.usize() == finish
+                contains_byte_between(batch, second_separator + 1.usize(), finish, 32)
+            ByteText::append_range(role, batch, cursor, first_separator)
+            return ValidationCode.MalformedCheckpointBatch if not valid_checkpoint_role(role)
+            region version_scope:
+                version: darray[u8] = [batch[index] for index in (first_separator + 1.usize())..<second_separator]
+                parsed_version: mutable u64 = 0.u64()
+                return ValidationCode.MalformedCheckpointBatch if not parse_checkpoint_version(version, &parsed_version)
+            return ValidationCode.MalformedHash if not Integrity::valid_sha256_hex_range(batch, second_separator + 1.usize(), finish)
             return ValidationCode.WellFormed
 
         def valid_checkpoint_role(role: darray[u8]&) -> bool:
