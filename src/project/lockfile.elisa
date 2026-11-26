@@ -34,7 +34,7 @@ module Lockfile:
             previous_name: mutable darray[u8] = []
             cursor: mutable usize = packages_start + 1.usize()
             while true:
-                while cursor < packages_end and (lock[cursor] == 32 or lock[cursor] == 9 or lock[cursor] == 10 or lock[cursor] == 13) |lock, cursor|:
+                while cursor < packages_end and is_space(lock[cursor]) |lock, cursor|:
                     cursor <- cursor + 1.usize()
                 return false if cursor >= packages_end or lock[cursor] != 123 or starts.count >= maximum_registry_records
                 record_end: usize = Json::object_end(lock, cursor)
@@ -48,7 +48,7 @@ module Lockfile:
                 previous_name <- package_name
                 starts.push(cursor)
                 cursor <- record_end + 1.usize()
-                while cursor < packages_end and (lock[cursor] == 32 or lock[cursor] == 9 or lock[cursor] == 10 or lock[cursor] == 13) |lock, cursor|:
+                while cursor < packages_end and is_space(lock[cursor]) |lock, cursor|:
                     cursor <- cursor + 1.usize()
                 if cursor == packages_end:
                     for index in 0..<starts.count |out, starts|:
@@ -94,5 +94,38 @@ module Lockfile:
             return -1 if not SemVer::parse_requirement(wanted.requirement, &requirement) or not SemVer::matches(requirement, version)
             return record_index.i64()
 
+        # Match only direct records in the packages array.
+        def contains_package(raw: darray[u8]&, wanted: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            start: usize = Json::root_value_offset(raw, "packages")
+            if start >= raw.count or raw[start] != 91:
+                return false
+            finish: usize = Json::array_end(raw, start)
+            return false if finish <= start or finish >= raw.count
+            cursor: mutable usize = start + 1.usize()
+            while cursor < finish |raw, finish, cursor, wanted|:
+                while cursor < finish and is_space(raw[cursor]) |raw, finish, cursor|:
+                    cursor <- cursor + 1.usize()
+                return false if cursor >= finish or raw[cursor] != 123
+                record_end: usize = Json::object_end(raw, cursor)
+                return false if record_end <= cursor or record_end >= finish
+                package_name: mutable darray[u8] = []
+                return true if Json::object_string_value(raw, cursor, record_end, "name", &package_name) and ByteText::equal(package_name, wanted)
+                cursor <- record_end + 1.usize()
+                while cursor < finish and is_space(raw[cursor]) |raw, finish, cursor|:
+                    cursor <- cursor + 1.usize()
+                return false if cursor >= finish or raw[cursor] != 44
+                cursor <- cursor + 1.usize()
+            return false
+
+        def registry_satisfies_roots(lock: darray[u8]&, packages_start: usize, packages_end: usize, roots: darray[Solver::Constraint]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            starts: mutable darray[usize] = []
+            return false if not registry_record_starts(lock, packages_start, packages_end, &starts)
+            for root_index in 0..<roots.count |lock, starts, roots|:
+                return false if matching_registry_record(lock, starts, roots[root_index]) < 0
+            return true
+
     private:
         const maximum_registry_records: usize = 4096.usize()
+
+        def is_space(byte: u8) -> bool:
+            return byte == 32 or byte == 9 or byte == 10 or byte == 13
