@@ -43,7 +43,6 @@ module Cli:
         const BUILD_TIMEOUT_MS: i64 = 600000
         const PROGRAM_TIMEOUT_MS: i64 = 120000
         const MAX_DEPENDENCIES: usize = 4096
-        const MAX_TARGETS: usize = 4096
         const MAX_BUILD_GRAPH_EDGES: usize = 65536.usize()
         const MAX_BUILD_AGGREGATE_BYTES: usize = 33554432.usize()
         const MAX_BUILD_SNAPSHOT_BYTES: usize = 268435456.usize()
@@ -867,7 +866,7 @@ module Cli:
                     return false if not Json::object_string_value(raw, index, object_end, "entry", &target_entry)
                     return false if not safe_relative_entry(target_entry) or not target_file_is_valid(root, target_entry)
                     return false if dependency_alias_seen(seen, target_name)
-                    return false if found >= MAX_TARGETS
+                    return false if found >= ManifestTargets::max_targets
                     seen.push(0) if seen.count > 0.usize()
                     for name_index in 0..<target_name.count |seen, target_name|:
                         seen.push(target_name[name_index])
@@ -4003,49 +4002,14 @@ module Cli:
             write_ok("updated dependency lock\n")
             return EXIT_OK
 
-        def remove_target_outputs(raw: darray[u8]&, build_dir: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            return false if not Json::valid_document(raw) or not Json::unique_object_keys(raw)
-            outputs: mutable darray[darray[u8]] = []
-            targets_start: usize = Json::root_value_offset(raw, "targets")
-            return false if targets_start >= raw.count or raw[targets_start] != 91
-            targets_end: usize = Json::array_end(raw, targets_start)
-            return false if targets_end <= targets_start or targets_end >= raw.count
-            cursor: mutable usize = targets_start + 1.usize()
-            while cursor < targets_end:
-                while cursor < targets_end and (raw[cursor] == 32 or raw[cursor] == 9 or raw[cursor] == 10 or raw[cursor] == 13 or raw[cursor] == 44):
-                    cursor <- cursor + 1.usize()
-                break if cursor >= targets_end
-                return false if raw[cursor] != 123 or outputs.count >= 2.usize() * MAX_TARGETS
-                object_end: usize = Json::object_end(raw, cursor)
-                return false if object_end <= cursor or object_end >= targets_end
-                target_name: mutable darray[u8] = []
-                target_kind: mutable darray[u8] = []
-                return false if not Json::object_string_value(raw, cursor, object_end, "name", &target_name) or not Json::object_string_value(raw, cursor, object_end, "kind", &target_kind)
-                return false if not valid_package_name(target_name)
-                return false if not bytes_equal_view(target_kind, "bin") and not bytes_equal_view(target_kind, "lib") and not bytes_equal_view(target_kind, "test")
-                artifact_leaf_storage: mutable darray[u8] = []
-                for index in 0..<target_name.count |artifact_leaf_storage, target_name|:
-                    artifact_leaf_storage.push(target_name[index])
-                if bytes_equal_view(target_kind, "lib"):
-                    bytes_push_view(&artifact_leaf_storage, ".o")
-                artifact_leaf_storage.push(0)
-                artifact_leaf: cstr = (&artifact_leaf_storage[0]).cast[cstr] can Unsafe.PointerCast
-                artifact: mutable darray[u8] = []
-                path_join_into(build_dir, artifact_leaf, &artifact)
-                outputs.push(artifact)
-                receipt_leaf_storage: mutable darray[u8] = []
-                for index in 0..<target_name.count |receipt_leaf_storage, target_name|:
-                    receipt_leaf_storage.push(target_name[index])
-                bytes_push_view(&receipt_leaf_storage, ".receipt")
-                receipt_leaf_storage.push(0)
-                receipt_leaf: cstr = (&receipt_leaf_storage[0]).cast[cstr] can Unsafe.PointerCast
-                receipt: mutable darray[u8] = []
-                path_join_into(build_dir, receipt_leaf, &receipt)
-                outputs.push(receipt)
-                cursor <- object_end + 1.usize()
-            return false if outputs.count == 0.usize()
-            for index in 0..<outputs.count |outputs|:
-                return false if not remove_known_file(outputs[index])
+        def remove_target_outputs(leaves: darray[darray[u8]]&, build_dir: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            for index in 0..<leaves.count |leaves, build_dir|:
+                terminated: mutable darray[u8] = []
+                path_with_nul_into(leaves[index], &terminated)
+                leaf: cstr = (&terminated[0]).cast[cstr] can Unsafe.PointerCast
+                path: mutable darray[u8] = []
+                path_join_into(build_dir, leaf, &path)
+                return false if not remove_known_file(path)
             return true
 
         def run_clean() -> i64 can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -4070,8 +4034,10 @@ module Cli:
             manifest_raw: mutable darray[u8] = []
             manifest_raw.resize(1048577)
             if read_cstr_into("elisapkg.json", &manifest_raw):
-                return EXIT_BUILD if not remove_target_outputs(manifest_raw, &build_dir)
-                return EXIT_BUILD if not remove_target_outputs(manifest_raw, &release_build_dir)
+                output_leaves: mutable darray[darray[u8]] = []
+                return EXIT_BUILD if not ManifestTargets::cleanup_output_leaves(manifest_raw, &output_leaves)
+                return EXIT_BUILD if not remove_target_outputs(output_leaves, build_dir)
+                return EXIT_BUILD if not remove_target_outputs(output_leaves, release_build_dir)
             # Remove legacy single-target names left by older receipts as well as the
             # manifest-declared target outputs.
             return EXIT_BUILD if not remove_known_file(&artifact)
