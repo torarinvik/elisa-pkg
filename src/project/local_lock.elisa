@@ -86,32 +86,38 @@ module LocalLock:
         # to its source digest and to the manifest digest seen in traversal.
         def append_sorted_records(queue: darray[u8]&, record_starts: darray[usize]&, sorted_records: darray[usize]&, total: usize, traversed_manifest_digests: darray[u8]&, root_source_bytes: usize, body: mutable darray[u8]) -> darray[u8]? can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             graph_source_bytes: mutable usize = root_source_bytes
-            first: mutable bool = true
-            for sorted_position in 0..<total |body, first, graph_source_bytes|:
-                selected: usize = sorted_records[sorted_position]
-                return null if selected >= record_starts.count
-                selected_name: mutable darray[u8] = []
-                selected_path: mutable darray[u8] = []
-                selected_version: mutable darray[u8] = []
-                return null if not queue_field_at(queue, record_starts, selected, 0, &selected_path) or not queue_field_at(queue, record_starts, selected, 1, &selected_name) or not queue_field_at(queue, record_starts, selected, 2, &selected_version)
-                selected_manifest_path: mutable darray[u8] = []
-                ProjectFiles::path_join_into(&selected_path, "elisapkg.json", &selected_manifest_path)
-                selected_manifest: mutable darray[u8] = []
-                selected_source_digest: mutable darray[u8] = []
-                selected_source_bytes: mutable usize = 0.usize()
-                return null if graph_source_bytes > SourceFingerprint::maximum_snapshot_bytes or not SourceFingerprint::at_bounded(selected_path, &selected_source_digest, SourceFingerprint::maximum_snapshot_bytes - graph_source_bytes, &selected_source_bytes)
-                graph_source_bytes <- graph_source_bytes + selected_source_bytes
-                return null if not Platform::read_bounded_file(selected_manifest_path, Json::maximum_document_bytes, &selected_manifest)
-                selected_digest: mutable darray[u8] = []
-                return null if not verified_manifest_digest(selected_manifest, traversed_manifest_digests, selected, &selected_digest)
-                body <- body.push(44) if not first
-                record: dstr = dependency_record(selected_name, selected_version, selected_path, selected_digest, selected_source_digest)
+            for sorted_position in 0..<total |body, graph_source_bytes|:
+                record: darray[u8] = sorted_record(queue, record_starts, sorted_records[sorted_position], traversed_manifest_digests, &graph_source_bytes)
+                return null if record.count == 0.usize()
+                body <- body.push(44) if sorted_position > 0.usize()
                 for index in 0..<record.count |body, record|:
-                    body <- body.push(record[index].u8())
+                    body <- body.push(record[index])
                 # Reserve seven bytes for the closing array, object, and line endings.
                 return null if body.count > Lockfile::maximum_body_bytes
-                first <- false
             return body
+
+        # Render the dependency record of queue record `selected`, adding its
+        # source size to the bounded `graph_source_bytes` total. Returns an
+        # empty array when the record cannot be verified.
+        def sorted_record(queue: darray[u8]&, record_starts: darray[usize]&, selected: usize, traversed_manifest_digests: darray[u8]&, graph_source_bytes: mutable usize&) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return [] if selected >= record_starts.count
+            selected_name: mutable darray[u8] = []
+            selected_path: mutable darray[u8] = []
+            selected_version: mutable darray[u8] = []
+            return [] if not queue_field_at(queue, record_starts, selected, 0, &selected_path) or not queue_field_at(queue, record_starts, selected, 1, &selected_name) or not queue_field_at(queue, record_starts, selected, 2, &selected_version)
+            selected_source_digest: mutable darray[u8] = []
+            region selected_source_bytes_scope:
+                selected_source_bytes: mutable usize = 0.usize()
+                return [] if graph_source_bytes > SourceFingerprint::maximum_snapshot_bytes or not SourceFingerprint::at_bounded(selected_path, &selected_source_digest, SourceFingerprint::maximum_snapshot_bytes - graph_source_bytes, &selected_source_bytes)
+                graph_source_bytes <- graph_source_bytes + selected_source_bytes
+            selected_digest: mutable darray[u8] = []
+            selected_manifest_path: mutable darray[u8] = []
+            ProjectFiles::path_join_into(&selected_path, "elisapkg.json", &selected_manifest_path)
+            selected_manifest: mutable darray[u8] = []
+            return [] if not Platform::read_bounded_file(selected_manifest_path, Json::maximum_document_bytes, &selected_manifest)
+            return [] if not verified_manifest_digest(selected_manifest, traversed_manifest_digests, selected, &selected_digest)
+            record: dstr = dependency_record(selected_name, selected_version, selected_path, selected_digest, selected_source_digest)
+            return [record[index].u8() for index in 0..<record.count]
 
         def dependency_record(name: darray[u8]&, version: darray[u8]&, path: darray[u8]&, manifest_digest: darray[u8]&, source_digest: darray[u8]&) -> dstr can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             requires name.count > 0 and version.count > 0 and path.count > 0 and manifest_digest.count > 0 and source_digest.count > 0
