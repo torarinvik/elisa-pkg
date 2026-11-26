@@ -54,17 +54,20 @@ def main() -> int:
         if not path.exists():
             raise SystemExit(f"error: {label} is missing: {path}; set ELISA_COMPILER_ROOT")
 
-    native_source = (ROOT / "src/platform_native.elisa").read_text(encoding="utf-8")
+    native_source = (ROOT / "src/platform/ed25519.elisa").read_text(encoding="utf-8")
     verifier_start = native_source.find("def verify_ed25519(")
     verifier_end = native_source.find("    private:", verifier_start)
     if verifier_start < 0 or verifier_end < 0:
         raise SystemExit("error: could not locate the native Ed25519 verifier")
     verifier = native_source[verifier_start:verifier_end]
     child_start = verifier.find("if pid == 0:")
-    group_setup = verifier.find("if set_process_group() != 0:", child_start)
-    limits_setup = verifier.find("if set_process_limits(2) != 0:", child_start)
-    output_redirect = verifier.find("duplicate_fd(null_fd, 2) != 2", child_start)
-    descriptor_close = verifier.find("if close_inherited_fds() != 0:", child_start)
+    group_setup = verifier.find("if NativeProcess::set_process_group() != 0:", child_start)
+    limits_setup = verifier.find("if NativeProcess::set_process_limits(2) != 0:", child_start)
+    redirects = [
+        verifier.find(f"PlatformNative::duplicate_fd(null_fd, {descriptor}) != {descriptor}", child_start)
+        for descriptor in range(3)
+    ]
+    descriptor_close = verifier.find("if PlatformNative::close_inherited_fds() != 0:", child_start)
     provider_exec = verifier.find(
         "_ = native_execve(openssl, raw_child_argv, raw_child_environment)", child_start
     )
@@ -72,7 +75,8 @@ def main() -> int:
     environment_pointer = verifier.find("raw_child_environment: void& = child_environment.cast[void&]")
     if not (
         0 <= empty_environment < environment_pointer < child_start
-        < group_setup < limits_setup < output_redirect < descriptor_close < provider_exec
+        < group_setup < limits_setup < redirects[0] < redirects[1] < redirects[2]
+        < descriptor_close < provider_exec
     ):
         raise SystemExit(
             "error: crypto provider launch must close inherited descriptors and exec with an empty environment"
@@ -149,18 +153,18 @@ def main() -> int:
         probe = work / "provider_trust_probe.elisa"
         binary = work / "provider_trust_probe"
         lines = [
-            f'include "{ROOT / "src/platform_native.elisa"}"',
+            f'include "{ROOT / "src/platform/ed25519.elisa"}"',
             "",
             "def main() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:",
             f'    fake_path: mutable darray[u8] = [{elisa_bytes(fake_provider)}]',
             '    fake_name: cstr = (&fake_path[0]).cast[cstr] can Unsafe.PointerCast',
-            '    return 1 if PlatformNative::is_trusted_crypto_executable(fake_name, 0.u64())',
+            '    return 1 if NativeTrustedPaths::is_trusted_crypto_executable(fake_name, 0.u64())',
             f'    fake_group_path: mutable darray[u8] = [{elisa_bytes(fake_group_provider)}]',
             '    fake_group_name: cstr = (&fake_group_path[0]).cast[cstr] can Unsafe.PointerCast',
-            f'    return 6 if PlatformNative::is_trusted_crypto_executable(fake_group_name, {expected_user_uid}.u64())',
+            f'    return 6 if NativeTrustedPaths::is_trusted_crypto_executable(fake_group_name, {expected_user_uid}.u64())',
             f'    system_path: mutable darray[u8] = [{elisa_bytes(trusted_provider)}]',
             '    system_name: cstr = (&system_path[0]).cast[cstr] can Unsafe.PointerCast',
-            '    return 2 if not PlatformNative::is_trusted_crypto_executable(system_name, 0.u64())',
+            '    return 2 if not NativeTrustedPaths::is_trusted_crypto_executable(system_name, 0.u64())',
             '    has_current_provider: mutable bool = false',
         ]
         if os.geteuid() != 0:
@@ -168,7 +172,7 @@ def main() -> int:
                 [
                     f'    group_only_path: mutable darray[u8] = [{elisa_bytes(fake_group_only_provider)}]',
                     '    group_only_name: cstr = (&group_only_path[0]).cast[cstr] can Unsafe.PointerCast',
-                    f'    return 7 if PlatformNative::is_trusted_crypto_executable(group_only_name, {os.geteuid()}.u64())',
+                    f'    return 7 if NativeTrustedPaths::is_trusted_crypto_executable(group_only_name, {os.geteuid()}.u64())',
                 ]
             )
         for index, candidate in enumerate(candidates):
@@ -176,7 +180,7 @@ def main() -> int:
                 [
                     f'    candidate_path_{index}: mutable darray[u8] = [{elisa_bytes(candidate)}]',
                     f'    candidate_name_{index}: cstr = (&candidate_path_{index}[0]).cast[cstr] can Unsafe.PointerCast',
-                    f'    candidate_trusted_{index}: bool = PlatformNative::is_trusted_crypto_executable(candidate_name_{index}, {os.geteuid()}.u64())',
+                    f'    candidate_trusted_{index}: bool = NativeTrustedPaths::is_trusted_crypto_executable(candidate_name_{index}, {os.geteuid()}.u64())',
                     f'    has_current_provider <- true if candidate_trusted_{index}',
                 ]
             )
@@ -189,7 +193,7 @@ def main() -> int:
                 [
                     f'    homebrew_path: mutable darray[u8] = [{elisa_bytes(homebrew_candidate)}]',
                     '    homebrew_name: cstr = (&homebrew_path[0]).cast[cstr] can Unsafe.PointerCast',
-                    f'    return 4 if not PlatformNative::is_trusted_crypto_executable(homebrew_name, {os.geteuid()}.u64())',
+                    f'    return 4 if not NativeTrustedPaths::is_trusted_crypto_executable(homebrew_name, {os.geteuid()}.u64())',
                 ]
             )
         public_key = bytes.fromhex("3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c")
@@ -204,7 +208,7 @@ def main() -> int:
                 f'    public_key: mutable darray[u8] = [{", ".join(str(byte) for byte in public_key)}]',
                 '    message: mutable darray[u8] = [114]',
                 f'    signature: mutable darray[u8] = [{", ".join(str(byte) for byte in signature)}]',
-                '    return 5 if PlatformNative::verify_ed25519(public_key, message, signature) != 0',
+                '    return 5 if NativeEd25519::verify_ed25519(public_key, message, signature) != 0',
                 '    return 0',
             ]
         )
@@ -214,7 +218,7 @@ def main() -> int:
         environment["ELISA_RUNTIME_OBJ"] = str(RUNTIME)
         environment.setdefault("ELISA_ALLOW_STALE_STAGE1", "0")
         subprocess.run(
-            [str(WRAPPER), "-emit", "exe", "-o", str(binary), str(probe)],
+            [str(WRAPPER), "-Wnever-leak=strict", "-emit", "exe", "-o", str(binary), str(probe)],
             cwd=work,
             env=environment,
             check=True,
