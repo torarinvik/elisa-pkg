@@ -38,13 +38,13 @@ module NativeFileMutation:
             return unlink_verified_identity(path, device, inode)
 
         def rmdir(path: cstr) -> i64:
-            return rmdir_secure(path)
+            return unlink_kind(path, at_remove_directory)
 
         def link(old_path: cstr, new_path: cstr) -> i64:
             return link_or_rename(old_path, new_path, false)
 
         def rename(old_path: cstr, new_path: cstr) -> i64:
-            return rename_secure(old_path, new_path)
+            return link_or_rename(old_path, new_path, true)
 
         def mkstemp(template_path: mutable darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return create_temporary(template_path, false)
@@ -143,71 +143,6 @@ module NativeFileMutation:
             return PlatformNative::close_result(directory, 0) if native_fsync(directory) == 0
             return PlatformNative::close_error(directory, NativeErrors::negative_value(NativeErrors::current_errno()))
 
-        def rmdir_secure(path: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            parent: mutable darray[u8] = []
-            leaf: mutable darray[u8] = []
-            return -22 if not PlatformNative::split_parent_leaf(path, &parent, &leaf)
-            leaf_snapshot: mutable darray[u8] = []
-            for index in 0..<leaf.count |leaf_snapshot, leaf|:
-                leaf_snapshot <- leaf_snapshot.push(leaf[index])
-            parent_directory: i64 =
-                parent_name: cstr = (&parent[0]).cast[cstr] can Unsafe.PointerCast
-                PlatformNative::open_directory_path(parent_name)
-            return parent_directory if parent_directory < 0
-            removed: i64 =
-                leaf_c: mutable darray[u8] = []
-                for index in 0..<leaf_snapshot.count |leaf_c, leaf_snapshot|:
-                    leaf_c <- leaf_c.push(leaf_snapshot[index])
-                leaf_name: cstr = (&leaf_c[0]).cast[cstr] can Unsafe.PointerCast
-                native_unlinkat(parent_directory, leaf_name, at_remove_directory)
-            errno_value: i64 = NativeErrors::error_code()
-            if removed == 0:
-                sync_status: i64 = native_fsync(parent_directory)
-                sync_errno: i64 = NativeErrors::error_code()
-                return PlatformNative::close_result(parent_directory, 0) if sync_status == 0
-                return PlatformNative::close_error(parent_directory, NativeErrors::negative_value(sync_errno))
-            return PlatformNative::close_error(parent_directory, NativeErrors::negative_value(errno_value))
-
-        def rename_secure(old_path: cstr, new_path: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            old_parent: mutable darray[u8] = []
-            old_leaf: mutable darray[u8] = []
-            new_parent: mutable darray[u8] = []
-            new_leaf: mutable darray[u8] = []
-            return -22 if not PlatformNative::split_parent_leaf(old_path, &old_parent, &old_leaf) or not PlatformNative::split_parent_leaf(new_path, &new_parent, &new_leaf)
-            old_leaf_snapshot: darray[u8] = byte_copy(old_leaf)
-            new_parent_snapshot: darray[u8] = byte_copy(new_parent)
-            new_leaf_snapshot: darray[u8] = byte_copy(new_leaf)
-            old_directory: i64 =
-                old_name: cstr = (&old_parent[0]).cast[cstr] can Unsafe.PointerCast
-                PlatformNative::open_directory_path(old_name)
-            return old_directory if old_directory < 0
-            new_directory: i64 =
-                new_parent_c: darray[u8] = byte_copy(new_parent_snapshot)
-                new_name: cstr = (&new_parent_c[0]).cast[cstr] can Unsafe.PointerCast
-                PlatformNative::open_directory_path(new_name)
-            return PlatformNative::close_error(old_directory, new_directory) if new_directory < 0
-            # The source is checked by descriptor and then acted on by name.
-            # Both already-open parents must exclude writes by other users, so
-            # an untrusted directory cannot swap that name between validation
-            # and rename.
-            region source_status_scope:
-                source_status: i64 = check_trusted_source(old_directory, new_directory, old_leaf_snapshot)
-                return PlatformNative::close_two_error(old_directory, new_directory, source_status) if source_status != 0
-            region destination_status_scope:
-                destination_status: i64 = check_replaceable_destination(new_directory, new_leaf_snapshot)
-                return PlatformNative::close_two_error(old_directory, new_directory, destination_status) if destination_status != 0
-            result: i64 =
-                old_rename_leaf: darray[u8] = byte_copy(old_leaf_snapshot)
-                new_rename_leaf: darray[u8] = byte_copy(new_leaf_snapshot)
-                old_rename_name: cstr = (&old_rename_leaf[0]).cast[cstr] can Unsafe.PointerCast
-                new_rename_name: cstr = (&new_rename_leaf[0]).cast[cstr] can Unsafe.PointerCast
-                native_renameat(old_directory, old_rename_name, new_directory, new_rename_name)
-            result_errno: i64 = NativeErrors::error_code()
-            return PlatformNative::close_two_result(old_directory, new_directory, 0) if result == 0
-            return PlatformNative::close_two_error(old_directory, new_directory, -result_errno)
-
-        # The destination name is absent or a trusted regular file. Returns 0
-        # or a negative errno.
         def check_replaceable_destination(new_directory: i64, new_leaf: darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             destination_file_descriptor: i64 =
                 new_leaf_c: darray[u8] = byte_copy(new_leaf)
@@ -280,66 +215,39 @@ module NativeFileMutation:
             return 0
 
         def unlink_kind(path: cstr, flags: i64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            parent: mutable darray[u8] = []
             leaf: mutable darray[u8] = []
-            return -22 if not PlatformNative::split_parent_leaf(path, &parent, &leaf)
-            leaf_snapshot: mutable darray[u8] = []
-            for index in 0..<leaf.count |leaf_snapshot, leaf|:
-                leaf_snapshot <- leaf_snapshot.push(leaf[index])
-            directory: i64 =
-                parent_name: cstr = (&parent[0]).cast[cstr] can Unsafe.PointerCast
-                PlatformNative::open_directory_path(parent_name)
+            directory: i64 = open_parent_directory(path, false, &leaf)
             return directory if directory < 0
-            result: i64 =
-                leaf_c: mutable darray[u8] = []
-                for index in 0..<leaf_snapshot.count |leaf_c, leaf_snapshot|:
-                    leaf_c <- leaf_c.push(leaf_snapshot[index])
-                leaf_c <- leaf_c.push(0)
-                leaf_name: cstr = (&leaf_c[0]).cast[cstr] can Unsafe.PointerCast
-                native_unlinkat(directory, leaf_name, flags)
-            errno_value: i64 = NativeErrors::error_code()
-            if result == 0:
-                sync_status: i64 = native_fsync(directory)
-                sync_errno: i64 = NativeErrors::error_code()
-                return PlatformNative::close_result(directory, 0) if sync_status == 0
-                return PlatformNative::close_error(directory, NativeErrors::negative_value(sync_errno))
-            return PlatformNative::close_error(directory, NativeErrors::negative_value(errno_value))
+            return sync_and_close(directory) if native_unlinkat(directory, ((&leaf[0]).cast[cstr] can Unsafe.PointerCast), flags) == 0
+            return PlatformNative::close_error(directory, NativeErrors::negative_errno())
 
+        # Rename (`is_move`) or hard-link `old_path` to `new_path`. A rename
+        # may replace a trusted regular file; a link needs an absent name.
         def link_or_rename(old_path: cstr, new_path: cstr, is_move: bool) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            old_parent: mutable darray[u8] = []
             old_leaf: mutable darray[u8] = []
-            new_parent: mutable darray[u8] = []
             new_leaf: mutable darray[u8] = []
-            return -22 if not PlatformNative::split_parent_leaf(old_path, &old_parent, &old_leaf) or not PlatformNative::split_parent_leaf(new_path, &new_parent, &new_leaf)
-            # Native calls may invalidate caller-owned array headers, so each
-            # call below receives a fresh copy of the name it needs.
-            old_leaf_snapshot: darray[u8] = byte_copy(old_leaf)
-            new_parent_snapshot: darray[u8] = byte_copy(new_parent)
-            new_leaf_snapshot: darray[u8] = byte_copy(new_leaf)
-            old_directory: i64 =
-                old_name: cstr = (&old_parent[0]).cast[cstr] can Unsafe.PointerCast
-                PlatformNative::open_directory_path(old_name)
+            old_directory: i64 = open_parent_directory(old_path, false, &old_leaf)
             return old_directory if old_directory < 0
-            new_directory: i64 =
-                new_parent_c: darray[u8] = byte_copy(new_parent_snapshot)
-                new_name: cstr = (&new_parent_c[0]).cast[cstr] can Unsafe.PointerCast
-                PlatformNative::open_directory_path(new_name)
+            new_directory: i64 = open_parent_directory(new_path, false, &new_leaf)
             return PlatformNative::close_error(old_directory, new_directory) if new_directory < 0
+            return link_or_rename_at(old_directory, new_directory, old_leaf, new_leaf, is_move)
+
+        # The source is checked by descriptor and then acted on by name. Both
+        # already-open parents must exclude writes by other users, so an
+        # untrusted directory cannot swap that name between validation and
+        # the rename or link.
+        def link_or_rename_at(old_directory: i64, new_directory: i64, old_leaf: darray[u8]&, new_leaf: darray[u8]&, is_move: bool) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            requires old_directory >= 0 and new_directory >= 0
             region source_status_scope:
-                source_status: i64 = check_trusted_source(old_directory, new_directory, old_leaf_snapshot)
+                source_status: i64 = check_trusted_source(old_directory, new_directory, old_leaf)
                 return PlatformNative::close_two_error(old_directory, new_directory, source_status) if source_status != 0
             region destination_status_scope:
-                destination_status: i64 = check_destination(new_directory, new_leaf_snapshot, is_move)
+                destination_status: i64 = check_replaceable_destination(new_directory, new_leaf) if is_move else check_destination(new_directory, new_leaf, false)
                 return PlatformNative::close_two_error(old_directory, new_directory, destination_status) if destination_status != 0
-            result: i64 =
-                old_leaf_c: darray[u8] = byte_copy(old_leaf_snapshot)
-                new_leaf_c: darray[u8] = byte_copy(new_leaf_snapshot)
-                old_leaf_name: cstr = (&old_leaf_c[0]).cast[cstr] can Unsafe.PointerCast
-                new_leaf_name: cstr = (&new_leaf_c[0]).cast[cstr] can Unsafe.PointerCast
-                native_renameat(old_directory, old_leaf_name, new_directory, new_leaf_name) if is_move else native_linkat(old_directory, old_leaf_name, new_directory, new_leaf_name, 0)
-            errno_value: i64 = NativeErrors::error_code()
-            return PlatformNative::close_two_result(old_directory, new_directory, 0) if result == 0
-            return PlatformNative::close_two_error(old_directory, new_directory, NativeErrors::negative_value(errno_value))
+            region result_scope:
+                result: i64 = native_renameat(old_directory, ((&old_leaf[0]).cast[cstr] can Unsafe.PointerCast), new_directory, ((&new_leaf[0]).cast[cstr] can Unsafe.PointerCast)) if is_move else native_linkat(old_directory, ((&old_leaf[0]).cast[cstr] can Unsafe.PointerCast), new_directory, ((&new_leaf[0]).cast[cstr] can Unsafe.PointerCast), 0)
+                return PlatformNative::close_two_result(old_directory, new_directory, 0) if result == 0
+            return PlatformNative::close_two_error(old_directory, new_directory, NativeErrors::negative_errno())
 
         def byte_copy(bytes: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
             return [bytes[index] for index in 0..<bytes.count]
