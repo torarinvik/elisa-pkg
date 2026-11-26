@@ -28,9 +28,7 @@ module RollbackRecords:
             digest_out.resize(0)
             metadata_digest_out.resize(0)
             is_v2: bool = version_2(state)
-            is_v3: bool = version_3(state)
-            is_v4: bool = version_4(state)
-            return Code.Malformed if not is_v2 and not is_v3 and not is_v4
+            return Code.Malformed if not is_v2 and not version_3(state) and not version_4(state)
             found: mutable bool = false
             while cursor < state.count |cursor: usize = 23.usize()|:
                 finish: mutable usize = cursor
@@ -39,40 +37,55 @@ module RollbackRecords:
                 # Every record is newline-terminated. A truncated final line
                 # must not be treated as durable trust history.
                 return Code.Malformed if finish == cursor or finish == state.count
-                first_separator: usize = next_space(state, cursor, finish)
-                second_separator: usize = next_space(state, first_separator + 1.usize(), finish)
-                third_separator: usize = next_space(state, second_separator + 1.usize(), finish)
-                return Code.Malformed if first_separator == cursor or second_separator >= finish or third_separator >= finish or first_separator + 1.usize() == second_separator or second_separator + 1.usize() == third_separator or third_separator + 1.usize() >= finish
-                line_package: darray[u8] = [state[index] for index in cursor..<first_separator]
-                return Code.Malformed if:
-                    is_v2 and ByteText::starts_with_text(line_package, "@package:")
-                    (is_v3 or is_v4) and PackageIdentity::valid_name(line_package)
-                line_version: darray[u8] = [state[index] for index in (first_separator + 1.usize())..<second_separator]
-                line_digest: darray[u8] = [state[index] for index in (second_separator + 1.usize())..<third_separator]
-                line_metadata_digest: darray[u8] = [state[index] for index in (third_separator + 1.usize())..<finish]
-                return Code.Malformed if not TrustIdentity::valid(line_package) or not Integrity::valid_sha256_hex(line_digest) or not Integrity::valid_sha256_hex(line_metadata_digest)
+                line_package: mutable darray[u8] = []
+                line_version: mutable darray[u8] = []
+                line_digest: mutable darray[u8] = []
+                line_metadata_digest: mutable darray[u8] = []
                 parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-                return Code.Malformed if not SemVer::parse(line_version, &parsed) or parsed.prerelease
-                previous: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-                should_copy: mutable bool = false
+                return Code.Malformed if not parse_record(state, cursor, finish, is_v2, &line_package, &line_version, &line_digest, &line_metadata_digest, &parsed)
                 if ByteText::equal(line_package, package):
-                    if found:
-                        return Code.Malformed if:
-                            not SemVer::parse(version_out, &previous)
-                            SemVer::compare(parsed, previous) < 0
-                            SemVer::compare(parsed, previous) == 0 and (not ByteText::equal(digest_out, line_digest) or not ByteText::equal(metadata_digest_out, line_metadata_digest))
-                        should_copy <- SemVer::compare(parsed, previous) > 0
-                    else:
-                        should_copy <- true
-                    if should_copy:
-                        version_out.resize(0)
-                        digest_out.resize(0)
-                        metadata_digest_out.resize(0)
-                        ByteText::append(version_out, line_version)
-                        ByteText::append(digest_out, line_digest)
-                        ByteText::append(metadata_digest_out, line_metadata_digest)
+                    region merge_status_scope:
+                        merge_status: Code = merge_found_record(found, parsed, line_version, line_digest, line_metadata_digest, version_out, digest_out, metadata_digest_out)
+                        return merge_status if merge_status != Code.Ok
                     found <- true
                 cursor <- finish + 1.usize()
+            return Code.Ok
+
+        # Parse the record `state[cursor..<finish]` as
+        # "PACKAGE VERSION DIGEST METADATA-DIGEST". Version 2 state names bare
+        # packages; later versions name only scoped identities.
+        def parse_record(state: darray[u8]&, cursor: usize, finish: usize, is_v2: bool, package: mutable darray[u8]&, version: mutable darray[u8]&, digest: mutable darray[u8]&, metadata_digest: mutable darray[u8]&, parsed: mutable Model::Version&) -> bool can[Memory.Allocate, Abort.Panic]:
+            requires cursor < finish and finish <= state.count
+            first_separator: usize = next_space(state, cursor, finish)
+            second_separator: usize = next_space(state, first_separator + 1.usize(), finish)
+            third_separator: usize = next_space(state, second_separator + 1.usize(), finish)
+            return false if first_separator == cursor or second_separator >= finish or third_separator >= finish or first_separator + 1.usize() == second_separator or second_separator + 1.usize() == third_separator or third_separator + 1.usize() >= finish
+            ByteText::append_range(package, state, cursor, first_separator)
+            ByteText::append_range(version, state, first_separator + 1.usize(), second_separator)
+            ByteText::append_range(digest, state, second_separator + 1.usize(), third_separator)
+            ByteText::append_range(metadata_digest, state, third_separator + 1.usize(), finish)
+            return false if:
+                is_v2 and ByteText::starts_with_text(package, "@package:")
+                not is_v2 and PackageIdentity::valid_name(package)
+                not TrustIdentity::valid(package) or not Integrity::valid_sha256_hex(digest) or not Integrity::valid_sha256_hex(metadata_digest)
+            return SemVer::parse(version, parsed) and not parsed.prerelease
+
+        # Keep the highest recorded version of a package. Two records of the
+        # same version must agree on both digests, and versions never decrease.
+        def merge_found_record(found: bool, parsed: Model::Version, version: darray[u8]&, digest: darray[u8]&, metadata_digest: darray[u8]&, version_out: mutable darray[u8]&, digest_out: mutable darray[u8]&, metadata_digest_out: mutable darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic]:
+            if found:
+                previous: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
+                return Code.Malformed if:
+                    not SemVer::parse(version_out, &previous)
+                    SemVer::compare(parsed, previous) < 0
+                    SemVer::compare(parsed, previous) == 0 and (not ByteText::equal(digest_out, digest) or not ByteText::equal(metadata_digest_out, metadata_digest))
+                return Code.Ok if SemVer::compare(parsed, previous) == 0
+            version_out.resize(0)
+            digest_out.resize(0)
+            metadata_digest_out.resize(0)
+            ByteText::append(version_out, version)
+            ByteText::append(digest_out, digest)
+            ByteText::append(metadata_digest_out, metadata_digest)
             return Code.Ok
 
         # Check every record of `state` without looking up a package.
