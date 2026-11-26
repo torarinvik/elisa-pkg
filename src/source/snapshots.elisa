@@ -36,6 +36,8 @@ module BuildSnapshots:
             cleanup_ok <- false if container_status != 0 and container_status != -2
             return cleanup_ok
 
+        # Once created, a snapshot is registered in package_roots even if
+        # verification fails. The caller uses remove_all on every exit path.
         def create_verified(container: darray[u8]&, source_root: darray[u8]&, label: cstr,
                                            expected_digest: darray[u8]&, relative_entry: darray[u8]&,
                                            package_roots: mutable darray[u8]&, total_bytes: mutable usize&,
@@ -49,7 +51,8 @@ module BuildSnapshots:
             ByteText::append(&template, container)
             if template.count == 0.usize() or template[template.count - 1.usize()] != 47:
                 template.push(47)
-            ByteText::append_bounded_text(&template, label)
+            return -22 if not valid_label(label)
+            ByteText::append_text(&template, label)
             ByteText::append_text(&template, "-XXXXXX")
             template.push(0)
             mkdtemp_status: i64 = Platform::pkg_mkdtemp(&template)
@@ -81,5 +84,18 @@ module BuildSnapshots:
             relative_name: cstr = (&relative_c[0]).cast[cstr] can Unsafe.PointerCast
             entry_path: mutable darray[u8] = []
             ProjectFiles::path_join_into(out_root, relative_name, &entry_path)
+            entry_c: mutable darray[u8] = []
+            ProjectFiles::path_with_nul_into(entry_path, &entry_c)
+            entry_name: cstr = (&entry_c[0]).cast[cstr] can Unsafe.PointerCast
+            return -88 if Platform::pkg_package_file_size(entry_name) < 0
             return -88 if not ProjectFiles::canonical_existing_path(entry_path, out_entry)
             return 0
+
+    private:
+        def valid_label(label: cstr) -> bool:
+            length: usize = Platform::pkg_strlen(label)
+            return false if length == 0.usize() or length > 64.usize()
+            for index in 0..<length |label|:
+                byte: u8 = label[index].u8()
+                return false if (byte < 97 or byte > 122) and (byte < 48 or byte > 57) and byte != 45
+            return true
