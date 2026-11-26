@@ -3582,6 +3582,19 @@ module Cli:
             out <- lower
             return true
 
+        def indexed_registry_constraint_matches(lock: darray[u8]&, starts: darray[usize]&, wanted: Solver::Constraint) -> bool can[Memory.Allocate, Abort.Panic]:
+            record_index: mutable usize = 0.usize()
+            return false if not registry_lock_record_index(lock, starts, wanted.package, &record_index)
+            record_start: usize = starts[record_index]
+            record_end: usize = json_object_end(lock, record_start)
+            return false if record_end <= record_start or record_end >= lock.count
+            version_text: mutable darray[u8] = []
+            return false if not object_string_value(lock, record_start, record_end, "version", &version_text)
+            version: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
+            return false if not SemVer::parse(version_text, &version) or version.prerelease
+            requirement: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
+            return SemVer::parse_requirement(wanted.requirement, &requirement) and SemVer::matches(requirement, version)
+
         def registry_offline_graph_closure(manifest: darray[u8]&, lock: darray[u8]&, packages_start: usize, packages_end: usize) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             roots: mutable darray[Solver::Constraint] = []
             has_local: mutable bool = false
@@ -3630,9 +3643,9 @@ module Cli:
                 dependencies: mutable darray[Solver::Constraint] = []
                 status: Registry::ResultCode = Registry::verify_metadata_snapshot(package, version_text, metadata_digest, cached_metadata, cached_signature, &resolved_archive, &resolved_digest, &resolved_size, &expires, &dependencies)
                 return EXIT_SECURITY if status != Registry::ResultCode.Ok or not bytes_equal(resolved_archive, archive) or not bytes_equal(resolved_digest, digest) or resolved_size != archive_size
-                for dependency_index in 0..<dependencies.count |lock, packages_start, packages_end, dependencies, reachable, reachable_count, dependency_index|:
+                for dependency_index in 0..<dependencies.count |lock, starts, dependencies, reachable, reachable_count, dependency_index|:
                     dependency: Solver::Constraint = dependencies[dependency_index]
-                    return EXIT_SECURITY if not registry_lock_satisfies_constraint(lock, packages_start, packages_end, dependency)
+                    return EXIT_SECURITY if not indexed_registry_constraint_matches(lock, starts, dependency)
                     if not registry_queue_contains(reachable, dependency.package):
                         return EXIT_RESOLVE if reachable_count >= MAX_DEPENDENCIES
                         registry_queue_append(&reachable, dependency.package)
