@@ -117,6 +117,16 @@ with tempfile.TemporaryDirectory(prefix='cli-review-', dir=ROOT / 'build') as di
     fetch_environment = dict(os.environ)
     fetch_environment.pop('ELISAPKG_REGISTRY_DIR', None)
     fetch_environment.pop('ELISAPKG_REGISTRY_TRUST_ROOT', None)
+    lockfile = project / 'elisapkg.lock'
+    saved_lock = lockfile.read_bytes()
+    invalid_registry_lock = '{"lock-version":3,"packages":[]}\n'
+    lockfile.write_text(invalid_registry_lock)
+    invalid_fetch = subprocess.run(
+        [BIN, 'fetch', '--locked'], cwd=project, env=fetch_environment,
+        capture_output=True, text=True, timeout=120, check=False)
+    assert invalid_fetch.returncode == 3, invalid_fetch
+    assert lockfile.read_text() == invalid_registry_lock
+    lockfile.write_bytes(saved_lock)
     colored_fetch = subprocess.run(
         [BIN, 'fetch', 'foo', '1.0.0', '--color', 'always'], cwd=project,
         env=fetch_environment, capture_output=True, text=True, timeout=120,
