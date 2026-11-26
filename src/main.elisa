@@ -38,6 +38,7 @@ include "./source/snapshots.elisa"
 include "./resolution/local_build_graph.elisa"
 include "./project/transaction.elisa"
 include "./project/lockfile.elisa"
+include "./project/schema_fields.elisa"
 
 module Cli:
     private:
@@ -330,7 +331,7 @@ module Cli:
                 if raw[index] == 123:
                     object_end: usize = Json::object_end(raw, index)
                     return false if object_end <= index or object_end >= targets_end
-                    return false if not valid_direct_field_set(raw, index, object_end, 2)
+                    return false if not SchemaFields::valid(raw, index, object_end, SchemaFields::Kind.ManifestTarget)
                     target_name: mutable darray[u8] = []
                     return false if not Json::object_string_value(raw, index, object_end, "name", &target_name)
                     return false if not valid_package_name(target_name)
@@ -422,60 +423,6 @@ module Cli:
             raw: mutable darray[u8] = []
             return false if not Platform::pkg_read_bounded_file(manifest_path, Json::max_document_bytes, &raw)
             return false if not validate_manifest_at(raw, root, name_out, version_out)
-            return true
-
-        def valid_direct_field_set(raw: darray[u8]&, object_start: usize, object_end: usize, set_kind: i64) -> bool can[Memory.Allocate, Abort.Panic]:
-            return false if object_start >= object_end or raw[object_start] != 123
-            in_string: mutable bool = false
-            escaped: mutable bool = false
-            string_start: mutable usize = 0.usize()
-            braces: mutable i64 = 1
-            brackets: mutable i64 = 0
-            for index in (object_start + 1.usize())..<object_end |raw, in_string, escaped, string_start, braces, brackets|:
-                byte: u8 = raw[index]
-                if not in_string:
-                    if byte == 34:
-                        in_string <- true
-                        string_start <- index + 1.usize()
-                    elif byte == 123:
-                        braces <- braces + 1
-                    elif byte == 125:
-                        braces <- braces - 1
-                    elif byte == 91:
-                        brackets <- brackets + 1
-                    elif byte == 93:
-                        brackets <- brackets - 1
-                elif escaped:
-                    escaped <- false
-                elif byte == 92:
-                    escaped <- true
-                elif byte == 34:
-                    after: mutable usize = index + 1.usize()
-                    while after < object_end and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
-                        after <- after + 1.usize()
-                    if braces == 1 and brackets == 0 and after < object_end and raw[after] == 58:
-                        key: mutable darray[u8] = []
-                        for key_index in string_start..<index |key, raw|:
-                            key.push(raw[key_index])
-                        allowed: mutable bool = false
-                        if set_kind == 1:
-                            allowed <- ByteText::equal_text(key, "name") or ByteText::equal_text(key, "version") or ByteText::equal_text(key, "description") or ByteText::equal_text(key, "license") or ByteText::equal_text(key, "elisa")
-                        elif set_kind == 2:
-                            allowed <- ByteText::equal_text(key, "name") or ByteText::equal_text(key, "kind") or ByteText::equal_text(key, "entry")
-                        elif set_kind == 3:
-                            allowed <- ByteText::equal_text(key, "lock-version") or ByteText::equal_text(key, "resolver") or ByteText::equal_text(key, "package") or ByteText::equal_text(key, "packages")
-                        elif set_kind == 4:
-                            allowed <- ByteText::equal_text(key, "name") or ByteText::equal_text(key, "version") or ByteText::equal_text(key, "source") or ByteText::equal_text(key, "archive-size") or ByteText::equal_text(key, "archive-digest") or ByteText::equal_text(key, "metadata-digest")
-                        elif set_kind == 5:
-                            allowed <- ByteText::equal_text(key, "type") or ByteText::equal_text(key, "registry") or ByteText::equal_text(key, "archive")
-                        elif set_kind == 6:
-                            allowed <- ByteText::equal_text(key, "name") or ByteText::equal_text(key, "version") or ByteText::equal_text(key, "manifest-digest") or ByteText::equal_text(key, "source-digest")
-                        elif set_kind == 7:
-                            allowed <- ByteText::equal_text(key, "path")
-                        elif set_kind == 8:
-                            allowed <- ByteText::equal_text(key, "registry") or ByteText::equal_text(key, "version")
-                        return false if not allowed
-                    in_string <- false
             return true
 
         def slice_less_slice(raw: darray[u8]&, left_start: usize, left_end: usize, right_start: usize, right_end: usize) -> bool:
@@ -1338,13 +1285,13 @@ module Cli:
             has_rev: bool = object_has_direct_key(raw, object_start, object_end, rev_key)
             return false if has_path and (has_registry or has_version)
             if has_path:
-                return false if not valid_direct_field_set(raw, object_start, object_end, 7)
+                return false if not SchemaFields::valid(raw, object_start, object_end, SchemaFields::Kind.ManifestPathDependency)
                 path: mutable darray[u8] = []
                 return false if not Json::object_string_value(raw, object_start, object_end, "path", &path)
                 return valid_dependency_path(path)
             if has_registry or has_version:
                 return false if has_git or has_rev or not has_registry or not has_version
-                return false if not valid_direct_field_set(raw, object_start, object_end, 8)
+                return false if not SchemaFields::valid(raw, object_start, object_end, SchemaFields::Kind.ManifestRegistryDependency)
                 registry: mutable darray[u8] = []
                 requirement: mutable darray[u8] = []
                 return false if not Json::object_string_value(raw, object_start, object_end, "registry", &registry) or not Json::object_string_value(raw, object_start, object_end, "version", &requirement)
@@ -1357,7 +1304,7 @@ module Cli:
             package_start: usize = Json::root_value_offset(raw, "package")
             package_end: usize = Json::object_end(raw, package_start)
             return false if package_start >= raw.count or package_end <= package_start
-            return false if not valid_direct_field_set(raw, package_start, package_end, 1)
+            return false if not SchemaFields::valid(raw, package_start, package_end, SchemaFields::Kind.ManifestPackage)
             description_key: mutable darray[u8] = [100, 101, 115, 99, 114, 105, 112, 116, 105, 111, 110]
             license_key: mutable darray[u8] = [108, 105, 99, 101, 110, 115, 101]
             elisa_key: mutable darray[u8] = [101, 108, 105, 115, 97]
@@ -1895,12 +1842,12 @@ module Cli:
                 return false if not collect_registry_roots(manifest, &registry_roots, &has_local_dependency) or has_local_dependency or registry_roots.count == 0.usize()
                 return false if not Json::valid_document(lock) or not Json::unique_object_keys(lock)
                 lock_end: usize = Json::object_end(lock, 0)
-                return false if lock_end >= lock.count or not valid_direct_field_set(lock, 0, lock_end, 3)
+                return false if lock_end >= lock.count or not SchemaFields::valid(lock, 0, lock_end, SchemaFields::Kind.RegistryLock)
                 resolver: mutable darray[u8] = []
                 return false if not Json::object_string_value(lock, 0, lock_end, "resolver", &resolver) or not ByteText::equal_text(resolver, "elisapkg-registry-v1")
                 package_start: usize = Json::root_value_offset(lock, "package")
                 package_end: usize = Json::object_end(lock, package_start)
-                return false if package_start >= lock.count or package_end <= package_start or not valid_direct_field_set(lock, package_start, package_end, 6)
+                return false if package_start >= lock.count or package_end <= package_start or not SchemaFields::valid(lock, package_start, package_end, SchemaFields::Kind.RegistryLockPackage)
                 locked_name: mutable darray[u8] = []
                 locked_version: mutable darray[u8] = []
                 return false if not Json::object_string_value(lock, package_start, package_end, "name", &locked_name) or not Json::object_string_value(lock, package_start, package_end, "version", &locked_version)
@@ -1926,7 +1873,7 @@ module Cli:
                     break if cursor == packages_end
                     return false if lock[cursor] != 123 or package_count >= MAX_DEPENDENCIES
                     record_end: usize = Json::object_end(lock, cursor)
-                    return false if record_end <= cursor or record_end >= packages_end or not valid_direct_field_set(lock, cursor, record_end, 4)
+                    return false if record_end <= cursor or record_end >= packages_end or not SchemaFields::valid(lock, cursor, record_end, SchemaFields::Kind.RegistryLockRecord)
                     package: mutable darray[u8] = []
                     version_text: mutable darray[u8] = []
                     return false if not Json::object_string_value(lock, cursor, record_end, "name", &package) or not Json::object_string_value(lock, cursor, record_end, "version", &version_text) or not valid_package_name(package)
@@ -1940,7 +1887,7 @@ module Cli:
                     return false if emitted_contains_slice(seen, package, 0, package.count)
                     source_start: mutable usize = 0.usize()
                     source_end: mutable usize = 0.usize()
-                    return false if not Json::object_value_span(lock, cursor, record_end, "source", &source_start, &source_end) or not valid_direct_field_set(lock, source_start, source_end, 5)
+                    return false if not Json::object_value_span(lock, cursor, record_end, "source", &source_start, &source_end) or not SchemaFields::valid(lock, source_start, source_end, SchemaFields::Kind.RegistryLockSource)
                     source_type: mutable darray[u8] = []
                     registry: mutable darray[u8] = []
                     archive: mutable darray[u8] = []
@@ -2356,7 +2303,7 @@ module Cli:
                     break if cursor == packages_end
                     return EXIT_RESOLVE if lock[cursor] != 123
                     record_end: usize = Json::object_end(lock, cursor)
-                    return EXIT_RESOLVE if record_end <= cursor or record_end >= packages_end or not valid_direct_field_set(lock, cursor, record_end, 4)
+                    return EXIT_RESOLVE if record_end <= cursor or record_end >= packages_end or not SchemaFields::valid(lock, cursor, record_end, SchemaFields::Kind.RegistryLockRecord)
                     package: mutable darray[u8] = []
                     version_text: mutable darray[u8] = []
                     return EXIT_RESOLVE if not Json::object_string_value(lock, cursor, record_end, "name", &package) or not Json::object_string_value(lock, cursor, record_end, "version", &version_text) or not valid_package_name(package)
@@ -2364,7 +2311,7 @@ module Cli:
                     return EXIT_RESOLVE if not SemVer::parse(version_text, &parsed_version) or parsed_version.prerelease
                     source_start: mutable usize = 0.usize()
                     source_end: mutable usize = 0.usize()
-                    return EXIT_RESOLVE if not Json::object_value_span(lock, cursor, record_end, "source", &source_start, &source_end) or not valid_direct_field_set(lock, source_start, source_end, 5)
+                    return EXIT_RESOLVE if not Json::object_value_span(lock, cursor, record_end, "source", &source_start, &source_end) or not SchemaFields::valid(lock, source_start, source_end, SchemaFields::Kind.RegistryLockSource)
                     source_type: mutable darray[u8] = []
                     registry: mutable darray[u8] = []
                     archive: mutable darray[u8] = []
@@ -2438,13 +2385,13 @@ module Cli:
                 return EXIT_SECURITY if expected_lock.count == 0.usize()
                 return EXIT_RESOLVE if not ByteText::equal(expected_lock, lock)
                 lock_end: usize = Json::object_end(lock, 0)
-                return EXIT_RESOLVE if lock_end >= lock.count or not valid_direct_field_set(lock, 0, lock_end, 3)
+                return EXIT_RESOLVE if lock_end >= lock.count or not SchemaFields::valid(lock, 0, lock_end, SchemaFields::Kind.RegistryLock)
                 resolver: mutable darray[u8] = []
                 return EXIT_RESOLVE if not Json::object_string_value(lock, 0, Json::object_end(lock, 0), "resolver", &resolver) or not ByteText::equal_text(resolver, "elisapkg-registry-v1")
                 package_start: usize = Json::root_value_offset(lock, "package")
                 package_end: usize = Json::object_end(lock, package_start)
                 return EXIT_RESOLVE if package_start >= lock.count or package_end <= package_start
-                return EXIT_RESOLVE if not valid_direct_field_set(lock, package_start, package_end, 6)
+                return EXIT_RESOLVE if not SchemaFields::valid(lock, package_start, package_end, SchemaFields::Kind.RegistryLockPackage)
                 locked_name: mutable darray[u8] = []
                 locked_version: mutable darray[u8] = []
                 return EXIT_RESOLVE if not Json::object_string_value(lock, package_start, package_end, "name", &locked_name) or not Json::object_string_value(lock, package_start, package_end, "version", &locked_version)
@@ -2465,7 +2412,7 @@ module Cli:
                     return EXIT_RESOLVE if lock[cursor] != 123
                     record_end: usize = Json::object_end(lock, cursor)
                     return EXIT_RESOLVE if record_end <= cursor or record_end >= packages_end
-                    return EXIT_RESOLVE if not valid_direct_field_set(lock, cursor, record_end, 4)
+                    return EXIT_RESOLVE if not SchemaFields::valid(lock, cursor, record_end, SchemaFields::Kind.RegistryLockRecord)
                     package: mutable darray[u8] = []
                     version_text: mutable darray[u8] = []
                     return EXIT_RESOLVE if not Json::object_string_value(lock, cursor, record_end, "name", &package) or not Json::object_string_value(lock, cursor, record_end, "version", &version_text) or not valid_package_name(package)
@@ -2474,7 +2421,7 @@ module Cli:
                     source_start: mutable usize = 0.usize()
                     source_end: mutable usize = 0.usize()
                     return EXIT_RESOLVE if not Json::object_value_span(lock, cursor, record_end, "source", &source_start, &source_end)
-                    return EXIT_RESOLVE if not valid_direct_field_set(lock, source_start, source_end, 5)
+                    return EXIT_RESOLVE if not SchemaFields::valid(lock, source_start, source_end, SchemaFields::Kind.RegistryLockSource)
                     source_type: mutable darray[u8] = []
                     registry: mutable darray[u8] = []
                     archive: mutable darray[u8] = []

@@ -1,0 +1,72 @@
+# Direct fields accepted by manifest and lockfile objects.
+include "../text/bytes.elisa"
+
+module SchemaFields:
+    public:
+        const enum Kind of u8:
+            ManifestPackage
+            ManifestTarget
+            RegistryLock
+            RegistryLockRecord
+            RegistryLockSource
+            RegistryLockPackage
+            ManifestPathDependency
+            ManifestRegistryDependency
+
+        # The caller checks JSON syntax and duplicate keys before schema validation.
+        def valid(raw: darray[u8]&, object_start: usize, object_end: usize, kind: Kind) -> bool can[Memory.Allocate, Abort.Panic]:
+            return false if object_start >= object_end or object_end >= raw.count or raw[object_start] != 123 or raw[object_end] != 125
+            in_string: mutable bool = false
+            escaped: mutable bool = false
+            string_start: mutable usize = 0.usize()
+            braces: mutable i64 = 1
+            brackets: mutable i64 = 0
+            for index in (object_start + 1.usize())..<object_end |raw, in_string, escaped, string_start, braces, brackets|:
+                byte: u8 = raw[index]
+                if not in_string:
+                    if byte == 34:
+                        in_string <- true
+                        string_start <- index + 1.usize()
+                    elif byte == 123:
+                        braces <- braces + 1
+                    elif byte == 125:
+                        braces <- braces - 1
+                    elif byte == 91:
+                        brackets <- brackets + 1
+                    elif byte == 93:
+                        brackets <- brackets - 1
+                elif escaped:
+                    escaped <- false
+                elif byte == 92:
+                    escaped <- true
+                elif byte == 34:
+                    after: mutable usize = index + 1.usize()
+                    while after < object_end and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
+                        after <- after + 1.usize()
+                    if braces == 1 and brackets == 0 and after < object_end and raw[after] == 58:
+                        key: mutable darray[u8] = []
+                        for key_index in string_start..<index |key, raw|:
+                            key.push(raw[key_index])
+                        return false if not allowed(kind, key)
+                    in_string <- false
+            return true
+
+    private:
+        def allowed(kind: Kind, key: darray[u8]&) -> bool:
+            if kind == Kind.ManifestPackage:
+                return ByteText::equal_text(key, "name") or ByteText::equal_text(key, "version") or ByteText::equal_text(key, "description") or ByteText::equal_text(key, "license") or ByteText::equal_text(key, "elisa")
+            if kind == Kind.ManifestTarget:
+                return ByteText::equal_text(key, "name") or ByteText::equal_text(key, "kind") or ByteText::equal_text(key, "entry")
+            if kind == Kind.RegistryLock:
+                return ByteText::equal_text(key, "lock-version") or ByteText::equal_text(key, "resolver") or ByteText::equal_text(key, "package") or ByteText::equal_text(key, "packages")
+            if kind == Kind.RegistryLockRecord:
+                return ByteText::equal_text(key, "name") or ByteText::equal_text(key, "version") or ByteText::equal_text(key, "source") or ByteText::equal_text(key, "archive-size") or ByteText::equal_text(key, "archive-digest") or ByteText::equal_text(key, "metadata-digest")
+            if kind == Kind.RegistryLockSource:
+                return ByteText::equal_text(key, "type") or ByteText::equal_text(key, "registry") or ByteText::equal_text(key, "archive")
+            if kind == Kind.RegistryLockPackage:
+                return ByteText::equal_text(key, "name") or ByteText::equal_text(key, "version") or ByteText::equal_text(key, "manifest-digest") or ByteText::equal_text(key, "source-digest")
+            if kind == Kind.ManifestPathDependency:
+                return ByteText::equal_text(key, "path")
+            if kind == Kind.ManifestRegistryDependency:
+                return ByteText::equal_text(key, "registry") or ByteText::equal_text(key, "version")
+            return false
