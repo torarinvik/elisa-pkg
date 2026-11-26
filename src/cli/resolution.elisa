@@ -1,0 +1,466 @@
+# Resolve, edit, and present project dependency locks.
+include "../package/manifest.elisa"
+include "../package/manifest_edits.elisa"
+include "../package/model.elisa"
+include "../package/package_identity.elisa"
+include "../platform.elisa"
+include "../project/files.elisa"
+include "../project/local_lock.elisa"
+include "../project/lock_resolution.elisa"
+include "../project/lock_validation.elisa"
+include "../project/lockfile.elisa"
+include "../project/manifest.elisa"
+include "../project/transaction.elisa"
+include "../registry.elisa"
+include "../resolution/registry_roots.elisa"
+include "../resolution/semver.elisa"
+include "../resolution/solver.elisa"
+include "../text/bytes.elisa"
+include "./output.elisa"
+include "./project_context.elisa"
+
+module ResolutionCommand:
+    public:
+        def add(argc: i64, slots: mutable cstr&&) -> i64 can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global{Read,Write}:
+                return EXIT_SECURITY if not ProjectTransaction::recover()
+                local_form: bool = argc == 5 and Platform::pkg_cstr_equal(slots[3].cast[cstr], "--path")
+                registry_form: bool = argc == 7 and Platform::pkg_cstr_equal(slots[3].cast[cstr], "--version") and Platform::pkg_cstr_equal(slots[5].cast[cstr], "--registry") and Platform::pkg_cstr_equal(slots[6].cast[cstr], "primary")
+                return EXIT_USAGE if not local_form and not registry_form
+                alias: mutable darray[u8] = []
+                ByteText::append_bounded_text(&alias, slots[2].cast[cstr])
+                return EXIT_USAGE if not PackageIdentity::valid_name(alias)
+                root: mutable darray[u8] = [46]
+                root_name: mutable darray[u8] = []
+                root_version: mutable darray[u8] = []
+                return EXIT_USAGE if not ProjectManifest::load_at(&root, &root_name, &root_version)
+                dependency_path: mutable darray[u8] = []
+                requirement: mutable darray[u8] = []
+                if local_form:
+                    ByteText::append_bounded_text(&dependency_path, slots[4].cast[cstr])
+                    return EXIT_USAGE if not Manifest::valid_dependency_path(dependency_path)
+                    dependency_name: mutable darray[u8] = []
+                    dependency_version: mutable darray[u8] = []
+                    return EXIT_RESOLVE if not ProjectManifest::load_at(&dependency_path, &dependency_name, &dependency_version)
+                    return EXIT_RESOLVE if not ByteText::equal(alias, dependency_name) or ByteText::equal(alias, root_name)
+                else:
+                    ByteText::append_bounded_text(&requirement, slots[4].cast[cstr])
+                    parsed_requirement: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
+                    return EXIT_USAGE if not SemVer::parse_requirement(requirement, &parsed_requirement)
+                    return EXIT_RESOLVE if ByteText::equal(alias, root_name)
+                raw: mutable darray[u8] = []
+                raw.resize(1048577)
+                return EXIT_USAGE if not ProjectFiles::read_cstr_into("elisapkg.json", &raw)
+                return EXIT_USAGE if not ProjectManifest::validate_at(raw, &root, &root_name, &root_version)
+                updated: darray[u8] = ManifestEdits::append_path(raw, alias, dependency_path) if local_form else ManifestEdits::append_registry(raw, alias, requirement)
+                if updated.count == 0.usize():
+                    CliOutput::write_error("error: dependency is already declared or the manifest has no dependency object\n")
+                    return EXIT_RESOLVE
+                return EXIT_SECURITY if not ProjectTransaction::begin(raw)
+                if not ProjectTransaction::stage_manifest(updated) or not ProjectFiles::write_cstr_file("elisapkg.json", &updated):
+                    _ = ProjectTransaction::restore()
+                    return EXIT_SOURCE
+                options: Model::CommandOptions = Model::CommandOptions{locked: false, offline: false, frozen: false, json: false, verbose: false, profile: "debug", target_name: "", target_kind: "", update_name: ""}
+                resolved: i64 = resolve(&root, options, true, false)
+                if resolved != EXIT_OK:
+                    restored: bool = ProjectTransaction::restore()
+                    if not restored:
+                        CliOutput::write_error("error: dependency edit failed and the original manifest could not be restored\n")
+                        return EXIT_SECURITY
+                    return resolved
+                if not ProjectTransaction::mark_lock():
+                    _ = ProjectTransaction::restore()
+                    return EXIT_SECURITY
+                return EXIT_SECURITY if not ProjectTransaction::commit()
+                CliOutput::write_ok("added ")
+                CliOutput::write_ok("local " if local_form else "registry ")
+                CliOutput::write_ok("dependency ")
+                CliOutput::write_bytes(1, &alias)
+                if local_form:
+                    CliOutput::write_ok(" from ")
+                    CliOutput::write_bytes(1, &dependency_path)
+                else:
+                    CliOutput::write_ok(" with requirement ")
+                    CliOutput::write_bytes(1, &requirement)
+                CliOutput::write_ok("\n")
+                return EXIT_OK
+
+        def why(argc: i64, slots: mutable cstr&&, start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                return EXIT_USAGE if argc < 3
+                wanted: mutable darray[u8] = []
+                ByteText::append_bounded_text(&wanted, slots[2].cast[cstr])
+                return EXIT_USAGE if not PackageIdentity::valid_name(wanted)
+                raw: mutable darray[u8] = []
+                raw.resize(1048577)
+                return EXIT_RESOLVE if not ProjectFiles::read_cstr_into("elisapkg.json", &raw)
+                root_name: mutable darray[u8] = []
+                root_version: mutable darray[u8] = []
+                return EXIT_RESOLVE if not ProjectManifest::validate_at(raw, start, &root_name, &root_version)
+                return EXIT_RESOLVE if not ProjectFiles::cstr_file_exists("elisapkg.lock")
+                lock: mutable darray[u8] = []
+                lock.resize(1048577)
+                return EXIT_RESOLVE if not ProjectFiles::read_cstr_into("elisapkg.lock", &lock)
+                return EXIT_RESOLVE if not LockValidation::matches_manifest(raw, lock, root_name, root_version, start)
+                # `why` reports the root edge. A lockfile also contains transitive
+                # records, so merely finding a name in the lock is insufficient and
+                # would misreport `root -> transitive` as a direct dependency.
+                return EXIT_RESOLVE if ByteText::equal(wanted, root_name)
+                dependency_start: mutable usize = 0.usize()
+                dependency_end: mutable usize = 0.usize()
+                return EXIT_RESOLVE if not Manifest::find_dependency_span(raw, wanted, &dependency_start, &dependency_end)
+                return EXIT_RESOLVE if not Lockfile::contains_package(lock, wanted)
+                if options.json:
+                    CliOutput::write_ok("{\"schema-version\":1,\"root\":\"")
+                    CliOutput::write_bytes(1, &root_name)
+                    CliOutput::write_ok("\",\"package\":\"")
+                    CliOutput::write_bytes(1, &wanted)
+                    CliOutput::write_ok("\"}\n")
+                    return EXIT_OK
+                CliOutput::write_bytes(1, &root_name)
+                CliOutput::write_ok(" -> ")
+                CliOutput::write_bytes(1, &wanted)
+                CliOutput::write_ok("\n")
+                return EXIT_OK
+
+        def resolve(start: darray[u8]&, options: Model::CommandOptions, transaction_owned: bool, emit_result: bool) -> i64 can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global{Read,Write}:
+                if not ProjectContext::manifest_exists():
+                    CliOutput::write_error("error: could not find elisapkg.json in the current directory\n")
+                    return EXIT_USAGE
+                raw: mutable darray[u8] = []
+                # Read up to the manifest policy limit. A smaller buffer would silently
+                # validate only a prefix of an attacker-controlled document.
+                raw.resize(1048577)
+                return EXIT_USAGE if not ProjectFiles::read_cstr_into("elisapkg.json", &raw)
+                name: mutable darray[u8] = []
+                version: mutable darray[u8] = []
+                return EXIT_USAGE if not ProjectManifest::validate(raw, &name, &version)
+                # Keep output identity in owned buffers. The resolver walks and
+                # normalizes graph records; preserving these copies prevents an
+                # implementation detail of that traversal from emptying the
+                # caller's manifest fields before the success envelope is emitted.
+                resolved_name: mutable darray[u8] = []
+                resolved_version: mutable darray[u8] = []
+                for index in 0..<name.count |resolved_name, name|:
+                    resolved_name.push(name[index])
+                for index in 0..<version.count |resolved_version, version|:
+                    resolved_version.push(version[index])
+                resolved_name_storage: mutable darray[u8] = []
+                resolved_version_storage: mutable darray[u8] = []
+                for index in 0..<resolved_name.count |resolved_name_storage, resolved_name|:
+                    resolved_name_storage.push(resolved_name[index])
+                for index in 0..<resolved_version.count |resolved_version_storage, resolved_version|:
+                    resolved_version_storage.push(resolved_version[index])
+                resolved_name_storage.push(0)
+                resolved_version_storage.push(0)
+                resolved_name_text: cstr = (&resolved_name_storage[0]).cast[cstr] can Unsafe.PointerCast
+                resolved_version_text: cstr = (&resolved_version_storage[0]).cast[cstr] can Unsafe.PointerCast
+                preferred_lock: mutable darray[u8] = []
+                lock_state: i64 = Platform::pkg_package_file_size("elisapkg.lock")
+                if lock_state >= 0:
+                    preferred_lock.resize(1048577)
+                    return EXIT_RESOLVE if not ProjectFiles::read_cstr_into("elisapkg.lock", &preferred_lock)
+                elif lock_state != -2:
+                    # An existing lock that cannot be opened is not equivalent to an
+                    # absent lock. Refusing to replace it preserves the operator's ability
+                    # to investigate permissions, corruption, or a hostile filesystem.
+                    CliOutput::write_error("error: existing elisapkg.lock is unreadable; refusing to replace it\n")
+                    return EXIT_RESOLVE
+                # Locked and frozen resolution is a read-only contract. Require the lock
+                # before consulting any provider so a missing lock cannot trigger metadata
+                # refreshes or trust-state writes. Registry v3 locks are checked against
+                # the manifest and their local root source digest only; build/fetch owns
+                # the later archive and signature verification step. Legacy local locks
+                # are recomputed from the local graph, which never invokes a registry.
+                if options.locked or options.frozen:
+                    return EXIT_RESOLVE if lock_state == -2
+                    if Lockfile::version_is(preferred_lock, 3):
+                        return EXIT_RESOLVE if not LockValidation::matches_manifest(raw, preferred_lock, name, version, start)
+                        write_resolved_text(resolved_name_text, resolved_version_text, options) if emit_result
+                        return EXIT_OK
+                    registry_roots: mutable darray[Solver::Constraint] = []
+                    has_local_dependency: mutable bool = false
+                    return EXIT_RESOLVE if not RegistryRoots::collect(raw, &registry_roots, &has_local_dependency)
+                    return EXIT_RESOLVE if registry_roots.count > 0.usize()
+                    local_expected: darray[u8] = LocalLock::canonical(name, version, raw, start)
+                    return EXIT_RESOLVE if local_expected.count == 0.usize() or not ByteText::equal(local_expected, preferred_lock)
+                    write_resolved_text(resolved_name_text, resolved_version_text, options) if emit_result
+                    return EXIT_OK
+                # Offline resolution may validate and replay an existing lock, but it must
+                # never consult a provider or refresh signed metadata. A registry graph
+                # without a lock is therefore unavailable offline; local graphs use the
+                # same canonical byte comparison as locked mode.
+                if options.offline:
+                    offline_registry_roots: mutable darray[Solver::Constraint] = []
+                    offline_has_local_dependency: mutable bool = false
+                    return EXIT_RESOLVE if not RegistryRoots::collect(raw, &offline_registry_roots, &offline_has_local_dependency)
+                    if offline_registry_roots.count > 0.usize():
+                        return EXIT_RESOLVE if lock_state == -2
+                        return EXIT_RESOLVE if not LockValidation::matches_manifest(raw, preferred_lock, name, version, start)
+                        write_resolved_text(resolved_name_text, resolved_version_text, options) if emit_result
+                        return EXIT_OK
+                lock: darray[u8] = LockResolution::canonical_with_options(name, version, raw, start, options, preferred_lock)
+                if lock.count > 0.usize() and lock[0] > 0 and lock[0] < 32:
+                    code: mutable Registry::ResultCode = Registry::ResultCode.TrustStateMalformed
+                    # The sentinel stores the enum value plus one so an empty lock remains
+                    # reserved for ordinary resolution failure.
+                    code <- Registry::ResultCode.NotConfigured if lock[0] == 2
+                    code <- Registry::ResultCode.InvalidConfiguration if lock[0] == 3
+                    code <- Registry::ResultCode.MissingIndex if lock[0] == 4
+                    code <- Registry::ResultCode.NoMatchingVersion if lock[0] == 5
+                    code <- Registry::ResultCode.MalformedMetadata if lock[0] == 6
+                    code <- Registry::ResultCode.MissingSignature if lock[0] == 7
+                    code <- Registry::ResultCode.MissingTrustRoot if lock[0] == 8
+                    code <- Registry::ResultCode.InvalidSignature if lock[0] == 9
+                    code <- Registry::ResultCode.ExpiredMetadata if lock[0] == 10
+                    code <- Registry::ResultCode.RollbackDetected if lock[0] == 11
+                    code <- Registry::ResultCode.DigestMismatch if lock[0] == 12
+                    code <- Registry::ResultCode.ArchiveMissing if lock[0] == 13
+                    code <- Registry::ResultCode.ResourceLimit if lock[0] == 14
+                    code <- Registry::ResultCode.TrustStateUnavailable if lock[0] == 15
+                    code <- Registry::ResultCode.TrustStateMalformed if lock[0] == 16
+                    code <- Registry::ResultCode.ClockRollback if lock[0] == 17
+                    code <- Registry::ResultCode.Unsatisfiable if lock[0] == 18
+                    code <- Registry::ResultCode.ClockUnavailable if lock[0] == 19
+                    code <- Registry::ResultCode.ExpiryHorizon if lock[0] == 20
+                    code <- Registry::ResultCode.TrustRootChanged if lock[0] == 21
+                    code <- Registry::ResultCode.TufEquivocationDetected if lock[0] == 22
+                    CliOutput::write_error("error: ")
+                    CliOutput::write_error(Registry::result_message(code))
+                    if code == Registry::ResultCode.Unsatisfiable:
+                        write_registry_conflict(lock)
+                        CliOutput::write_error("\n")
+                        return EXIT_RESOLVE
+                    if code == Registry::ResultCode.TrustStateUnavailable or code == Registry::ResultCode.TrustStateMalformed or code == Registry::ResultCode.ClockRollback:
+                        CliOutput::write_error(" while recording registry trust state\n")
+                    else:
+                        CliOutput::write_error("\n")
+                    return EXIT_SECURITY
+
+                return EXIT_RESOLVE if lock.count == 0.usize()
+                if options.locked or options.frozen:
+                    return EXIT_RESOLVE if not ProjectFiles::cstr_file_exists("elisapkg.lock")
+                    existing: mutable darray[u8] = []
+                    existing.resize(1048577)
+                    return EXIT_RESOLVE if not ProjectFiles::read_cstr_into("elisapkg.lock", &existing)
+                    return EXIT_RESOLVE if not ByteText::equal(existing, lock)
+                if not (options.locked or options.frozen):
+                    if not transaction_owned:
+                        if not ProjectTransaction::begin_with_lock(raw, lock_state, preferred_lock):
+                            CliOutput::write_error("error: could not claim the package transaction; another edit may be active or the manifest or lockfile may have changed\n")
+                            return EXIT_SECURITY
+                    # Record the exact replacement before publishing it. Recovery
+                    # can then distinguish our new lock from an unrelated edit if
+                    # the process stops between these two writes.
+                    if not ProjectFiles::write_cstr_file(".elisapkg/transaction.new-lock", &lock):
+                        if not transaction_owned:
+                            _ = ProjectTransaction::restore()
+                        return EXIT_SECURITY
+                    if not ProjectFiles::write_cstr_file("elisapkg.lock", &lock):
+                        if not transaction_owned:
+                            _ = ProjectTransaction::restore()
+                        return EXIT_RESOLVE
+                    if not transaction_owned:
+                        if not ProjectTransaction::mark_lock():
+                            _ = ProjectTransaction::restore()
+                            return EXIT_SECURITY
+                        return EXIT_SECURITY if not ProjectTransaction::commit()
+                write_resolved_text(resolved_name_text, resolved_version_text, options) if emit_result
+                return EXIT_OK
+
+        def tree(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                if not ProjectContext::manifest_exists():
+                    CliOutput::write_error("error: could not find elisapkg.json in the current directory\n")
+                    return EXIT_RESOLVE
+                raw: mutable darray[u8] = []
+                raw.resize(1048577)
+                return EXIT_RESOLVE if not ProjectFiles::read_cstr_into("elisapkg.json", &raw)
+                name: mutable darray[u8] = []
+                version: mutable darray[u8] = []
+                return EXIT_RESOLVE if not ProjectManifest::validate(raw, &name, &version)
+                return EXIT_RESOLVE if not ProjectFiles::cstr_file_exists("elisapkg.lock")
+                lock: mutable darray[u8] = []
+                lock.resize(1048577)
+                return EXIT_RESOLVE if not ProjectFiles::read_cstr_into("elisapkg.lock", &lock)
+                return EXIT_RESOLVE if not LockValidation::matches_manifest(raw, lock, name, version, start)
+                if options.json:
+                    return EXIT_OK if print_lock_packages_json(lock)
+                    return EXIT_RESOLVE
+                return EXIT_RESOLVE if not print_lock_packages(lock)
+                return EXIT_OK
+
+        def remove(argc: i64, slots: mutable cstr&&) -> i64 can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global{Read,Write}:
+                return EXIT_SECURITY if not ProjectTransaction::recover()
+                return EXIT_USAGE if argc != 3
+                alias: mutable darray[u8] = []
+                ByteText::append_bounded_text(&alias, slots[2].cast[cstr])
+                return EXIT_USAGE if not PackageIdentity::valid_name(alias)
+                root: mutable darray[u8] = [46]
+                root_name: mutable darray[u8] = []
+                root_version: mutable darray[u8] = []
+                return EXIT_USAGE if not ProjectManifest::load_at(&root, &root_name, &root_version)
+                raw: mutable darray[u8] = []
+                raw.resize(1048577)
+                return EXIT_USAGE if not ProjectFiles::read_cstr_into("elisapkg.json", &raw)
+                return EXIT_USAGE if not ProjectManifest::validate_at(raw, &root, &root_name, &root_version)
+                updated: darray[u8] = ManifestEdits::remove(raw, alias)
+                if updated.count == 0.usize():
+                    CliOutput::write_error("error: dependency is not declared; no manifest or lockfile mutation was performed\n")
+                    return EXIT_RESOLVE
+                return EXIT_SECURITY if not ProjectTransaction::begin(raw)
+                if not ProjectTransaction::stage_manifest(updated) or not ProjectFiles::write_cstr_file("elisapkg.json", &updated):
+                    _ = ProjectTransaction::restore()
+                    return EXIT_SOURCE
+                options: Model::CommandOptions = Model::CommandOptions{locked: false, offline: false, frozen: false, json: false, verbose: false, profile: "debug", target_name: "", target_kind: "", update_name: ""}
+                resolved: i64 = resolve(&root, options, true, false)
+                if resolved != EXIT_OK:
+                    restored: bool = ProjectTransaction::restore()
+                    if not restored:
+                        CliOutput::write_error("error: dependency removal failed and the original manifest could not be restored\n")
+                        return EXIT_SECURITY
+                    return resolved
+                if not ProjectTransaction::mark_lock():
+                    _ = ProjectTransaction::restore()
+                    return EXIT_SECURITY
+                return EXIT_SECURITY if not ProjectTransaction::commit()
+                CliOutput::write_ok("removed dependency ")
+                CliOutput::write_bytes(1, &alias)
+                CliOutput::write_ok("\n")
+                return EXIT_OK
+
+        def update(argc: i64, slots: mutable cstr&&) -> i64 can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global{Read,Write}:
+                return EXIT_SECURITY if not ProjectTransaction::recover()
+                return EXIT_USAGE if argc > 3
+                wanted: mutable darray[u8] = []
+                if argc == 3:
+                    ByteText::append_bounded_text(&wanted, slots[2].cast[cstr])
+                    return EXIT_USAGE if not PackageIdentity::valid_name(wanted)
+                root: mutable darray[u8] = [46]
+                raw: mutable darray[u8] = []
+                raw.resize(1048577)
+                return EXIT_USAGE if not ProjectFiles::read_cstr_into("elisapkg.json", &raw)
+                root_name: mutable darray[u8] = []
+                root_version: mutable darray[u8] = []
+                return EXIT_USAGE if not ProjectManifest::validate_at(raw, &root, &root_name, &root_version)
+                return EXIT_USAGE if wanted.count > 0.usize() and ByteText::equal(wanted, root_name)
+                return EXIT_SECURITY if not ProjectTransaction::begin(raw)
+                options: Model::CommandOptions = Model::CommandOptions{locked: false, offline: false, frozen: false, json: false, verbose: false, profile: "debug", target_name: "", target_kind: "", update_name: ""}
+                if wanted.count > 0.usize():
+                    options.update_name <- slots[2].cast[cstr]
+                resolved: i64 = resolve(&root, options, true, false)
+                if resolved != EXIT_OK:
+                    restored: bool = ProjectTransaction::restore()
+                    if not restored:
+                        CliOutput::write_error("error: update failed and the original manifest or lockfile could not be restored\n")
+                        return EXIT_SECURITY
+                    return resolved
+                if wanted.count > 0.usize():
+                    lock: mutable darray[u8] = []
+                    lock.resize(1048577)
+                    if not ProjectFiles::read_cstr_into("elisapkg.lock", &lock) or not Lockfile::contains_package(lock, wanted):
+                        _ = ProjectTransaction::restore()
+                        return EXIT_RESOLVE
+                if not ProjectTransaction::mark_lock():
+                    _ = ProjectTransaction::restore()
+                    return EXIT_SECURITY
+                return EXIT_SECURITY if not ProjectTransaction::commit()
+                CliOutput::write_ok("updated dependency lock\n")
+                return EXIT_OK
+
+    private:
+        const EXIT_OK: i64 = 0
+        const EXIT_USAGE: i64 = 2
+        const EXIT_RESOLVE: i64 = 3
+        const EXIT_SOURCE: i64 = 4
+        const EXIT_SECURITY: i64 = 5
+
+        def print_lock_packages(raw: darray[u8]&) -> bool can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic]:
+            can Global.Read:
+                found: mutable usize = 0.usize()
+                for index in 0..<raw.count |raw, found|:
+                    continue if raw[index] != 123
+                    object_end: usize = Json::object_end(raw, index)
+                    continue if object_end <= index
+                    package_name: mutable darray[u8] = []
+                    package_version: mutable darray[u8] = []
+                    if Json::object_string_value(raw, index, object_end, "name", &package_name) and Json::object_string_value(raw, index, object_end, "version", &package_version):
+                        CliOutput::write_bytes(1, &package_name)
+                        CliOutput::write_ok(" ")
+                        CliOutput::write_bytes(1, &package_version)
+                        CliOutput::write_ok("\n")
+                        found <- found + 1.usize()
+                return found > 0.usize()
+
+        def print_lock_packages_json(raw: darray[u8]&) -> bool can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic]:
+            can Global.Read:
+                found: mutable usize = 0.usize()
+                CliOutput::write_ok("{\"schema-version\":1,\"packages\":[")
+                for index in 0..<raw.count |raw, found|:
+                    continue if raw[index] != 123
+                    object_end: usize = Json::object_end(raw, index)
+                    continue if object_end <= index
+                    package_name: mutable darray[u8] = []
+                    package_version: mutable darray[u8] = []
+                    if Json::object_string_value(raw, index, object_end, "name", &package_name) and Json::object_string_value(raw, index, object_end, "version", &package_version):
+                        CliOutput::write_ok(",") if found > 0.usize()
+                        CliOutput::write_ok("{\"name\":\"")
+                        CliOutput::write_bytes(1, &package_name)
+                        CliOutput::write_ok("\",\"version\":\"")
+                        CliOutput::write_bytes(1, &package_version)
+                        CliOutput::write_ok("\"}")
+                        found <- found + 1.usize()
+                return false if found == 0.usize()
+                CliOutput::write_ok("]}\n")
+                return true
+
+        def write_resolved_text(name: cstr, version: cstr, options: Model::CommandOptions) -> void can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                if options.json:
+                    CliOutput::write_ok("{\"schema-version\":1,\"resolved\":true,\"package\":{\"name\":\"")
+                    CliOutput::write_text(1, name)
+                    CliOutput::write_ok("\",\"version\":\"")
+                    CliOutput::write_text(1, version)
+                    CliOutput::write_ok("\"}}\n")
+                    return
+                CliOutput::write_ok("resolved ")
+                CliOutput::write_text(1, name)
+                CliOutput::write_ok(" ")
+                CliOutput::write_text(1, version)
+                CliOutput::write_ok("\n")
+
+        def registry_conflict_field(raw: darray[u8]&, wanted: usize, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            out.resize(0)
+            cursor: mutable usize = 1.usize()
+            current: mutable usize = 0.usize()
+            while cursor < raw.count |raw, cursor, current, out|:
+                finish: mutable usize = cursor
+                while finish < raw.count and raw[finish] != 0 |raw, finish|:
+                    finish <- finish + 1.usize()
+                return false if finish == raw.count
+                if current == wanted:
+                    for index in cursor..<finish |raw, out|:
+                        out.push(raw[index])
+                    return true
+                current <- current + 1.usize()
+                cursor <- finish + 1.usize()
+            return false
+
+        def write_registry_conflict(raw: darray[u8]&) -> void can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                package: mutable darray[u8] = []
+                first_requirement: mutable darray[u8] = []
+                second_requirement: mutable darray[u8] = []
+                return if:
+                    not registry_conflict_field(raw, 0, &package) or not registry_conflict_field(raw, 1, &first_requirement) or not registry_conflict_field(raw, 2, &second_requirement)
+                    package.count == 0.usize() or first_requirement.count == 0.usize() or second_requirement.count == 0.usize()
+                CliOutput::write_error(" (package ")
+                CliOutput::write_bytes(2, &package)
+                CliOutput::write_error("; requirements ")
+                CliOutput::write_bytes(2, &first_requirement)
+                CliOutput::write_error(" and ")
+                CliOutput::write_bytes(2, &second_requirement)
+                CliOutput::write_error(")")
