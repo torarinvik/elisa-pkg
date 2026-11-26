@@ -42,7 +42,7 @@ module NativeTrustedPaths:
             return 0 if native_close(directory) == 0 else -5
 
         def ensure_trusted_directory(path: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            directory: i64 = walk_trusted_directory(path, native_geteuid().u64(), true)
+            directory: i64 = walk_trusted_directory(path, native_geteuid().u64(), true, false)
             return directory if directory < 0
             return 0 if native_close(directory) == 0 else -5
 
@@ -168,10 +168,10 @@ module NativeTrustedPaths:
     private:
     public:
         def open_trusted_directory(path: cstr, expected_user_identifier: u64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            return walk_trusted_directory(path, expected_user_identifier, false)
+            return walk_trusted_directory(path, expected_user_identifier, false, false)
 
     private:
-        def walk_trusted_directory(path: cstr, expected_user_identifier: u64, create_missing: bool) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+        def walk_trusted_directory(path: cstr, expected_user_identifier: u64, create_missing: bool, crypto_policy: bool) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             length: usize = native_strlen(path)
             return -22 if length == 0 or length > 4096 or path[0].u8() != 47
             path_copy: mutable darray[u8] = []
@@ -183,7 +183,7 @@ module NativeTrustedPaths:
                 effective_length <- effective_length - 1.usize()
             directory: mutable i64 = native_open("/", PlatformNative::flags_directory())
             return -NativeErrors::error_code() if directory < 0
-            if not trusted_directory_file_descriptor(directory, expected_user_identifier):
+            if not directory_trusted_by_policy(directory, expected_user_identifier, crypto_policy):
                 return PlatformNative::close_error(directory, -13)
             while start < effective_length |start: usize = 1.usize()|:
                 finish: mutable usize = start
@@ -194,7 +194,7 @@ module NativeTrustedPaths:
                 for index in start..<finish |part_storage, path_copy|:
                     part_storage <- part_storage.push(path_copy[index])
                 part_storage <- part_storage.push(0)
-                directory <- open_trusted_child(directory, ((&part_storage[0]).cast[cstr] can Unsafe.PointerCast), expected_user_identifier, create_missing)
+                directory <- open_trusted_child(directory, ((&part_storage[0]).cast[cstr] can Unsafe.PointerCast), expected_user_identifier, create_missing, crypto_policy)
                 return directory if directory < 0
                 break if finish == effective_length
                 start <- finish + 1.usize()
@@ -204,7 +204,7 @@ module NativeTrustedPaths:
         # Open the trusted child directory `part` of `directory`, creating it
         # when `create_missing`. On success `directory` is closed and the child
         # descriptor returned; on failure both are closed.
-        def open_trusted_child(directory: i64, part: cstr, expected_user_identifier: u64, create_missing: bool) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+        def open_trusted_child(directory: i64, part: cstr, expected_user_identifier: u64, create_missing: bool, crypto_policy: bool) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             requires directory >= 0
             return PlatformNative::close_error(directory, -22) if PlatformNative::c_string_equal(part, ".") or PlatformNative::c_string_equal(part, "..")
             next: mutable i64 = native_openat(directory, part, PlatformNative::flags_directory() + flag_no_follow)
@@ -213,7 +213,7 @@ module NativeTrustedPaths:
                 return PlatformNative::close_error(directory, NativeErrors::negative_errno()) if native_mkdirat(directory, part, 493) != 0 and NativeErrors::current_errno() != 17
                 next <- native_openat(directory, part, PlatformNative::flags_directory() + flag_no_follow)
             return PlatformNative::close_error(directory, NativeErrors::negative_errno()) if next < 0
-            return PlatformNative::close_two_error(directory, next, -13) if not trusted_directory_file_descriptor(next, expected_user_identifier)
+            return PlatformNative::close_two_error(directory, next, -13) if not directory_trusted_by_policy(next, expected_user_identifier, crypto_policy)
             # An EEXIST result may come from another installer that created
             # the directory but has not synced the parent yet.
             return PlatformNative::close_two_error(directory, next, NativeErrors::negative_errno()) if needs_parent_sync and native_fsync(directory) != 0
@@ -263,41 +263,11 @@ module NativeTrustedPaths:
             return 18446744073709551615
 
         def open_crypto_trusted_directory(path: cstr, expected_user_identifier: u64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            length: usize = native_strlen(path)
-            return -22 if length == 0 or length > 4096 or path[0].u8() != 47
-            path_copy: mutable darray[u8] = []
-            for index in 0..<length |path_copy, path|:
-                path_copy <- path_copy.push(path[index].u8())
-            path_copy <- path_copy.push(0)
-            effective_length: mutable usize = length
-            while effective_length > 1.usize() and path_copy[effective_length - 1.usize()] == 47:
-                effective_length <- effective_length - 1.usize()
-            directory: mutable i64 = native_open("/", PlatformNative::flags_directory())
-            return -NativeErrors::error_code() if directory < 0
-            if not crypto_trusted_directory_file_descriptor(directory, expected_user_identifier):
-                return PlatformNative::close_error(directory, -13)
-            while start < effective_length |start: usize = 1.usize()|:
-                finish: mutable usize = start
-                while finish < effective_length and path_copy[finish] != 47 |path_copy, finish|:
-                    finish <- finish + 1.usize()
-                return PlatformNative::close_error(directory, -22) if finish == start
-                next: i64 =
-                    part_storage: mutable darray[u8] = []
-                    for index in start..<finish |part_storage, path_copy|:
-                        part_storage <- part_storage.push(path_copy[index])
-                    part_storage <- part_storage.push(0)
-                    part: cstr = (&part_storage[0]).cast[cstr] can Unsafe.PointerCast
-                    return PlatformNative::close_error(directory, -22) if PlatformNative::c_string_equal(part, ".") or PlatformNative::c_string_equal(part, "..")
-                    native_openat(directory, part, PlatformNative::flags_directory() + flag_no_follow)
-                return PlatformNative::close_error(directory, -NativeErrors::error_code()) if next < 0
-                if not crypto_trusted_directory_file_descriptor(next, expected_user_identifier):
-                    return PlatformNative::close_two_error(directory, next, -13)
-                return PlatformNative::close_error(directory, -5) if native_close(directory) != 0
-                directory <- next
-                break if finish == effective_length
-                start <- finish + 1.usize()
-                return PlatformNative::close_error(directory, -22) if start == effective_length or path_copy[start] == 47
-            return directory
+            return walk_trusted_directory(path, expected_user_identifier, false, true)
+
+        # Apply the crypto provider directory policy or the strict one.
+        def directory_trusted_by_policy(file_descriptor: i64, expected_user_identifier: u64, crypto_policy: bool) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return crypto_trusted_directory_file_descriptor(file_descriptor, expected_user_identifier) if crypto_policy else trusted_directory_file_descriptor(file_descriptor, expected_user_identifier)
 
         def executable_source_directory_file_descriptor(file_descriptor: i64, expected_user_identifier: u64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return true if PlatformNative::package_source_directory_file_descriptor(file_descriptor)
