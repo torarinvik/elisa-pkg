@@ -421,6 +421,11 @@ module PlatformNative:
             return directory if directory < 0
             return 0 if native_close(directory) == 0 else -5
 
+        def ensure_trusted_directory(path: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            directory: i64 = walk_trusted_directory(path, native_geteuid().u64(), true)
+            return directory if directory < 0
+            return 0 if native_close(directory) == 0 else -5
+
         def package_file_size(path: cstr) -> i64:
             fd: i64 = open_package_file(path)
             return fd if fd < 0
@@ -2250,6 +2255,9 @@ module PlatformNative:
                 return owner_seen and group_seen and other_seen and previous_tag == linux_acl_tag_other
 
         def open_trusted_directory(path: cstr, expected_uid: u64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return walk_trusted_directory(path, expected_uid, false)
+
+        def walk_trusted_directory(path: cstr, expected_uid: u64, create_missing: bool) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             length: usize = native_strlen(path)
             return -22 if length == 0 or length > 4096 or path[0].u8() != 47
             path_copy: mutable darray[u8] = []
@@ -2275,8 +2283,14 @@ module PlatformNative:
                 part_storage.push(0)
                 part: cstr = (&part_storage[0]).cast[cstr] can Unsafe.PointerCast
                 return close_error(directory, -22) if cstr_equal(part, ".") or cstr_equal(part, "..")
-                next: i64 = native_openat(directory, part, flags_directory() + flag_no_follow)
-                return close_error(directory, -error_code()) if next < 0
+                next: mutable i64 = native_openat(directory, part, flags_directory() + flag_no_follow)
+                if next < 0 and create_missing and current_errno() == 2:
+                    created: i32 = native_mkdirat(directory, part, 493)
+                    return close_error(directory, negative_errno()) if created != 0 and current_errno() != 17
+                    if created == 0 and native_fsync(directory) != 0:
+                        return close_error(directory, negative_errno())
+                    next <- native_openat(directory, part, flags_directory() + flag_no_follow)
+                return close_error(directory, negative_errno()) if next < 0
                 if not trusted_directory_fd(next, expected_uid):
                     return close_two_error(directory, next, -13)
                 return close_error(next, -5) if native_close(directory) != 0
