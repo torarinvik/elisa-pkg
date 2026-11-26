@@ -285,6 +285,27 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
         '    solver_budget_result: Solver::SolveCode = Solver::solve(solver_budget_candidates, solver_budget_roots, &solver_budget_selected)',
     ])
     check('solver_budget_result == Solver::SolveCode.ResourceLimit and solver_budget_selected.count == 0.usize()')
+    # The root occupies one active slot before the candidate expands.
+    lines.extend([
+        "    branch_name: darray[u8] = [97]",
+        "    missing_name: darray[u8] = [98]",
+        "    exact_version: darray[u8] = [49,46,48,46,48]",
+        "    branch_roots: mutable darray[Solver::Constraint] = []",
+        "    branch_roots.push(Solver::Constraint{package: branch_name, requirement: exact_version})",
+        "    branch_dependencies: mutable darray[Solver::Constraint] = []",
+        "    for index in 0..<(Solver::maximum_constraints - 1.usize()) |branch_dependencies|:",
+        "        branch_dependencies.push(Solver::Constraint{package: missing_name, requirement: exact_version})",
+        "    branch_candidates: mutable darray[Solver::Candidate] = []",
+        "    branch_candidates.push(Solver::Candidate{package: branch_name, version: Model::Version{major: 1, minor: 0, patch: 0, prerelease: false}, dependencies: branch_dependencies, yanked: false})",
+        "    branch_selected: mutable darray[usize] = []",
+        "    branch_exact_result: Solver::SolveCode = Solver::solve(branch_candidates, branch_roots, &branch_selected)",
+        "    branch_dependencies.push(Solver::Constraint{package: missing_name, requirement: exact_version})",
+        "    branch_candidates.resize(0)",
+        "    branch_candidates.push(Solver::Candidate{package: branch_name, version: Model::Version{major: 1, minor: 0, patch: 0, prerelease: false}, dependencies: branch_dependencies, yanked: false})",
+        "    branch_over_result: Solver::SolveCode = Solver::solve(branch_candidates, branch_roots, &branch_selected)",
+    ])
+    check('branch_exact_result == Solver::SolveCode.Unsatisfiable')
+    check('branch_over_result == Solver::SolveCode.ResourceLimit and branch_selected.count == 0.usize()')
     lines.extend([
         '    solver_bad_requirement: mutable darray[u8] = [49,46,48]',
         '    solver_bad_roots: mutable darray[Solver::Constraint] = []',
