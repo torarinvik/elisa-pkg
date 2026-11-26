@@ -144,8 +144,7 @@ module RollbackRecords:
                 ByteText::append_text(out, "elisapkg-trust-state:4\n")
                 return Code.Ok
             if version_4(state):
-                for index in 0..<state.count |out, state|:
-                    out.push(state[index])
+                ByteText::append(out, state)
                 return Code.Ok
             return Code.Malformed if not version_2(state) and not version_3(state)
             region validation_status_scope:
@@ -177,33 +176,31 @@ module RollbackRecords:
         def has_root_scoped_history(state: darray[u8]&, root_key_identity: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
             return false if not version_4(state) or state.count <= 23.usize()
             return true if not ByteText::starts_with_text(root_key_identity, "@root-key:") or root_key_identity.count != 74.usize()
-            root_hash: mutable darray[u8] = []
-            for index in 0..<64.usize() |root_hash, root_key_identity|:
-                root_hash <- root_hash.push(root_key_identity[10.usize() + index])
-            package_prefix: mutable darray[u8] = []
-            ByteText::append_text(&package_prefix, "@package:")
-            ByteText::append(&package_prefix, root_hash)
-            package_prefix <- package_prefix.push(58)
-            index_prefix: mutable darray[u8] = []
-            ByteText::append_text(&index_prefix, "@index:")
-            ByteText::append(&index_prefix, root_hash)
-            index_prefix <- index_prefix.push(58)
+            package_prefix: darray[u8] = root_scoped_prefix(true, root_key_identity)
+            index_prefix: darray[u8] = root_scoped_prefix(false, root_key_identity)
             while cursor < state.count |cursor: usize = 23.usize()|:
                 finish: mutable usize = cursor
                 while finish < state.count and state[finish] != 10 |state, finish|:
                     finish <- finish + 1.usize()
                 return true if finish == state.count
-                identity_end: mutable usize = cursor
-                while identity_end < finish and state[identity_end] != 32 |state, identity_end|:
-                    identity_end <- identity_end + 1.usize()
-                return true if identity_end == cursor or identity_end == finish
-                package_match: mutable bool = identity_end - cursor >= package_prefix.count
-                region index_match_scope:
-                    index_match: mutable bool = identity_end - cursor >= index_prefix.count
-                    for index in 0..<package_prefix.count |state, cursor, identity_end, package_prefix, package_match|:
-                        package_match <- package_match and state[cursor + index] == package_prefix[index]
-                    for index in 0..<index_prefix.count |state, cursor, identity_end, index_prefix, index_match|:
-                        index_match <- index_match and state[cursor + index] == index_prefix[index]
-                    return true if package_match or index_match
+                region identity_end_scope:
+                    identity_end: usize = next_space(state, cursor, finish)
+                    return true if identity_end == cursor or identity_end == finish
+                    return true if:
+                        identity_end - cursor >= package_prefix.count and ByteText::range_equals(state, cursor, cursor + package_prefix.count, package_prefix)
+                        identity_end - cursor >= index_prefix.count and ByteText::range_equals(state, cursor, cursor + index_prefix.count, index_prefix)
                 cursor <- finish + 1.usize()
             return false
+
+        # "@package:" (or "@index:") followed by the 64-character root hash
+        # of `root_key_identity` ("@root-key:HASH") and a colon.
+        def root_scoped_prefix(package_kind: bool, root_key_identity: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
+            requires root_key_identity.count == 74.usize()
+            prefix: mutable darray[u8] = []
+            if package_kind:
+                ByteText::append_text(&prefix, "@package:")
+            else:
+                ByteText::append_text(&prefix, "@index:")
+            ByteText::append_range(&prefix, root_key_identity, 10.usize(), 74.usize())
+            prefix <- prefix.push(58)
+            return prefix
