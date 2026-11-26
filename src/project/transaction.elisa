@@ -115,21 +115,27 @@ module ProjectTransaction:
 
         def begin_with_lock(original_manifest: darray[u8]&, expected_lock_state: i64, expected_lock: darray[u8]&) -> bool can[Global{Read,Write}, Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             can Global{Read,Write}:
+                # Preserve legacy guards before opening a lock file that would
+                # change how recovery classifies them.
+                return false if transaction_guard_state() != 0
                 state_root: mutable darray[u8] = []
                 ByteText::append_text(&state_root, ".elisapkg")
                 return false if not ProjectFiles::make_directory(&state_root)
                 return false if not transaction_lock_acquire()
+                journal_exists: bool =
+                    Platform::pkg_package_file_size(phase_path) != -2 or
+                    Platform::pkg_package_file_size(original_manifest_path) != -2 or
+                    Platform::pkg_package_file_size(original_lock_path) != -2 or
+                    Platform::pkg_package_file_size(staged_manifest_path) != -2 or
+                    Platform::pkg_package_file_size(staged_lock_path) != -2 or
+                    Platform::pkg_package_file_size(staged_missing_lock_path) != -2
+                if journal_exists:
+                    _ = transaction_lock_release()
+                    return false
                 guard: mutable darray[u8] = []
                 ByteText::append_text(&guard, guard_path)
                 if Platform::pkg_mkdir(guard_path, 448.u16()) != 0:
                     _ = transaction_lock_release()
-                    return false
-                transaction_state: i64 = Platform::pkg_package_file_size(phase_path)
-                if transaction_state >= 0:
-                    _ = transaction_abort_begin(guard)
-                    return false
-                if transaction_state != -2:
-                    _ = transaction_abort_begin(guard)
                     return false
                 # The caller prepared its edit before taking the guard. Another
                 # transaction may have committed in that interval, so compare the
