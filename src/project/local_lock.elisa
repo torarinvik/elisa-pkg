@@ -57,23 +57,10 @@ module LocalLock:
             processed: mutable usize = 0.usize()
             while processed < total |edge_offsets, processed|:
                 package_root: mutable darray[u8] = []
-                return false if not queue_field_at(queue, record_starts, processed, 0, &package_root)
-                manifest_path: mutable darray[u8] = []
-                ProjectFiles::path_join_into(&package_root, "elisapkg.json", &manifest_path)
                 child_raw: mutable darray[u8] = []
-                return false if not Platform::read_bounded_file(manifest_path, Json::maximum_document_bytes, &child_raw)
-                child_name: mutable darray[u8] = []
-                child_version: mutable darray[u8] = []
                 return false if:
-                    not ProjectManifest::validate_at(child_raw, &package_root, &child_name, &child_version)
-                    ByteText::equal(child_name, name)
-                queued_name: mutable darray[u8] = []
-                region queued_version_scope:
-                    queued_version: mutable darray[u8] = []
-                    return false if:
-                        not queue_field_at(queue, record_starts, processed, 1, &queued_name) or not queue_field_at(queue, record_starts, processed, 2, &queued_version)
-                        not ByteText::equal(queued_name, child_name) or not ByteText::equal(queued_version, child_version)
-                        not append_local_dependency_records(child_raw, &package_root, queue, record_starts, sorted_records, edges, edge_count, total, processed)
+                    not read_queued_manifest(name, queue, record_starts, processed, &package_root, &child_raw)
+                    not append_local_dependency_records(child_raw, &package_root, queue, record_starts, sorted_records, edges, edge_count, total, processed)
                 region digest_scope:
                     digest: mutable darray[u8] = []
                     return false if Integrity::sha256(child_raw, &digest) != Integrity::DigestCode.Ok
@@ -81,6 +68,20 @@ module LocalLock:
                 processed <- processed + 1.usize()
                 edge_offsets <- edge_offsets.push(edges.count)
             return DependencyGraph::is_acyclic(total, edges, edge_offsets)
+
+        # Read the manifest of queued package `processed`. It must not be the
+        # root package and must name the queued package and version.
+        def read_queued_manifest(name: darray[u8]&, queue: darray[u8]&, record_starts: darray[usize]&, processed: usize, package_root: mutable darray[u8]&, child_raw: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return false if not queue_field_at(queue, record_starts, processed, 0, package_root)
+            manifest_path: mutable darray[u8] = []
+            ProjectFiles::path_join_into(package_root, "elisapkg.json", &manifest_path)
+            return false if not Platform::read_bounded_file(manifest_path, Json::maximum_document_bytes, child_raw)
+            child_name: mutable darray[u8] = []
+            child_version: mutable darray[u8] = []
+            return false if not ProjectManifest::validate_at(child_raw, package_root, &child_name, &child_version) or ByteText::equal(child_name, name)
+            queued_name: mutable darray[u8] = []
+            queued_version: mutable darray[u8] = []
+            return queue_field_at(queue, record_starts, processed, 1, &queued_name) and queue_field_at(queue, record_starts, processed, 2, &queued_version) and ByteText::equal(queued_name, child_name) and ByteText::equal(queued_version, child_version)
 
         # Append one dependency record per package in name order, binding each
         # to its source digest and to the manifest digest seen in traversal.
