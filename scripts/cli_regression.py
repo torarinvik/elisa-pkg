@@ -178,10 +178,4 @@ with tempfile.TemporaryDirectory(prefix='cli-review-', dir=ROOT / 'build') as di
     assert result.returncode == 6, result
     assert artifact.read_bytes() == b'previous working output'
 
-    guard = project / '.elisapkg/transaction.guard'
-    guard.mkdir()
-    result = subprocess.run([BIN, 'check-manifest'], cwd=project, capture_output=True, timeout=120, check=False)
-    assert result.returncode == 5, result
-    guard.rmdir()
-
 print('CLI regressions passed')

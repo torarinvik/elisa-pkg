@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Check that another CLI process never replays a journal under its owner guard."""
 
+import fcntl
 from pathlib import Path
 import subprocess
 import tempfile
@@ -48,23 +49,24 @@ def main() -> int:
         lock.write_bytes(new_lock)
         guard = state / "transaction.guard"
         guard.mkdir(mode=0o700)
+        transaction_flock = state / "transaction.flock"
 
-        # This is a separate CLI process observing the exact state left by a
-        # live mutator. It must fail without restoring files or consuming its
-        # journal while the mutator's guard remains present.
-        run("check-manifest", cwd=project, expected=5)
-        run("resolve", cwd=project, expected=5)
+        # Hold the same kernel lock as an active mutator while invoking the CLI.
+        transaction_flock.touch(mode=0o600, exist_ok=True)
+        with transaction_flock.open("r+b") as descriptor:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            run("check-manifest", cwd=project, expected=5)
+            run("resolve", cwd=project, expected=5)
         if manifest.read_bytes() != new_manifest or lock.read_bytes() != new_lock:
             raise SystemExit("active-guard refusal changed the manifest or lockfile")
         if not (state / "transaction.state").is_file() or not guard.is_dir():
             raise SystemExit("active-guard refusal removed transaction recovery evidence")
 
-        # Once the owner guard is absent, recovery claims it and restores the
-        # original manifest/lock pair from the staged journal.
-        guard.rmdir()
+        # Process exit releases the flock and leaves the directory behind.
+        # Recovery must restore the original manifest and lock in that state.
         run("check-manifest", cwd=project, expected=0)
         if manifest.read_bytes() != original_manifest or lock.read_bytes() != original_lock:
-            raise SystemExit("recovery without an active guard did not restore the original pair")
+            raise SystemExit("recovery after lock release did not restore the original pair")
         if (state / "transaction.state").exists() or guard.exists():
             raise SystemExit("successful transaction recovery retained its journal")
 
@@ -103,8 +105,8 @@ def main() -> int:
         run("check-manifest", cwd=project, expected=5)
         if manifest.read_bytes() != external_manifest or not (state / "transaction.state").is_file():
             raise SystemExit("pending recovery overwrote an external edit or discarded its journal")
-        if guard.exists():
-            raise SystemExit("failed recovery retained its temporary guard and blocked a repaired retry")
+        if not guard.is_dir():
+            raise SystemExit("failed recovery discarded its transaction guard")
         manifest.write_bytes(original_manifest)
         run("check-manifest", cwd=project, expected=0)
 
@@ -131,8 +133,15 @@ def main() -> int:
         if (state / "transaction.state").exists():
             raise SystemExit("missing-lock recovery retained its journal")
 
-        # A guard with no state marker is also fail-closed instead of being
-        # mistaken for an unused project directory.
+        # A modern guard can be recovered after a crash before journal publication.
+        guard.mkdir(mode=0o700)
+        (state / "transaction.manifest").write_bytes(original_manifest)
+        run("check-manifest", cwd=project, expected=0)
+        if guard.exists() or (state / "transaction.manifest").exists():
+            raise SystemExit("recovery retained files from a partially prepared journal")
+
+        # A legacy guard has no flock file and requires operator recovery.
+        transaction_flock.unlink()
         guard.mkdir(mode=0o700)
         run("check-manifest", cwd=project, expected=5)
         if not guard.is_dir():
