@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -37,13 +38,30 @@ def graph_records(dependencies: dict[str, str]) -> str:
     return "\n".join(records)
 
 
+def target_manifest(names: list[str]) -> str:
+    return byte_list(json.dumps({
+        "schema-version": 1,
+        "package": {"name": "example", "version": "1.0.0"},
+        "targets": [
+            {"name": name, "kind": "bin", "entry": "src/main.elisa"}
+            for name in names
+        ],
+    }).encode("ascii"))
+
+
 def probe_source() -> str:
     module_path = ROOT / "src" / "resolution" / "local_build_graph.elisa"
     safe_path = b"/tmp/package root/src/main.elisa"
     expected = b"x\ninclude \"" + safe_path + b"\"\n"
     cache_path = ROOT / "src" / "project" / "build_cache.elisa"
+    manifest_path = ROOT / "src" / "project" / "manifest.elisa"
+    # Both valid names start in the same bucket of the target-name index.
+    collision_names = ["target28", "target375"]
+    distinct_targets = target_manifest(collision_names)
+    duplicate_target = target_manifest([*collision_names, collision_names[-1]])
     return f'''include "{module_path}"
 include "{cache_path}"
+include "{manifest_path}"
 
 def same_bytes(left: darray[u8]&, right: darray[u8]&) -> bool:
     return false if left.count != right.count
@@ -89,6 +107,14 @@ def cached_artifact_matches() -> bool can[Memory.Allocate, Abort.Panic, Unsafe.P
     ByteText::append_text(&artifact, "-different")
     return not BuildCache::verified_digest(artifact, receipt, prefix, 0, &digest) and digest.count == 0
 
+def target_names_are_distinct() -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    distinct: darray[u8] = [{distinct_targets}]
+    duplicate: darray[u8] = [{duplicate_target}]
+    name: mutable darray[u8] = []
+    version: mutable darray[u8] = []
+    return false if not ProjectManifest::validate(distinct, &name, &version)
+    return not ProjectManifest::validate(duplicate, &name, &version)
+
 def main() -> i64 can[Memory.Allocate, Abort.Panic]:
     safe_path: mutable darray[u8] = [{byte_list(safe_path)}]
     output: mutable darray[u8] = [120, 10]
@@ -132,6 +158,7 @@ def main() -> i64 can[Memory.Allocate, Abort.Panic]:
     return 15 if not graph_order_is_stable()
     return 16 if not cyclic_graph_is_rejected()
     return 17 if not cached_artifact_matches()
+    return 18 if not target_names_are_distinct()
     return 0
 '''
 
@@ -167,6 +194,8 @@ def main() -> int:
         source = work / "build_include_probe.elisa"
         binary = work / "build_include_probe"
         source.write_text(probe_source(), encoding="utf-8")
+        (work / "src").mkdir()
+        (work / "src" / "main.elisa").touch()
         (work / "artifact").write_bytes(CACHED_ARTIFACT)
         (work / "artifact-different").write_bytes(b"different artifact\n")
         receipt_suffix = f"\nartifact-digest:sha256:{ARTIFACT_DIGEST}\n".encode("ascii")
@@ -193,7 +222,7 @@ def main() -> int:
         if result.returncode != 0:
             raise SystemExit(f"error: include-emission probe returned status {result.returncode}")
 
-    print("Elisa build includes, graph ordering, and cache regression passed")
+    print("Elisa build includes, graph ordering, cache, and target validation passed")
     return 0
 
 
