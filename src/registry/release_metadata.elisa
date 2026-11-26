@@ -89,24 +89,25 @@ module ReleaseMetadata:
             while cursor < dependency_end:
                 entry: mutable DependencyEntry::Span = DependencyEntry::Span{name_start: 0, name_end: 0, object_start: 0, object_end: 0}
                 return false if not DependencyEntry::read(raw, cursor, dependency_end, &entry)
-                return false if not append_dependency(raw, entry.name_start, entry.name_end, entry.object_start, entry.object_end, out)
+                return false if not append_dependency(raw, entry, out)
                 cursor <- DependencyEntry::next_start(raw, entry.object_end, dependency_end)
                 return true if cursor == dependency_end
             return false
 
-        def append_dependency(raw: darray[u8]&, alias_start: usize, alias_end: usize, value_start: usize, value_end: usize, out: mutable darray[Solver::Constraint]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            requires alias_start <= alias_end and alias_end < value_start and value_start < value_end and value_end < raw.count
-            for existing in 0..<out.count |out, raw, alias_start, alias_end|:
-                return false if ByteText::range_equals(raw, alias_start, alias_end, out[existing].package)
-            alias: mutable darray[u8] = []
-            ByteText::append_range(&alias, raw, alias_start, alias_end)
-            return false if not SchemaFields::valid(raw, value_start, value_end, SchemaFields::Kind.RegistryDependency)
+        def append_dependency(raw: darray[u8]&, entry: DependencyEntry::Span&, out: mutable darray[Solver::Constraint]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            requires entry.name_start < entry.name_end and entry.name_end < entry.object_start
+            requires entry.object_start < entry.object_end and entry.object_end < raw.count
+            return false if out.count >= max_dependencies
+            for existing in 0..<out.count |out, raw, entry|:
+                return false if ByteText::range_equals(raw, entry.name_start, entry.name_end, out[existing].package)
             requirement: mutable darray[u8] = []
-            return false if not Json::object_string_value(raw, value_start, value_end, "version", &requirement)
             parsed: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
-            return false if not SemVer::parse_requirement(requirement, &parsed)
-            return false if:
-                not Json::object_string_equals_text(raw, value_start, value_end, "registry", "primary")
-                out.count >= max_dependencies
+            return false if not:
+                SchemaFields::valid(raw, entry.object_start, entry.object_end, SchemaFields::Kind.RegistryDependency)
+                Json::object_string_value(raw, entry.object_start, entry.object_end, "version", &requirement)
+                SemVer::parse_requirement(requirement, &parsed)
+                Json::object_string_equals_text(raw, entry.object_start, entry.object_end, "registry", "primary")
+            alias: mutable darray[u8] = []
+            ByteText::append_range(&alias, raw, entry.name_start, entry.name_end)
             out.push(Solver::Constraint{package: alias, requirement: requirement})
             return true
