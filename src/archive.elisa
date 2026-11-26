@@ -110,38 +110,41 @@ module Archive:
                     cursor <- cursor + 1.usize()
                 return false if cursor >= paths.count
                 cursor <- cursor + 1.usize()
-                content: mutable darray[u8] = []
-                entry_c: mutable darray[u8] = []
                 return false if not is_safe_entry(entry) or UstarFields::archive_name_seen(seen, entry)
                 archive_push_array(&seen, entry)
                 seen.push(0)
                 entry_count <- entry_count + 1.usize()
-                archive_push_array(&entry_c, entry)
-                entry_c.push(0)
-                entry_name: cstr = (&entry_c[0]).cast[cstr] can Unsafe.PointerCast
-                entry_size: i64 = Platform::pkg_package_file_size(entry_name)
-                return false if entry_size < 0 or entry_size > UstarFields::max_payload_bytes.i64()
-                payload_size: usize = entry_size.usize()
-                padding: usize = UstarFields::padding_bytes(payload_size)
-                padded_payload: usize = payload_size + padding
-                return false if padded_payload > UstarFields::max_payload_bytes
-                return false if out.count > UstarFields::max_payload_bytes - padded_payload
-                header: darray[u8] = tar_file_header(entry, payload_size)
-                return false if header.count != 512.usize()
-                content.resize(payload_size + 1.usize())
-                content_raw: mutable u8& = (&content[0]).cast[mutable u8&] can Unsafe.PointerCast
-                read_size: i64 = Platform::pkg_read_package_file(entry_name, content_raw, content.count)
-                return false if read_size != entry_size
-                content.resize(payload_size)
-                header_start: usize = out.count
-                out.resize(out.count + 512.usize())
-                for header_index in 0..<512.usize() |out, header, header_start, header_index|:
-                    out[header_start + header_index] <- header[header_index]
-                for content_index in 0..<content.count |out, content|:
-                    out.push(content[content_index])
-                out.resize(out.count + padding)
+                return false if not append_file_entry(entry, out)
             out.resize(out.count + 1024.usize())
             return out.count <= UstarFields::max_archive_bytes
+
+        def append_file_entry(entry: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            terminated_path: mutable darray[u8] = []
+            archive_push_array(&terminated_path, entry)
+            terminated_path.push(0)
+            entry_name: cstr = (&terminated_path[0]).cast[cstr] can Unsafe.PointerCast
+            entry_size: i64 = Platform::pkg_package_file_size(entry_name)
+            return false if entry_size < 0 or entry_size > UstarFields::max_payload_bytes.i64()
+            payload_size: usize = entry_size.usize()
+            padding: usize = UstarFields::padding_bytes(payload_size)
+            padded_payload: usize = payload_size + padding
+            return false if padded_payload > UstarFields::max_payload_bytes
+            return false if out.count > UstarFields::max_payload_bytes - padded_payload
+            header: darray[u8] = tar_file_header(entry, payload_size)
+            return false if header.count != 512.usize()
+            archive_push_array(out, header)
+
+            # The reader requires a spare byte to distinguish EOF from growth.
+            # Use the first padding byte when present, or reserve one extra.
+            payload_start: usize = out.count
+            payload_capacity: usize = payload_size + 1.usize()
+            reserved: usize = padded_payload if padding > 0.usize() else payload_capacity
+            out.resize(payload_start + reserved)
+            payload: mutable u8& = (&out[payload_start]).cast[mutable u8&] can Unsafe.PointerCast
+            read_size: i64 = Platform::pkg_read_package_file(entry_name, payload, payload_capacity)
+            return false if read_size != entry_size
+            out.resize(payload_start + padded_payload)
+            return true
 
         const max_embedded_manifest_size: usize = 1048576
 
