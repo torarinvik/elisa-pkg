@@ -212,12 +212,16 @@ module Solver:
         def solver_search(candidates: darray[Candidate]&, package_slots: darray[usize]&, constraints: mutable darray[Constraint]&, preferences: darray[Preference]&, assigned: mutable darray[i64]&, decisions: mutable usize&, failure_constraints: mutable darray[Constraint]&, work: mutable WorkBudget&, capture_conflict: bool) -> SolveCode can[Memory.Allocate, Abort.Panic]:
             return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
             return SolveCode.ResourceLimit if decisions >= max_decisions or constraints.count > maximum_constraints
-            for constraint_index in 0..<constraints.count |constraints, package_slots, candidates|:
+            return SolveCode.ResourceLimit if not solver_charge_work(work, package_slots.count)
+            required_slots: mutable darray[bool] = []
+            required_slots.resize(package_slots.count)
+            for constraint_index in 0..<constraints.count |constraints, package_slots, candidates, required_slots|:
                 return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
                 slot: usize = solver_slot_for(constraints[constraint_index].package, package_slots, candidates, work)
                 return SolveCode.ResourceLimit if solver_work_exhausted(work)
                 if slot == package_slots.count:
                     return solver_record_unsatisfiable(constraints, failure_constraints, work, capture_conflict)
+                required_slots[slot] <- true
             for slot in 0..<assigned.count |assigned, candidates, package_slots, constraints|:
                 return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
                 continue if assigned[slot] < 0
@@ -227,17 +231,10 @@ module Solver:
                     return solver_record_unsatisfiable(constraints, failure_constraints, work, capture_conflict)
             best_slot: mutable usize = package_slots.count
             best_count: mutable usize = 18446744073709551615.usize()
-            for slot in 0..<package_slots.count |package_slots, assigned, candidates, constraints, best_slot, best_count|:
+            for slot in 0..<package_slots.count |package_slots, assigned, candidates, constraints, required_slots, best_slot, best_count|:
                 return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
-                continue if assigned[slot] >= 0
+                continue if assigned[slot] >= 0 or not required_slots[slot]
                 possible: mutable usize = 0.usize()
-                has_requirement: mutable bool = false
-                for constraint_index in 0..<constraints.count |constraints, candidates, package_slots, slot, has_requirement|:
-                    return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
-                    constraint_slot: usize = solver_slot_for(constraints[constraint_index].package, package_slots, candidates, work)
-                    return SolveCode.ResourceLimit if solver_work_exhausted(work)
-                    has_requirement <- true if constraint_slot == slot
-                continue if not has_requirement
                 for candidate_index in 0..<candidates.count |candidates, package_slots, slot, constraints, possible|:
                     return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
                     candidate_slot: usize = solver_slot_for(candidates[candidate_index].package, package_slots, candidates, work)
@@ -249,6 +246,8 @@ module Solver:
                     satisfies: bool = solver_candidate_satisfies(candidates[candidate_index], package_slots[slot], constraints, package_slots, candidates, work)
                     return SolveCode.ResourceLimit if solver_work_exhausted(work)
                     possible <- possible + 1.usize() if satisfies
+                    # Later slots only win when they have strictly fewer choices.
+                    break if possible >= best_count
                 return solver_record_unsatisfiable(constraints, failure_constraints, work, capture_conflict) if possible == 0.usize()
                 if possible < best_count:
                     best_count <- possible
