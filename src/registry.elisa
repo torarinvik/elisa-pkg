@@ -107,7 +107,7 @@ module Registry:
         # metadata verification step unnoticed.
         def read_archive(package: darray[u8]&, version: darray[u8]&, metadata: darray[u8]&, archive: darray[u8]&, expected_digest: darray[u8]&, expected_size: u64, out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out.resize(0)
-            return ResultCode.InvalidConfiguration if not valid_package_name(package) or not valid_package_version(version) or not Archive::is_safe_entry(archive) or not valid_digest(expected_digest) or expected_size > Archive::max_archive_bytes.u64()
+            return ResultCode.InvalidConfiguration if not valid_package_name(package) or not valid_package_version(version) or not Archive::is_safe_entry(archive) or not Integrity::valid_sha256_hex(expected_digest) or expected_size > Archive::max_archive_bytes.u64()
             root: mutable darray[u8] = []
             return ResultCode.NotConfigured if not configured_root(&root)
             return ResultCode.InvalidConfiguration if not valid_registry_root(root)
@@ -188,8 +188,8 @@ module Registry:
         # one trust-state lock acquisition, closing the gap between index read
         # and package trust publication.
         def record_trusted_at_index(package: darray[u8]&, version: darray[u8]&, digest: darray[u8]&, metadata_digest: darray[u8]&, expires: u64, generation: u64, index_digest: darray[u8]&, index_identity: darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
-            return ResultCode.InvalidConfiguration if not registry_valid_name(package) or generation == 0 or not valid_digest(index_digest)
-            return ResultCode.InvalidConfiguration if not valid_digest(metadata_digest) or not valid_digest(digest)
+            return ResultCode.InvalidConfiguration if not registry_valid_name(package) or generation == 0 or not Integrity::valid_sha256_hex(index_digest)
+            return ResultCode.InvalidConfiguration if not Integrity::valid_sha256_hex(metadata_digest) or not Integrity::valid_sha256_hex(digest)
             now: i64 = Platform::pkg_wall_clock_seconds()
             return ResultCode.ClockUnavailable if now < 0
             expiry_status: ResultCode = metadata_expiry_status(expires, now.u64())
@@ -357,7 +357,7 @@ module Registry:
             archive_size_out <- 0
             expires_out <- 0
             dependencies_out.resize(0)
-            return ResultCode.InvalidConfiguration if not valid_package_name(package) or not valid_package_version(version) or not valid_digest(expected_metadata_digest)
+            return ResultCode.InvalidConfiguration if not valid_package_name(package) or not valid_package_version(version) or not Integrity::valid_sha256_hex(expected_metadata_digest)
             return ResultCode.MalformedMetadata if metadata.count == 0.usize() or metadata.count > 1048576.usize() or not Json::valid_document(metadata) or not Json::unique_object_keys(metadata) or not metadata_root_object(metadata) or not metadata_allowed_fields(metadata)
             root: mutable darray[u8] = []
             return ResultCode.NotConfigured if not configured_root(&root)
@@ -1480,7 +1480,7 @@ module Registry:
             return false if not bytes_equal(registry, root) or not bytes_equal(package_value, package) or not bytes_equal(version_value, version)
             return false if algorithm.count != 7 or algorithm[0] != 101 or algorithm[1] != 100 or algorithm[2] != 50 or algorithm[3] != 53 or algorithm[4] != 53 or algorithm[5] != 49 or algorithm[6] != 57
             return false if not metadata_string(raw, "archive", archive_out) or not Archive::is_safe_entry(archive_out)
-            return false if not metadata_string(raw, "archive-digest", digest_out) or not valid_digest(digest_out)
+            return false if not metadata_string(raw, "archive-digest", digest_out) or not Integrity::valid_sha256_hex(digest_out)
             parsed_size: mutable u64 = 0
             return false if not metadata_integer(raw, "archive-size", &parsed_size) or parsed_size > Archive::max_archive_bytes.u64()
             size_out <- parsed_size
@@ -1883,7 +1883,7 @@ module Registry:
                     line_digest.push(state[index])
                 for index in (third_separator + 1.usize())..<finish |line_metadata_digest, state|:
                     line_metadata_digest.push(state[index])
-                return ResultCode.TrustStateMalformed if not trust_state_identity_valid(line_package) or not valid_digest(line_digest) or not valid_digest(line_metadata_digest)
+                return ResultCode.TrustStateMalformed if not trust_state_identity_valid(line_package) or not Integrity::valid_sha256_hex(line_digest) or not Integrity::valid_sha256_hex(line_metadata_digest)
                 parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
                 return ResultCode.TrustStateMalformed if not SemVer::parse(line_version, &parsed) or parsed.prerelease
                 previous: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
@@ -2063,10 +2063,10 @@ module Registry:
             return trust_state_record_internal(package, version, digest, metadata_digest, expires, true, generation, index_digest, index_identity, key_fingerprint)
 
         def trust_state_record_internal(package: darray[u8]&, version: darray[u8]&, digest: darray[u8]&, metadata_digest: darray[u8]&, expires: u64, guard_index: bool, index_generation: u64, index_digest: darray[u8]&, index_identity: darray[u8]&, key_fingerprint: darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
-            return ResultCode.InvalidConfiguration if not trust_state_identity_valid(package) or not valid_package_version(version) or not valid_digest(digest) or not valid_digest(metadata_digest) or not guard_index and not valid_digest(key_fingerprint)
+            return ResultCode.InvalidConfiguration if not trust_state_identity_valid(package) or not valid_package_version(version) or not Integrity::valid_sha256_hex(digest) or not Integrity::valid_sha256_hex(metadata_digest) or not guard_index and not Integrity::valid_sha256_hex(key_fingerprint)
             parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
             return ResultCode.InvalidConfiguration if not SemVer::parse(version, &parsed) or parsed.prerelease
-            return ResultCode.InvalidConfiguration if guard_index and (index_generation == 0 or not valid_digest(index_digest) or not trust_state_identity_valid(index_identity))
+            return ResultCode.InvalidConfiguration if guard_index and (index_generation == 0 or not Integrity::valid_sha256_hex(index_digest) or not trust_state_identity_valid(index_identity))
             root: mutable darray[u8] = []
             return ResultCode.NotConfigured if not configured_root(&root)
             if guard_index:
@@ -2226,7 +2226,7 @@ module Registry:
             return trust_state_finish(lock_fd, ResultCode.Ok)
 
         def trust_state_verify(package: darray[u8]&, version: darray[u8]&, digest: darray[u8]&, metadata_digest: darray[u8]&, expires: u64) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
-            return ResultCode.InvalidConfiguration if not trust_state_identity_valid(package) or not valid_package_version(version) or not valid_digest(digest) or not valid_digest(metadata_digest)
+            return ResultCode.InvalidConfiguration if not trust_state_identity_valid(package) or not valid_package_version(version) or not Integrity::valid_sha256_hex(digest) or not Integrity::valid_sha256_hex(metadata_digest)
             parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
             return ResultCode.InvalidConfiguration if not SemVer::parse(version, &parsed) or parsed.prerelease
             package_value: mutable darray[u8] = []
@@ -2534,7 +2534,7 @@ module Registry:
                 next_cursor: mutable usize = 0.usize()
                 return false if not trust_tuf_parse_row(state, cursor, &key, &version, &digest, &next_cursor)
                 ignored_version: mutable u64 = 0.u64()
-                return false if not trust_tuf_scoped_role_valid(key) or not Tuf::parse_checkpoint_version(version, &ignored_version) or not valid_digest(digest)
+                return false if not trust_tuf_scoped_role_valid(key) or not Tuf::parse_checkpoint_version(version, &ignored_version) or not Integrity::valid_sha256_hex(digest)
                 return false if row_count > 0.usize() and trust_tuf_compare_keys(previous_key, key) >= 0
                 previous_key <- key
                 cursor <- next_cursor
@@ -2794,7 +2794,7 @@ module Registry:
             out.resize(cursor)
 
         def trust_clock_write(path: darray[u8]&, value: u64, state_digest: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
-            return false if not valid_digest(state_digest)
+            return false if not Integrity::valid_sha256_hex(state_digest)
             encoded: mutable darray[u8] = []
             registry_push_text(&encoded, "clock:")
             trust_clock_append_decimal(&encoded, value)
@@ -2839,12 +2839,6 @@ module Registry:
             return ResultCode.ExpiredMetadata if expires <= now
             return ResultCode.ExpiryHorizon if expires - now > max_metadata_lifetime_seconds
             return ResultCode.Ok
-
-        def valid_digest(value: darray[u8]&) -> bool:
-            return false if value.count != 64
-            for index in 0..<value.count |value|:
-                return false if (value[index] < 48 or value[index] > 57) and (value[index] < 97 or value[index] > 102)
-            return true
 
         def bytes_equal(left: darray[u8]&, right: darray[u8]&) -> bool:
             return false if left.count != right.count
