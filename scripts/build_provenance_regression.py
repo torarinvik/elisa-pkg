@@ -215,14 +215,25 @@ def main() -> int:
         wrong_pin_env = dict(env)
         wrong_pin_env["ELISA_COMPILER_SHA"] = "0" * 40
         wrong_pin_inputs["env"] = wrong_pin_env
+        unverified_output = inputs["project_root"] / "build/unverified/candidate"
+        wrong_pin_inputs["output_dir_input"] = unverified_output
         try:
             provenance.generate_candidate(**wrong_pin_inputs)
         except provenance.ProvenanceError:
             pass
         else:
             raise SystemExit("error: release candidate accepted a compiler checkout with a wrong pin")
+        if unverified_output.parent.exists():
+            raise SystemExit("error: rejected release candidate created an output directory")
 
         project_root = inputs["project_root"]
+        try:
+            provenance.generate_candidate(**{**inputs, "output_dir_input": project_root})
+        except provenance.ProvenanceError:
+            pass
+        else:
+            raise SystemExit("error: release candidate accepted the project root as its output directory")
+
         tracked_file = project_root / "README.md"
         original = tracked_file.read_bytes()
         tracked_file.write_bytes(original + b"dirty\n")

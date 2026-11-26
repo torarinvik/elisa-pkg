@@ -314,24 +314,9 @@ def generate_candidate(
         output_relative = output_path_lexical.relative_to(project_root_lexical)
     except ValueError as error:
         raise ProvenanceError("candidate output directory must be below the project root") from error
+    if not output_relative.parts:
+        raise ProvenanceError("candidate output directory must be below the project root")
     output_dir = project_root / output_relative
-    require_within(output_dir, project_root, "candidate output directory")
-    current = project_root
-    try:
-        for component in output_dir.relative_to(project_root).parts:
-            current = current / component
-            try:
-                info = current.lstat()
-            except FileNotFoundError:
-                current.mkdir()
-                info = current.lstat()
-            if not stat.S_ISDIR(info.st_mode):
-                raise ProvenanceError(
-                    f"candidate output path contains a non-directory or symlink: {current}"
-                )
-        output_dir = output_dir.resolve(strict=True)
-    except OSError as error:
-        raise ProvenanceError(f"a source or output directory is unavailable: {error}") from error
 
     if required_env(env, "GITHUB_EVENT_NAME") != "push" or required_env(env, "GITHUB_REF") != "refs/heads/main":
         raise ProvenanceError("release candidate artifacts are limited to pushes on main")
@@ -433,6 +418,24 @@ def generate_candidate(
     manifest_bytes = (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
     if len(manifest_bytes) > MAX_MANIFEST_BYTES:
         raise ProvenanceError("generated provenance manifest exceeds its size limit")
+
+    current = project_root
+    try:
+        for component in output_dir.relative_to(project_root).parts:
+            current = current / component
+            try:
+                info = current.lstat()
+            except FileNotFoundError:
+                current.mkdir()
+                info = current.lstat()
+            if not stat.S_ISDIR(info.st_mode):
+                raise ProvenanceError(
+                    f"candidate output path contains a non-directory or symlink: {current}"
+                )
+        output_dir = output_dir.resolve(strict=True)
+        require_within(output_dir, project_root, "candidate output directory")
+    except OSError as error:
+        raise ProvenanceError(f"a source or output directory is unavailable: {error}") from error
 
     manifest_path = output_dir / "elisapkg.provenance.json"
     archive_path = output_dir / "elisapkg-macos-arm64.tar.gz"
