@@ -271,6 +271,26 @@ module Cli:
                 CliOutput::write_error(Security::publish_message())
                 return Security::publish_status()
 
+        # Select the manifest target named by `options`; installation needs a
+        # binary target.
+        def select_binary_target(options: Model::CommandOptions, target_name: mutable darray[u8]&) -> CliStatus::ExitStatus can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                manifest_raw: mutable darray[u8] = []
+                manifest_raw <- manifest_raw.resize(ProjectFiles::project_document_limit)
+                return CliStatus::build_failed if not ProjectFiles::read_c_string_into("elisapkg.json", &manifest_raw)
+                target_kind: mutable darray[u8] = []
+                target_entry: mutable darray[u8] = []
+                return CliStatus::build_failed if not ManifestTargets::select_target(manifest_raw, options.target_name, options.target_kind, target_name, &target_kind, &target_entry)
+                return CliStatus::success if ByteText::equal_text(target_kind, "bin")
+                CliOutput::write_error("error: install --local requires a binary target\n")
+                return CliStatus::operation_failed
+
+        # Read the built artifact and its hex SHA-256 digest.
+        def read_artifact_with_digest(artifact: darray[u8]&, artifact_bytes: mutable darray[u8]&, digest: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return false if not read_package_file_into(artifact, artifact_bytes)
+            digest_bytes: mutable darray[u8] = []
+            return Integrity::sha256(artifact_bytes, &digest_bytes) == Integrity::DigestCode.Ok and Integrity::hex_digest(digest_bytes, digest)
+
         def run_install_local(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global{Read,Write}:
                 prefix: mutable darray[u8] = []
@@ -282,17 +302,10 @@ module Cli:
                 region resolved_scope:
                     resolved: i64 = ResolutionCommand::resolve(&root, options, false, false)
                     return resolved if resolved != CliStatus::success
-                manifest_raw: mutable darray[u8] = []
-                manifest_raw <- manifest_raw.resize(ProjectFiles::project_document_limit)
-                return CliStatus::build_failed if not ProjectFiles::read_c_string_into("elisapkg.json", &manifest_raw)
                 target_name: mutable darray[u8] = []
-                target_kind: mutable darray[u8] = []
-                region target_entry_scope:
-                    target_entry: mutable darray[u8] = []
-                    return CliStatus::build_failed if not ManifestTargets::select_target(manifest_raw, options.target_name, options.target_kind, &target_name, &target_kind, &target_entry)
-                if not ByteText::equal_text(target_kind, "bin"):
-                    CliOutput::write_error("error: install --local requires a binary target\n")
-                    return CliStatus::operation_failed
+                region target_status_scope:
+                    target_status: i64 = select_binary_target(options, &target_name)
+                    return target_status if target_status != CliStatus::success
                 name: mutable darray[u8] = []
                 version: mutable darray[u8] = []
                 return CliStatus::usage if not ProjectManifest::load_at(&root, &name, &version)
@@ -308,10 +321,8 @@ module Cli:
                     build_directory: darray[u8] = Build::output_directory(start, Platform::c_string_equal(options.profile, "release"))
                     ProjectFiles::path_join_bytes_into(build_directory, target_name, &artifact)
                 artifact_bytes: mutable darray[u8] = []
-                return CliStatus::operation_failed if not read_package_file_into(&artifact, &artifact_bytes)
-                digest_bytes: mutable darray[u8] = []
                 digest: mutable darray[u8] = []
-                return CliStatus::operation_failed if Integrity::sha256(artifact_bytes, &digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(digest_bytes, &digest)
+                return CliStatus::operation_failed if not read_artifact_with_digest(artifact, &artifact_bytes, &digest)
                 if not use_prebuilt_artifact and (expected_build_digest.count != 64.usize() or not ByteText::equal(digest, expected_build_digest)):
                     CliOutput::write_error("error: build output changed after compilation; refusing to install an unverified artifact\n")
                     return CliStatus::build_failed
