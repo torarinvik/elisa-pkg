@@ -1,0 +1,64 @@
+# Collect direct registry constraints from a validated package manifest.
+include "../json.elisa"
+include "../text/bytes.elisa"
+include "./solver.elisa"
+
+module RegistryRoots:
+    public:
+        def collect[@r](raw: darray[u8]&, out: mutable darray[Solver::Constraint]& @r, has_local: mutable bool&) -> bool can[Memory.Allocate, Abort.Panic]:
+            out.resize(0)
+            has_local <- false
+            dependency_start: usize = Json::root_value_offset(raw, "dependencies")
+            return true if dependency_start >= raw.count
+            dependency_end: usize = Json::object_end(raw, dependency_start)
+            return false if dependency_end <= dependency_start or raw[dependency_start] != 123
+            in_string: mutable bool = false
+            escaped: mutable bool = false
+            string_start: mutable usize = 0
+            braces: mutable i64 = 1
+            brackets: mutable i64 = 0
+            for index in (dependency_start + 1)..<dependency_end |raw, out, has_local, in_string, escaped, string_start, braces, brackets|:
+                byte: u8 = raw[index]
+                if not in_string:
+                    if byte == 34:
+                        in_string <- true
+                        string_start <- index + 1
+                    elif byte == 123:
+                        braces <- braces + 1
+                    elif byte == 125:
+                        braces <- braces - 1
+                    elif byte == 91:
+                        brackets <- brackets + 1
+                    elif byte == 93:
+                        brackets <- brackets - 1
+                elif escaped:
+                    escaped <- false
+                elif byte == 92:
+                    escaped <- true
+                elif byte == 34:
+                    after: mutable usize = index + 1
+                    while after < dependency_end and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
+                        after <- after + 1
+                    if braces == 1 and brackets == 0 and after < dependency_end and raw[after] == 58:
+                        alias: mutable darray[u8] @r = []
+                        for item in string_start..<index |raw, alias|:
+                            alias.push(raw[item])
+                        after <- after + 1
+                        while after < dependency_end and (raw[after] == 32 or raw[after] == 9 or raw[after] == 10 or raw[after] == 13) |raw, after|:
+                            after <- after + 1
+                        value_end: usize = Json::object_end(raw, after)
+                        return false if after >= dependency_end or value_end <= after or raw[after] != 123 or value_end > dependency_end
+                        if Json::object_has_key(raw, after, value_end, "path"):
+                            has_local <- true
+                        else:
+                            registry: mutable darray[u8] = []
+                            requirement: mutable darray[u8] @r = []
+                            return false if not Json::object_string_value(raw, after, value_end, "registry", &registry) or not Json::object_string_value(raw, after, value_end, "version", &requirement)
+                            return false if not ByteText::equal_text(registry, "primary")
+                            return false if out.count >= maximum_dependencies
+                            out.push(Solver::Constraint{package: alias, requirement: requirement})
+                    in_string <- false
+            return true
+
+    private:
+        const maximum_dependencies: usize = 4096.usize()

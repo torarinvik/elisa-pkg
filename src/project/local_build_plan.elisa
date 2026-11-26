@@ -1,0 +1,92 @@
+# Reconstruct the bounded local build graph from the verified lock and manifests.
+include "../integrity.elisa"
+include "../package/package_identity.elisa"
+include "../resolution/local_build_graph.elisa"
+include "../resolution/registry_roots.elisa"
+include "../source/fingerprint.elisa"
+include "./build_paths.elisa"
+include "./manifest.elisa"
+
+module LocalBuildPlan:
+    public:
+        const maximum_packages: usize = 4096.usize()
+        const maximum_edges: usize = 65536.usize()
+
+        def read_ordered_includes[@r](lock: darray[u8]&, start: darray[u8]&, root_entry: cstr, source_byte_budget: usize, aggregate: mutable darray[u8]&, has_dependencies: mutable bool&, packages: mutable darray[LocalBuildGraph::Package]& @r, order: mutable darray[usize]& @r) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            aggregate.resize(0)
+            has_dependencies <- false
+            packages.resize(0)
+            order.resize(0)
+            return false if not Lockfile::version_is(lock, 2)
+            packages_start: usize = Json::root_value_offset(lock, "packages")
+            packages_end: usize = Json::array_end(lock, packages_start)
+            return false if packages_start >= lock.count or packages_end <= packages_start or lock[packages_start] != 91
+            root_path: mutable darray[u8] = []
+            return false if not ProjectFiles::canonical_existing_path(start, &root_path)
+            total_graph_edges: mutable usize = 0.usize()
+            total_dependency_source_bytes: mutable usize = 0.usize()
+            cursor: mutable usize = packages_start + 1.usize()
+            while cursor < packages_end:
+                while cursor < packages_end and (lock[cursor] == 32 or lock[cursor] == 9 or lock[cursor] == 10 or lock[cursor] == 13):
+                    cursor <- cursor + 1.usize()
+                break if cursor >= packages_end or lock[cursor] == 93
+                return false if lock[cursor] != 123 or packages.count >= maximum_packages
+                record_end: usize = Json::object_end(lock, cursor)
+                return false if record_end <= cursor or record_end >= packages_end
+                package_name: mutable darray[u8] @r = []
+                package_version: mutable darray[u8] = []
+                source_start: mutable usize = 0.usize()
+                source_end: mutable usize = 0.usize()
+                return false if:
+                    not Json::object_string_value(lock, cursor, record_end, "name", &package_name)
+                    not PackageIdentity::valid_name(package_name)
+                    not Json::object_string_value(lock, cursor, record_end, "version", &package_version)
+                    not Json::object_value_span(lock, cursor, record_end, "source", &source_start, &source_end)
+                source_type: mutable darray[u8] = []
+                return false if:
+                    not Json::object_string_value(lock, source_start, source_end, "type", &source_type) or not ByteText::equal_text(source_type, "path")
+                    packages.count > 0.usize() and not ByteText::less(packages[packages.count - 1.usize()].name, package_name)
+                canonical_root: mutable darray[u8] @r = []
+                return false if not BuildPaths::resolve_local_source(lock, source_start, source_end, root_path, &canonical_root)
+                manifest_path: mutable darray[u8] = []
+                ProjectFiles::path_join_into(canonical_root, "elisapkg.json", &manifest_path)
+                package_manifest: mutable darray[u8] = []
+                return false if not Platform::pkg_read_bounded_file(manifest_path, Json::max_document_bytes, &package_manifest)
+                actual_name: mutable darray[u8] = []
+                actual_version: mutable darray[u8] = []
+                return false if not ProjectManifest::validate_at(package_manifest, canonical_root, &actual_name, &actual_version)
+                return false if not ByteText::equal(actual_name, package_name) or not ByteText::equal(actual_version, package_version)
+                manifest_digest_bytes: mutable darray[u8] = []
+                manifest_digest: mutable darray[u8] = []
+                return false if Integrity::sha256(package_manifest, &manifest_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(manifest_digest_bytes, &manifest_digest)
+                return false if not Lockfile::sha256_field_equals(lock, cursor, record_end, "manifest-digest", manifest_digest)
+                source_digest: mutable darray[u8] @r = []
+                package_source_bytes: mutable usize = 0.usize()
+                return false if total_dependency_source_bytes > source_byte_budget or not SourceFingerprint::at_bounded(canonical_root, &source_digest, source_byte_budget - total_dependency_source_bytes, &package_source_bytes)
+                total_dependency_source_bytes <- total_dependency_source_bytes + package_source_bytes
+                return false if not Lockfile::sha256_field_equals(lock, cursor, record_end, "source-digest", source_digest)
+                registry_roots: mutable darray[Solver::Constraint] = []
+                has_local_dependency: mutable bool = false
+                return false if not RegistryRoots::collect(package_manifest, &registry_roots, &has_local_dependency) or registry_roots.count != 0.usize()
+                library_entry: mutable darray[u8] @r = []
+                relative_entry: mutable darray[u8] @r = []
+                return false if not BuildPaths::resolve_library_entry(package_manifest, canonical_root, &library_entry, &relative_entry)
+                dependency_names: mutable darray[u8] @r = []
+                remaining_edges: usize = maximum_edges - total_graph_edges
+                edge_limit: usize = maximum_packages if maximum_packages < remaining_edges else remaining_edges
+                package_edges: i64 = Manifest::local_dependency_names(package_manifest, edge_limit, &dependency_names)
+                return false if package_edges < 0
+                total_graph_edges <- total_graph_edges + package_edges.usize()
+                snapshot_entry: mutable darray[u8] @r = []
+                dependents: mutable darray[usize] @r = []
+                packages.push(LocalBuildGraph::Package{name: package_name, root: canonical_root, entry: library_entry, relative_entry: relative_entry, source_digest: source_digest, snapshot_entry: snapshot_entry, dependency_names: dependency_names, dependents: dependents, remaining_dependencies: 0})
+                cursor <- record_end + 1.usize()
+                while cursor < packages_end and (lock[cursor] == 32 or lock[cursor] == 9 or lock[cursor] == 10 or lock[cursor] == 13) |lock, cursor|:
+                    cursor <- cursor + 1.usize()
+                if cursor < packages_end:
+                    return false if lock[cursor] != 44
+                    cursor <- cursor + 1.usize()
+            if packages.count == 0.usize():
+                return true
+            has_dependencies <- true
+            return LocalBuildGraph::write_ordered_includes(packages, order, root_entry, aggregate)
