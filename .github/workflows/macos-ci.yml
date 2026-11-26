@@ -225,6 +225,23 @@ jobs:
                   value[key] = item
               return value
 
+          def require_object(value, label):
+              if not isinstance(value, dict):
+                  fail(f"manifest {label} must be a JSON object")
+              return value
+
+          def require_file_record(value, label):
+              record = require_object(value, label)
+              digest = record.get("sha256")
+              size = record.get("size_bytes")
+              if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                  fail(f"manifest {label} has an invalid SHA-256 digest")
+              if type(size) is not int or size <= 0:
+                  fail(f"manifest {label} has an invalid size")
+
+          def reject_nonfinite(value):
+              fail(f"manifest contains a nonfinite JSON value: {value}")
+
           require_directory(candidate)
           require_directory(release)
           binary_info = require_regular_file(binary, 128 * 1024 * 1024)
@@ -234,15 +251,21 @@ jobs:
 
           binary_bytes = binary.read_bytes()
           manifest_bytes = manifest_path.read_bytes()
-          manifest = json.loads(manifest_bytes, object_pairs_hook=reject_duplicate_keys)
+          manifest = require_object(json.loads(
+              manifest_bytes, object_pairs_hook=reject_duplicate_keys, parse_constant=reject_nonfinite
+          ), "root")
           canonical = (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
           if canonical != manifest_bytes or type(manifest.get("schema_version")) is not int or manifest["schema_version"] != 1:
               fail("manifest is not canonical schema version 1")
-          source = manifest.get("source", {})
-          builder = manifest.get("builder", {})
-          toolchain = manifest.get("toolchain", {})
-          artifact = manifest.get("artifact", {})
-          platform = builder.get("platform", {})
+          source = require_object(manifest.get("source"), "source")
+          builder = require_object(manifest.get("builder"), "builder")
+          toolchain = require_object(manifest.get("toolchain"), "toolchain")
+          artifact = require_object(manifest.get("artifact"), "artifact")
+          platform = require_object(builder.get("platform"), "builder platform")
+          compiler = require_object(toolchain.get("elisa_compiler"), "Elisa compiler")
+          core = require_object(toolchain.get("elisa_core"), "Elisa core")
+          go = require_object(toolchain.get("go"), "Go toolchain")
+          llvm = require_object(toolchain.get("llvm"), "LLVM toolchain")
           if source.get("repository") != os.environ["EXPECTED_REPOSITORY"] or source.get("revision") != os.environ["EXPECTED_SOURCE_REVISION"]:
               fail("manifest source repository or commit does not match this workflow run")
           if source.get("ref") != "refs/heads/main" or source.get("event") != "push":
@@ -253,15 +276,20 @@ jobs:
               fail("manifest workflow identity does not match this workflow run")
           if platform.get("system") != "macOS" or platform.get("architecture") != "arm64":
               fail("manifest builder platform is not macOS arm64")
-          if toolchain.get("elisa_compiler", {}).get("source_revision") != os.environ["EXPECTED_COMPILER_REVISION"]:
+          if compiler.get("source_revision") != os.environ["EXPECTED_COMPILER_REVISION"]:
               fail("manifest compiler revision does not match the pinned source")
-          if toolchain.get("elisa_core", {}).get("source_revision") != os.environ["EXPECTED_CORE_REVISION"]:
+          if core.get("source_revision") != os.environ["EXPECTED_CORE_REVISION"]:
               fail("manifest core revision does not match the pinned source")
-          go_version = toolchain.get("go", {}).get("version", "")
-          if not re.search(r"(?:^|\s)go" + re.escape(os.environ["EXPECTED_GO_VERSION"]) + r"(?:\s|$)", go_version):
+          go_version = go.get("version")
+          if not isinstance(go_version, str) or not re.search(r"(?:^|\s)go" + re.escape(os.environ["EXPECTED_GO_VERSION"]) + r"(?:\s|$)", go_version):
               fail("manifest Go version does not match the configured toolchain")
-          if toolchain.get("llvm", {}).get("version") != os.environ["EXPECTED_LLVM_VERSION"]:
+          if llvm.get("version") != os.environ["EXPECTED_LLVM_VERSION"]:
               fail("manifest LLVM version does not match the configured toolchain")
+          for records, key in (
+              (compiler, "wrapper"), (compiler, "stage1"), (core, "stage0"),
+              (toolchain, "runtime_object"), (go, "executable"), (llvm, "clang"), (llvm, "llvm_config"),
+          ):
+              require_file_record(records.get(key), key)
           if (
               artifact.get("name") != "elisapkg"
               or artifact.get("file") != "elisapkg"
