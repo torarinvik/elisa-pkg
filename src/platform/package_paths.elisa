@@ -14,6 +14,32 @@ extend PlatformNative:
         def regular_file_read_flags() -> i64:
             return flag_read_only + flag_no_follow + flag_close_on_exec + flag_nonblock
 
+        # "/proc/self/fd/N" with a terminator, for descriptor `descriptor`.
+        def proc_descriptor_path(descriptor: u64) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
+            path: mutable darray[u8] = [47, 112, 114, 111, 99, 47, 115, 101, 108, 102, 47, 102, 100, 47]
+            digits: mutable darray[u8] = [48] if descriptor == 0.u64() else []
+            while remaining > 0.u64() |digits, remaining: u64 = descriptor|:
+                digits <- digits.push(48 + (remaining % 10.u64()).u8())
+                remaining <- remaining / 10.u64()
+            for index in 0..<digits.count |path, digits|:
+                path <- path.push(digits[digits.count - 1.usize() - index])
+            path <- path.push(0)
+            return path
+
+        # The freshly opened descriptor is still the regular file `before`
+        # described. `report_kind` reports a non-regular file by its kind
+        # instead of as a permission failure. Closes `opened` on failure.
+        def verify_opened_regular_file(opened: i64, before: darray[u8]&, report_kind: bool) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            requires opened >= 0
+            after: mutable darray[u8] = []
+            after <- after.resize(status_buffer_bytes)
+            return close_error(opened, NativeErrors::negative_errno()) if native_fstat(opened, ((&after[0]).cast[mutable void&] can Unsafe.PointerCast)) != 0
+            region after_mode_scope:
+                after_mode: u64 = NativeStat::file_type(after)
+                return close_error(opened, package_nonregular_file_error(after_mode)) if report_kind and after_mode != NativeStat::regular_mode
+                return close_error(opened, -13) if after_mode != NativeStat::regular_mode or not NativeStat::same_identity(before, after)
+            return opened
+
         def open_regular_file_at_pinned(directory: i64, leaf_name: cstr, before: darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return -22 if not package_leaf_component_safe(leaf_name)
             pinned: i64 =
@@ -35,19 +61,7 @@ extend PlatformNative:
                 return close_error(pinned, -13)
 
             reopened: i64 =
-                descriptor_path: mutable darray[u8] = []
-                for byte in [47, 112, 114, 111, 99, 47, 115, 101, 108, 102, 47, 102, 100, 47]:
-                    descriptor_path <- descriptor_path.push(byte.u8())
-                digits: mutable darray[u8] = []
-                remaining: mutable u64 = pinned.u64()
-                if remaining == 0.u64():
-                    digits <- digits.push(48.u8())
-                while remaining > 0.u64() |digits, remaining|:
-                    digits <- digits.push(48 + (remaining % 10.u64()).u8())
-                    remaining <- remaining / 10.u64()
-                for index in 0..<digits.count |descriptor_path, digits|:
-                    descriptor_path <- descriptor_path.push(digits[digits.count - 1.usize() - index])
-                descriptor_path <- descriptor_path.push(0)
+                descriptor_path: darray[u8] = proc_descriptor_path(pinned.u64())
                 descriptor_name: cstr = (&descriptor_path[0]).cast[cstr] can Unsafe.PointerCast
                 native_open(descriptor_name, flag_read_only + flag_nonblock + flag_close_on_exec)
             reopen_errno: i64 = NativeErrors::current_errno()
@@ -111,17 +125,7 @@ extend PlatformNative:
                     write_u64_le(&how, 16.usize(), linux_resolve_no_symlinks + linux_resolve_beneath)
                     how_raw: mutable void& = (&how[0]).cast[mutable void&] can Unsafe.PointerCast
                     native_syscall(linux_openat2_syscall, directory, leaf_name, how_raw, 24)
-                if opened >= 0:
-                    after: mutable darray[u8] = []
-                    after <- after.resize(status_buffer_bytes)
-                    region after_raw_scope:
-                        after_raw: mutable void& = (&after[0]).cast[mutable void&] can Unsafe.PointerCast
-                        if native_fstat(opened, after_raw) != 0:
-                            errno_value: i64 = NativeErrors::negative_errno()
-                            return close_error(opened, errno_value)
-                    if (NativeStat::file_type(after)) != NativeStat::regular_mode or not NativeStat::same_identity(before, after):
-                        return close_error(opened, -13)
-                    return opened
+                return verify_opened_regular_file(opened, before, false) if opened >= 0
                 region open_errno_scope:
                     open_errno: i64 = NativeErrors::current_errno()
                     if open_errno != 38 and open_errno != 22:
@@ -130,20 +134,7 @@ extend PlatformNative:
             else:
                 opened: i64 = native_openat(directory, leaf_name, regular_file_read_flags())
                 return NativeErrors::negative_errno() if opened < 0
-                after: mutable darray[u8] = []
-                after <- after.resize(status_buffer_bytes)
-                region after_raw_scope:
-                    after_raw: mutable void& = (&after[0]).cast[mutable void&] can Unsafe.PointerCast
-                    if native_fstat(opened, after_raw) != 0:
-                        errno_value: i64 = NativeErrors::negative_errno()
-                        return close_error(opened, errno_value)
-                region after_mode_scope:
-                    after_mode: u64 = NativeStat::file_type(after)
-                    if after_mode != NativeStat::regular_mode:
-                        return close_error(opened, package_nonregular_file_error(after_mode))
-                if not NativeStat::same_identity(before, after):
-                    return close_error(opened, -13)
-                return opened
+                return verify_opened_regular_file(opened, before, true)
 
     public:
         def package_source_directory_file_descriptor(file_descriptor: i64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
