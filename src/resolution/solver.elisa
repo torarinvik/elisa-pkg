@@ -242,19 +242,10 @@ module Solver:
                 continue if assigned[slot] >= 0 or not required_slots[slot]
                 possible: mutable usize = 0.usize()
                 for candidate_index in 0..<candidates.count |candidates, package_slots, slot, constraints, possible|:
-                    return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
-                    region candidate_slot_scope:
-                        candidate_slot: usize = solver_slot_for(candidates[candidate_index].package, package_slots, candidates, work)
-                        return SolveCode.ResourceLimit if solver_work_exhausted(work)
-                        continue if candidate_slot != slot
-                    region available_scope:
-                        available: bool = solver_candidate_available(candidates[candidate_index], preferences, work)
-                        return SolveCode.ResourceLimit if solver_work_exhausted(work)
-                        continue if not available
-                    region satisfies_scope:
-                        satisfies: bool = solver_candidate_satisfies(candidates[candidate_index], package_slots[slot], constraints, package_slots, candidates, work)
-                        return SolveCode.ResourceLimit if solver_work_exhausted(work)
-                        possible <- possible + 1.usize() if satisfies
+                    region viability_scope:
+                        viability: SolveCode = candidate_viability(candidates, candidate_index, slot, package_slots, constraints, preferences, work)
+                        return viability if viability == SolveCode.ResourceLimit
+                        possible <- possible + 1.usize() if viability == SolveCode.Solved
                     # Later slots only win when they have strictly fewer choices.
                     break if possible >= best_count
                 return solver_record_unsatisfiable(constraints, failure_constraints, work, capture_conflict) if possible == 0.usize()
@@ -273,26 +264,36 @@ module Solver:
 
             order: mutable darray[usize] = []
             for candidate_index in 0..<candidates.count |candidates, package_slots, best_slot, constraints, order|:
-                return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
-                region candidate_slot_scope:
-                    candidate_slot: usize = solver_slot_for(candidates[candidate_index].package, package_slots, candidates, work)
-                    return SolveCode.ResourceLimit if solver_work_exhausted(work)
-                    continue if candidate_slot != best_slot
-                region available_scope:
-                    available: bool = solver_candidate_available(candidates[candidate_index], preferences, work)
-                    return SolveCode.ResourceLimit if solver_work_exhausted(work)
-                    continue if not available
-                satisfies: bool = solver_candidate_satisfies(candidates[candidate_index], package_slots[best_slot], constraints, package_slots, candidates, work)
-                return SolveCode.ResourceLimit if solver_work_exhausted(work)
-                order <- order.push(candidate_index) if satisfies
+                viability: SolveCode = candidate_viability(candidates, candidate_index, best_slot, package_slots, constraints, preferences, work)
+                return viability if viability == SolveCode.ResourceLimit
+                order <- order.push(candidate_index) if viability == SolveCode.Solved
             return SolveCode.ResourceLimit if not solver_sort_candidates(&order, candidates, preferences, work)
-            for order_index in 0..<order.count |order, candidates, package_slots, best_slot, constraints, assigned, decisions|:
+            return try_candidates(candidates, package_slots, constraints, preferences, assigned, decisions, failure_constraints, work, capture_conflict, order, best_slot)
+
+        # Whether one candidate can fill `slot` under the current constraints:
+        # Solved when it can, Unsatisfiable when it cannot, or ResourceLimit.
+        def candidate_viability(candidates: darray[Candidate]&, candidate_index: usize, slot: usize, package_slots: darray[usize]&, constraints: darray[Constraint]&, preferences: darray[Preference]&, work: mutable WorkBudget&) -> SolveCode:
+            return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
+            candidate_slot: usize = solver_slot_for(candidates[candidate_index].package, package_slots, candidates, work)
+            return SolveCode.ResourceLimit if solver_work_exhausted(work)
+            return SolveCode.Unsatisfiable if candidate_slot != slot
+            available: bool = solver_candidate_available(candidates[candidate_index], preferences, work)
+            return SolveCode.ResourceLimit if solver_work_exhausted(work)
+            return SolveCode.Unsatisfiable if not available
+            satisfies: bool = solver_candidate_satisfies(candidates[candidate_index], package_slots[slot], constraints, package_slots, candidates, work)
+            return SolveCode.ResourceLimit if solver_work_exhausted(work)
+            return SolveCode.Solved if satisfies else SolveCode.Unsatisfiable
+
+        # Assign each ordered candidate to `slot` in turn, add its
+        # dependencies, and search on; undo the choice when the branch fails.
+        def try_candidates(candidates: darray[Candidate]&, package_slots: darray[usize]&, constraints: mutable darray[Constraint]&, preferences: darray[Preference]&, assigned: mutable darray[i64]&, decisions: mutable usize&, failure_constraints: mutable darray[Constraint]&, work: mutable WorkBudget&, capture_conflict: bool, order: darray[usize]&, slot: usize) -> SolveCode can[Memory.Allocate, Abort.Panic]:
+            for order_index in 0..<order.count |order, candidates, package_slots, slot, constraints, assigned, decisions|:
                 return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
                 candidate_index: usize = order[order_index]
                 constraint_mark: usize = constraints.count
                 dependency_count: usize = candidates[candidate_index].dependencies.count
                 return SolveCode.ResourceLimit if dependency_count > maximum_constraints - constraint_mark
-                assigned[best_slot] <- candidate_index.i64()
+                assigned[slot] <- candidate_index.i64()
                 decisions <- decisions + 1.usize()
                 for dependency_index in 0..<dependency_count |candidates, candidate_index, constraints|:
                     dependency: Constraint = candidates[candidate_index].dependencies[dependency_index]
@@ -305,7 +306,7 @@ module Solver:
                     result: SolveCode = solver_search(candidates, package_slots, constraints, preferences, assigned, decisions, failure_constraints, work, capture_conflict)
                     return result if result == SolveCode.Solved or result == SolveCode.ResourceLimit or result == SolveCode.Malformed
                 constraints.resize(constraint_mark)
-                assigned[best_slot] <- -1
+                assigned[slot] <- -1
             return SolveCode.Unsatisfiable
 
         def solver_record_unsatisfiable(constraints: darray[Constraint]&, failure_constraints: mutable darray[Constraint]&, work: mutable WorkBudget&, capture_conflict: bool) -> SolveCode can[Memory.Allocate, Abort.Panic]:
