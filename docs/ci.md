@@ -77,7 +77,8 @@ using whatever compiler happens to be installed on the runner:
 | `actions/attest` | `1e69f48acb82d1966a394da916b4c1698aa569d6` (v4.2.2) |
 
 Each Stage0 and Stage1 rebuild runs through
-`scripts/compiler_rebuild_timeout.py`, which enforces a 30-second wall-clock
+`scripts/compiler_rebuild_timeout.py`, which terminates the rebuild process
+group on cancellation and enforces a 30-second wall-clock
 limit, kills the rebuild's entire process group at the deadline, and reports
 elapsed wall time on success. The CI job gives Stage0 a new empty Go build cache
 and Stage1 a new empty SMT proof cache; it also disables the retained analysis

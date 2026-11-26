@@ -8,33 +8,19 @@ import signal
 import subprocess
 import sys
 import time
-from typing import Optional
 
 
 TIMEOUT_SECONDS = 30
 
 
-def wait_for_process_group_exit(process_group: int, deadline: float) -> Optional[float]:
-    """Wait until the rebuild leader and every same-group child have exited."""
-    while True:
-        if time.monotonic() >= deadline:
-            return None
-        try:
-            os.killpg(process_group, 0)
-        except ProcessLookupError:
-            # Do not let scheduler delay turn a post-deadline observation into
-            # a successful rebuild result.
-            completed_at = time.monotonic()
-            return completed_at if completed_at < deadline else None
-        except PermissionError:
-            # The group still exists, but the wrapper cannot signal it. Keep
-            # enforcing the deadline and let the caller report the timeout.
-            pass
-
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return None
-        time.sleep(min(0.01, remaining))
+def process_group_exists(process_group: int) -> bool:
+    try:
+        os.killpg(process_group, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def terminate_process_group(process_group: int) -> None:
@@ -71,6 +57,16 @@ def main() -> int:
         # process owns the timeout and group, so keep the seed build inside it
         # for reliable cancellation at the same deadline.
         environment["ELISA_STAGE1_SEED_TIMEOUT_WRAPPED"] = "1"
+    cancellation_signal = 0
+
+    def request_cancel(signum, _frame):
+        # Record cancellation even if it arrives while Popen is starting the
+        # session. Cleanup runs once the child's process group is known.
+        nonlocal cancellation_signal
+        cancellation_signal = signum
+
+    signal.signal(signal.SIGINT, request_cancel)
+    signal.signal(signal.SIGTERM, request_cancel)
     try:
         process = subprocess.Popen(
             command,
@@ -82,43 +78,36 @@ def main() -> int:
         print(f"error: unable to start compiler rebuild: {error}", file=sys.stderr)
         return 127
 
-    try:
-        return_code = process.wait(timeout=max(0.0, deadline - time.monotonic()))
-    except subprocess.TimeoutExpired:
-        # The rebuild can spawn make, Go, or compiler children. Keep them in
-        # one session and signal the whole process group at the deadline.
-        terminate_process_group(process.pid)
-        # Reap the leader only if it has already exited. A blocking wait here
-        # would let an uninterruptible child defeat the wall-clock deadline.
-        process.poll()
-        print(
-            f"error: compiler rebuild exceeded its {TIMEOUT_SECONDS}-second "
-            "wall-clock limit; sent SIGKILL to its process group",
-            file=sys.stderr,
-        )
-        return 124
+    # Reap the leader and confirm the complete rebuild group has exited.
+    # Polling also lets cancellation interrupt the wait without interrupting
+    # Popen or leaving its newly detached child behind.
+    while not cancellation_signal and time.monotonic() < deadline:
+        return_code = process.poll()
+        if return_code is not None and not process_group_exists(process.pid):
+            completed_at = time.monotonic()
+            if not cancellation_signal and completed_at < deadline:
+                elapsed = completed_at - started
+                print(
+                    f"compiler rebuild completed in {elapsed:.3f}s "
+                    f"(limit {TIMEOUT_SECONDS}s)",
+                    file=sys.stderr,
+                )
+                return return_code if return_code >= 0 else 128 - return_code
+            break
+        time.sleep(max(0.0, min(0.01, deadline - time.monotonic())))
 
-    # A wrapper can exit successfully while a background compiler child keeps
-    # rebuilding. The wall-clock contract covers the whole process group, not
-    # only the command whose PID Popen tracks.
-    completed_at = wait_for_process_group_exit(process.pid, deadline)
-    if completed_at is None:
-        terminate_process_group(process.pid)
-        process.poll()
-        print(
-            f"error: compiler rebuild exceeded its {TIMEOUT_SECONDS}-second "
-            "wall-clock limit; sent SIGKILL to its process group",
-            file=sys.stderr,
-        )
-        return 124
-
-    elapsed = completed_at - started
+    terminate_process_group(process.pid)
+    # An uninterruptible child must not extend the wall-clock limit.
+    process.poll()
+    if cancellation_signal:
+        print("error: compiler rebuild cancelled; terminated its process group", file=sys.stderr)
+        return 128 + cancellation_signal
     print(
-        f"compiler rebuild completed in {elapsed:.3f}s "
-        f"(limit {TIMEOUT_SECONDS}s)",
+        f"error: compiler rebuild exceeded its {TIMEOUT_SECONDS}-second "
+        "wall-clock limit; sent SIGKILL to its process group",
         file=sys.stderr,
     )
-    return return_code if return_code >= 0 else 128 - return_code
+    return 124
 
 
 if __name__ == "__main__":
