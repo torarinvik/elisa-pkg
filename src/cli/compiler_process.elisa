@@ -9,20 +9,6 @@ module CompilerProcess:
     private:
         const callback_environment_prefix: cstr = "CALLBACK_PATH="
 
-    public:
-        struct Invocation:
-            profile: cstr
-            scratch_directory: cstr
-            stage1_binary: cstr
-            runtime_object: cstr
-            allow_stale: cstr
-            clang: cstr
-            executable: cstr
-            release: bool
-            emit_kind: cstr
-            output_path: cstr
-            source_path: cstr
-
         def prepare_callback_parameter(parameter: mutable darray[u8]&) -> usize can[Memory.Allocate, Abort.Panic]:
             parameter.resize(0)
             ByteText::append_text(parameter, callback_environment_prefix)
@@ -31,13 +17,6 @@ module CompilerProcess:
             ByteText::append_text(parameter, "00000000000000000000.c")
             parameter.push(0)
             return digits_offset
-
-        def remove_callback_file(parameter: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            path_offset: usize = Platform::pkg_strlen(callback_environment_prefix)
-            return false if parameter.count <= path_offset
-            path: cstr = (&parameter[path_offset]).cast[cstr] can Unsafe.PointerCast
-            status: i64 = Platform::pkg_unlink(path)
-            return status == 0 or status == -2
 
         # Fill the reserved compiler callback filename with the child's PID.
         def set_callback_path_pid(value: mutable darray[u8]&, digits_offset: usize, process_id: i64) -> bool:
@@ -59,8 +38,32 @@ module CompilerProcess:
             value[digits_offset + digit_count + 2.usize()] <- 0
             return true
 
+    public:
+        struct Invocation:
+            profile: cstr
+            scratch_directory: cstr
+            stage1_binary: cstr
+            runtime_object: cstr
+            allow_stale: cstr
+            clang: cstr
+            executable: cstr
+            release: bool
+            emit_kind: cstr
+            output_path: cstr
+            source_path: cstr
+
+        def remove_callback_file(process_id: i64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return false if process_id <= 0
+            parameter: mutable darray[u8] = []
+            digits_offset: usize = prepare_callback_parameter(&parameter)
+            return false if not set_callback_path_pid(&parameter, digits_offset, process_id)
+            path_offset: usize = Platform::pkg_strlen(callback_environment_prefix)
+            path: cstr = (&parameter[path_offset]).cast[cstr] can Unsafe.PointerCast
+            status: i64 = Platform::pkg_unlink(path)
+            return status == 0 or status == -2
+
         # Keep the environment buffers alive in this frame through fork and exec.
-        def spawn(invocation: Invocation, sdk_root: darray[u8]&, developer_dir: darray[u8]&, callback_parameter: mutable darray[u8]&, callback_digits_offset: usize, sandbox_work_directory_fd: i64, compiler_stdout_fd: i64, compiler_stderr_fd: i64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+        def spawn(invocation: Invocation, sdk_root: darray[u8]&, developer_dir: darray[u8]&, sandbox_work_directory_fd: i64, compiler_stdout_fd: i64, compiler_stderr_fd: i64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             # The compiler was resolved against the fixed child PATH above;
             # invoking its absolute path keeps execution and sandbox policy aligned.
             stage1_env: mutable darray[u8] = []
@@ -70,6 +73,8 @@ module CompilerProcess:
             sdkroot_env: mutable darray[u8] = []
             developer_dir_env: mutable darray[u8] = []
             temporary_env: mutable darray[u8] = []
+            callback_parameter: mutable darray[u8] = []
+            callback_digits_offset: usize = prepare_callback_parameter(&callback_parameter)
             args: mutable darray[cstr] = []
             args.push("/usr/bin/sandbox-exec")
             args.push("-D")
@@ -144,7 +149,7 @@ module CompilerProcess:
             pid: i64 = Platform::pkg_fork()
             if pid == 0:
                 process_id: i64 = Platform::pkg_process_id()
-                if not set_callback_path_pid(callback_parameter, callback_digits_offset, process_id):
+                if not set_callback_path_pid(&callback_parameter, callback_digits_offset, process_id):
                     Platform::pkg_process_exit(126)
                 callback_path_offset: usize = Platform::pkg_strlen(callback_environment_prefix)
                 callback_file_name: cstr = (&callback_parameter[callback_path_offset]).cast[cstr] can Unsafe.PointerCast
@@ -177,13 +182,6 @@ module CompilerProcess:
             wait_status: i64 = Platform::pkg_waitpid_timeout(pid, &exit_status, timeout_milliseconds)
             group_stopped: bool = Platform::pkg_terminate_process_group(pid) == 0
             return Completion{wait_status: wait_status, exit_status: exit_status, group_stopped: group_stopped}
-
-        def stop_after_setup_failure(pid: i64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            exit_status: mutable i32 = 0
-            # Give an already exited child one millisecond to be reaped.
-            # The wait helper then terminates and reaps a child that is still running.
-            wait_status: i64 = Platform::pkg_waitpid_group_timeout(pid, &exit_status, 1)
-            return wait_status == 0 or wait_status == Platform::pkg_timeout_error()
 
         # For failed builds whose compiler is no longer running.
         def discard_scratch(sandbox_directory: cstr, output_path: cstr, aggregate_path: cstr, snapshot_container: cstr, snapshot_roots: darray[u8]&) -> void can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
