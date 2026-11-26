@@ -11,16 +11,6 @@ module InstallRecords:
         const version_label: cstr = "\nversion:"
         const digest_label: cstr = "\nartifact-digest:sha256:"
 
-        # Return the offset after the literal, or -1 on a mismatch.
-        def match_literal(raw: darray[u8]&, start: usize, literal: cstr) -> i64:
-            position: mutable usize = start
-            index: mutable usize = 0.usize()
-            while literal[index].u8() != 0 |raw, literal, position, index|:
-                return -1 if position >= raw.count or raw[position] != literal[index].u8()
-                position <- position + 1.usize()
-                index <- index + 1.usize()
-            return position.i64()
-
     public:
         const max_record_bytes: usize = 8192.usize()
 
@@ -58,14 +48,14 @@ module InstallRecords:
             journal_name: mutable darray[u8] = []
             journal_version: mutable darray[u8] = []
             journal_digest: mutable darray[u8] = []
-            operation_start: i64 = match_literal(raw, 0.usize(), journal_prefix)
+            operation_start: i64 = ByteText::match_text_end(raw, 0.usize(), journal_prefix)
             return false if operation_start < 0
             name_offset: mutable i64 = -1
             for operation_index in 0..<2:
                 operation: cstr = "install" if operation_index == 0 else "uninstall"
-                operation_end: i64 = match_literal(raw, operation_start.usize(), operation)
+                operation_end: i64 = ByteText::match_text_end(raw, operation_start.usize(), operation)
                 continue if operation_end < 0
-                name_offset <- match_literal(raw, operation_end.usize(), name_label)
+                name_offset <- ByteText::match_text_end(raw, operation_end.usize(), name_label)
                 if name_offset >= 0:
                     ByteText::append_text(&journal_operation, operation)
                     break
@@ -77,7 +67,7 @@ module InstallRecords:
             return false if name_end == name_start or name_end >= raw.count or name_end - name_start > PackageIdentity::max_name_bytes
             ByteText::append_range(&journal_name, raw, name_start, name_end)
             return false if not PackageIdentity::valid_name(journal_name)
-            version_offset: i64 = match_literal(raw, name_end, version_label)
+            version_offset: i64 = ByteText::match_text_end(raw, name_end, version_label)
             return false if version_offset < 0
             version_start: usize = version_offset.usize()
             version_end: mutable usize = version_start
@@ -87,19 +77,14 @@ module InstallRecords:
             ByteText::append_range(&journal_version, raw, version_start, version_end)
             parsed_version: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
             return false if not PackageIdentity::parse_version(journal_version, &parsed_version)
-            digest_offset: i64 = match_literal(raw, version_end, digest_label)
+            digest_offset: i64 = ByteText::match_text_end(raw, version_end, digest_label)
             return false if digest_offset < 0
             digest_start: usize = digest_offset.usize()
             return false if raw.count - digest_start != 65.usize()
-            for index in 0..<64 |raw, journal_digest, digest_start|:
-                journal_digest <- journal_digest.push(raw[digest_start + index])
+            ByteText::append_range(&journal_digest, raw, digest_start, raw.count - 1.usize())
             return false if raw[raw.count - 1.usize()] != 10 or not Integrity::valid_sha256_hex(journal_digest)
-            for index in 0..<journal_operation.count |out_operation, journal_operation|:
-                out_operation.push(journal_operation[index])
-            for index in 0..<journal_name.count |out_name, journal_name|:
-                out_name.push(journal_name[index])
-            for index in 0..<journal_version.count |out_version, journal_version|:
-                out_version.push(journal_version[index])
-            for index in 0..<journal_digest.count |out_digest, journal_digest|:
-                out_digest.push(journal_digest[index])
+            ByteText::append(out_operation, journal_operation)
+            ByteText::append(out_name, journal_name)
+            ByteText::append(out_version, journal_version)
+            ByteText::append(out_digest, journal_digest)
             return true
