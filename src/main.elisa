@@ -20,6 +20,7 @@ include "./integrity.elisa"
 include "./json.elisa"
 include "./package_path_policy.elisa"
 include "./build.elisa"
+include "./toolchain.elisa"
 include "./cache.elisa"
 include "./resolution/resolve.elisa"
 include "./resolution/solver.elisa"
@@ -121,25 +122,6 @@ module Cli:
                 return false if left[index].u8() != right[index].u8()
             return true
 
-        def valid_compiler_argument(value: cstr) -> bool:
-            length: usize = Platform::pkg_strlen(value)
-            # The compiler is the first utility argument after `env -i`. Reject forms
-            # that the env utility would interpret as an option or NAME=VALUE prefix;
-            # a malformed override must fail before child process construction.
-            return false if length == 0.usize() or length > 4096.usize() or value[0].u8() == 45 or value[0].u8() == 61
-            for index in 0..<length |value|:
-                byte: u8 = value[index].u8()
-                return false if byte == 61 or byte < 32 or byte == 127
-            return true
-
-        def valid_toolchain_value(value: cstr, maximum: usize) -> bool:
-            length: usize = Platform::pkg_strlen(value)
-            return false if length > maximum
-            for index in 0..<length |value|:
-                byte: u8 = value[index].u8()
-                return false if byte < 32 or byte == 127
-            return true
-
         def bytes_count(haystack: darray[u8]&, needle: cstr) -> usize:
             needle_length: usize = Platform::pkg_strlen(needle)
             total: mutable usize = 0.usize()
@@ -171,41 +153,6 @@ module Cli:
             for index in 0..<suffix.count |value, suffix, offset|:
                 return false if value[offset + index] != suffix[index]
             return true
-
-        def canonical_path_bytes(path: cstr, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            out.resize(0)
-            resolved: mutable darray[u8] = []
-            resolved.resize(4096)
-            if Platform::pkg_realpath(path, &resolved) is canonical:
-                length: usize = Platform::pkg_strlen(canonical)
-                return false if length == 0.usize() or length >= 4096.usize()
-                for index in 0..<length |out, canonical|:
-                    out.push(canonical[index].u8())
-                return true
-            return false
-
-        def path_without_suffix(path: darray[u8]&, suffix: cstr, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            out.resize(0)
-            suffix_length: usize = Platform::pkg_strlen(suffix)
-            return false if suffix_length >= path.count
-            offset: usize = path.count - suffix_length
-            for index in 0..<suffix_length |path, suffix, offset|:
-                return false if path[offset + index] != suffix[index].u8()
-            return false if offset == 0.usize() or path[offset - 1.usize()] == 47
-            for index in 0..<offset |out, path|:
-                out.push(path[index])
-            return true
-
-        def stage1_wrapper_pair_matches(wrapper: cstr, stage1: cstr) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            return false if Platform::pkg_strlen(wrapper) == 0.usize() or Platform::pkg_strlen(stage1) == 0.usize()
-            wrapper_real: mutable darray[u8] = []
-            stage1_real: mutable darray[u8] = []
-            return false if not canonical_path_bytes(wrapper, &wrapper_real) or not canonical_path_bytes(stage1, &stage1_real)
-            wrapper_root: mutable darray[u8] = []
-            stage1_root: mutable darray[u8] = []
-            return false if not path_without_suffix(wrapper_real, "/scripts/elisac_stage1.sh", &wrapper_root)
-            return false if not path_without_suffix(stage1_real, "/bin/elisac-stage1", &stage1_root)
-            return bytes_equal(wrapper_root, stage1_root)
 
         def write_bytes(fd: i64, value: darray[u8]&) -> void can[Console.Write, Unsafe.PointerCast]:
             return if fd == 1 and cli_quiet and not cli_json_output
@@ -259,7 +206,7 @@ module Cli:
                 has_slash <- true if path[index].u8() == 47
             if has_slash:
                 canonical: mutable darray[u8] = []
-                return false if not canonical_path_bytes(path, &canonical)
+                return false if not Toolchain::canonical_path_bytes(path, &canonical)
                 canonical_c: mutable darray[u8] = []
                 path_with_nul_into(canonical, &canonical_c)
                 canonical_name: cstr = (&canonical_c[0]).cast[cstr] can Unsafe.PointerCast
@@ -285,7 +232,7 @@ module Cli:
                 candidate.push(0)
                 candidate_name: cstr = (&candidate[0]).cast[cstr] can Unsafe.PointerCast
                 canonical_candidate: mutable darray[u8] = []
-                if canonical_path_bytes(candidate_name, &canonical_candidate):
+                if Toolchain::canonical_path_bytes(candidate_name, &canonical_candidate):
                     canonical_candidate_c: mutable darray[u8] = []
                     path_with_nul_into(canonical_candidate, &canonical_candidate_c)
                     canonical_candidate_name: cstr = (&canonical_candidate_c[0]).cast[cstr] can Unsafe.PointerCast
@@ -344,7 +291,7 @@ module Cli:
                 bytes_push_view(out, "none" if optional else "unavailable")
                 return optional
             resolved_path: mutable darray[u8] = []
-            if not canonical_path_bytes(path, &resolved_path):
+            if not Toolchain::canonical_path_bytes(path, &resolved_path):
                 bytes_push_view(out, "unavailable")
                 return false
             for index in 0..<resolved_path.count |resolved_path, out|:
@@ -6189,7 +6136,7 @@ module Cli:
                 compiler: mutable cstr = "elisac-stage1"
                 if Platform::pkg_getenv("ELISAPKG_COMPILER") is configured:
                     compiler <- configured.cast[cstr]
-                return EXIT_BUILD if not valid_compiler_argument(compiler)
+                return EXIT_BUILD if not Toolchain::valid_compiler_argument(compiler)
                 resolved_compiler_path: mutable darray[u8] = []
                 if not resolve_build_compiler(compiler, &resolved_compiler_path):
                     write_error("error: selected compiler was not found as an executable on the isolated build PATH\n")
@@ -6212,9 +6159,9 @@ module Cli:
                     allow_stale <- configured_stale.cast[cstr]
                 if Platform::pkg_getenv("ELISA_CLANG") is configured_clang:
                     clang_tool <- configured_clang.cast[cstr]
-                return EXIT_BUILD if not valid_toolchain_value(stage1_bin, 4096.usize()) or not valid_toolchain_value(runtime_obj, 4096.usize()) or not valid_toolchain_value(allow_stale, 64.usize()) or not valid_toolchain_value(clang_tool, 4096.usize())
+                return EXIT_BUILD if not Toolchain::valid_toolchain_value(stage1_bin, 4096.usize()) or not Toolchain::valid_toolchain_value(runtime_obj, 4096.usize()) or not Toolchain::valid_toolchain_value(allow_stale, 64.usize()) or not Toolchain::valid_toolchain_value(clang_tool, 4096.usize())
                 compiler_executable: mutable cstr = compiler
-                compiler_is_stage1_wrapper: bool = stage1_wrapper_pair_matches(compiler, stage1_bin)
+                compiler_is_stage1_wrapper: bool = Toolchain::stage1_wrapper_pair_matches(compiler, stage1_bin)
                 if compiler_is_stage1_wrapper and stage1_bin[0].u8() != 0:
                     compiler_executable <- stage1_bin
                 home_name: mutable cstr = ""
