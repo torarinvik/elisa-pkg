@@ -3,6 +3,17 @@ include "./files.elisa"
 
 module ProjectTransaction:
     private:
+        const kernel_lock_path: cstr = ".elisapkg/transaction.flock"
+        const guard_path: cstr = ".elisapkg/transaction.guard"
+        const original_lock_path: cstr = ".elisapkg/transaction.lock"
+        const original_manifest_path: cstr = ".elisapkg/transaction.manifest"
+        const staged_lock_path: cstr = ".elisapkg/transaction.new-lock"
+        const staged_missing_lock_path: cstr = ".elisapkg/transaction.new-lock-missing"
+        const staged_manifest_path: cstr = ".elisapkg/transaction.new-manifest"
+        const phase_path: cstr = ".elisapkg/transaction.state"
+        const live_manifest_path: cstr = "elisapkg.json"
+        const live_lock_path: cstr = "elisapkg.lock"
+
         # Serialized phase names are part of the on-disk journal format.
         const prepared_with_lock: cstr = "prepared-lock\n"
         const prepared_without_lock: cstr = "prepared-no-lock\n"
@@ -18,12 +29,7 @@ module ProjectTransaction:
         def transaction_lock_acquire() -> bool can[Global{Read,Write}, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global{Read,Write}:
                 return false if transaction_lock_fd >= 0
-                lock_path: mutable darray[u8] = []
-                ByteText::append_text(&lock_path, ".elisapkg/transaction.flock")
-                lock_path_c: mutable darray[u8] = []
-                ProjectFiles::path_with_nul_into(&lock_path, &lock_path_c)
-                lock_path_name: cstr = (&lock_path_c[0]).cast[cstr] can Unsafe.PointerCast
-                fd: i64 = Platform::pkg_acquire_project_transaction_lock(lock_path_name)
+                fd: i64 = Platform::pkg_acquire_project_transaction_lock(kernel_lock_path)
                 return false if fd < 0
                 transaction_lock_fd <- fd
                 return true
@@ -46,10 +52,10 @@ module ProjectTransaction:
             # file size helper returns -21 for directories, so verify that case
             # with the no-follow directory opener instead of treating every
             # negative result as an absent guard.
-            state: i64 = Platform::pkg_package_file_size(".elisapkg/transaction.guard")
+            state: i64 = Platform::pkg_package_file_size(guard_path)
             return 0 if state == -2
             return -1 if state >= 0 or state != -21
-            return 1 if Platform::pkg_is_directory(".elisapkg/transaction.guard") == 1
+            return 1 if Platform::pkg_is_directory(guard_path) == 1
             return -1
 
         def invalid_journal_file(size_result: i64) -> bool:
@@ -63,15 +69,15 @@ module ProjectTransaction:
 
         def remove_transaction_files() -> bool:
             return false if:
-                not ProjectFiles::remove_cstr_file(".elisapkg/transaction.manifest")
-                not ProjectFiles::remove_cstr_file(".elisapkg/transaction.lock")
-                not ProjectFiles::remove_cstr_file(".elisapkg/transaction.new-manifest")
-                not ProjectFiles::remove_cstr_file(".elisapkg/transaction.new-lock")
-                not ProjectFiles::remove_cstr_file(".elisapkg/transaction.new-lock-missing")
+                not ProjectFiles::remove_cstr_file(original_manifest_path)
+                not ProjectFiles::remove_cstr_file(original_lock_path)
+                not ProjectFiles::remove_cstr_file(staged_manifest_path)
+                not ProjectFiles::remove_cstr_file(staged_lock_path)
+                not ProjectFiles::remove_cstr_file(staged_missing_lock_path)
             guard: mutable darray[u8] = []
-            ByteText::append_text(&guard, ".elisapkg/transaction.guard")
+            ByteText::append_text(&guard, guard_path)
             return false if not ProjectFiles::remove_empty_directory(&guard)
-            return ProjectFiles::remove_cstr_file(".elisapkg/transaction.state")
+            return ProjectFiles::remove_cstr_file(phase_path)
 
         def live_file_matches(expected_path: cstr, live_path: cstr) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             expected: mutable darray[u8] = []
@@ -89,11 +95,11 @@ module ProjectTransaction:
         def published_manifest_matches_journal() -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             state: mutable darray[u8] = []
             state.resize(128)
-            return false if not ProjectFiles::read_cstr_into(".elisapkg/transaction.state", &state)
+            return false if not ProjectFiles::read_cstr_into(phase_path, &state)
             if ByteText::equal_text(state, prepared_with_lock) or ByteText::equal_text(state, prepared_without_lock):
-                return live_file_matches(".elisapkg/transaction.manifest", "elisapkg.json")
+                return live_file_matches(original_manifest_path, live_manifest_path)
             if has_manifest_intent(state):
-                return live_file_matches(".elisapkg/transaction.new-manifest", "elisapkg.json")
+                return live_file_matches(staged_manifest_path, live_manifest_path)
             return false
 
         def report_recovery_error(message: cstr) -> void can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -114,14 +120,11 @@ module ProjectTransaction:
                 return false if not ProjectFiles::make_directory(&state_root)
                 return false if not transaction_lock_acquire()
                 guard: mutable darray[u8] = []
-                ByteText::append_text(&guard, ".elisapkg/transaction.guard")
-                guard_c: mutable darray[u8] = []
-                ProjectFiles::path_with_nul_into(&guard, &guard_c)
-                guard_name: cstr = (&guard_c[0]).cast[cstr] can Unsafe.PointerCast
-                if Platform::pkg_mkdir(guard_name, 448.u16()) != 0:
+                ByteText::append_text(&guard, guard_path)
+                if Platform::pkg_mkdir(guard_path, 448.u16()) != 0:
                     _ = transaction_lock_release()
                     return false
-                transaction_state: i64 = Platform::pkg_package_file_size(".elisapkg/transaction.state")
+                transaction_state: i64 = Platform::pkg_package_file_size(phase_path)
                 if transaction_state >= 0:
                     _ = transaction_abort_begin(guard)
                     return false
@@ -134,29 +137,29 @@ module ProjectTransaction:
                 # overwriting a newer dependency edit from a stale snapshot.
                 current_manifest: mutable darray[u8] = []
                 current_manifest.resize(1048577)
-                if not ProjectFiles::read_cstr_into("elisapkg.json", &current_manifest) or not ByteText::equal(current_manifest, original_manifest):
+                if not ProjectFiles::read_cstr_into(live_manifest_path, &current_manifest) or not ByteText::equal(current_manifest, original_manifest):
                     _ = transaction_abort_begin(guard)
                     return false
                 if expected_lock_state != -3:
-                    current_lock_state: i64 = Platform::pkg_package_file_size("elisapkg.lock")
+                    current_lock_state: i64 = Platform::pkg_package_file_size(live_lock_path)
                     if current_lock_state != expected_lock_state:
                         _ = transaction_abort_begin(guard)
                         return false
                     if current_lock_state >= 0:
                         current_lock: mutable darray[u8] = []
                         current_lock.resize(1048577)
-                        if not ProjectFiles::read_cstr_into("elisapkg.lock", &current_lock) or not ByteText::equal(current_lock, expected_lock):
+                        if not ProjectFiles::read_cstr_into(live_lock_path, &current_lock) or not ByteText::equal(current_lock, expected_lock):
                             _ = transaction_abort_begin(guard)
                             return false
-                if not ProjectFiles::write_cstr_file(".elisapkg/transaction.manifest", original_manifest):
+                if not ProjectFiles::write_cstr_file(original_manifest_path, original_manifest):
                     _ = transaction_cleanup()
                     return false
                 state: mutable darray[u8] = []
-                lock_state: i64 = Platform::pkg_package_file_size("elisapkg.lock")
+                lock_state: i64 = Platform::pkg_package_file_size(live_lock_path)
                 if lock_state >= 0:
                     original_lock: mutable darray[u8] = []
                     original_lock.resize(1048577)
-                    if not ProjectFiles::read_cstr_into("elisapkg.lock", &original_lock) or not ProjectFiles::write_cstr_file(".elisapkg/transaction.lock", &original_lock):
+                    if not ProjectFiles::read_cstr_into(live_lock_path, &original_lock) or not ProjectFiles::write_cstr_file(original_lock_path, &original_lock):
                         _ = transaction_cleanup()
                         return false
                     ByteText::append_text(&state, prepared_with_lock)
@@ -165,7 +168,7 @@ module ProjectTransaction:
                 else:
                     _ = transaction_cleanup()
                     return false
-                if not ProjectFiles::write_cstr_file(".elisapkg/transaction.state", &state):
+                if not ProjectFiles::write_cstr_file(phase_path, &state):
                     _ = transaction_cleanup()
                     return false
                 return true
@@ -182,27 +185,27 @@ module ProjectTransaction:
             # either atomic rename boundary.
             can Global.Read:
                 return false if transaction_lock_fd < 0
-            if not live_file_matches(".elisapkg/transaction.manifest", "elisapkg.json"):
+            if not live_file_matches(original_manifest_path, live_manifest_path):
                 report_recovery_error("error: manifest changed before transaction publication\n")
                 return false
-            return false if not ProjectFiles::write_cstr_file(".elisapkg/transaction.new-manifest", new_manifest)
+            return false if not ProjectFiles::write_cstr_file(staged_manifest_path, new_manifest)
             state: mutable darray[u8] = []
             ByteText::append_text(&state, manifest_pending)
-            return false if not ProjectFiles::write_cstr_file(".elisapkg/transaction.state", &state)
-            return ProjectFiles::write_cstr_file("elisapkg.json", new_manifest)
+            return false if not ProjectFiles::write_cstr_file(phase_path, &state)
+            return ProjectFiles::write_cstr_file(live_manifest_path, new_manifest)
 
         def publish_lock(new_lock: darray[u8]&) -> LockPublication can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             # Record the intended bytes before replacing the live lockfile so
             # recovery can distinguish publication from an external edit.
             can Global.Read:
                 return LockPublication.JournalFailed if transaction_lock_fd < 0
-            original_size: i64 = Platform::pkg_package_file_size(".elisapkg/transaction.lock")
-            original_matches: bool = Platform::pkg_package_file_size("elisapkg.lock") == -2 if original_size == -2 else live_file_matches(".elisapkg/transaction.lock", "elisapkg.lock")
+            original_size: i64 = Platform::pkg_package_file_size(original_lock_path)
+            original_matches: bool = Platform::pkg_package_file_size(live_lock_path) == -2 if original_size == -2 else live_file_matches(original_lock_path, live_lock_path)
             if not original_matches:
                 report_recovery_error("error: lockfile changed before transaction publication\n")
                 return LockPublication.JournalFailed
-            return LockPublication.JournalFailed if not ProjectFiles::write_cstr_file(".elisapkg/transaction.new-lock", new_lock)
-            return LockPublication.Published if ProjectFiles::write_cstr_file("elisapkg.lock", new_lock) else LockPublication.WriteFailed
+            return LockPublication.JournalFailed if not ProjectFiles::write_cstr_file(staged_lock_path, new_lock)
+            return LockPublication.Published if ProjectFiles::write_cstr_file(live_lock_path, new_lock) else LockPublication.WriteFailed
 
         def restore() -> bool can[Global{Read,Write}, Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             can Global{Read,Write}:
@@ -216,28 +219,28 @@ module ProjectTransaction:
             can Global{Read,Write}:
                 state: mutable darray[u8] = []
                 state.resize(128)
-                return false if not ProjectFiles::read_cstr_into(".elisapkg/transaction.state", &state)
+                return false if not ProjectFiles::read_cstr_into(phase_path, &state)
                 recognized: bool = ByteText::equal_text(state, prepared_with_lock) or ByteText::equal_text(state, prepared_without_lock) or has_manifest_intent(state)
                 if not recognized:
                     report_recovery_error("error: unrecognized project transaction state; preserve .elisapkg/transaction.* for recovery\n")
                     return false
                 original_manifest: mutable darray[u8] = []
                 original_manifest.resize(1048577)
-                return false if not ProjectFiles::read_cstr_into(".elisapkg/transaction.manifest", &original_manifest)
+                return false if not ProjectFiles::read_cstr_into(original_manifest_path, &original_manifest)
                 current_manifest: mutable darray[u8] = []
                 current_manifest.resize(1048577)
-                return false if not ProjectFiles::read_cstr_into("elisapkg.json", &current_manifest)
+                return false if not ProjectFiles::read_cstr_into(live_manifest_path, &current_manifest)
                 if has_manifest_intent(state):
                     new_manifest: mutable darray[u8] = []
                     new_manifest.resize(1048577)
-                    return false if not ProjectFiles::read_cstr_into(".elisapkg/transaction.new-manifest", &new_manifest)
+                    return false if not ProjectFiles::read_cstr_into(staged_manifest_path, &new_manifest)
                     if not ByteText::equal(current_manifest, new_manifest) and not ByteText::equal(current_manifest, original_manifest):
                         report_recovery_error("error: transaction recovery found an external manifest edit; recovery files were retained\n")
                         return false
                 elif not ByteText::equal(current_manifest, original_manifest):
                     report_recovery_error("error: transaction recovery found an external manifest edit; recovery files were retained\n")
                     return false
-                original_lock_state: i64 = Platform::pkg_package_file_size(".elisapkg/transaction.lock")
+                original_lock_state: i64 = Platform::pkg_package_file_size(original_lock_path)
                 return false if original_lock_state < 0 and original_lock_state != -2
                 original_lock_present: bool = original_lock_state >= 0
                 if ByteText::equal_text(state, prepared_with_lock) and not original_lock_present:
@@ -249,27 +252,27 @@ module ProjectTransaction:
                 original_lock: mutable darray[u8] = []
                 if original_lock_present:
                     original_lock.resize(1048577)
-                    return false if not ProjectFiles::read_cstr_into(".elisapkg/transaction.lock", &original_lock)
-                current_lock_state: i64 = Platform::pkg_package_file_size("elisapkg.lock")
+                    return false if not ProjectFiles::read_cstr_into(original_lock_path, &original_lock)
+                current_lock_state: i64 = Platform::pkg_package_file_size(live_lock_path)
                 return false if current_lock_state < 0 and current_lock_state != -2
                 current_lock_present: bool = current_lock_state >= 0
-                new_lock_state: i64 = Platform::pkg_package_file_size(".elisapkg/transaction.new-lock")
+                new_lock_state: i64 = Platform::pkg_package_file_size(staged_lock_path)
                 return false if new_lock_state < 0 and new_lock_state != -2
-                new_lock_missing_state: i64 = Platform::pkg_package_file_size(".elisapkg/transaction.new-lock-missing")
+                new_lock_missing_state: i64 = Platform::pkg_package_file_size(staged_missing_lock_path)
                 return false if new_lock_missing_state < 0 and new_lock_missing_state != -2
                 return false if new_lock_state >= 0 and new_lock_missing_state >= 0
                 if new_lock_missing_state >= 0:
                     missing_lock_marker: mutable darray[u8] = []
                     missing_lock_marker.resize(64)
-                    return false if not ProjectFiles::read_cstr_into(".elisapkg/transaction.new-lock-missing", &missing_lock_marker) or not ByteText::equal_text(missing_lock_marker, "missing\n")
+                    return false if not ProjectFiles::read_cstr_into(staged_missing_lock_path, &missing_lock_marker) or not ByteText::equal_text(missing_lock_marker, "missing\n")
                 if current_lock_present:
                     current_lock: mutable darray[u8] = []
                     current_lock.resize(1048577)
-                    return false if not ProjectFiles::read_cstr_into("elisapkg.lock", &current_lock)
+                    return false if not ProjectFiles::read_cstr_into(live_lock_path, &current_lock)
                     if new_lock_state >= 0:
                         new_lock: mutable darray[u8] = []
                         new_lock.resize(1048577)
-                        return false if not ProjectFiles::read_cstr_into(".elisapkg/transaction.new-lock", &new_lock)
+                        return false if not ProjectFiles::read_cstr_into(staged_lock_path, &new_lock)
                         if not ByteText::equal(current_lock, new_lock) and (not original_lock_present or not ByteText::equal(current_lock, original_lock)):
                             report_recovery_error("error: transaction recovery found an external lockfile edit; recovery files were retained\n")
                             return false
@@ -279,33 +282,33 @@ module ProjectTransaction:
                 elif original_lock_present and new_lock_missing_state < 0:
                     report_recovery_error("error: transaction recovery found an external lockfile edit; recovery files were retained\n")
                     return false
-                return false if not ProjectFiles::write_cstr_file("elisapkg.json", &original_manifest)
+                return false if not ProjectFiles::write_cstr_file(live_manifest_path, &original_manifest)
                 if original_lock_present:
-                    return false if not ProjectFiles::write_cstr_file("elisapkg.lock", &original_lock)
+                    return false if not ProjectFiles::write_cstr_file(live_lock_path, &original_lock)
                 else:
-                    return false if not ProjectFiles::remove_cstr_file("elisapkg.lock")
+                    return false if not ProjectFiles::remove_cstr_file(live_lock_path)
                 restored_state: mutable darray[u8] = []
                 ByteText::append_text(&restored_state, rolled_back)
-                return false if not ProjectFiles::write_cstr_file(".elisapkg/transaction.state", &restored_state)
+                return false if not ProjectFiles::write_cstr_file(phase_path, &restored_state)
                 return remove_transaction_files()
 
     public:
         def recover() -> bool can[Global{Read,Write}, Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             can Global{Read,Write}:
                 return false if transaction_lock_fd >= 0
-                transaction_state: mutable i64 = Platform::pkg_package_file_size(".elisapkg/transaction.state")
+                transaction_state: mutable i64 = Platform::pkg_package_file_size(phase_path)
                 return false if invalid_journal_file(transaction_state)
                 guard_state: mutable i64 = transaction_guard_state()
                 if guard_state < 0:
                     report_recovery_error("error: invalid project transaction guard at .elisapkg/transaction.guard; preserve it for recovery\n")
                     return false
-                lock_state: i64 = Platform::pkg_package_file_size(".elisapkg/transaction.flock")
+                lock_state: i64 = Platform::pkg_package_file_size(kernel_lock_path)
                 return false if invalid_journal_file(lock_state)
-                original_manifest_state: i64 = Platform::pkg_package_file_size(".elisapkg/transaction.manifest")
-                original_lock_state: i64 = Platform::pkg_package_file_size(".elisapkg/transaction.lock")
-                new_manifest_state: i64 = Platform::pkg_package_file_size(".elisapkg/transaction.new-manifest")
-                new_lock_state: i64 = Platform::pkg_package_file_size(".elisapkg/transaction.new-lock")
-                missing_lock_state: i64 = Platform::pkg_package_file_size(".elisapkg/transaction.new-lock-missing")
+                original_manifest_state: i64 = Platform::pkg_package_file_size(original_manifest_path)
+                original_lock_state: i64 = Platform::pkg_package_file_size(original_lock_path)
+                new_manifest_state: i64 = Platform::pkg_package_file_size(staged_manifest_path)
+                new_lock_state: i64 = Platform::pkg_package_file_size(staged_lock_path)
+                missing_lock_state: i64 = Platform::pkg_package_file_size(staged_missing_lock_path)
                 return false if:
                     invalid_journal_file(original_manifest_state)
                     invalid_journal_file(original_lock_state)
@@ -327,7 +330,7 @@ module ProjectTransaction:
                 if not transaction_lock_acquire():
                     report_recovery_error("error: could not acquire the project transaction lock; wait for any active edit to finish, then retry\n")
                     return false
-                transaction_state <- Platform::pkg_package_file_size(".elisapkg/transaction.state")
+                transaction_state <- Platform::pkg_package_file_size(phase_path)
                 guard_state <- transaction_guard_state()
                 if invalid_journal_file(transaction_state) or guard_state < 0:
                     _ = transaction_lock_release()
@@ -339,16 +342,11 @@ module ProjectTransaction:
                     return transaction_cleanup()
                 state: mutable darray[u8] = []
                 state.resize(128)
-                if not ProjectFiles::read_cstr_into(".elisapkg/transaction.state", &state):
+                if not ProjectFiles::read_cstr_into(phase_path, &state):
                     _ = transaction_lock_release()
                     return false
                 return transaction_cleanup() if ByteText::equal_text(state, committed) or ByteText::equal_text(state, rolled_back)
-                guard: mutable darray[u8] = []
-                ByteText::append_text(&guard, ".elisapkg/transaction.guard")
-                guard_c: mutable darray[u8] = []
-                ProjectFiles::path_with_nul_into(&guard, &guard_c)
-                guard_name: cstr = (&guard_c[0]).cast[cstr] can Unsafe.PointerCast
-                if guard_state == 0 and Platform::pkg_mkdir(guard_name, 448.u16()) != 0:
+                if guard_state == 0 and Platform::pkg_mkdir(guard_path, 448.u16()) != 0:
                     _ = transaction_lock_release()
                     return false
                 return restore()
@@ -360,13 +358,13 @@ module ProjectTransaction:
                     report_recovery_error("error: published manifest does not match the transaction journal\n")
                     _ = restore()
                     return false
-                if not live_file_matches(".elisapkg/transaction.new-lock", "elisapkg.lock"):
+                if not live_file_matches(staged_lock_path, live_lock_path):
                     report_recovery_error("error: published lockfile does not match the staged transaction bytes\n")
                     _ = restore()
                     return false
                 state: mutable darray[u8] = []
                 ByteText::append_text(&state, committed)
-                if not ProjectFiles::write_cstr_file(".elisapkg/transaction.state", &state):
+                if not ProjectFiles::write_cstr_file(phase_path, &state):
                     _ = transaction_lock_release()
                     return false
                 return transaction_cleanup()
