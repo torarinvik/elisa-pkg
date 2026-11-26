@@ -180,6 +180,18 @@ with tempfile.TemporaryDirectory(prefix='cli-review-', dir=ROOT / 'build') as di
     result = subprocess.run([BIN, 'check-manifest'], cwd=project, capture_output=True, timeout=120, check=False)
     assert result.returncode == 2, result
     manifest.write_text(valid)
+    lockfile = project / 'elisapkg.lock'
+    original_lock = lockfile.read_bytes()
+    for command in (
+        ['add', 'other', '--version', '1.0.0', '--registry', 'primary'],
+        ['remove', 'other'],
+        ['update'],
+    ):
+        result = subprocess.run([BIN, *command], cwd=project, capture_output=True,
+                                timeout=120, check=False)
+        assert result.returncode == 2, (command, result)
+        assert manifest.read_text() == valid and legacy_only.read_text() == valid
+        assert lockfile.read_bytes() == original_lock
     legacy_only.unlink()
     artifact = project / '.elisapkg/build/app'
     artifact.parent.mkdir(parents=True, exist_ok=True)
