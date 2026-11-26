@@ -4,11 +4,11 @@ set -euo pipefail
 lint_flags=()
 case "${1:-}" in
   "") ;;
-  --strict) lint_flags=(-Wnever-leak=strict) ;;
-  *) echo "usage: scripts/build.sh [--strict]" >&2; exit 2 ;;
+  --strict|--check) lint_flags=(-Wnever-leak=strict) ;;
+  *) echo "usage: scripts/build.sh [--strict|--check]" >&2; exit 2 ;;
 esac
 if [[ $# -gt 1 ]]; then
-  echo "usage: scripts/build.sh [--strict]" >&2
+  echo "usage: scripts/build.sh [--strict|--check]" >&2
   exit 2
 fi
 
@@ -34,6 +34,13 @@ if [[ ! -x "$STAGE1" ]]; then
   echo "error: stage1 compiler is not executable: $STAGE1" >&2
   echo "note: seed the compiler first or set ELISA_STAGE1_BIN" >&2
   exit 2
+fi
+# Lint the full include graph without invoking code generation or the linker.
+if [[ ${1:-} == --check ]]; then
+  ELISA_STAGE1_BIN="$STAGE1" \
+  ELISA_ALLOW_STALE_STAGE1="${ELISA_ALLOW_STALE_STAGE1:-0}" \
+  ELISA_STAGE1_SEMANTIC_GATE=1 \
+    exec "$WRAPPER" -Wnever-leak=strict -emit check "$ROOT/src/main.elisa"
 fi
 if [[ ! -f "$RUNTIME" ]]; then
   echo "error: Elisa runtime object is missing: $RUNTIME" >&2

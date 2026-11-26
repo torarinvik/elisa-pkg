@@ -7,4 +7,4 @@ test:
 	./scripts/test.sh
 
 lint:
-	./scripts/build.sh --strict
+	./scripts/build.sh --check

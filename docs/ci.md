@@ -103,7 +103,9 @@ GitHub references: [artifact attestations](https://docs.github.com/en/actions/ho
 ## Strict Elisa lint
 
 Run `make lint` with a Stage1 toolchain that supports
-`-Wnever-leak=strict`. The command compiles the package manager with the
-strict diagnostics enabled and writes `build/elisapkg-strict`. The current
-CI compiler pin predates this flag. Upgrade and verify that pin before making
-the strict lint part of the release build.
+`-Wnever-leak=strict` and `-emit check`. The command checks the full
+package-manager source graph and reports strict lint diagnostics without
+linking an executable. Use `scripts/build.sh --strict` to produce
+`build/elisapkg-strict` with the same diagnostics enabled. The current CI
+compiler pin predates this flag. Upgrade and verify that pin before enabling
+strict lint in the release build.
