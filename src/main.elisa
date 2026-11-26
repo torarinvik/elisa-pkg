@@ -3221,8 +3221,6 @@ module Cli:
                     # returns by tying allocations to the caller's output region.
                     dependency_packages: mutable darray[LocalBuildGraph::Package] @build_state = []
                     dependency_order: mutable darray[usize] @build_state = []
-                    source_snapshot_container_storage: mutable darray[u8] @build_state = []
-                    source_snapshot_container_name: mutable cstr = ""
                     if source_tree_bytes > SourceFingerprint::maximum_snapshot_bytes or not build_local_dependency_aggregate(lock_raw, start, target_entry_name, SourceFingerprint::maximum_snapshot_bytes - source_tree_bytes, &dependency_aggregate, &has_local_build_dependencies, dependency_packages, dependency_order):
                         CliOutput::write_error("error: local dependency graph is invalid, unreadable, or exceeds the combined source-size limits; refusing to compile an incomplete graph\n")
                         return EXIT_BUILD
@@ -3394,14 +3392,9 @@ module Cli:
                     if Platform::pkg_mkdtemp(&snapshot_template) != 0:
                         CliOutput::write_error("error: unable to create the private build source snapshot directory\n")
                         return EXIT_BUILD
-                    snapshot_container_length: usize = Platform::pkg_strlen((&snapshot_template[0]).cast[cstr] can Unsafe.PointerCast)
-                    for index in 0..<snapshot_container_length |source_snapshot_container_storage, snapshot_template|:
-                        source_snapshot_container_storage.push(snapshot_template[index])
-                    source_snapshot_container_storage.push(0)
-                    source_snapshot_container_name <- (&source_snapshot_container_storage[0]).cast[cstr] can Unsafe.PointerCast
+                    source_snapshot_container_name: cstr = (&snapshot_template[0]).cast[cstr] can Unsafe.PointerCast
                     snapshot_container_path: mutable darray[u8] = []
-                    for index in 0..<snapshot_container_length |snapshot_container_path, source_snapshot_container_storage|:
-                        snapshot_container_path.push(source_snapshot_container_storage[index])
+                    ByteText::append_text(&snapshot_container_path, source_snapshot_container_name)
                     if not ProjectFiles::canonical_existing_path(snapshot_container_path, &source_snapshot_root):
                         _ = BuildSnapshots::remove_all(source_snapshot_container_name, source_snapshot_roots)
                         CliOutput::write_error("error: unable to resolve the private build source snapshot directory\n")
@@ -3434,18 +3427,8 @@ module Cli:
                             snapshot_error.push(0)
                             CliOutput::write_error((&snapshot_error[0]).cast[cstr] can Unsafe.PointerCast)
                         return EXIT_BUILD
-                    dependency_snapshots_ok: mutable bool = true
-                    for order_index in 0..<dependency_order.count |dependency_order, dependency_packages, source_snapshot_root, source_snapshot_roots, snapshot_total_bytes, dependency_snapshots_ok|:
-                        package_index: usize = dependency_order[order_index]
-                        snapshot_package_root: mutable darray[u8] = []
-                        if package_index >= dependency_packages.count:
-                            dependency_snapshots_ok <- false
-                            break
-                        snapshot_status: i64 = BuildSnapshots::create_verified(source_snapshot_root, dependency_packages[package_index].root, "dependency", dependency_packages[package_index].source_digest, dependency_packages[package_index].relative_entry, &source_snapshot_roots, &snapshot_total_bytes, &snapshot_package_root, &dependency_packages[package_index].snapshot_entry)
-                        if snapshot_status != 0:
-                            dependency_snapshots_ok <- false
-                            break
-                    if not dependency_snapshots_ok:
+                    dependency_snapshots_valid: bool = BuildSnapshots::create_dependencies(&dependency_packages, dependency_order, source_snapshot_root, &source_snapshot_roots, &snapshot_total_bytes)
+                    if not dependency_snapshots_valid:
                         _ = BuildSnapshots::remove_all(source_snapshot_container_name, source_snapshot_roots)
                         CliOutput::write_error("error: local dependency changed or could not be copied into the verified build snapshot\n")
                         return EXIT_BUILD
@@ -3462,13 +3445,7 @@ module Cli:
                         return EXIT_BUILD
                     source_digest <- snapshot_source_digest
                     if has_local_build_dependencies:
-                        dependency_aggregate_ok: mutable bool = true
-                        for order_index in 0..<dependency_order.count |dependency_order, dependency_packages, compiler_dependency_aggregate|:
-                            package_index: usize = dependency_order[order_index]
-                            if package_index >= dependency_packages.count or not Build::append_include_path(dependency_packages[package_index].snapshot_entry, &compiler_dependency_aggregate):
-                                dependency_aggregate_ok <- false
-                                break
-                        if not dependency_aggregate_ok or not Build::append_include_path(root_snapshot_entry, &compiler_dependency_aggregate) or compiler_dependency_aggregate.count > LocalBuildGraph::maximum_aggregate_bytes:
+                        if not LocalBuildGraph::write_snapshot_includes(dependency_packages, dependency_order, root_snapshot_entry, &compiler_dependency_aggregate):
                             _ = BuildSnapshots::remove_all(source_snapshot_container_name, source_snapshot_roots)
                             CliOutput::write_error("error: verified dependency aggregate exceeds the configured build limit\n")
                             return EXIT_BUILD
