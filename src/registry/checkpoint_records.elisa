@@ -1,0 +1,210 @@
+# On-disk TUF checkpoint records and monotonic merge policy.
+include "../integrity.elisa"
+include "../platform.elisa"
+include "../tuf.elisa"
+include "./bytes.elisa"
+
+module CheckpointRecords:
+    public:
+        const enum Code of u8:
+            Ok
+            MalformedBatch
+            MalformedState
+            ResourceLimit
+            Rollback
+            Equivocation
+
+        const maximum_state_bytes: usize = 1048576.usize()
+
+        def header_length() -> usize:
+            return Platform::pkg_strlen(checkpoint_header)
+
+        def valid(state: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            header_bytes: usize = header_length()
+            return false if state.count <= header_bytes or state.count > maximum_state_bytes or not RegistryBytes::starts_with_text(state, checkpoint_header)
+            cursor: mutable usize = header_bytes
+            previous_key: mutable darray[u8] = []
+            row_count: mutable usize = 0.usize()
+            while cursor < state.count |state, cursor, row_count|:
+                key: mutable darray[u8] = []
+                version: mutable darray[u8] = []
+                digest: mutable darray[u8] = []
+                next_cursor: mutable usize = 0.usize()
+                return false if not parse_row(state, cursor, &key, &version, &digest, &next_cursor)
+                ignored_version: mutable u64 = 0.u64()
+                return false if not valid_scoped_role(key) or not Tuf::parse_checkpoint_version(version, &ignored_version) or not Integrity::valid_sha256_hex(digest)
+                return false if row_count > 0.usize() and compare_keys(previous_key, key) >= 0
+                previous_key <- key
+                cursor <- next_cursor
+                row_count <- row_count + 1.usize()
+                return false if row_count > 32768.usize()
+            return row_count > 0.usize()
+
+        # The registry validates the authenticated batch before scoping its rows.
+        def scope_batch(scope: darray[u8]&, batch: darray[u8]&, out: mutable darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic]:
+            out.resize(0)
+            batch_header: cstr = "elisapkg-tuf-batch:1\n"
+            cursor: mutable usize = Platform::pkg_strlen(batch_header)
+            RegistryBytes::append_text(out, checkpoint_header)
+            while cursor < batch.count |batch, cursor|:
+                finish: mutable usize = cursor
+                while finish < batch.count and batch[finish] != 10 |batch, finish|:
+                    finish <- finish + 1.usize()
+                return Code.MalformedBatch if finish == batch.count
+                first_separator: mutable usize = cursor
+                while first_separator < finish and batch[first_separator] != 32 |batch, first_separator|:
+                    first_separator <- first_separator + 1.usize()
+                RegistryBytes::append(out, scope)
+                out.push(58)
+                for index in cursor..<first_separator |out, batch|:
+                    out.push(batch[index])
+                for index in first_separator..=finish |out, batch|:
+                    out.push(batch[index])
+                return Code.ResourceLimit if out.count > maximum_state_bytes
+                cursor <- finish + 1.usize()
+            return Code.Ok
+
+        def merge(state: darray[u8]&, candidates: darray[u8]&, out: mutable darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic]:
+            out.resize(0)
+            header_bytes: usize = header_length()
+            RegistryBytes::append_text(out, checkpoint_header)
+            old_cursor: mutable usize = header_bytes if state.count > 0.usize() else 0.usize()
+            candidate_cursor: mutable usize = header_bytes
+            old_end: mutable bool = state.count == 0.usize()
+            candidate_end: mutable bool = false
+            while not old_end or not candidate_end |state, candidates, out, old_cursor, candidate_cursor, old_end, candidate_end|:
+                if old_end:
+                    unused_key: mutable darray[u8] = []
+                    unused_version: mutable darray[u8] = []
+                    unused_digest: mutable darray[u8] = []
+                    next_candidate: mutable usize = 0.usize()
+                    if not parse_row(candidates, candidate_cursor, &unused_key, &unused_version, &unused_digest, &next_candidate):
+                        return Code.MalformedState
+                    for index in candidate_cursor..<next_candidate |out, candidates|:
+                        out.push(candidates[index])
+                    if out.count > maximum_state_bytes:
+                        return Code.ResourceLimit
+                    candidate_cursor <- next_candidate
+                    candidate_end <- candidate_cursor == candidates.count
+                    continue
+                if candidate_end:
+                    unused_key: mutable darray[u8] = []
+                    unused_version: mutable darray[u8] = []
+                    unused_digest: mutable darray[u8] = []
+                    next_old: mutable usize = 0.usize()
+                    if not parse_row(state, old_cursor, &unused_key, &unused_version, &unused_digest, &next_old):
+                        return Code.MalformedState
+                    for index in old_cursor..<next_old |out, state|:
+                        out.push(state[index])
+                    if out.count > maximum_state_bytes:
+                        return Code.ResourceLimit
+                    old_cursor <- next_old
+                    old_end <- old_cursor == state.count
+                    continue
+                old_key: mutable darray[u8] = []
+                old_version_text: mutable darray[u8] = []
+                old_digest: mutable darray[u8] = []
+                next_old: mutable usize = 0.usize()
+                if not parse_row(state, old_cursor, &old_key, &old_version_text, &old_digest, &next_old):
+                    return Code.MalformedState
+                candidate_key: mutable darray[u8] = []
+                candidate_version_text: mutable darray[u8] = []
+                candidate_digest: mutable darray[u8] = []
+                next_candidate: mutable usize = 0.usize()
+                if not parse_row(candidates, candidate_cursor, &candidate_key, &candidate_version_text, &candidate_digest, &next_candidate):
+                    return Code.MalformedState
+                key_comparison: i64 = compare_keys(old_key, candidate_key)
+                if key_comparison < 0:
+                    for index in old_cursor..<next_old |out, state|:
+                        out.push(state[index])
+                    if out.count > maximum_state_bytes:
+                        return Code.ResourceLimit
+                    old_cursor <- next_old
+                    old_end <- old_cursor == state.count
+                    continue
+                if key_comparison > 0:
+                    for index in candidate_cursor..<next_candidate |out, candidates|:
+                        out.push(candidates[index])
+                    if out.count > maximum_state_bytes:
+                        return Code.ResourceLimit
+                    candidate_cursor <- next_candidate
+                    candidate_end <- candidate_cursor == candidates.count
+                    continue
+                old_version: mutable u64 = 0.u64()
+                candidate_version: mutable u64 = 0.u64()
+                if not Tuf::parse_checkpoint_version(old_version_text, &old_version) or not Tuf::parse_checkpoint_version(candidate_version_text, &candidate_version):
+                    return Code.MalformedState
+                checkpoint_status: Tuf::CheckpointCode = Tuf::check_authenticated_checkpoint(old_version, old_digest, candidate_version, candidate_digest)
+                if checkpoint_status == Tuf::CheckpointCode.Rollback:
+                    return Code.Rollback
+                if checkpoint_status == Tuf::CheckpointCode.Equivocation:
+                    return Code.Equivocation
+                if checkpoint_status != Tuf::CheckpointCode.Accepted:
+                    return Code.MalformedState
+                if candidate_version == old_version:
+                    for index in old_cursor..<next_old |out, state|:
+                        out.push(state[index])
+                else:
+                    for index in candidate_cursor..<next_candidate |out, candidates|:
+                        out.push(candidates[index])
+                old_cursor <- next_old
+                candidate_cursor <- next_candidate
+                old_end <- old_cursor == state.count
+                candidate_end <- candidate_cursor == candidates.count
+                if out.count > maximum_state_bytes:
+                    return Code.ResourceLimit
+            return Code.Ok
+
+        def parse_row(raw: darray[u8]&, cursor: usize, key_out: mutable darray[u8]&, version_out: mutable darray[u8]&, digest_out: mutable darray[u8]&, next_out: mutable usize&) -> bool can[Memory.Allocate, Abort.Panic]:
+            key_out.resize(0)
+            version_out.resize(0)
+            digest_out.resize(0)
+            next_out <- 0.usize()
+            return false if cursor >= raw.count
+            finish: mutable usize = cursor
+            while finish < raw.count and raw[finish] != 10 |raw, finish|:
+                finish <- finish + 1.usize()
+            return false if finish == cursor or finish == raw.count
+            first_separator: mutable usize = cursor
+            while first_separator < finish and raw[first_separator] != 32 |raw, first_separator|:
+                first_separator <- first_separator + 1.usize()
+            second_separator: mutable usize = first_separator + 1.usize()
+            while second_separator < finish and raw[second_separator] != 32 |raw, second_separator|:
+                second_separator <- second_separator + 1.usize()
+            return false if first_separator == cursor or second_separator >= finish or first_separator + 1.usize() == second_separator or second_separator + 1.usize() == finish
+            return false if contains_byte(raw, second_separator + 1.usize(), finish, 32)
+            for index in cursor..<first_separator |key_out, raw|:
+                key_out.push(raw[index])
+            for index in (first_separator + 1.usize())..<second_separator |version_out, raw|:
+                version_out.push(raw[index])
+            for index in (second_separator + 1.usize())..<finish |digest_out, raw|:
+                digest_out.push(raw[index])
+            next_out <- finish + 1.usize()
+            return true
+
+    private:
+        const checkpoint_header: cstr = "elisapkg-tuf-checkpoints:1\n"
+
+        def valid_scoped_role(key: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            return false if key.count < 66.usize() or key.count > 193.usize() or key[64] != 58
+            for index in 0..<64.usize() |key|:
+                byte: u8 = key[index]
+                return false if (byte < 48 or byte > 57) and (byte < 97 or byte > 102)
+            role: mutable darray[u8] = []
+            for index in 65..<key.count |role, key|:
+                role.push(key[index])
+            return Tuf::valid_checkpoint_role(role)
+
+        def compare_keys(left: darray[u8]&, right: darray[u8]&) -> i64:
+            common: usize = left.count if left.count < right.count else right.count
+            for index in 0..<common |left, right|:
+                return -1 if left[index] < right[index]
+                return 1 if left[index] > right[index]
+            return -1 if left.count < right.count
+            return 1 if left.count > right.count
+            return 0
+
+        def contains_byte(raw: darray[u8]&, start: usize, finish: usize, wanted: u8) -> bool:
+            for index in start..<finish |raw|:
+                return true if raw[index] == wanted
+            return false
