@@ -112,6 +112,7 @@ normal exit returns the program's status.
 - **Cannot find the build compiler:** Set `ELISAPKG_COMPILER` to the absolute path of the trusted compiler wrapper, then run `doctor`.
 - **Manifest or target not found:** Check your working directory and the target's `name` and `kind` in `elisapkg.json`. Use [the manifest reference](docs/manifest.md) when defining a new target.
 - **Frozen lock is stale:** Review the source or dependency changes. If they're intentional, run `resolve` and review the updated `elisapkg.lock`.
+- **Project transaction recovery failed:** Let any active package edit finish, then retry. If recovery still fails, preserve `elisapkg.json`, `elisapkg.lock` if present, and the files named `.elisapkg/transaction.*` together for inspection. Run `elisapkg doctor` for toolchain diagnostics while recovery is blocked.
 - **Sandbox unavailable:** Project builds require macOS and successful Seatbelt profile application. An installed `sandbox-exec` alone does not prove a profile can run.
 - **Local install refused:** Check for an existing destination and use a private, trusted prefix. You can choose another absolute directory with `ELISAPKG_INSTALL_PREFIX`. The installer will not replace an existing binary.
 
