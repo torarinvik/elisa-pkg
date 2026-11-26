@@ -3,6 +3,11 @@
 module UstarFields:
     private:
         const block_size: usize = 512.usize()
+        const mode_offset: usize = 100.usize()
+        const owner_offset: usize = 108.usize()
+        const group_offset: usize = 116.usize()
+        const size_offset: usize = 124.usize()
+        const modified_time_offset: usize = 136.usize()
         const checksum_offset: usize = 148.usize()
         const type_offset: usize = 156.usize()
         const magic_offset: usize = 257.usize()
@@ -10,12 +15,12 @@ module UstarFields:
         law WithinBlock(self: usize) = self < 512.usize()
 
         def archive_header_shape(archive: darray[u8]&, offset: usize) -> bool:
-            return false if offset > archive.count or archive.count - offset < 512.usize()
-            return archive[offset + 257] == 117 and archive[offset + 258] == 115 and archive[offset + 259] == 116 and archive[offset + 260] == 97 and archive[offset + 261] == 114 and archive[offset + 262] == 0 and archive[offset + 263] == 48 and archive[offset + 264] == 48 and archive[offset + 156] == 48
+            return false if offset > archive.count or archive.count - offset < block_size
+            return archive[offset + magic_offset] == 117 and archive[offset + magic_offset + 1.usize()] == 115 and archive[offset + magic_offset + 2.usize()] == 116 and archive[offset + magic_offset + 3.usize()] == 97 and archive[offset + magic_offset + 4.usize()] == 114 and archive[offset + magic_offset + 5.usize()] == 0 and archive[offset + magic_offset + 6.usize()] == 48 and archive[offset + magic_offset + 7.usize()] == 48 and archive[offset + type_offset] == 48
 
         def archive_metadata_zero(archive: darray[u8]&, offset: usize, name_length: usize) -> bool:
             return false if:
-                offset > archive.count or archive.count - offset < 512.usize() or name_length >= 100.usize()
+                offset > archive.count or archive.count - offset < block_size or name_length >= 100.usize()
                 not archive_range_zero(archive, offset + name_length + 1.usize(), 100.usize() - name_length - 1.usize())
                 not archive_range_zero(archive, offset + 157.usize(), 100.usize())
                 not archive_range_zero(archive, offset + 265.usize(), 80.usize())
@@ -62,7 +67,7 @@ module UstarFields:
     public:
         const max_archive_bytes: usize = 67108864.usize()
         # Reserve one entry header and both end-of-archive blocks.
-        const max_payload_bytes: usize = max_archive_bytes - 1536.usize()
+        const max_payload_bytes: usize = max_archive_bytes - 3.usize() * block_size
 
         # ustar's name field is intentionally bounded. Long-name/PAX/GNU
         # extensions are rejected until their canonical semantics have a
@@ -74,11 +79,11 @@ module UstarFields:
                 header.resize(block_size)
                 for index in 0..<entry.count |header, entry|:
                     header[index] <- entry[index]
-                write_octal(&header, 100, 420, 8)
-                write_octal(&header, 108, 0, 8)
-                write_octal(&header, 116, 0, 8)
-                write_octal(&header, 124, size, 12)
-                write_octal(&header, 136, 0, 12)
+                write_octal(&header, mode_offset, 420, 8)
+                write_octal(&header, owner_offset, 0, 8)
+                write_octal(&header, group_offset, 0, 8)
+                write_octal(&header, size_offset, size, 12)
+                write_octal(&header, modified_time_offset, 0, 12)
                 header[type_offset] <- 48
                 header[magic_offset] <- 117
                 header[magic_offset + 1.usize()] <- 115
@@ -96,11 +101,11 @@ module UstarFields:
             return header
 
         def padding_bytes(payload_size: usize) -> usize is WithinBlock:
-            ensure (payload_size % 512.usize() + result) % 512.usize() == 0.usize()
-            return (512.usize() - payload_size % 512.usize()) % 512.usize()
+            ensure (payload_size % block_size + result) % block_size == 0.usize()
+            return (block_size - payload_size % block_size) % block_size
 
         def archive_block_zero(archive: darray[u8]&, offset: usize) -> bool:
-            return archive_range_zero(archive, offset, 512.usize())
+            return archive_range_zero(archive, offset, block_size)
 
         # Return the normalized header's payload size, or -1 on rejection.
         def normalized_payload_size(archive: darray[u8]&, offset: usize, name_length: usize) -> i64:
@@ -112,14 +117,19 @@ module UstarFields:
             size: mutable usize = 0.usize()
             mtime: mutable usize = 0.usize()
             stored_checksum: mutable usize = 0.usize()
-            return -1 if not parse_octal_raw(archive, offset + 100.usize(), 8.usize(), &mode) or not parse_octal_raw(archive, offset + 108.usize(), 8.usize(), &uid) or not parse_octal_raw(archive, offset + 116.usize(), 8.usize(), &gid) or not parse_octal_raw(archive, offset + 124.usize(), 12.usize(), &size) or not parse_octal_raw(archive, offset + 136.usize(), 12.usize(), &mtime) or not parse_octal_raw(archive, offset + 148.usize(), 8.usize(), &stored_checksum)
+            return -1 if:
+                not parse_octal_raw(archive, offset + mode_offset, 8.usize(), &mode)
+                not parse_octal_raw(archive, offset + owner_offset, 8.usize(), &uid)
+                not parse_octal_raw(archive, offset + group_offset, 8.usize(), &gid)
+                not parse_octal_raw(archive, offset + size_offset, 12.usize(), &size)
+                not parse_octal_raw(archive, offset + modified_time_offset, 12.usize(), &mtime)
+                not parse_octal_raw(archive, offset + checksum_offset, 8.usize(), &stored_checksum)
             return -1 if mode != 420.usize() or uid != 0.usize() or gid != 0.usize() or mtime != 0.usize() or size > max_payload_bytes
             return size.i64() if header_checksum(archive, offset) == stored_checksum else -1
 
         # Return zero if the payload is truncated or its alignment padding
         # is invalid. A valid entry always advances by at least one block.
         def next_entry_offset(archive: darray[u8]&, header_offset: usize, payload_size: usize) -> usize:
-            block_size: usize = 512.usize()
             return 0.usize() if header_offset > archive.count or archive.count - header_offset < block_size
             payload_start: usize = header_offset + block_size
             return 0.usize() if payload_size > archive.count - payload_start
