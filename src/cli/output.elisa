@@ -41,20 +41,27 @@ module CliOutput:
         def forward_descriptor(file_descriptor: i64, target: i64) -> bool can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             can Global.Read:
                 return false if Platform::seek_file_descriptor(file_descriptor, 0, 0) < 0
-                total: mutable i64 = 0
                 region buffer_scope:
                     buffer: mutable darray[u8] = []
-                    buffer <- buffer.resize(8192)
-                    while total < 134217728 |total, buffer, file_descriptor, target|:
-                        raw: mutable u8& = (&buffer[0]).cast[mutable u8&] can Unsafe.PointerCast
-                        capacity: mutable usize = 8192.usize()
-                        if 134217728 - total < capacity.i64():
-                            capacity <- (134217728 - total).usize()
-                        amount: i64 = Platform::read_file_descriptor(file_descriptor, raw, capacity)
-                        return false if amount < 0 or amount > capacity.i64()
+                    while total < 134217728 |buffer, total: i64 = 0|:
+                        amount: i64 = forward_chunk(file_descriptor, target, &buffer, 134217728 - total)
+                        return false if amount < 0
                         break if amount == 0
-                        buffer <- buffer.resize(amount.usize())
-                        write_bytes(target, &buffer)
                         total <- total + amount
-                        buffer <- buffer.resize(8192)
                 return true
+
+        # Copy at most 8 KiB, and at most `remaining` bytes, from one
+        # descriptor to another. Returns the byte count, 0 at end of file, or
+        # -1 on a read error.
+        def forward_chunk(file_descriptor: i64, target: i64, buffer: mutable darray[u8]&, remaining: i64) -> i64 can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            requires remaining > 0
+            can Global.Read:
+                capacity: usize = 8192.usize() if remaining >= 8192 else remaining.usize()
+                buffer.resize(capacity)
+                amount: i64 =
+                    raw: mutable u8& = (&buffer[0]).cast[mutable u8&] can Unsafe.PointerCast
+                    Platform::read_file_descriptor(file_descriptor, raw, capacity)
+                return -1 if amount < 0 or amount > capacity.i64()
+                buffer.resize(amount.usize())
+                write_bytes(target, buffer) if amount > 0
+                return amount
