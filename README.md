@@ -8,7 +8,7 @@
 
 ### 1. Build elisapkg
 
-Start in the root of this repository. You'll need Bash and a separate Elisa compiler checkout with an executable Stage1 compiler, its wrapper script, and a built runtime object. Set the first path below to your actual compiler checkout. See [compiler compatibility](docs/compatibility.md) for the supported toolchain layout.
+Start in the root of this repository. You'll need Bash, Python 3, and a separate Elisa compiler checkout with an executable Stage1 compiler, its wrapper script, and a built runtime object. Set the first path below to your actual compiler checkout. See [compiler compatibility](docs/compatibility.md) for the supported toolchain layout.
 
 ```sh
 export ELISA_COMPILER_ROOT="/absolute/path/to/elisa-compiler"

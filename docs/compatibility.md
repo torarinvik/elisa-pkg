@@ -16,8 +16,9 @@ scripts/build.sh
 ```
 
 `scripts/build.sh` invokes the compiler wrapper with the selected Elisa runtime
-object and `ELISA_STAGE1_SEMANTIC_GATE=1` supplied by the package manager's
-child build environment. Filesystem traversal, archive extraction, and process
+object and `ELISA_STAGE1_SEMANTIC_GATE=1`. It stages the executable in a
+private directory and uses Python 3 to replace the previous build atomically
+after a successful compile. Package builds also require the semantic gate. Filesystem traversal, archive extraction, and process
 policy are compiled from Elisa; only direct libc/POSIX primitives cross the
 private FFI boundary. The errno accessor is selected at compile time for the
 target (`__error` on Apple and `__errno_location` on Linux), so a Linux build

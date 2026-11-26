@@ -40,10 +40,38 @@ if [[ ! -f "$RUNTIME" ]]; then
   exit 2
 fi
 
+if ! command -v python3 >/dev/null; then
+  echo "error: python3 is required to publish the build output" >&2
+  exit 2
+fi
+
 mkdir -p "$ROOT/build"
+staging_directory="$(mktemp -d "$ROOT/build/.elisapkg-build.XXXXXXXX")"
+trap 'rm -rf -- "$staging_directory"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+staged_binary="$staging_directory/${OUT##*/}"
 
 ELISA_STAGE1_BIN="$STAGE1" \
 ELISA_ALLOW_STALE_STAGE1="${ELISA_ALLOW_STALE_STAGE1:-0}" \
+ELISA_STAGE1_SEMANTIC_GATE=1 \
 ELISA_RUNTIME_OBJ="$RUNTIME" \
-  "$WRAPPER" ${lint_flags[@]+"${lint_flags[@]}"} -emit exe -o "$OUT" "$ROOT/src/main.elisa"
+  "$WRAPPER" ${lint_flags[@]+"${lint_flags[@]}"} -emit exe -o "$staged_binary" "$ROOT/src/main.elisa"
+
+if [[ ! -f "$staged_binary" || -L "$staged_binary" || ! -s "$staged_binary" || ! -x "$staged_binary" ]]; then
+  echo "error: compiler did not produce a nonempty executable file" >&2
+  exit 1
+fi
+
+# Rename on the same filesystem. A directory at OUT is an error, rather
+# than a destination into which the binary can be moved.
+python3 - "$staged_binary" "$OUT" <<'PYTHON'
+import os
+import sys
+
+try:
+    os.replace(sys.argv[1], sys.argv[2])
+except OSError as error:
+    raise SystemExit(f"error: unable to publish elisapkg: {error}") from error
+PYTHON
 echo "built $OUT"
