@@ -58,14 +58,14 @@ module LockValidation:
                     not Lockfile::sha256_field_equals(lock, package_start, package_end, "source-digest", source_digest)
                 packages_start: usize = Json::root_value_offset(lock, "packages")
                 packages_end: usize = Json::array_end(lock, packages_start)
-                return false if packages_start >= lock.count or packages_end <= packages_start
+                return false if packages_start >= lock.count or packages_end <= packages_start or packages_end >= lock.count
                 cursor: mutable usize = packages_start + 1.usize()
-                package_count: mutable usize = 0.usize()
+                record_starts: mutable darray[usize] = []
                 previous_package: mutable darray[u8] = []
                 while cursor < packages_end:
                     cursor <- Json::skip_whitespace(lock, cursor, packages_end)
                     break if cursor == packages_end
-                    return false if lock[cursor] != 123 or package_count >= LocalBuildPlan::maximum_packages
+                    return false if lock[cursor] != 123 or record_starts.count >= LocalBuildPlan::maximum_packages
                     record_end: usize = Json::object_end(lock, cursor)
                     return false if record_end <= cursor or record_end >= packages_end or not SchemaFields::valid(lock, cursor, record_end, SchemaFields::Kind.RegistryLockRecord)
                     package: mutable darray[u8] = []
@@ -92,16 +92,16 @@ module LockValidation:
                         not Lockfile::has_sha256_field(lock, cursor, record_end, "metadata-digest")
                     previous_package <- previous_package.resize(0)
                     ByteText::append(&previous_package, package)
-                    package_count <- package_count + 1.usize()
+                    record_starts <- record_starts.push(cursor)
                     cursor <- record_end + 1.usize()
                     cursor <- Json::skip_whitespace(lock, cursor, packages_end)
                     if cursor < packages_end:
                         return false if lock[cursor] != 44
                         cursor <- cursor + 1.usize()
-                return false if package_count == 0.usize()
+                return false if record_starts.count == 0.usize()
                 # Direct registry requirements are the minimum graph contract that can be
                 # checked without loading signed metadata in offline mode. Transitive
                 # edges are authenticated by the cached metadata digest when an online
                 # fetch revalidates the lock; offline mode must at least reject omission
                 # of any dependency named by the manifest itself.
-                return Lockfile::registry_satisfies_roots(lock, packages_start, packages_end, registry_roots)
+                return Lockfile::registry_satisfies_roots(lock, record_starts, registry_roots)
