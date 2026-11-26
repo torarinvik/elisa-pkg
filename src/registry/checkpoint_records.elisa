@@ -92,50 +92,53 @@ module CheckpointRecords:
 
         # Copy the row at `cursor` to `out` and advance past it.
         def copy_row(source: darray[u8]&, cursor: mutable usize&, out: mutable darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic]:
-            key: mutable darray[u8] = []
-            version: mutable darray[u8] = []
-            digest: mutable darray[u8] = []
-            next_cursor: mutable usize = 0.usize()
-            return Code.MalformedState if not parse_row(source, cursor, &key, &version, &digest, &next_cursor)
-            ByteText::append_range(out, source, cursor, next_cursor)
+            row: mutable Row = empty_row()
+            return Code.MalformedState if not read_row(source, cursor, &row)
+            ByteText::append_range(out, source, cursor, row.next)
             return Code.ResourceLimit if out.count > maximum_state_bytes
-            cursor <- next_cursor
+            cursor <- row.next
             return Code.Ok
 
         # Merge the next row of each sorted input. The smaller key is copied
         # alone; equal keys must form an authenticated, non-rolled-back
         # checkpoint, and the newer row wins.
         def merge_next_rows(state: darray[u8]&, old_cursor: mutable usize&, candidates: darray[u8]&, candidate_cursor: mutable usize&, out: mutable darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic]:
-            old_key: mutable darray[u8] = []
-            old_version_text: mutable darray[u8] = []
-            old_digest: mutable darray[u8] = []
-            next_old: mutable usize = 0.usize()
-            return Code.MalformedState if not parse_row(state, old_cursor, &old_key, &old_version_text, &old_digest, &next_old)
-            candidate_key: mutable darray[u8] = []
-            candidate_version_text: mutable darray[u8] = []
-            candidate_digest: mutable darray[u8] = []
-            next_candidate: mutable usize = 0.usize()
-            return Code.MalformedState if not parse_row(candidates, candidate_cursor, &candidate_key, &candidate_version_text, &candidate_digest, &next_candidate)
+            old_row: mutable Row = empty_row()
+            candidate_row: mutable Row = empty_row()
+            return Code.MalformedState if not read_row(state, old_cursor, &old_row) or not read_row(candidates, candidate_cursor, &candidate_row)
             region key_comparison_scope:
-                key_comparison: i64 = compare_keys(old_key, candidate_key)
+                key_comparison: i64 = compare_keys(old_row.key, candidate_row.key)
                 return copy_row(state, old_cursor, out) if key_comparison < 0
                 return copy_row(candidates, candidate_cursor, out) if key_comparison > 0
             old_version: mutable u64 = 0.u64()
             candidate_version: mutable u64 = 0.u64()
-            return Code.MalformedState if not Tuf::parse_checkpoint_version(old_version_text, &old_version) or not Tuf::parse_checkpoint_version(candidate_version_text, &candidate_version)
+            return Code.MalformedState if not Tuf::parse_checkpoint_version(old_row.version, &old_version) or not Tuf::parse_checkpoint_version(candidate_row.version, &candidate_version)
             region checkpoint_status_scope:
-                checkpoint_status: Tuf::CheckpointCode = Tuf::check_authenticated_checkpoint(old_version, old_digest, candidate_version, candidate_digest)
+                checkpoint_status: Tuf::CheckpointCode = Tuf::check_authenticated_checkpoint(old_version, old_row.digest, candidate_version, candidate_row.digest)
                 return Code.Rollback if checkpoint_status == Tuf::CheckpointCode.Rollback
                 return Code.Equivocation if checkpoint_status == Tuf::CheckpointCode.Equivocation
                 return Code.MalformedState if checkpoint_status != Tuf::CheckpointCode.Accepted
             if candidate_version == old_version:
-                ByteText::append_range(out, state, old_cursor, next_old)
+                ByteText::append_range(out, state, old_cursor, old_row.next)
             else:
-                ByteText::append_range(out, candidates, candidate_cursor, next_candidate)
-            old_cursor <- next_old
-            candidate_cursor <- next_candidate
+                ByteText::append_range(out, candidates, candidate_cursor, candidate_row.next)
+            old_cursor <- old_row.next
+            candidate_cursor <- candidate_row.next
             return Code.ResourceLimit if out.count > maximum_state_bytes
             return Code.Ok
+
+        # One parsed "KEY VERSION DIGEST" row and the offset after its newline.
+        struct Row:
+            key: mutable darray[u8]
+            version: mutable darray[u8]
+            digest: mutable darray[u8]
+            next: mutable usize
+
+        def empty_row() -> Row:
+            return Row{key: [], version: [], digest: [], next: 0.usize()}
+
+        def read_row(raw: darray[u8]&, cursor: usize, row: mutable Row&) -> bool can[Memory.Allocate, Abort.Panic]:
+            return parse_row(raw, cursor, &row.key, &row.version, &row.digest, &row.next)
 
         def parse_row(raw: darray[u8]&, cursor: usize, key_out: mutable darray[u8]&, version_out: mutable darray[u8]&, digest_out: mutable darray[u8]&, next_out: mutable usize&) -> bool can[Memory.Allocate, Abort.Panic]:
             key_out.resize(0)
