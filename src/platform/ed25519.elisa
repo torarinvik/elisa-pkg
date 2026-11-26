@@ -40,29 +40,31 @@ module NativeEd25519:
                     signature_path <- signature_path.resize(0)
                 cleanup: i64 = cleanup_crypto_inputs(staging_name, public_path, message_path, signature_path)
                 return -38 if cleanup == 0 else -5
-            public_name: cstr = (&public_path[0]).cast[cstr] can Unsafe.PointerCast
-            message_name: cstr = (&message_path[0]).cast[cstr] can Unsafe.PointerCast
-            signature_name: cstr = (&signature_path[0]).cast[cstr] can Unsafe.PointerCast
-            arguments: mutable darray[cstr] = [
-                openssl, "pkeyutl", "-verify", "-pubin", "-inkey", public_name,
-                "-keyform", "DER", "-rawin", "-in", message_name, "-sigfile", signature_name
-            ]
-            arguments <- arguments.push(null)
-            child_argument_vector: mutable cstr&& = (&arguments[0]).cast[mutable cstr&&] can Unsafe.PointerCast
-            empty_environment: mutable darray[cstr] = [null]
-            child_environment: mutable cstr&& = (&empty_environment[0]).cast[mutable cstr&&] can Unsafe.PointerCast
-            raw_child_argument_vector: void& = child_argument_vector.cast[void&] can Unsafe.PointerCast
-            raw_child_environment: void& = child_environment.cast[void&] can Unsafe.PointerCast
-            child_process_identifier: i64 = native_fork()
-            result: mutable i64 = NativeErrors::negative_errno() if child_process_identifier < 0 else -1
-            if child_process_identifier == 0:
-                run_verifier_child(openssl, raw_child_argument_vector, raw_child_environment)
-            elif child_process_identifier > 0:
-                result <- wait_for_verifier(child_process_identifier)
+            result: i64 = run_verifier(openssl, public_path, message_path, signature_path)
             return -5 if cleanup_crypto_inputs(staging_name, public_path, message_path, signature_path) != 0
             return result
 
     private:
+        # Run `openssl pkeyutl -verify` on the staged key, message, and
+        # signature files with an empty environment. Returns 0 when the
+        # signature verifies.
+        def run_verifier(openssl: cstr, public_path: darray[u8]&, message_path: darray[u8]&, signature_path: darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            arguments: mutable darray[cstr] = [
+                openssl, "pkeyutl", "-verify", "-pubin", "-inkey", ((&public_path[0]).cast[cstr] can Unsafe.PointerCast),
+                "-keyform", "DER", "-rawin", "-in", ((&message_path[0]).cast[cstr] can Unsafe.PointerCast), "-sigfile", ((&signature_path[0]).cast[cstr] can Unsafe.PointerCast)
+            ]
+            arguments <- arguments.push(null)
+            raw_child_argument_vector: void& = (&arguments[0]).cast[void&] can Unsafe.PointerCast
+            empty_environment: mutable darray[cstr] = [null]
+            child_environment: mutable cstr&& = (&empty_environment[0]).cast[mutable cstr&&] can Unsafe.PointerCast
+            raw_child_environment: void& = child_environment.cast[void&] can Unsafe.PointerCast
+            child_process_identifier: i64 = native_fork()
+            return NativeErrors::negative_errno() if child_process_identifier < 0
+            if child_process_identifier == 0:
+                run_verifier_child(openssl, raw_child_argument_vector, raw_child_environment)
+                return -1
+            return wait_for_verifier(child_process_identifier)
+
         # The first fixed OpenSSL candidate that resolves to a trusted
         # executable, in Homebrew openssl@3, Homebrew openssl, system order.
         def trusted_openssl(resolved_openssl: mutable darray[u8]&) -> cstr? can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -137,10 +139,10 @@ module NativeEd25519:
             return 0
 
         def cleanup_crypto_inputs(directory: cstr, key: darray[u8]&, message: darray[u8]&, signature: darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            key_status: i64 = remove_temporary_blob(key)
-            message_status: i64 = remove_temporary_blob(message)
-            signature_status: i64 = remove_temporary_blob(signature)
             region directory_status_scope:
+                key_status: i64 = remove_temporary_blob(key)
+                message_status: i64 = remove_temporary_blob(message)
+                signature_status: i64 = remove_temporary_blob(signature)
                 directory_status: i64 = NativeFileMutation::rmdir(directory)
                 return -5 if key_status != 0 or message_status != 0 or signature_status != 0 or directory_status != 0
             return 0
