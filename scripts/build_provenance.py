@@ -228,7 +228,30 @@ def add_tar_file(archive: tarfile.TarFile, path: Path, name: str, mode: int) -> 
         archive.addfile(info, stream)
 
 
-def create_archive(binary: Path, manifest: Path, output: Path) -> None:
+def verify_archive(
+    path: Path, expected_binary_digest: str, expected_manifest: bytes
+) -> None:
+    # Check the bytes actually written. The build path may have been replaced
+    # between recording its digest and opening it for packaging.
+    with tarfile.open(path, mode="r:gz") as archive:
+        with archive.extractfile("elisapkg") as binary:
+            digest = hashlib.sha256()
+            for chunk in iter(lambda: binary.read(1024 * 1024), b""):
+                digest.update(chunk)
+        with archive.extractfile("elisapkg.provenance.json") as manifest:
+            if digest.hexdigest() != expected_binary_digest or (
+                manifest.read(MAX_MANIFEST_BYTES + 1) != expected_manifest
+            ):
+                raise ProvenanceError("release archive inputs changed during packaging")
+
+
+def create_archive(
+    binary: Path,
+    manifest: Path,
+    output: Path,
+    expected_binary_digest: str,
+    expected_manifest: bytes,
+) -> None:
     temporary_name = ""
     try:
         descriptor, temporary_name = tempfile.mkstemp(prefix=f".{output.name}.", dir=output.parent)
@@ -241,6 +264,7 @@ def create_archive(binary: Path, manifest: Path, output: Path) -> None:
             raw.flush()
             os.fchmod(raw.fileno(), 0o644)
             os.fsync(raw.fileno())
+        verify_archive(Path(temporary_name), expected_binary_digest, expected_manifest)
         os.replace(temporary_name, output)
         temporary_name = ""
         directory_fd = os.open(output.parent, os.O_RDONLY)
@@ -360,6 +384,7 @@ def generate_candidate(
 
     run_id = required_env(env, "GITHUB_RUN_ID")
     run_attempt = required_env(env, "GITHUB_RUN_ATTEMPT")
+    binary_digest = sha256_file(binary)
     manifest: dict[str, object] = {
         "schema_version": 1,
         "source": {
@@ -396,7 +421,7 @@ def generate_candidate(
         "artifact": {
             "name": "elisapkg",
             "file": "elisapkg",
-            "sha256": sha256_file(binary),
+            "sha256": binary_digest,
             "size_bytes": binary.stat().st_size,
             "mode": f"{stat.S_IMODE(binary.stat().st_mode):04o}",
         },
@@ -409,7 +434,7 @@ def generate_candidate(
     archive_path = output_dir / "elisapkg-macos-arm64.tar.gz"
     checksum_path = output_dir / "elisapkg-macos-arm64.tar.gz.sha256"
     atomic_write(manifest_path, manifest_bytes)
-    create_archive(binary, manifest_path, archive_path)
+    create_archive(binary, manifest_path, archive_path, binary_digest, manifest_bytes)
     checksum = f"{sha256_file(archive_path)}  {archive_path.name}\n".encode("ascii")
     atomic_write(checksum_path, checksum)
     return manifest_path, archive_path, checksum_path
