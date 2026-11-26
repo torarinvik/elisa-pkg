@@ -17,8 +17,23 @@ def byte_list(value: bytes) -> str:
     return ",".join(str(byte) for byte in value)
 
 
+def graph_records(dependencies: dict[str, str]) -> str:
+    records = []
+    for package, dependency in sorted(dependencies.items()):
+        name = byte_list(package.encode("ascii"))
+        entry = byte_list(f"/{package}.elisa".encode("ascii"))
+        edges = byte_list(dependency.encode("ascii") + b"\0") if dependency else ""
+        records.append(
+            f"        packages.push(LocalBuildGraph::Package{{name: [{name}], "
+            f"root: [], entry: [{entry}], relative_entry: [], source_digest: [], "
+            f"snapshot_entry: [], dependency_names: [{edges}], dependents: [], "
+            f"remaining_dependencies: 0}})"
+        )
+    return "\n".join(records)
+
+
 def probe_source() -> str:
-    module_path = ROOT / "src" / "build.elisa"
+    module_path = ROOT / "src" / "resolution" / "local_build_graph.elisa"
     safe_path = b"/tmp/package root/src/main.elisa"
     expected = b"x\ninclude \"" + safe_path + b"\"\n"
     return f'''include "{module_path}"
@@ -33,6 +48,23 @@ def rejected_without_change(path: darray[u8]&) -> bool can[Memory.Allocate, Abor
     output: mutable darray[u8] = [120, 10]
     accepted: bool = Build::append_include_path(path, &output)
     return not accepted and output.count == 2.usize() and output[0] == 120 and output[1] == 10
+
+def graph_order_is_stable() -> bool can[Memory.Allocate, Abort.Panic]:
+    region plan(1048576):
+        packages: mutable darray[LocalBuildGraph::Package] @plan = []
+        order: mutable darray[usize] @plan = []
+        aggregate: mutable darray[u8] @plan = []
+{graph_records({"a": "b", "b": "", "c": "", "d": "a"})}
+        return false if not LocalBuildGraph::write_ordered_includes(packages, order, "/root.elisa", &aggregate)
+        return order.count == 4.usize() and order[0] == 1 and order[1] == 0 and order[2] == 2 and order[3] == 3
+
+def cyclic_graph_is_rejected() -> bool can[Memory.Allocate, Abort.Panic]:
+    region plan(1048576):
+        packages: mutable darray[LocalBuildGraph::Package] @plan = []
+        order: mutable darray[usize] @plan = []
+        aggregate: mutable darray[u8] @plan = []
+{graph_records({"a": "b", "b": "a", "c": ""})}
+        return not LocalBuildGraph::write_ordered_includes(packages, order, "/root.elisa", &aggregate)
 
 def main() -> i64 can[Memory.Allocate, Abort.Panic]:
     safe_path: mutable darray[u8] = [{byte_list(safe_path)}]
@@ -74,6 +106,8 @@ def main() -> i64 can[Memory.Allocate, Abort.Panic]:
     while over_limit.count < 4097.usize() |over_limit|:
         over_limit.push(97)
     return 14 if not rejected_without_change(over_limit)
+    return 15 if not graph_order_is_stable()
+    return 16 if not cyclic_graph_is_rejected()
     return 0
 '''
 
