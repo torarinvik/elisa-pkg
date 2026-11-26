@@ -3,6 +3,14 @@ include "./files.elisa"
 
 module ProjectTransaction:
     private:
+        # Serialized phase names are part of the on-disk journal format.
+        const prepared_with_lock: cstr = "prepared-lock\n"
+        const prepared_without_lock: cstr = "prepared-no-lock\n"
+        const manifest_pending: cstr = "manifest-pending\n"
+        const legacy_manifest_replaced: cstr = "manifest-replaced\n"
+        const committed: cstr = "complete\n"
+        const rolled_back: cstr = "restored\n"
+
         # One descriptor holds the project-local transaction flock across the
         # entire manifest/lock update and its recovery or cleanup.
         global mutable transaction_lock_fd: i64 = -1
@@ -72,13 +80,16 @@ module ProjectTransaction:
                 not ProjectFiles::read_cstr_into(live_path, &live)
             return ByteText::equal(expected, live)
 
+        def has_manifest_intent(state: darray[u8]&) -> bool:
+            return ByteText::equal_text(state, manifest_pending) or ByteText::equal_text(state, legacy_manifest_replaced)
+
         def published_manifest_matches_journal() -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             state: mutable darray[u8] = []
             state.resize(128)
             return false if not ProjectFiles::read_cstr_into(".elisapkg/transaction.state", &state)
-            if ByteText::equal_text(state, "prepared-lock\n") or ByteText::equal_text(state, "prepared-no-lock\n"):
+            if ByteText::equal_text(state, prepared_with_lock) or ByteText::equal_text(state, prepared_without_lock):
                 return live_file_matches(".elisapkg/transaction.manifest", "elisapkg.json")
-            if ByteText::equal_text(state, "manifest-pending\n") or ByteText::equal_text(state, "manifest-replaced\n"):
+            if has_manifest_intent(state):
                 return live_file_matches(".elisapkg/transaction.new-manifest", "elisapkg.json")
             return false
 
@@ -140,9 +151,9 @@ module ProjectTransaction:
                     if not ProjectFiles::read_cstr_into("elisapkg.lock", &original_lock) or not ProjectFiles::write_cstr_file(".elisapkg/transaction.lock", &original_lock):
                         _ = transaction_cleanup()
                         return false
-                    ByteText::append_text(&state, "prepared-lock\n")
+                    ByteText::append_text(&state, prepared_with_lock)
                 elif lock_state == -2:
-                    ByteText::append_text(&state, "prepared-no-lock\n")
+                    ByteText::append_text(&state, prepared_without_lock)
                 else:
                     _ = transaction_cleanup()
                     return false
@@ -163,7 +174,7 @@ module ProjectTransaction:
             # either atomic rename boundary.
             return false if not ProjectFiles::write_cstr_file(".elisapkg/transaction.new-manifest", new_manifest)
             state: mutable darray[u8] = []
-            ByteText::append_text(&state, "manifest-pending\n")
+            ByteText::append_text(&state, manifest_pending)
             return ProjectFiles::write_cstr_file(".elisapkg/transaction.state", &state)
 
         def stage_lock(new_lock: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
@@ -183,7 +194,7 @@ module ProjectTransaction:
                 state: mutable darray[u8] = []
                 state.resize(128)
                 return false if not ProjectFiles::read_cstr_into(".elisapkg/transaction.state", &state)
-                recognized: bool = ByteText::equal_text(state, "prepared-lock\n") or ByteText::equal_text(state, "prepared-no-lock\n") or ByteText::equal_text(state, "manifest-pending\n") or ByteText::equal_text(state, "manifest-replaced\n")
+                recognized: bool = ByteText::equal_text(state, prepared_with_lock) or ByteText::equal_text(state, prepared_without_lock) or has_manifest_intent(state)
                 if not recognized:
                     report_recovery_error("error: unrecognized project transaction state; preserve .elisapkg/transaction.* for recovery\n")
                     return false
@@ -193,7 +204,7 @@ module ProjectTransaction:
                 current_manifest: mutable darray[u8] = []
                 current_manifest.resize(1048577)
                 return false if not ProjectFiles::read_cstr_into("elisapkg.json", &current_manifest)
-                if ByteText::equal_text(state, "manifest-pending\n") or ByteText::equal_text(state, "manifest-replaced\n"):
+                if has_manifest_intent(state):
                     new_manifest: mutable darray[u8] = []
                     new_manifest.resize(1048577)
                     return false if not ProjectFiles::read_cstr_into(".elisapkg/transaction.new-manifest", &new_manifest)
@@ -206,10 +217,10 @@ module ProjectTransaction:
                 original_lock_state: i64 = Platform::pkg_package_file_size(".elisapkg/transaction.lock")
                 return false if original_lock_state < 0 and original_lock_state != -2
                 original_lock_present: bool = original_lock_state >= 0
-                if ByteText::equal_text(state, "prepared-lock\n") and not original_lock_present:
+                if ByteText::equal_text(state, prepared_with_lock) and not original_lock_present:
                     report_recovery_error("error: transaction recovery is missing the original lockfile backup; recovery files were retained\n")
                     return false
-                if ByteText::equal_text(state, "prepared-no-lock\n") and original_lock_present:
+                if ByteText::equal_text(state, prepared_without_lock) and original_lock_present:
                     report_recovery_error("error: transaction recovery found an unexpected lockfile backup; recovery files were retained\n")
                     return false
                 original_lock: mutable darray[u8] = []
@@ -246,12 +257,12 @@ module ProjectTransaction:
                     report_recovery_error("error: transaction recovery found an external lockfile edit; recovery files were retained\n")
                     return false
                 return false if not ProjectFiles::write_cstr_file("elisapkg.json", &original_manifest)
-                if ByteText::equal_text(state, "prepared-lock\n") or ((ByteText::equal_text(state, "manifest-pending\n") or ByteText::equal_text(state, "manifest-replaced\n")) and original_lock_present):
+                if original_lock_present:
                     return false if not ProjectFiles::write_cstr_file("elisapkg.lock", &original_lock)
                 else:
                     return false if not ProjectFiles::remove_cstr_file("elisapkg.lock")
                 restored_state: mutable darray[u8] = []
-                ByteText::append_text(&restored_state, "restored\n")
+                ByteText::append_text(&restored_state, rolled_back)
                 return false if not ProjectFiles::write_cstr_file(".elisapkg/transaction.state", &restored_state)
                 return remove_transaction_files()
 
@@ -297,7 +308,7 @@ module ProjectTransaction:
                 if not ProjectFiles::read_cstr_into(".elisapkg/transaction.state", &state):
                     _ = transaction_lock_release()
                     return false
-                return transaction_cleanup() if ByteText::equal_text(state, "complete\n") or ByteText::equal_text(state, "restored\n")
+                return transaction_cleanup() if ByteText::equal_text(state, committed) or ByteText::equal_text(state, rolled_back)
                 guard: mutable darray[u8] = []
                 ByteText::append_text(&guard, ".elisapkg/transaction.guard")
                 guard_c: mutable darray[u8] = []
@@ -320,7 +331,7 @@ module ProjectTransaction:
                     _ = restore()
                     return false
                 state: mutable darray[u8] = []
-                ByteText::append_text(&state, "complete\n")
+                ByteText::append_text(&state, committed)
                 if not ProjectFiles::write_cstr_file(".elisapkg/transaction.state", &state):
                     _ = transaction_lock_release()
                     return false
