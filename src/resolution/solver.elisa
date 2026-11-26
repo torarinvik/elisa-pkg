@@ -57,7 +57,7 @@ module Solver:
         def solve_with_preferences(candidates: darray[Candidate]&, roots: darray[Constraint]&, preferences: darray[Preference]&, selected: mutable darray[usize]&) -> SolveCode can[Memory.Allocate, Abort.Panic]:
             failure_constraints: mutable darray[Constraint] = []
             work: mutable WorkBudget = WorkBudget{used: 0}
-            return solver_solve_with_preferences(candidates, roots, preferences, selected, &failure_constraints, &work)
+            return solver_solve_with_preferences(candidates, roots, preferences, selected, &failure_constraints, &work, false)
 
         # The conflict companion records constraints from one actual failed
         # search branch. Candidate dependencies from mutually exclusive
@@ -68,7 +68,7 @@ module Solver:
             conflict.second_requirement.resize(0)
             failure_constraints: mutable darray[Constraint] = []
             work: mutable WorkBudget = WorkBudget{used: 0}
-            result: SolveCode = solver_solve_with_preferences(candidates, roots, preferences, selected, &failure_constraints, &work)
+            result: SolveCode = solver_solve_with_preferences(candidates, roots, preferences, selected, &failure_constraints, &work, true)
             return result if result != SolveCode.Unsatisfiable
             # Diagnostic work may stop early once unsatisfiability is proven.
             for first in 0..<failure_constraints.count |failure_constraints, candidates, conflict|:
@@ -115,7 +115,7 @@ module Solver:
             ByteText::append(&conflict.first_requirement, first.requirement)
             ByteText::append(&conflict.second_requirement, second.requirement)
 
-        def solver_solve_with_preferences(candidates: darray[Candidate]&, roots: darray[Constraint]&, preferences: darray[Preference]&, selected: mutable darray[usize]&, failure_constraints: mutable darray[Constraint]&, work: mutable WorkBudget&) -> SolveCode can[Memory.Allocate, Abort.Panic]:
+        def solver_solve_with_preferences(candidates: darray[Candidate]&, roots: darray[Constraint]&, preferences: darray[Preference]&, selected: mutable darray[usize]&, failure_constraints: mutable darray[Constraint]&, work: mutable WorkBudget&, capture_conflict: bool) -> SolveCode can[Memory.Allocate, Abort.Panic]:
             selected.resize(0)
             failure_constraints.resize(0)
             return SolveCode.ResourceLimit if:
@@ -183,7 +183,7 @@ module Solver:
                 return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
                 assigned.push(-1)
             decisions: mutable usize = 0.usize()
-            result: SolveCode = solver_search(candidates, package_slots, &constraints, ordered_preferences, &assigned, &decisions, failure_constraints, work)
+            result: SolveCode = solver_search(candidates, package_slots, &constraints, ordered_preferences, &assigned, &decisions, failure_constraints, work, capture_conflict)
             return result if result != SolveCode.Solved
             # A dependency edge can point at an already selected package, so
             # satisfiability alone does not rule out A -> B -> A (or A -> A).
@@ -209,7 +209,7 @@ module Solver:
         const max_decisions: usize = 16384
         const max_packages: usize = 1024
 
-        def solver_search(candidates: darray[Candidate]&, package_slots: darray[usize]&, constraints: mutable darray[Constraint]&, preferences: darray[Preference]&, assigned: mutable darray[i64]&, decisions: mutable usize&, failure_constraints: mutable darray[Constraint]&, work: mutable WorkBudget&) -> SolveCode can[Memory.Allocate, Abort.Panic]:
+        def solver_search(candidates: darray[Candidate]&, package_slots: darray[usize]&, constraints: mutable darray[Constraint]&, preferences: darray[Preference]&, assigned: mutable darray[i64]&, decisions: mutable usize&, failure_constraints: mutable darray[Constraint]&, work: mutable WorkBudget&, capture_conflict: bool) -> SolveCode can[Memory.Allocate, Abort.Panic]:
             return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
             return SolveCode.ResourceLimit if decisions >= max_decisions or constraints.count > maximum_constraints
             for constraint_index in 0..<constraints.count |constraints, package_slots, candidates|:
@@ -217,14 +217,14 @@ module Solver:
                 slot: usize = solver_slot_for(constraints[constraint_index].package, package_slots, candidates, work)
                 return SolveCode.ResourceLimit if solver_work_exhausted(work)
                 if slot == package_slots.count:
-                    return solver_record_unsatisfiable(constraints, failure_constraints, work)
+                    return solver_record_unsatisfiable(constraints, failure_constraints, work, capture_conflict)
             for slot in 0..<assigned.count |assigned, candidates, package_slots, constraints|:
                 return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
                 continue if assigned[slot] < 0
                 satisfies: bool = solver_candidate_satisfies(candidates[assigned[slot].usize()], package_slots[slot], constraints, package_slots, candidates, work)
                 return SolveCode.ResourceLimit if solver_work_exhausted(work)
                 if not satisfies:
-                    return solver_record_unsatisfiable(constraints, failure_constraints, work)
+                    return solver_record_unsatisfiable(constraints, failure_constraints, work, capture_conflict)
             best_slot: mutable usize = package_slots.count
             best_count: mutable usize = 18446744073709551615.usize()
             for slot in 0..<package_slots.count |package_slots, assigned, candidates, constraints, best_slot, best_count|:
@@ -249,7 +249,7 @@ module Solver:
                     satisfies: bool = solver_candidate_satisfies(candidates[candidate_index], package_slots[slot], constraints, package_slots, candidates, work)
                     return SolveCode.ResourceLimit if solver_work_exhausted(work)
                     possible <- possible + 1.usize() if satisfies
-                return solver_record_unsatisfiable(constraints, failure_constraints, work) if possible == 0.usize()
+                return solver_record_unsatisfiable(constraints, failure_constraints, work, capture_conflict) if possible == 0.usize()
                 if possible < best_count:
                     best_count <- possible
                     best_slot <- slot
@@ -259,7 +259,7 @@ module Solver:
                 # backtrack to a version that forms an acyclic graph.
                 graph_acyclic: bool = solver_selected_graph_acyclic(candidates, package_slots, assigned, work)
                 return SolveCode.ResourceLimit if solver_work_exhausted(work)
-                return solver_record_unsatisfiable(constraints, failure_constraints, work) if not graph_acyclic
+                return solver_record_unsatisfiable(constraints, failure_constraints, work, capture_conflict) if not graph_acyclic
                 return SolveCode.Solved
 
             order: mutable darray[usize] = []
@@ -289,17 +289,17 @@ module Solver:
                     return SolveCode.ResourceLimit if not solver_charge_work(work, dependency.package.count)
                     return SolveCode.ResourceLimit if not solver_charge_work(work, dependency.requirement.count)
                     constraints.push(dependency)
-                result: SolveCode = solver_search(candidates, package_slots, constraints, preferences, assigned, decisions, failure_constraints, work)
+                result: SolveCode = solver_search(candidates, package_slots, constraints, preferences, assigned, decisions, failure_constraints, work, capture_conflict)
                 return result if result == SolveCode.Solved or result == SolveCode.ResourceLimit or result == SolveCode.Malformed
                 constraints.resize(constraint_mark)
                 assigned[best_slot] <- -1
             return SolveCode.Unsatisfiable
 
-        def solver_record_unsatisfiable(constraints: darray[Constraint]&, failure_constraints: mutable darray[Constraint]&, work: mutable WorkBudget&) -> SolveCode can[Memory.Allocate, Abort.Panic]:
+        def solver_record_unsatisfiable(constraints: darray[Constraint]&, failure_constraints: mutable darray[Constraint]&, work: mutable WorkBudget&, capture_conflict: bool) -> SolveCode can[Memory.Allocate, Abort.Panic]:
             # Keep only the first concrete failure witness. Re-copying the
             # whole active graph at every dead search leaf would multiply the
             # solver's bounded branch count by its bounded constraint count.
-            if failure_constraints.count == 0.usize():
+            if capture_conflict and failure_constraints.count == 0.usize():
                 for index in 0..<constraints.count |constraints, failure_constraints|:
                     return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
                     return SolveCode.ResourceLimit if not solver_charge_work(work, constraints[index].package.count)
