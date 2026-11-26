@@ -19,22 +19,10 @@ module MaintenanceCommand:
             can Global.Read:
                 root: mutable darray[u8] = [46]
                 state: mutable darray[u8] = []
-                build_directory: mutable darray[u8] = []
-                release_build_directory: mutable darray[u8] = []
-                artifact: mutable darray[u8] = []
-                library_artifact: mutable darray[u8] = []
-                receipt: mutable darray[u8] = []
-                package_archive: mutable darray[u8] = []
-                package_receipt: mutable darray[u8] = []
                 ProjectFiles::path_join_into(root, ".elisapkg", &state)
                 return CliStatus::build_failed if not ProjectFiles::make_directory(&state)
-                build_directory <- Build::output_directory(root, false)
-                release_build_directory <- Build::output_directory(root, true)
-                ProjectFiles::path_join_into(build_directory, "app", &artifact)
-                ProjectFiles::path_join_into(build_directory, "app.o", &library_artifact)
-                ProjectFiles::path_join_into(build_directory, "receipt", &receipt)
-                ProjectFiles::path_join_into(state, "package.tar", &package_archive)
-                ProjectFiles::path_join_into(state, "package.receipt", &package_receipt)
+                build_directory: darray[u8] = Build::output_directory(root, false)
+                release_build_directory: darray[u8] = Build::output_directory(root, true)
                 region manifest_raw_scope:
                     manifest_raw: mutable darray[u8] = []
                     manifest_raw <- manifest_raw.resize(ProjectFiles::project_document_limit)
@@ -47,17 +35,17 @@ module MaintenanceCommand:
                 # Remove legacy single-target names left by older receipts as well as the
                 # manifest-declared target outputs.
                 return CliStatus::build_failed if:
-                    not ProjectFiles::remove_known_file(&artifact)
-                    not ProjectFiles::remove_known_file(&library_artifact)
-                    not ProjectFiles::remove_known_file(&receipt)
-                    not ProjectFiles::remove_known_file(&package_archive)
-                    not ProjectFiles::remove_known_file(&package_receipt)
-                    not remove_build_directory_if_empty(&release_build_directory)
-                    not remove_build_directory_if_empty(&build_directory)
+                    not remove_known_file_in(build_directory, "app")
+                    not remove_known_file_in(build_directory, "app.o")
+                    not remove_known_file_in(build_directory, "receipt")
+                    not remove_known_file_in(state, "package.tar")
+                    not remove_known_file_in(state, "package.receipt")
+                    not remove_directory_if_empty(release_build_directory)
+                    not remove_directory_if_empty(build_directory)
                 # `.elisapkg` is removed only when it is empty; cache/state files are never
                 # traversed or recursively deleted by clean. A retained cache makes this
                 # directory intentionally non-empty, which is a successful clean result.
-                return CliStatus::build_failed if not remove_state_directory(&state)
+                return CliStatus::build_failed if not remove_directory_if_empty(state)
                 CliOutput::write_ok("cleaned known .elisapkg outputs\n")
                 return CliStatus::success
 
@@ -164,26 +152,19 @@ module MaintenanceCommand:
                 return CliStatus::usage
 
     private:
-        def remove_build_directory_if_empty(path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            path_c: mutable darray[u8] = []
-            path_c <- ProjectFiles::with_null_terminator(path)
-            path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
+        # Remove `path` if it is an empty directory. A missing or non-empty
+        # directory is kept and counts as success: clean owns only the files it
+        # names, and a retained cache keeps the state directory non-empty.
+        def remove_directory_if_empty(path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            path_c: darray[u8] = ProjectFiles::with_null_terminator(path)
             region result_scope:
-                result: i64 = Platform::remove_directory(path_name)
-                # Keep compiler metadata and any unrecognized build files. Clean
-                # owns only the artifacts named by the manifest and their receipts.
-                return true if result == 0 or result == -2 or result == -Platform::directory_not_empty_error()
-            return false
+                result: i64 = Platform::remove_directory((&path_c[0]).cast[cstr] can Unsafe.PointerCast)
+                return result == 0 or result == -2 or result == -Platform::directory_not_empty_error()
 
-        def remove_state_directory(path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            path_c: mutable darray[u8] = []
-            path_c <- ProjectFiles::with_null_terminator(path)
-            path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
-            region result_scope:
-                result: i64 = Platform::remove_directory(path_name)
-                # A retained cache makes the state directory intentionally non-empty.
-                return true if result == 0 or result == -2 or result == -Platform::directory_not_empty_error()
-            return false
+        def remove_known_file_in(directory: darray[u8]&, leaf: cstr) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            path: mutable darray[u8] = []
+            ProjectFiles::path_join_into(directory, leaf, &path)
+            return ProjectFiles::remove_known_file(&path)
 
         def remove_target_outputs(leaves: darray[darray[u8]]&, build_directory: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             for index in 0..<leaves.count |leaves, build_directory|:
