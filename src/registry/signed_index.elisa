@@ -49,19 +49,10 @@ module SignedRegistryIndex:
                 return Code.InvalidConfiguration if loaded < 0
                 return Code.MalformedMetadata if loaded == 0 or snapshot.count > 1048576
 
-            signature_path: mutable darray[u8] = []
-            return Code.InvalidConfiguration if not RegistryFiles::join_path_leaf(root, package, "index.sig", &signature_path)
-            signature: mutable darray[u8] = []
-            region signature_size_scope:
-                signature_size: i64 = RegistryFiles::read_trusted_file(signature_path, Trust::ed25519_signature_bytes, &signature)
-                return Code.MissingSignature if signature_size < 0 or signature_size != Trust::ed25519_signature_bytes.i64()
-            public_key: mutable darray[u8] = []
-            return Code.MissingTrustRoot if RegistryFiles::read_trusted_file(key_path, Trust::ed25519_public_key_bytes, &public_key) != Trust::ed25519_public_key_bytes.i64()
             key_fingerprint_hex: mutable darray[u8] = []
-            return Code.TrustStateUnavailable if not Integrity::sha256_hex(public_key, &key_fingerprint_hex)
-            region trust_status_scope:
-                trust_status: Trust::VerificationCode = Trust::verify_detached("ed25519", public_key, snapshot, signature)
-                return Code.InvalidSignature if trust_status != Trust::VerificationCode.Valid
+            region signature_status_scope:
+                signature_status: Code = verify_snapshot_signature(root, package, key_path, snapshot, &key_fingerprint_hex)
+                return signature_status if signature_status != Code.Ok
 
             versions: mutable darray[u8] = []
             yanked_flags: mutable darray[u8] = []
@@ -90,6 +81,23 @@ module SignedRegistryIndex:
             ByteText::append(snapshot_digest_out, snapshot_digest)
             ByteText::append(identity_out, index_identity)
             ByteText::append(key_fingerprint_out, key_fingerprint_hex)
+            return Code.Ok
+
+        # Check the detached Ed25519 signature of an index snapshot against
+        # the configured key, and report that key's fingerprint.
+        def verify_snapshot_signature(root: darray[u8]&, package: darray[u8]&, key_path: darray[u8]&, snapshot: darray[u8]&, key_fingerprint_hex: mutable darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            signature_path: mutable darray[u8] = []
+            return Code.InvalidConfiguration if not RegistryFiles::join_path_leaf(root, package, "index.sig", &signature_path)
+            signature: mutable darray[u8] = []
+            region signature_size_scope:
+                signature_size: i64 = RegistryFiles::read_trusted_file(signature_path, Trust::ed25519_signature_bytes, &signature)
+                return Code.MissingSignature if signature_size < 0 or signature_size != Trust::ed25519_signature_bytes.i64()
+            public_key: mutable darray[u8] = []
+            return Code.MissingTrustRoot if RegistryFiles::read_trusted_file(key_path, Trust::ed25519_public_key_bytes, &public_key) != Trust::ed25519_public_key_bytes.i64()
+            return Code.TrustStateUnavailable if not Integrity::sha256_hex(public_key, key_fingerprint_hex)
+            region trust_status_scope:
+                trust_status: Trust::VerificationCode = Trust::verify_detached("ed25519", public_key, snapshot, signature)
+                return Code.InvalidSignature if trust_status != Trust::VerificationCode.Valid
             return Code.Ok
 
         def contains_version(versions: darray[u8]&, version: darray[u8]&) -> bool:
