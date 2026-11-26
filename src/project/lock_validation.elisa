@@ -22,14 +22,7 @@ module LockValidation:
                 # locks are already authenticated artifacts; inspection commands must
                 # validate their signed identity and shape without refreshing registry
                 # metadata or changing trust state.
-                if not Lockfile::version_is(lock, Lockfile::registry_version):
-                    return false if not Lockfile::version_is(lock, Lockfile::local_version)
-                    local_roots: mutable darray[Solver::Constraint] = []
-                    region has_local_scope:
-                        has_local: mutable bool = false
-                        return false if not RegistryRoots::collect(manifest, &local_roots, &has_local) or local_roots.count != 0.usize()
-                    expected: darray[u8] = LocalLock::canonical(name, version, manifest, start)
-                    return expected.count > 0.usize() and ByteText::equal(expected, lock)
+                return matches_local_lock(manifest, lock, name, version, start) if not Lockfile::version_is(lock, Lockfile::registry_version)
                 registry_roots: mutable darray[Solver::Constraint] = []
                 region has_local_dependency_scope:
                     has_local_dependency: mutable bool = false
@@ -47,6 +40,37 @@ module LockValidation:
                     return false if:
                         lock_end >= lock.count or not SchemaFields::valid(lock, 0, lock_end, SchemaFields::Kind.RegistryLock)
                         not Json::object_string_equals_text(lock, 0, lock_end, "resolver", Lockfile::registry_resolver)
+                return false if not root_package_matches(manifest, lock, name, version, start)
+                packages_start: usize = Json::root_value_offset(lock, "packages")
+                packages_end: usize = Json::array_end(lock, packages_start)
+                return false if packages_start >= lock.count or packages_end <= packages_start or packages_end >= lock.count
+                record_starts: mutable darray[usize] = []
+                return false if not read_dependency_records(lock, packages_start, packages_end, name, &record_starts)
+                return false if record_starts.count == 0.usize()
+                # Direct registry requirements are the minimum graph contract that can be
+                # checked without loading signed metadata in offline mode. Transitive
+                # edges are authenticated by the cached metadata digest when an online
+                # fetch revalidates the lock; offline mode must at least reject omission
+                # of any dependency named by the manifest itself.
+                return Lockfile::registry_satisfies_roots(lock, record_starts, registry_roots)
+
+    private:
+        # A local lock must be exactly what the deterministic resolver emits
+        # for a manifest with no registry roots.
+        def matches_local_lock(manifest: darray[u8]&, lock: darray[u8]&, name: darray[u8]&, version: darray[u8]&, start: darray[u8]&) -> bool can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                return false if not Lockfile::version_is(lock, Lockfile::local_version)
+                local_roots: mutable darray[Solver::Constraint] = []
+                region has_local_scope:
+                    has_local: mutable bool = false
+                    return false if not RegistryRoots::collect(manifest, &local_roots, &has_local) or local_roots.count != 0.usize()
+                expected: darray[u8] = LocalLock::canonical(name, version, manifest, start)
+                return expected.count > 0.usize() and ByteText::equal(expected, lock)
+
+        # The lock's root package names this project and binds its manifest
+        # and source digests.
+        def root_package_matches(manifest: darray[u8]&, lock: darray[u8]&, name: darray[u8]&, version: darray[u8]&, start: darray[u8]&) -> bool can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
                 package_start: usize = Json::root_value_offset(lock, "package")
                 package_end: usize = Json::object_end(lock, package_start)
                 return false if package_start >= lock.count or package_end <= package_start or not SchemaFields::valid(lock, package_start, package_end, SchemaFields::Kind.RegistryLockPackage)
@@ -63,51 +87,47 @@ module LockValidation:
                     return false if not:
                         SourceFingerprint::at(start, &source_digest)
                         Lockfile::sha256_field_equals(lock, package_start, package_end, "source-digest", source_digest)
-                packages_start: usize = Json::root_value_offset(lock, "packages")
-                packages_end: usize = Json::array_end(lock, packages_start)
-                return false if packages_start >= lock.count or packages_end <= packages_start or packages_end >= lock.count
-                record_starts: mutable darray[usize] = []
-                previous_start: mutable usize = 0
-                previous_end: mutable usize = 0
-                while cursor < packages_end |cursor: usize = packages_start + 1.usize()|:
-                    cursor <- Json::skip_whitespace(lock, cursor, packages_end)
-                    break if cursor == packages_end
-                    return false if lock[cursor] != 123 or record_starts.count >= LocalBuildPlan::maximum_packages
-                    record_end: usize = Json::object_end(lock, cursor)
-                    return false if record_end <= cursor or record_end >= packages_end or not SchemaFields::valid(lock, cursor, record_end, SchemaFields::Kind.RegistryLockRecord)
-                    name_start: mutable usize = 0
-                    name_end: mutable usize = 0
-                    # The root package is never a dependency record, and dependency
-                    # names must appear in strictly increasing order.
-                    return false if not:
-                        Json::object_string_span(lock, cursor, record_end, "name", &name_start, &name_end)
-                        PackageIdentity::valid_name_segment(lock, name_start, name_end)
-                        not ByteText::range_equals(lock, name_start, name_end, name)
-                        previous_end <= previous_start or Lockfile::name_precedes(lock, previous_start, previous_end, name_start, name_end)
-                    region parsed_version_scope:
-                        parsed_version: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-                        return false if not Lockfile::read_registry_version(lock, cursor, record_end, &parsed_version)
-                    region archive_scope:
-                        archive: mutable darray[u8] = []
-                        return false if not Lockfile::read_registry_archive(lock, cursor, record_end, &archive)
-                    region archive_size_scope:
-                        archive_size: mutable u64 = 0
-                        return false if not Json::object_unsigned_value(lock, cursor, record_end, "archive-size", &archive_size) or archive_size > Archive::maximum_archive_bytes.u64()
-                    return false if not:
-                        Lockfile::has_sha256_field(lock, cursor, record_end, "archive-digest")
-                        Lockfile::has_sha256_field(lock, cursor, record_end, "metadata-digest")
-                    previous_start <- name_start
-                    previous_end <- name_end
-                    record_starts <- record_starts.push(cursor)
-                    cursor <- record_end + 1.usize()
-                    cursor <- Json::skip_whitespace(lock, cursor, packages_end)
-                    if cursor < packages_end:
-                        return false if lock[cursor] != 44
-                        cursor <- cursor + 1.usize()
-                return false if record_starts.count == 0.usize()
-                # Direct registry requirements are the minimum graph contract that can be
-                # checked without loading signed metadata in offline mode. Transitive
-                # edges are authenticated by the cached metadata digest when an online
-                # fetch revalidates the lock; offline mode must at least reject omission
-                # of any dependency named by the manifest itself.
-                return Lockfile::registry_satisfies_roots(lock, record_starts, registry_roots)
+                return true
+
+        # Read the dependency records of a registry lock. Each is
+        # schema-valid, names a dependency other than the root package, and
+        # follows the previous record in strictly increasing name order.
+        def read_dependency_records(lock: darray[u8]&, packages_start: usize, packages_end: usize, name: darray[u8]&, record_starts: mutable darray[usize]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            previous_start: mutable usize = 0
+            previous_end: mutable usize = 0
+            while cursor < packages_end |cursor: usize = packages_start + 1.usize()|:
+                cursor <- Json::skip_whitespace(lock, cursor, packages_end)
+                break if cursor == packages_end
+                return false if lock[cursor] != 123 or record_starts.count >= LocalBuildPlan::maximum_packages
+                record_end: usize = Json::object_end(lock, cursor)
+                return false if record_end <= cursor or record_end >= packages_end or not SchemaFields::valid(lock, cursor, record_end, SchemaFields::Kind.RegistryLockRecord)
+                name_start: mutable usize = 0
+                name_end: mutable usize = 0
+                # The root package is never a dependency record, and dependency
+                # names must appear in strictly increasing order.
+                return false if not:
+                    Json::object_string_span(lock, cursor, record_end, "name", &name_start, &name_end)
+                    PackageIdentity::valid_name_segment(lock, name_start, name_end)
+                    not ByteText::range_equals(lock, name_start, name_end, name)
+                    previous_end <= previous_start or Lockfile::name_precedes(lock, previous_start, previous_end, name_start, name_end)
+                region parsed_version_scope:
+                    parsed_version: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
+                    return false if not Lockfile::read_registry_version(lock, cursor, record_end, &parsed_version)
+                region archive_scope:
+                    archive: mutable darray[u8] = []
+                    return false if not Lockfile::read_registry_archive(lock, cursor, record_end, &archive)
+                region archive_size_scope:
+                    archive_size: mutable u64 = 0
+                    return false if not Json::object_unsigned_value(lock, cursor, record_end, "archive-size", &archive_size) or archive_size > Archive::maximum_archive_bytes.u64()
+                return false if not:
+                    Lockfile::has_sha256_field(lock, cursor, record_end, "archive-digest")
+                    Lockfile::has_sha256_field(lock, cursor, record_end, "metadata-digest")
+                previous_start <- name_start
+                previous_end <- name_end
+                record_starts <- record_starts.push(cursor)
+                cursor <- record_end + 1.usize()
+                cursor <- Json::skip_whitespace(lock, cursor, packages_end)
+                if cursor < packages_end:
+                    return false if lock[cursor] != 44
+                    cursor <- cursor + 1.usize()
+            return true
