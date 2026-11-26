@@ -8,6 +8,7 @@
 
 include "./platform.elisa"
 include "./install_faults.elisa"
+include "./package/install_records.elisa"
 include "./sandbox.elisa"
 include "./package/model.elisa"
 include "./trust.elisa"
@@ -4340,90 +4341,6 @@ module Cli:
             path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
             return Platform::pkg_unlink_file_identity(path_name, device, inode) == 0
 
-        def valid_install_digest(digest: darray[u8]&) -> bool:
-            return false if digest.count != 64.usize()
-            for index in 0..<digest.count |digest|:
-                byte: u8 = digest[index]
-                return false if (byte < 48 or byte > 57) and (byte < 97 or byte > 102)
-            return true
-
-        def local_install_receipt_bytes(name: darray[u8]&, version: darray[u8]&, destination: darray[u8]&, digest: darray[u8]&, out: mutable darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
-            out.resize(0)
-            bytes_push_view(out, "elisapkg-install-receipt:1\nname:")
-            bytes_push_array(out, name)
-            bytes_push_view(out, "\nversion:")
-            bytes_push_array(out, version)
-            bytes_push_view(out, "\npath:")
-            bytes_push_array(out, destination)
-            bytes_push_view(out, "\nartifact-digest:sha256:")
-            bytes_push_array(out, digest)
-            bytes_push_view(out, "\n")
-
-        def local_install_transaction_bytes(operation: cstr, name: darray[u8]&, version: darray[u8]&, digest: darray[u8]&, out: mutable darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
-            out.resize(0)
-            bytes_push_view(out, "elisapkg-install-transaction:1\noperation:")
-            bytes_push_view(out, operation)
-            bytes_push_view(out, "\nname:")
-            bytes_push_array(out, name)
-            bytes_push_view(out, "\nversion:")
-            bytes_push_array(out, version)
-            bytes_push_view(out, "\nartifact-digest:sha256:")
-            bytes_push_array(out, digest)
-            bytes_push_view(out, "\n")
-
-        def parse_local_install_transaction(raw: darray[u8]&, out_operation: mutable darray[u8]&, out_name: mutable darray[u8]&, out_version: mutable darray[u8]&, out_digest: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            out_operation.resize(0)
-            out_name.resize(0)
-            out_version.resize(0)
-            out_digest.resize(0)
-            operation_prefix: mutable darray[u8] = []
-            bytes_push_view(&operation_prefix, "elisapkg-install-transaction:1\noperation:")
-            operation_start: usize = operation_prefix.count
-            operation_end: mutable usize = 0.usize()
-            for operation in ["install", "uninstall"]:
-                candidate: mutable darray[u8] = []
-                for index in 0..<operation_start |candidate, operation_prefix|:
-                    candidate.push(operation_prefix[index])
-                bytes_push_view(&candidate, operation)
-                bytes_push_view(&candidate, "\nname:")
-                if bytes_starts_with(raw, candidate):
-                    bytes_push_view(out_operation, operation)
-                    operation_end <- candidate.count
-                    break
-            return false if out_operation.count == 0.usize()
-            name_start: usize = operation_end
-            name_end: mutable usize = name_start
-            while name_end < raw.count and raw[name_end] != 10:
-                name_end <- name_end + 1.usize()
-            return false if name_end == name_start or name_end >= raw.count or name_end - name_start > 64.usize()
-            for index in name_start..<name_end |raw, out_name|:
-                out_name.push(raw[index])
-            return false if not valid_package_name(out_name)
-            version_key: mutable darray[u8] = []
-            bytes_push_view(&version_key, "\nversion:")
-            return false if name_end + version_key.count >= raw.count
-            for index in 0..<version_key.count |raw, version_key, name_end|:
-                return false if raw[name_end + index] != version_key[index]
-            version_start: usize = name_end + version_key.count
-            version_end: mutable usize = version_start
-            while version_end < raw.count and raw[version_end] != 10:
-                version_end <- version_end + 1
-            return false if version_end == version_start or version_end >= raw.count or version_end - version_start > MAX_INSTALL_VERSION_BYTES
-            for index in version_start..<version_end |raw, out_version|:
-                out_version.push(raw[index])
-            parsed_version: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-            return false if not parse_version(out_version, &parsed_version)
-            digest_key: mutable darray[u8] = []
-            bytes_push_view(&digest_key, "artifact-digest:sha256:")
-            digest_start: usize = version_end + 1.usize() + digest_key.count
-            return false if digest_start > raw.count or raw.count != digest_start + 65.usize()
-            for index in 0..<digest_key.count |raw, digest_key, version_end|:
-                return false if raw[version_end + 1.usize() + index] != digest_key[index]
-            for index in 0..<64 |raw, out_digest, digest_start|:
-                out_digest.push(raw[digest_start + index])
-            return false if raw[raw.count - 1.usize()] != 10 or not valid_install_digest(out_digest)
-            return true
-
         def sync_local_install_entry_parents(destination_name: cstr, receipt_name: cstr) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             # A transaction journal may be retired only after both target
             # directories durably record the current install or uninstall state.
@@ -4469,7 +4386,7 @@ module Cli:
             name: mutable darray[u8] = []
             version: mutable darray[u8] = []
             expected_digest: mutable darray[u8] = []
-            return false if not parse_local_install_transaction(raw, &operation, &name, &version, &expected_digest)
+            return false if not InstallRecords::parse_journal(raw, &operation, &name, &version, &expected_digest)
             name_c: mutable darray[u8] = []
             path_with_nul_into(&name, &name_c)
             name_raw: cstr = (&name_c[0]).cast[cstr] can Unsafe.PointerCast
@@ -4493,7 +4410,7 @@ module Cli:
             return false if destination_state < 0 and destination_state != -2
             return false if receipt_state < 0 and receipt_state != -2
             expected_receipt: mutable darray[u8] = []
-            local_install_receipt_bytes(name, version, destination, expected_digest, &expected_receipt)
+            InstallRecords::encode_receipt(name, version, destination, expected_digest, &expected_receipt)
             if bytes_equal_view(operation, "install"):
                 # No target was published: discard the intent and let the caller
                 # retry. A receipt without its expected binary is unexplained and
@@ -4660,9 +4577,9 @@ module Cli:
             if file_exists(&receipt_path):
                 return finish_local_install_error(lock_fd, "error: install destination or receipt already exists; refusing to overwrite\n")
             receipt: mutable darray[u8] = []
-            local_install_receipt_bytes(name, version, destination_snapshot, digest, &receipt)
+            InstallRecords::encode_receipt(name, version, destination_snapshot, digest, &receipt)
             transaction: mutable darray[u8] = []
-            local_install_transaction_bytes("install", name, version, digest, &transaction)
+            InstallRecords::encode_journal("install", name, version, digest, &transaction)
             transaction_path: mutable darray[u8] = []
             local_install_transaction_path(prefix, &transaction_path)
             transaction_c: mutable darray[u8] = []
@@ -4835,7 +4752,7 @@ module Cli:
             if not parse_version(version_bytes, &parsed_version):
                 return finish_local_install_error(lock_fd, "error: installation receipt does not match the current file; refusing removal\n")
             transaction: mutable darray[u8] = []
-            local_install_transaction_bytes("uninstall", name, version_bytes, digest, &transaction)
+            InstallRecords::encode_journal("uninstall", name, version_bytes, digest, &transaction)
             transaction_path: mutable darray[u8] = []
             local_install_transaction_path(prefix, &transaction_path)
             transaction_c: mutable darray[u8] = []

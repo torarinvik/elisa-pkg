@@ -1,0 +1,106 @@
+# On-disk records for local binary installation and transaction recovery.
+
+include "./package_identity.elisa"
+
+module InstallRecords:
+    private:
+        def valid_install_digest(digest: darray[u8]&) -> bool:
+            return false if digest.count != 64.usize()
+            for index in 0..<digest.count |digest|:
+                byte: u8 = digest[index]
+                return false if (byte < 48 or byte > 57) and (byte < 97 or byte > 102)
+            return true
+
+        def bytes_push_view(out: mutable darray[u8]&, value: cstr) -> void can[Memory.Allocate, Abort.Panic]:
+            index: mutable usize = 0.usize()
+            while value[index].u8() != 0 |out, value, index|:
+                out.push(value[index].u8())
+                index <- index + 1.usize()
+
+        def bytes_push_array(out: mutable darray[u8]&, value: darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
+            for index in 0..<value.count |out, value|:
+                out.push(value[index])
+
+        def bytes_starts_with(value: darray[u8]&, prefix: darray[u8]&) -> bool:
+            return false if prefix.count > value.count
+            for index in 0..<prefix.count |value, prefix|:
+                return false if value[index] != prefix[index]
+            return true
+
+    public:
+        def encode_receipt(name: darray[u8]&, version: darray[u8]&, destination: darray[u8]&, digest: darray[u8]&, out: mutable darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
+            out.resize(0)
+            bytes_push_view(out, "elisapkg-install-receipt:1\nname:")
+            bytes_push_array(out, name)
+            bytes_push_view(out, "\nversion:")
+            bytes_push_array(out, version)
+            bytes_push_view(out, "\npath:")
+            bytes_push_array(out, destination)
+            bytes_push_view(out, "\nartifact-digest:sha256:")
+            bytes_push_array(out, digest)
+            bytes_push_view(out, "\n")
+
+        def encode_journal(operation: cstr, name: darray[u8]&, version: darray[u8]&, digest: darray[u8]&, out: mutable darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
+            out.resize(0)
+            bytes_push_view(out, "elisapkg-install-transaction:1\noperation:")
+            bytes_push_view(out, operation)
+            bytes_push_view(out, "\nname:")
+            bytes_push_array(out, name)
+            bytes_push_view(out, "\nversion:")
+            bytes_push_array(out, version)
+            bytes_push_view(out, "\nartifact-digest:sha256:")
+            bytes_push_array(out, digest)
+            bytes_push_view(out, "\n")
+
+        def parse_journal(raw: darray[u8]&, out_operation: mutable darray[u8]&, out_name: mutable darray[u8]&, out_version: mutable darray[u8]&, out_digest: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            out_operation.resize(0)
+            out_name.resize(0)
+            out_version.resize(0)
+            out_digest.resize(0)
+            operation_prefix: mutable darray[u8] = []
+            bytes_push_view(&operation_prefix, "elisapkg-install-transaction:1\noperation:")
+            operation_start: usize = operation_prefix.count
+            operation_end: mutable usize = 0.usize()
+            for operation in ["install", "uninstall"]:
+                candidate: mutable darray[u8] = []
+                for index in 0..<operation_start |candidate, operation_prefix|:
+                    candidate.push(operation_prefix[index])
+                bytes_push_view(&candidate, operation)
+                bytes_push_view(&candidate, "\nname:")
+                if bytes_starts_with(raw, candidate):
+                    bytes_push_view(out_operation, operation)
+                    operation_end <- candidate.count
+                    break
+            return false if out_operation.count == 0.usize()
+            name_start: usize = operation_end
+            name_end: mutable usize = name_start
+            while name_end < raw.count and raw[name_end] != 10:
+                name_end <- name_end + 1.usize()
+            return false if name_end == name_start or name_end >= raw.count or name_end - name_start > PackageIdentity::max_name_bytes
+            for index in name_start..<name_end |raw, out_name|:
+                out_name.push(raw[index])
+            return false if not PackageIdentity::valid_name(out_name)
+            version_key: mutable darray[u8] = []
+            bytes_push_view(&version_key, "\nversion:")
+            return false if name_end + version_key.count >= raw.count
+            for index in 0..<version_key.count |raw, version_key, name_end|:
+                return false if raw[name_end + index] != version_key[index]
+            version_start: usize = name_end + version_key.count
+            version_end: mutable usize = version_start
+            while version_end < raw.count and raw[version_end] != 10:
+                version_end <- version_end + 1
+            return false if version_end == version_start or version_end >= raw.count or version_end - version_start > SemVer::max_version_bytes
+            for index in version_start..<version_end |raw, out_version|:
+                out_version.push(raw[index])
+            parsed_version: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
+            return false if not PackageIdentity::parse_version(out_version, &parsed_version)
+            digest_key: mutable darray[u8] = []
+            bytes_push_view(&digest_key, "artifact-digest:sha256:")
+            digest_start: usize = version_end + 1.usize() + digest_key.count
+            return false if digest_start > raw.count or raw.count != digest_start + 65.usize()
+            for index in 0..<digest_key.count |raw, digest_key, version_end|:
+                return false if raw[version_end + 1.usize() + index] != digest_key[index]
+            for index in 0..<64 |raw, out_digest, digest_start|:
+                out_digest.push(raw[digest_start + index])
+            return false if raw[raw.count - 1.usize()] != 10 or not valid_install_digest(out_digest)
+            return true
