@@ -11,10 +11,7 @@ extend PlatformNative:
             return flag_read_only + flag_directory + flag_close_on_exec
 
     private:
-        def flags_read_no_follow() -> i64:
-            return flag_read_only + flag_no_follow + flag_close_on_exec + flag_nonblock
-
-        def flags_file_read() -> i64:
+        def regular_file_read_flags() -> i64:
             return flag_read_only + flag_no_follow + flag_close_on_exec + flag_nonblock
 
         def open_regular_file_at_pinned(directory: i64, leaf_name: cstr, before: darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -67,11 +64,11 @@ extend PlatformNative:
                 return -5 if close_status != 0 else -13
             return reopened
 
+    public:
         # openat treats slash-containing names as paths and `O_NOFOLLOW` only
         # protects the final component. Keep these helpers limited to one
         # ordinary component so callers cannot smuggle traversal through a
         # supposedly descriptor-relative leaf.
-    public:
         def package_leaf_component_safe(name: cstr) -> bool:
             length: usize = native_strlen(name)
             return false if length == 0 or length > 4096 or cstr_equal(name, ".") or cstr_equal(name, "..")
@@ -79,13 +76,11 @@ extend PlatformNative:
                 return false if name[index].u8() == 47
             return true
 
-    private:
         # Pin a candidate without invoking a device driver's open operation.
         # Linux uses openat2 with beneath/no-symlink resolution and falls back
         # to O_PATH plus procfs when the syscall or resolve flags are unavailable.
         # macOS has no O_PATH equivalent, so its protected-parent policy combines
         # pre-stat, O_NOFOLLOW, and a post-open inode comparison.
-    public:
         def open_regular_file_at(directory: i64, leaf_name: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return -22 if not package_leaf_component_safe(leaf_name)
             before: mutable darray[u8] = []
@@ -100,7 +95,7 @@ extend PlatformNative:
                 how <- how.resize(24)
                 for index in 0..<how.count |how|:
                     how[index] <- 0
-                write_u64_le(&how, 0.usize(), flags_file_read().u64())
+                write_u64_le(&how, 0.usize(), regular_file_read_flags().u64())
                 write_u64_le(&how, 16.usize(), linux_resolve_no_symlinks + linux_resolve_beneath)
                 how_raw: mutable void& = (&how[0]).cast[mutable void&] can Unsafe.PointerCast
                 opened: i64 = native_syscall(linux_openat2_syscall, directory, leaf_name, how_raw, 24)
@@ -119,7 +114,7 @@ extend PlatformNative:
                     return NativeErrors::negative_value(open_errno)
                 return open_regular_file_at_pinned(directory, leaf_name, before)
             else:
-                opened: i64 = native_openat(directory, leaf_name, flags_file_read())
+                opened: i64 = native_openat(directory, leaf_name, regular_file_read_flags())
                 return NativeErrors::negative_errno() if opened < 0
                 after: mutable darray[u8] = []
                 after <- after.resize(stat_buffer_bytes)
