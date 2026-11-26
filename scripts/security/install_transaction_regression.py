@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 
@@ -17,23 +18,26 @@ VERSION = b"1.2.3"
 DIGEST = hashlib.sha256(ARTIFACT).hexdigest().encode("ascii")
 
 
+def function_source(source: str, name: str) -> str:
+    declaration = re.search(rf"(?m)^( +)def {re.escape(name)}\(", source)
+    if declaration is None:
+        raise SystemExit(f"error: could not locate {name}")
+    indentation = declaration[1]
+    remainder = source[declaration.end():]
+    next_declaration = re.search(rf"(?m)^(?:{indentation}def | +(?:public|private):)", remainder)
+    end = declaration.end() + next_declaration.start() if next_declaration else len(source)
+    return source[declaration.start():end]
+
+
 def check_install_recovery_sync_order() -> None:
-    source = (ROOT / "src/main.elisa").read_text(encoding="utf-8")
-    retire_start = source.find("def retire_local_install_transaction(")
-    retire_end = source.find("def remove_build_directory_if_empty(", retire_start)
-    if retire_start < 0 or retire_end < 0:
-        raise SystemExit("error: durable local install transaction retirement helper is missing")
-    retire = source[retire_start:retire_end]
+    source = (ROOT / "src/package/install_transaction.elisa").read_text(encoding="utf-8")
+    retire = function_source(source, "retire_local_install_transaction")
     unlink = retire.find("remove_known_file(&path_snapshot)")
     journal_parent_sync = retire.find("Platform::pkg_fsync_parent(path_name)")
     if unlink < 0 or journal_parent_sync <= unlink:
         raise SystemExit("error: transaction journal retirement must sync its parent after unlink")
 
-    recovery_start = source.find("def recover_local_install_transaction(")
-    recovery_end = source.find("def finish_local_install_error(", recovery_start)
-    if recovery_start < 0 or recovery_end < 0:
-        raise SystemExit("error: local install recovery implementation is missing")
-    recovery = source[recovery_start:recovery_end]
+    recovery = function_source(source, "recover_local_install_transaction")
     install_start = recovery.find('if ByteText::equal_text(operation, "install"):')
     uninstall_start = recovery.find("# Removal intent is durable", install_start)
     copy_outputs_start = recovery.find("for index in 0..<operation.count", uninstall_start)
@@ -67,25 +71,15 @@ def check_install_recovery_sync_order() -> None:
             raise SystemExit("error: uninstall recovery must sync both target directories before retiring its journal")
         previous_retire = position
 
-    publish_start = source.find("def publish_local_install_receipt(")
-    publish_end = source.find("def recover_local_install_transaction(", publish_start)
-    if publish_start < 0 or publish_end < 0:
-        raise SystemExit("error: local receipt publication helper is missing")
-    publish = source[publish_start:publish_end]
-    matching_receipt = publish.find("return false if not ByteText::equal(existing, receipt)")
+    publish = function_source(source, "publish_local_install_receipt")
+    matching_receipt = publish.find("not ByteText::equal(existing, receipt)")
     parent_sync = publish.find("Platform::pkg_fsync_parent(path_name)")
     if matching_receipt < 0 or parent_sync <= matching_receipt:
         raise SystemExit("error: receipt publication must sync its parent before success")
 
-    for begin, end, label in (
-        ("def run_install_local(", "def run_install(", "install"),
-        ("def run_uninstall_local(", "def run_uninstall(", "uninstall"),
-    ):
-        start = source.find(begin)
-        stop = source.find(end, start)
-        if start < 0 or stop < 0:
-            raise SystemExit(f"error: normal local {label} implementation is missing")
-        operation = source[start:stop]
+    command_source = (ROOT / "src/cli/local_install.elisa").read_text(encoding="utf-8")
+    for function, label in (("publish_verified", "install"), ("uninstall_local", "uninstall")):
+        operation = function_source(command_source, function)
         retire = operation.rfind("retire_local_install_transaction(transaction_path)")
         sync = operation.rfind("sync_local_install_entry_parents(destination_name, receipt_sync_name)" if label == "install" else "sync_local_install_entry_parents(destination_name, receipt_name)")
         if sync < 0 or sync >= retire:
