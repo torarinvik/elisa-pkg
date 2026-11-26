@@ -144,46 +144,13 @@ module ProjectTransaction:
                 if Platform::make_directory(guard_path, 448.u16()) != 0:
                     _ = transaction_lock_release()
                     return false
-                # The caller prepared its edit before taking the guard. Another
-                # transaction may have committed in that interval, so compare the
-                # live manifest again while holding the exclusive guard instead of
-                # overwriting a newer dependency edit from a stale snapshot.
-                region current_manifest_scope:
-                    current_manifest: mutable darray[u8] = []
-                    current_manifest <- current_manifest.resize(ProjectFiles::project_document_limit)
-                    if not ProjectFiles::read_c_string_into(live_manifest_path, &current_manifest) or not ByteText::equal(current_manifest, original_manifest):
-                        _ = transaction_abort_begin(guard)
-                        return false
-                if expected_lock_state != -3:
-                    current_lock_state: i64 = Platform::package_file_size(live_lock_path)
-                    if current_lock_state != expected_lock_state:
-                        _ = transaction_abort_begin(guard)
-                        return false
-                    if current_lock_state >= 0:
-                        current_lock: mutable darray[u8] = []
-                        current_lock <- current_lock.resize(ProjectFiles::project_document_limit)
-                        if not ProjectFiles::read_c_string_into(live_lock_path, &current_lock) or not ByteText::equal(current_lock, expected_lock):
-                            _ = transaction_abort_begin(guard)
-                            return false
+                if not live_files_match(original_manifest, expected_lock_state, expected_lock):
+                    _ = transaction_abort_begin(guard)
+                    return false
                 if not ProjectFiles::write_c_string_file(original_manifest_path, original_manifest):
                     _ = transaction_cleanup()
                     return false
-                state: mutable darray[u8] = []
-                lock_state: i64 = Platform::package_file_size(live_lock_path)
-                if lock_state >= 0:
-                    region original_lock_scope:
-                        original_lock: mutable darray[u8] = []
-                        original_lock <- original_lock.resize(ProjectFiles::project_document_limit)
-                        if not ProjectFiles::read_c_string_into(live_lock_path, &original_lock) or not ProjectFiles::write_c_string_file(original_lock_path, &original_lock):
-                            _ = transaction_cleanup()
-                            return false
-                    ByteText::append_text(&state, prepared_with_lock)
-                elif lock_state == -2:
-                    ByteText::append_text(&state, prepared_without_lock)
-                else:
-                    _ = transaction_cleanup()
-                    return false
-                if not ProjectFiles::write_c_string_file(phase_path, &state):
+                if not record_prepared_state():
                     _ = transaction_cleanup()
                     return false
                 return true
@@ -293,6 +260,38 @@ module ProjectTransaction:
                     ByteText::append_text(&restored_state, rolled_back)
                     return false if not ProjectFiles::write_c_string_file(phase_path, &restored_state)
                 return remove_transaction_files()
+
+        # The caller prepared its edit before taking the guard. Another
+        # transaction may have committed in that interval, so compare the live
+        # manifest and lock again while holding the exclusive guard instead of
+        # overwriting a newer dependency edit from a stale snapshot. An
+        # expected lock state of -3 skips the lock comparison.
+        def live_files_match(original_manifest: darray[u8]&, expected_lock_state: i64, expected_lock: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            region current_manifest_scope:
+                current_manifest: mutable darray[u8] = []
+                return false if not read_document(live_manifest_path, &current_manifest) or not ByteText::equal(current_manifest, original_manifest)
+            return true if expected_lock_state == -3
+            current_lock_state: i64 = Platform::package_file_size(live_lock_path)
+            return false if current_lock_state != expected_lock_state
+            return true if current_lock_state < 0
+            current_lock: mutable darray[u8] = []
+            return read_document(live_lock_path, &current_lock) and ByteText::equal(current_lock, expected_lock)
+
+        # Back up the live lock, when present, and record which prepared
+        # state recovery should expect.
+        def record_prepared_state() -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            state: mutable darray[u8] = []
+            lock_state: i64 = Platform::package_file_size(live_lock_path)
+            if lock_state >= 0:
+                region original_lock_scope:
+                    original_lock: mutable darray[u8] = []
+                    return false if not read_document(live_lock_path, &original_lock) or not ProjectFiles::write_c_string_file(original_lock_path, &original_lock)
+                ByteText::append_text(&state, prepared_with_lock)
+            elif lock_state == -2:
+                ByteText::append_text(&state, prepared_without_lock)
+            else:
+                return false
+            return ProjectFiles::write_c_string_file(phase_path, &state)
 
         def read_document(path: cstr, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out.resize(ProjectFiles::project_document_limit)
