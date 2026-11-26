@@ -4,6 +4,7 @@
 include "../archive.elisa"
 include "../json.elisa"
 include "../text/bytes.elisa"
+include "./dependency_entry.elisa"
 include "./package_identity.elisa"
 include "./selection.elisa"
 include "../project/schema_fields.elisa"
@@ -81,51 +82,23 @@ module Manifest:
             return 0 if dependency_start >= raw.count
             dependency_end: usize = Json::object_end(raw, dependency_start)
             return -1 if dependency_end <= dependency_start or dependency_end >= raw.count or raw[dependency_start] != 123
-            in_string: mutable bool = false
-            escaped: mutable bool = false
-            string_start: mutable usize = 0.usize()
-            braces: mutable i64 = 1
-            brackets: mutable i64 = 0
             count: mutable usize = 0.usize()
-            for index in (dependency_start + 1.usize())..<dependency_end |raw, out, in_string, escaped, string_start, braces, brackets, count|:
-                byte: u8 = raw[index]
-                if not in_string:
-                    if byte == 34:
-                        in_string <- true
-                        string_start <- index + 1.usize()
-                    elif byte == 123:
-                        braces <- braces + 1
-                    elif byte == 125:
-                        braces <- braces - 1
-                    elif byte == 91:
-                        brackets <- brackets + 1
-                    elif byte == 93:
-                        brackets <- brackets - 1
-                elif escaped:
-                    escaped <- false
-                elif byte == 92:
-                    escaped <- true
-                elif byte == 34:
-                    after: mutable usize = index + 1.usize()
-                    after <- Json::skip_whitespace(raw, after, dependency_end)
-                    if braces == 1 and brackets == 0 and after < dependency_end and raw[after] == 58:
-                        return -1 if count >= maximum_edges
-                        alias: mutable darray[u8] = []
-                        ByteText::append_range(&alias, raw, string_start, index)
-                        return -1 if not PackageIdentity::valid_name(alias)
-                        object_start: mutable usize = after + 1.usize()
-                        while object_start < dependency_end and (raw[object_start] == 32 or raw[object_start] == 9 or raw[object_start] == 10 or raw[object_start] == 13) |raw, object_start|:
-                            object_start <- object_start + 1.usize()
-                        object_end: usize = Json::object_end(raw, object_start)
-                        return -1 if object_start >= dependency_end or object_end <= object_start or object_end > dependency_end or raw[object_start] != 123
-                        path: mutable darray[u8] = []
-                        return -1 if not Json::object_string_value(raw, object_start, object_end, "path", &path)
-                        for key_index in 0..<alias.count |out, alias|:
-                            out.push(alias[key_index])
-                        out.push(0)
-                        count <- count + 1.usize()
-                    in_string <- false
-            return count.i64()
+            cursor: mutable usize = Json::skip_whitespace(raw, dependency_start + 1.usize(), dependency_end)
+            return 0 if cursor == dependency_end
+            while cursor < dependency_end:
+                return -1 if count >= maximum_edges
+                entry: mutable DependencyEntry::Span = DependencyEntry::Span{name_start: 0, name_end: 0, object_start: 0, object_end: 0}
+                return -1 if not DependencyEntry::read(raw, cursor, dependency_end, &entry)
+                path: mutable darray[u8] = []
+                return -1 if not Json::object_string_value(raw, entry.object_start, entry.object_end, "path", &path)
+                ByteText::append_range(out, raw, entry.name_start, entry.name_end)
+                out.push(0)
+                count <- count + 1.usize()
+                cursor <- Json::skip_whitespace(raw, entry.object_end + 1.usize(), dependency_end)
+                return count.i64() if cursor == dependency_end
+                return -1 if raw[cursor] != 44
+                cursor <- Json::skip_whitespace(raw, cursor + 1.usize(), dependency_end)
+            return -1
 
         def find_dependency_span(raw: darray[u8]&, alias: darray[u8]&, start_out: mutable usize&, end_out: mutable usize&) -> bool:
             start_out <- 0.usize()
@@ -239,46 +212,20 @@ module Manifest:
             dependency_end: usize = Json::object_end(raw, dependency_start)
             return false if dependency_end <= dependency_start or dependency_end >= raw.count or raw[dependency_start] != 123
             dependency_count: mutable usize = 0.usize()
-            in_string: mutable bool = false
-            escaped: mutable bool = false
-            string_start: mutable usize = 0.usize()
-            braces: mutable i64 = 1
-            brackets: mutable i64 = 0
-            for index in (dependency_start + 1.usize())..<dependency_end |raw, dependency_count, in_string, escaped, string_start, braces, brackets|:
-                byte: u8 = raw[index]
-                if not in_string:
-                    if byte == 34:
-                        in_string <- true
-                        string_start <- index + 1.usize()
-                    elif byte == 123:
-                        braces <- braces + 1
-                    elif byte == 125:
-                        braces <- braces - 1
-                    elif byte == 91:
-                        brackets <- brackets + 1
-                    elif byte == 93:
-                        brackets <- brackets - 1
-                elif escaped:
-                    escaped <- false
-                elif byte == 92:
-                    escaped <- true
-                elif byte == 34:
-                    after: mutable usize = index + 1.usize()
-                    after <- Json::skip_whitespace(raw, after, dependency_end)
-                    direct_key: bool = braces == 1 and brackets == 0 and after < dependency_end and raw[after] == 58
-                    if direct_key:
-                        return false if dependency_count >= maximum_dependencies
-                        dependency_count <- dependency_count + 1.usize()
-                        return false if not PackageIdentity::valid_name_segment(raw, string_start, index)
-                        after <- after + 1.usize()
-                        after <- Json::skip_whitespace(raw, after, dependency_end)
-                        return false if after >= dependency_end or raw[after] != 123
-                        value_end: usize = Json::object_end(raw, after)
-                        return false if:
-                            value_end <= after or value_end >= dependency_end
-                            not valid_dependency_object(raw, after, value_end)
-                    in_string <- false
-            return true
+            cursor: mutable usize = Json::skip_whitespace(raw, dependency_start + 1.usize(), dependency_end)
+            return true if cursor == dependency_end
+            while cursor < dependency_end:
+                return false if dependency_count >= maximum_dependencies
+                entry: mutable DependencyEntry::Span = DependencyEntry::Span{name_start: 0, name_end: 0, object_start: 0, object_end: 0}
+                return false if not:
+                    DependencyEntry::read(raw, cursor, dependency_end, &entry)
+                    valid_dependency_object(raw, entry.object_start, entry.object_end)
+                dependency_count <- dependency_count + 1.usize()
+                cursor <- Json::skip_whitespace(raw, entry.object_end + 1.usize(), dependency_end)
+                return true if cursor == dependency_end
+                return false if raw[cursor] != 44
+                cursor <- Json::skip_whitespace(raw, cursor + 1.usize(), dependency_end)
+            return false
 
     private:
         const maximum_dependencies: usize = 4096.usize()
