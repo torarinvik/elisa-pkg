@@ -58,6 +58,29 @@ module Registry:
             return read_index_with_key_fingerprint(package, out, yanked_flags_out, generation_out, snapshot_digest_out, identity_out, &key_fingerprint)
 
     private:
+        # Authenticate `metadata` with the trust root at `key_path` and check
+        # that its signed `expires` time has not passed.
+        def verify_signed_metadata(key_path: darray[u8]&, metadata: darray[u8]&, signature: darray[u8]&, expires_out: mutable u64&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            public_key: mutable darray[u8] = []
+            return ResultCode.MissingTrustRoot if RegistryFiles::read_trusted_file(key_path, Trust::ed25519_public_key_bytes, &public_key) != Trust::ed25519_public_key_bytes.i64()
+            return ResultCode.InvalidSignature if Trust::verify_detached("ed25519", public_key, metadata, signature) != Trust::VerificationCode.Valid
+            return ResultCode.MalformedMetadata if not ReleaseMetadata::unsigned_field(metadata, "expires", expires_out)
+            return metadata_expiry_result(expires_out)
+
+        # The archive named by authenticated metadata exists with the expected
+        # size and its bytes match the metadata.
+        def verify_archive_file(root: darray[u8]&, package: darray[u8]&, version: darray[u8]&, metadata: darray[u8]&, archive: darray[u8]&, digest: darray[u8]&, archive_size: u64) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            archive_path: mutable darray[u8] = []
+            return ResultCode.InvalidConfiguration if not RegistryFiles::join_archive_path(root, package, version, archive, &archive_path)
+            region actual_size_scope:
+                terminated_path: darray[u8] = ProjectFiles::with_null_terminator(archive_path)
+                actual_size: i64 = Platform::package_file_size((&terminated_path[0]).cast[cstr] can Unsafe.PointerCast)
+                return ResultCode.ArchiveMissing if actual_size < 0
+                return ResultCode.DigestMismatch if actual_size.u64() != archive_size
+            archive_bytes: mutable darray[u8] = []
+            return ResultCode.ArchiveMissing if not RegistryFiles::read_file(archive_path, Archive::maximum_archive_bytes, &archive_bytes)
+            return verify_archive_payload(package, version, metadata, archive_bytes, digest, archive_size)
+
         # Check `expires` against the current wall clock.
         def metadata_expiry_result(expires: u64) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             now: i64 = Platform::wall_clock_seconds()
@@ -322,18 +345,10 @@ module Registry:
             region trust_root_status_scope:
                 trust_root_status: ResultCode = configuration_result(RegistryConfiguration::configured_trust_root(root, &key_path))
                 return trust_root_status if trust_root_status != ResultCode.Ok
-            public_key: mutable darray[u8] = []
-            return ResultCode.MissingTrustRoot if RegistryFiles::read_trusted_file(key_path, Trust::ed25519_public_key_bytes, &public_key) != Trust::ed25519_public_key_bytes.i64()
-            region trust_status_scope:
-                trust_status: Trust::VerificationCode = Trust::verify_detached("ed25519", public_key, metadata, signature)
-                return ResultCode.InvalidSignature if trust_status != Trust::VerificationCode.Valid
             verified_expires: mutable u64 = 0
-            return ResultCode.MalformedMetadata if not ReleaseMetadata::unsigned_field(metadata, "expires", &verified_expires)
-            now: i64 = Platform::wall_clock_seconds()
-            return ResultCode.ClockUnavailable if now < 0
-            region expiry_status_scope:
-                expiry_status: ResultCode = rollback_store_result(RollbackStore::metadata_expiry_status(verified_expires, now.u64()))
-                return expiry_status if expiry_status != ResultCode.Ok
+            region signature_status_scope:
+                signature_status: ResultCode = verify_signed_metadata(key_path, metadata, signature, &verified_expires)
+                return signature_status if signature_status != ResultCode.Ok
             return ResultCode.MalformedMetadata if not ReleaseMetadata::dependencies(metadata, dependencies_out)
             ByteText::append(archive_out, verified_archive)
             ByteText::append(digest_out, verified_digest)
@@ -397,31 +412,12 @@ module Registry:
             return ResultCode.InvalidConfiguration if not RegistryFiles::sibling_path(metadata_path, "metadata.sig", &signature_path)
             signature: mutable darray[u8] = []
             return ResultCode.MissingSignature if not RegistryFiles::read_file(signature_path, Trust::ed25519_signature_bytes, &signature)
-            public_key: mutable darray[u8] = []
-            return ResultCode.MissingTrustRoot if RegistryFiles::read_trusted_file(key_path, Trust::ed25519_public_key_bytes, &public_key) != Trust::ed25519_public_key_bytes.i64()
-            region trust_status_scope:
-                trust_status: Trust::VerificationCode = Trust::verify_detached("ed25519", public_key, metadata, signature)
-                return ResultCode.InvalidSignature if trust_status != Trust::VerificationCode.Valid
-            expires: mutable u64 = 0
-            return ResultCode.MalformedMetadata if not ReleaseMetadata::unsigned_field(metadata, "expires", &expires)
-            now: i64 = Platform::wall_clock_seconds()
-            return ResultCode.ClockUnavailable if now < 0
-            region expiry_status_scope:
-                expiry_status: ResultCode = rollback_store_result(RollbackStore::metadata_expiry_status(expires, now.u64()))
-                return expiry_status if expiry_status != ResultCode.Ok
+            region signature_status_scope:
+                expires: mutable u64 = 0
+                signature_status: ResultCode = verify_signed_metadata(key_path, metadata, signature, &expires)
+                return signature_status if signature_status != ResultCode.Ok
             if verify_archive:
-                archive_path: mutable darray[u8] = []
-                return ResultCode.InvalidConfiguration if not RegistryFiles::join_archive_path(root, package, selected, selected_archive, &archive_path)
-                archive_c: mutable darray[u8] = []
-                archive_c <- ProjectFiles::with_null_terminator(archive_path)
-                archive_name: cstr = (&archive_c[0]).cast[cstr] can Unsafe.PointerCast
-                region actual_size_scope:
-                    actual_size: i64 = Platform::package_file_size(archive_name)
-                    return ResultCode.ArchiveMissing if actual_size < 0
-                    return ResultCode.DigestMismatch if actual_size.u64() != selected_archive_size
-                archive_bytes: mutable darray[u8] = []
-                return ResultCode.ArchiveMissing if not RegistryFiles::read_file(archive_path, Archive::maximum_archive_bytes, &archive_bytes)
-                archive_status: ResultCode = verify_archive_payload(package, selected, metadata, archive_bytes, selected_digest, selected_archive_size)
+                archive_status: ResultCode = verify_archive_file(root, package, selected, metadata, selected_archive, selected_digest, selected_archive_size)
                 return archive_status if archive_status != ResultCode.Ok
             ByteText::append(version_out, selected)
             ByteText::append(metadata_out, metadata)
