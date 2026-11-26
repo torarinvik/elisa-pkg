@@ -30,6 +30,7 @@ include "./cache.elisa"
 include "./resolution/resolve.elisa"
 include "./resolution/solver.elisa"
 include "./registry.elisa"
+include "./text/bytes.elisa"
 
 module Cli:
     private:
@@ -72,88 +73,6 @@ module Cli:
         global mutable transaction_lock_fd: i64 = -1
         # ---------- byte and output helpers ---------------------------------------------------
 
-        def bytes_push_view(out: mutable darray[u8]&, value: cstr) -> void can[Memory.Allocate, Abort.Panic]:
-            length: usize = Platform::pkg_strlen(value)
-            for index in 0..<length |out, value|:
-                byte: u8 = value[index].u8()
-                out.push(byte)
-
-        def bytes_push_i64(out: mutable darray[u8]&, value: i64) -> void can[Memory.Allocate, Abort.Panic]:
-            negative: bool = value < 0
-            unsigned: mutable u64 = (0.u64() - value.u64()) if negative else value.u64()
-            digits: mutable darray[u8] = []
-            while unsigned > 0.u64() |digits, unsigned|:
-                digits.push((48.u64() + (unsigned % 10.u64())).u8())
-                unsigned <- unsigned / 10.u64()
-            digits.push(48) if digits.count == 0.usize()
-            out.push(45) if negative
-            cursor: mutable usize = digits.count
-            while cursor > 0.usize() |out, digits, cursor|:
-                cursor <- cursor - 1.usize()
-                out.push(digits[cursor])
-
-        def bytes_push_cstr(out: mutable darray[u8]&, value: cstr) -> void can[Memory.Allocate, Abort.Panic]:
-            index: mutable usize = 0.usize()
-            while index < 1048576.usize() |out, value, index|:
-                byte: u8 = value[index].u8()
-                break if byte == 0
-                out.push(byte)
-                index <- index + 1.usize()
-
-        def bytes_equal(left: darray[u8]&, right: darray[u8]&) -> bool:
-            false return if left.count != right.count
-            for index in 0..<left.count |left, right|:
-                false return if left[index] != right[index]
-            return true
-
-        def bytes_equal_view(left: darray[u8]&, right: cstr) -> bool:
-            length: usize = Platform::pkg_strlen(right)
-            false return if left.count != length
-            for index in 0..<left.count |left, right|:
-                right_byte: u8 = right[index].u8()
-                false return if left[index] != right_byte
-            return true
-
-        def cstr_equal(left: cstr, right: cstr) -> bool:
-            left_length: usize = Platform::pkg_strlen(left)
-            right_length: usize = Platform::pkg_strlen(right)
-            return false if left_length != right_length
-            for index in 0..<left_length |left, right|:
-                return false if left[index].u8() != right[index].u8()
-            return true
-
-        def bytes_count(haystack: darray[u8]&, needle: cstr) -> usize:
-            needle_length: usize = Platform::pkg_strlen(needle)
-            total: mutable usize = 0.usize()
-            return total if needle_length == 0.usize() or needle_length > haystack.count
-            start: mutable usize = 0.usize()
-            while start + needle_length <= haystack.count |haystack, needle, total, start, needle_length|:
-                matched: mutable bool = true
-                for offset in 0..<needle_length |haystack, needle, start, matched|:
-                    needle_byte: u8 = needle[offset].u8()
-                    if haystack[start + offset] != needle_byte:
-                        matched <- false
-                        break
-                if matched:
-                    total <- total + 1.usize()
-                    start <- start + needle_length
-                else:
-                    start <- start + 1.usize()
-            return total
-
-        def bytes_starts_with(value: darray[u8]&, prefix: darray[u8]&) -> bool:
-            return false if prefix.count > value.count
-            for index in 0..<prefix.count |value, prefix|:
-                return false if value[index] != prefix[index]
-            return true
-
-        def bytes_ends_with(value: darray[u8]&, suffix: darray[u8]&) -> bool:
-            return false if suffix.count > value.count
-            offset: usize = value.count - suffix.count
-            for index in 0..<suffix.count |value, suffix, offset|:
-                return false if value[offset + index] != suffix[index]
-            return true
-
         def write_bytes(fd: i64, value: darray[u8]&) -> void can[Global.Read, Console.Write, Unsafe.PointerCast]:
             can Global.Read:
                 return if fd == 1 and cli_quiet and not cli_json_output
@@ -168,7 +87,7 @@ module Cli:
             can Global.Read:
                 return if fd == 1 and cli_quiet and not cli_json_output
                 buffer: mutable darray[u8] = []
-                bytes_push_view(&buffer, value)
+                ByteText::append_text(&buffer, value)
                 write_bytes(fd, &buffer)
 
         def write_error(value: cstr) -> void can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -227,38 +146,38 @@ module Cli:
         def tool_file_identity(path: cstr, optional: bool, executable: bool, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out.resize(0)
             if path[0].u8() == 0:
-                bytes_push_view(out, "none" if optional else "unavailable")
+                ByteText::append_text(out, "none" if optional else "unavailable")
                 return optional
             resolved_path: mutable darray[u8] = []
             if not Toolchain::canonical_path_bytes(path, &resolved_path):
-                bytes_push_view(out, "unavailable")
+                ByteText::append_text(out, "unavailable")
                 return false
             for index in 0..<resolved_path.count |resolved_path, out|:
                 byte: u8 = resolved_path[index]
                 if byte < 32 or byte == 127:
                     out.resize(0)
-                    bytes_push_view(out, "unavailable")
+                    ByteText::append_text(out, "unavailable")
                     return false
             if executable:
                 resolved_path_c: mutable darray[u8] = []
                 path_with_nul_into(&resolved_path, &resolved_path_c)
                 resolved_path_name: cstr = (&resolved_path_c[0]).cast[cstr] can Unsafe.PointerCast
                 if Platform::pkg_access(resolved_path_name, 1) != 0:
-                    bytes_push_view(out, "unavailable")
+                    ByteText::append_text(out, "unavailable")
                     return false
             content: mutable darray[u8] = []
             if not read_package_file_into(&resolved_path, &content):
-                bytes_push_view(out, "unavailable")
+                ByteText::append_text(out, "unavailable")
                 return false
             digest_bytes: mutable darray[u8] = []
             digest: mutable darray[u8] = []
             if Integrity::sha256(content, &digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(digest_bytes, &digest):
-                bytes_push_view(out, "unavailable")
+                ByteText::append_text(out, "unavailable")
                 return false
-            bytes_push_view(out, "path:")
-            bytes_push_array(out, resolved_path)
-            bytes_push_view(out, ";sha256:")
-            bytes_push_array(out, digest)
+            ByteText::append_text(out, "path:")
+            ByteText::append(out, resolved_path)
+            ByteText::append_text(out, ";sha256:")
+            ByteText::append(out, digest)
             return true
 
         def read_cstr_into(path_name: cstr, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -294,15 +213,15 @@ module Cli:
             # mkstemp provides an exclusive 0600 temporary file; fsync and rename make
             # the lockfile transition atomic and prevent readers from seeing a prefix.
             path_snapshot: mutable darray[u8] = []
-            bytes_push_cstr(&path_snapshot, path_name)
+            ByteText::append_bounded_text(&path_snapshot, path_name)
             template: mutable darray[u8] = []
-            bytes_push_array(&template, path_snapshot)
-            bytes_push_view(&template, ".tmp.XXXXXX")
+            ByteText::append(&template, path_snapshot)
+            ByteText::append_text(&template, ".tmp.XXXXXX")
             template.push(0)
             fd: i64 = Platform::pkg_mkstemp(&template)
             return false if fd < 0
             temp_snapshot: mutable darray[u8] = []
-            bytes_push_array(&temp_snapshot, template)
+            ByteText::append(&temp_snapshot, template)
             if not write_fd_all(fd, value):
                 _ = Platform::pkg_close(fd)
                 return false
@@ -312,7 +231,7 @@ module Cli:
             if Platform::pkg_close(fd) != 0:
                 return false
             temp_c: mutable darray[u8] = []
-            bytes_push_array(&temp_c, temp_snapshot)
+            ByteText::append(&temp_c, temp_snapshot)
             target_c: mutable darray[u8] = []
             path_with_nul_into(&path_snapshot, &target_c)
             temp_name: cstr = (&temp_c[0]).cast[cstr] can Unsafe.PointerCast
@@ -333,22 +252,22 @@ module Cli:
             # never be replaced by a rename race. The temporary is removed after the
             # link, leaving one durable directory entry for the caller to own.
             path_snapshot: mutable darray[u8] = []
-            bytes_push_cstr(&path_snapshot, path_name)
+            ByteText::append_bounded_text(&path_snapshot, path_name)
             template: mutable darray[u8] = []
-            bytes_push_array(&template, path_snapshot)
-            bytes_push_view(&template, ".tmp.XXXXXX")
+            ByteText::append(&template, path_snapshot)
+            ByteText::append_text(&template, ".tmp.XXXXXX")
             template.push(0)
             fd: i64 = Platform::pkg_mkstemp(&template)
             return -5 if fd < 0
             temp_snapshot: mutable darray[u8] = []
-            bytes_push_array(&temp_snapshot, template)
+            ByteText::append(&temp_snapshot, template)
             if not write_fd_all(fd, value) or Platform::pkg_fsync(fd) != 0:
                 _ = Platform::pkg_close(fd)
                 return -5
             if Platform::pkg_close(fd) != 0:
                 return -5
             temp_c: mutable darray[u8] = []
-            bytes_push_array(&temp_c, temp_snapshot)
+            ByteText::append(&temp_c, temp_snapshot)
             target_c: mutable darray[u8] = []
             path_with_nul_into(&path_snapshot, &target_c)
             temp_name: mutable cstr = (&temp_c[0]).cast[cstr] can Unsafe.PointerCast
@@ -360,7 +279,7 @@ module Cli:
                 # replacement installed by another actor.
                 return link_status
             temp_c.resize(0)
-            bytes_push_array(&temp_c, temp_snapshot)
+            ByteText::append(&temp_c, temp_snapshot)
             temp_name <- (&temp_c[0]).cast[cstr] can Unsafe.PointerCast
             unlink_status: i64 = Platform::pkg_unlink(temp_name)
             if unlink_status != 0:
@@ -390,7 +309,7 @@ module Cli:
             # successful fetch into an unverified cache hit.
             digest_bytes: mutable darray[u8] = []
             actual: mutable darray[u8] = []
-            return false if Integrity::sha256(content, &digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(digest_bytes, &actual) or not bytes_equal(actual, digest)
+            return false if Integrity::sha256(content, &digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(digest_bytes, &actual) or not ByteText::equal(actual, digest)
             blob_path: mutable darray[u8] = []
             return false if not Cache::blob_path(digest, &blob_path)
             cache_parent: mutable darray[u8] = []
@@ -402,7 +321,7 @@ module Cli:
             if cstr_file_exists(blob_c):
                 return true if Cache::verify_blob(digest)
                 quarantine_parent: mutable darray[u8] = []
-                bytes_push_view(&quarantine_parent, Cache::quarantine_directory)
+                ByteText::append_text(&quarantine_parent, Cache::quarantine_directory)
                 return false if not make_directory(&quarantine_parent)
                 return false if not Cache::quarantine_blob(digest)
             publication_status: i64 = write_cstr_file_noclobber_status(blob_c, content)
@@ -479,7 +398,7 @@ module Cli:
 
         def remove_known_file(path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             path_snapshot: mutable darray[u8] = []
-            bytes_push_array(&path_snapshot, path)
+            ByteText::append(&path_snapshot, path)
             path_c: mutable darray[u8] = []
             path_with_nul_into(&path_snapshot, &path_c)
             path_name: mutable cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
@@ -496,7 +415,7 @@ module Cli:
         # otherwise a power loss could resurrect an old intent after success.
         def retire_local_install_transaction(path: darray[u8]&) -> bool can[Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             path_snapshot: mutable darray[u8] = []
-            bytes_push_array(&path_snapshot, path)
+            ByteText::append(&path_snapshot, path)
             return false if not remove_known_file(&path_snapshot)
             InstallFaults::transaction_boundary("transaction.journal.unlinked")
             path_c: mutable darray[u8] = []
@@ -541,7 +460,7 @@ module Cli:
             can Global{Read,Write}:
                 return true if transaction_lock_fd >= 0
                 lock_path: mutable darray[u8] = []
-                bytes_push_view(&lock_path, ".elisapkg/transaction.flock")
+                ByteText::append_text(&lock_path, ".elisapkg/transaction.flock")
                 lock_path_c: mutable darray[u8] = []
                 path_with_nul_into(&lock_path, &lock_path_c)
                 lock_path_name: cstr = (&lock_path_c[0]).cast[cstr] can Unsafe.PointerCast
@@ -582,7 +501,7 @@ module Cli:
                 return false if not remove_cstr_file(".elisapkg/transaction.new-lock")
                 return false if not remove_cstr_file(".elisapkg/transaction.new-lock-missing")
                 guard: mutable darray[u8] = []
-                bytes_push_view(&guard, ".elisapkg/transaction.guard")
+                ByteText::append_text(&guard, ".elisapkg/transaction.guard")
                 return false if not remove_empty_directory(&guard)
                 return false if not remove_cstr_file(".elisapkg/transaction.state")
                 return transaction_lock_release()
@@ -590,11 +509,11 @@ module Cli:
         def transaction_begin_with_lock(original_manifest: darray[u8]&, expected_lock_state: i64, expected_lock: darray[u8]&) -> bool can[Global{Read,Write}, Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             can Global{Read,Write}:
                 state_root: mutable darray[u8] = []
-                bytes_push_view(&state_root, ".elisapkg")
+                ByteText::append_text(&state_root, ".elisapkg")
                 return false if not make_directory(&state_root)
                 return false if not transaction_lock_acquire()
                 guard: mutable darray[u8] = []
-                bytes_push_view(&guard, ".elisapkg/transaction.guard")
+                ByteText::append_text(&guard, ".elisapkg/transaction.guard")
                 guard_c: mutable darray[u8] = []
                 path_with_nul_into(&guard, &guard_c)
                 guard_name: cstr = (&guard_c[0]).cast[cstr] can Unsafe.PointerCast
@@ -614,7 +533,7 @@ module Cli:
                 # overwriting a newer dependency edit from a stale snapshot.
                 current_manifest: mutable darray[u8] = []
                 current_manifest.resize(1048577)
-                if not read_cstr_into("elisapkg.json", &current_manifest) or not bytes_equal(current_manifest, original_manifest):
+                if not read_cstr_into("elisapkg.json", &current_manifest) or not ByteText::equal(current_manifest, original_manifest):
                     _ = transaction_abort_begin(guard)
                     return false
                 if expected_lock_state != -3:
@@ -625,7 +544,7 @@ module Cli:
                     if current_lock_state >= 0:
                         current_lock: mutable darray[u8] = []
                         current_lock.resize(1048577)
-                        if not read_cstr_into("elisapkg.lock", &current_lock) or not bytes_equal(current_lock, expected_lock):
+                        if not read_cstr_into("elisapkg.lock", &current_lock) or not ByteText::equal(current_lock, expected_lock):
                             _ = transaction_abort_begin(guard)
                             return false
                 if not write_cstr_file(".elisapkg/transaction.manifest", original_manifest):
@@ -639,9 +558,9 @@ module Cli:
                     if not read_cstr_into("elisapkg.lock", &original_lock) or not write_cstr_file(".elisapkg/transaction.lock", &original_lock):
                         _ = transaction_cleanup()
                         return false
-                    bytes_push_view(&state, "prepared-lock\n")
+                    ByteText::append_text(&state, "prepared-lock\n")
                 elif lock_state == -2:
-                    bytes_push_view(&state, "prepared-no-lock\n")
+                    ByteText::append_text(&state, "prepared-no-lock\n")
                 else:
                     _ = transaction_cleanup()
                     return false
@@ -662,7 +581,7 @@ module Cli:
             # either atomic rename boundary.
             return false if not write_cstr_file(".elisapkg/transaction.new-manifest", new_manifest)
             state: mutable darray[u8] = []
-            bytes_push_view(&state, "manifest-pending\n")
+            ByteText::append_text(&state, "manifest-pending\n")
             return write_cstr_file(".elisapkg/transaction.state", &state)
 
         def transaction_mark_lock() -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
@@ -675,14 +594,14 @@ module Cli:
                 current_lock: mutable darray[u8] = []
                 current_lock.resize(1048577)
                 return false if not read_cstr_into("elisapkg.lock", &current_lock)
-                return bytes_equal(staged_lock, current_lock)
+                return ByteText::equal(staged_lock, current_lock)
             if cstr_file_exists("elisapkg.lock"):
                 current_lock: mutable darray[u8] = []
                 current_lock.resize(1048577)
                 return false if not read_cstr_into("elisapkg.lock", &current_lock)
                 return write_cstr_file(".elisapkg/transaction.new-lock", &current_lock)
             missing: mutable darray[u8] = []
-            bytes_push_view(&missing, "missing\n")
+            ByteText::append_text(&missing, "missing\n")
             return write_cstr_file(".elisapkg/transaction.new-lock-missing", &missing)
 
         def transaction_restore() -> bool can[Global{Read,Write}, Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
@@ -690,7 +609,7 @@ module Cli:
                 state: mutable darray[u8] = []
                 state.resize(128)
                 return false if not read_cstr_into(".elisapkg/transaction.state", &state)
-                recognized: bool = bytes_equal_view(state, "prepared-lock\n") or bytes_equal_view(state, "prepared-no-lock\n") or bytes_equal_view(state, "manifest-pending\n") or bytes_equal_view(state, "manifest-replaced\n")
+                recognized: bool = ByteText::equal_text(state, "prepared-lock\n") or ByteText::equal_text(state, "prepared-no-lock\n") or ByteText::equal_text(state, "manifest-pending\n") or ByteText::equal_text(state, "manifest-replaced\n")
                 return false if not recognized
                 original_manifest: mutable darray[u8] = []
                 original_manifest.resize(1048577)
@@ -698,14 +617,14 @@ module Cli:
                 current_manifest: mutable darray[u8] = []
                 current_manifest.resize(1048577)
                 return false if not read_cstr_into("elisapkg.json", &current_manifest)
-                if bytes_equal_view(state, "manifest-pending\n") or bytes_equal_view(state, "manifest-replaced\n"):
+                if ByteText::equal_text(state, "manifest-pending\n") or ByteText::equal_text(state, "manifest-replaced\n"):
                     new_manifest: mutable darray[u8] = []
                     new_manifest.resize(1048577)
                     return false if not read_cstr_into(".elisapkg/transaction.new-manifest", &new_manifest)
-                    if not bytes_equal(current_manifest, new_manifest) and not bytes_equal(current_manifest, original_manifest):
+                    if not ByteText::equal(current_manifest, new_manifest) and not ByteText::equal(current_manifest, original_manifest):
                         write_error("error: transaction recovery found an external manifest edit; recovery files were retained\n")
                         return false
-                elif not bytes_equal(current_manifest, original_manifest):
+                elif not ByteText::equal(current_manifest, original_manifest):
                     write_error("error: transaction recovery found an external manifest edit; recovery files were retained\n")
                     return false
                 original_lock_state: i64 = Platform::pkg_package_file_size(".elisapkg/transaction.lock")
@@ -726,7 +645,7 @@ module Cli:
                 if new_lock_missing_state >= 0:
                     missing_lock_marker: mutable darray[u8] = []
                     missing_lock_marker.resize(64)
-                    return false if not read_cstr_into(".elisapkg/transaction.new-lock-missing", &missing_lock_marker) or not bytes_equal_view(missing_lock_marker, "missing\n")
+                    return false if not read_cstr_into(".elisapkg/transaction.new-lock-missing", &missing_lock_marker) or not ByteText::equal_text(missing_lock_marker, "missing\n")
                 if current_lock_present:
                     current_lock: mutable darray[u8] = []
                     current_lock.resize(1048577)
@@ -735,22 +654,22 @@ module Cli:
                         new_lock: mutable darray[u8] = []
                         new_lock.resize(1048577)
                         return false if not read_cstr_into(".elisapkg/transaction.new-lock", &new_lock)
-                        if not bytes_equal(current_lock, new_lock) and (not original_lock_present or not bytes_equal(current_lock, original_lock)):
+                        if not ByteText::equal(current_lock, new_lock) and (not original_lock_present or not ByteText::equal(current_lock, original_lock)):
                             write_error("error: transaction recovery found an external lockfile edit; recovery files were retained\n")
                             return false
-                    elif not original_lock_present or not bytes_equal(current_lock, original_lock):
+                    elif not original_lock_present or not ByteText::equal(current_lock, original_lock):
                         write_error("error: transaction recovery found an external lockfile edit; recovery files were retained\n")
                         return false
                 elif original_lock_present and new_lock_missing_state < 0:
                     write_error("error: transaction recovery found an external lockfile edit; recovery files were retained\n")
                     return false
                 return false if not write_cstr_file("elisapkg.json", &original_manifest)
-                if bytes_equal_view(state, "prepared-lock\n") or ((bytes_equal_view(state, "manifest-pending\n") or bytes_equal_view(state, "manifest-replaced\n")) and original_lock_present):
+                if ByteText::equal_text(state, "prepared-lock\n") or ((ByteText::equal_text(state, "manifest-pending\n") or ByteText::equal_text(state, "manifest-replaced\n")) and original_lock_present):
                     return false if not write_cstr_file("elisapkg.lock", &original_lock)
                 else:
                     return false if not remove_cstr_file("elisapkg.lock")
                 restored_state: mutable darray[u8] = []
-                bytes_push_view(&restored_state, "restored\n")
+                ByteText::append_text(&restored_state, "restored\n")
                 return false if not write_cstr_file(".elisapkg/transaction.state", &restored_state)
                 return transaction_cleanup()
 
@@ -773,7 +692,7 @@ module Cli:
                     write_error("error: this transaction guard predates automatic recovery; preserve its journal and guard for operator recovery\n")
                     return false
                 state_root: mutable darray[u8] = []
-                bytes_push_view(&state_root, ".elisapkg")
+                ByteText::append_text(&state_root, ".elisapkg")
                 return false if not make_directory(&state_root)
                 if not transaction_lock_acquire():
                     write_error("error: a package edit is active; wait for it to finish before retrying\n")
@@ -789,7 +708,7 @@ module Cli:
                     # backups and the stale guard while holding the kernel lock.
                     return transaction_cleanup()
                 guard: mutable darray[u8] = []
-                bytes_push_view(&guard, ".elisapkg/transaction.guard")
+                ByteText::append_text(&guard, ".elisapkg/transaction.guard")
                 guard_c: mutable darray[u8] = []
                 path_with_nul_into(&guard, &guard_c)
                 guard_name: cstr = (&guard_c[0]).cast[cstr] can Unsafe.PointerCast
@@ -801,11 +720,11 @@ module Cli:
                 if not read_cstr_into(".elisapkg/transaction.state", &state):
                     _ = transaction_lock_release()
                     return false
-                recognized: bool = bytes_equal_view(state, "complete\n") or bytes_equal_view(state, "restored\n") or bytes_equal_view(state, "prepared-lock\n") or bytes_equal_view(state, "prepared-no-lock\n") or bytes_equal_view(state, "manifest-pending\n") or bytes_equal_view(state, "manifest-replaced\n")
+                recognized: bool = ByteText::equal_text(state, "complete\n") or ByteText::equal_text(state, "restored\n") or ByteText::equal_text(state, "prepared-lock\n") or ByteText::equal_text(state, "prepared-no-lock\n") or ByteText::equal_text(state, "manifest-pending\n") or ByteText::equal_text(state, "manifest-replaced\n")
                 if not recognized:
                     _ = transaction_lock_release()
                     return false
-                recovered: bool = transaction_cleanup() if bytes_equal_view(state, "complete\n") or bytes_equal_view(state, "restored\n") else transaction_restore()
+                recovered: bool = transaction_cleanup() if ByteText::equal_text(state, "complete\n") or ByteText::equal_text(state, "restored\n") else transaction_restore()
                 if not recovered:
                     # Retain the journal and guard, but release the OS lock so a
                     # later invocation can retry after an external edit or I/O
@@ -816,7 +735,7 @@ module Cli:
         def transaction_commit() -> bool can[Global{Read,Write}, Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             can Global{Read,Write}:
                 state: mutable darray[u8] = []
-                bytes_push_view(&state, "complete\n")
+                ByteText::append_text(&state, "complete\n")
                 return false if not write_cstr_file(".elisapkg/transaction.state", &state)
                 return transaction_cleanup()
 
@@ -856,7 +775,7 @@ module Cli:
                     return false if not valid_package_name(target_name)
                     target_kind: mutable darray[u8] = []
                     return false if not Json::object_string_value(raw, index, object_end, "kind", &target_kind)
-                    return false if not (bytes_equal_view(target_kind, "bin") or bytes_equal_view(target_kind, "lib") or bytes_equal_view(target_kind, "test"))
+                    return false if not (ByteText::equal_text(target_kind, "bin") or ByteText::equal_text(target_kind, "lib") or ByteText::equal_text(target_kind, "test"))
                     target_entry: mutable darray[u8] = []
                     return false if not Json::object_string_value(raw, index, object_end, "entry", &target_entry)
                     return false if not safe_relative_entry(target_entry) or not target_file_is_valid(root, target_entry)
@@ -993,36 +912,23 @@ module Cli:
                             key.push(raw[key_index])
                         allowed: mutable bool = false
                         if set_kind == 1:
-                            allowed <- bytes_equal_view(key, "name") or bytes_equal_view(key, "version") or bytes_equal_view(key, "description") or bytes_equal_view(key, "license") or bytes_equal_view(key, "elisa")
+                            allowed <- ByteText::equal_text(key, "name") or ByteText::equal_text(key, "version") or ByteText::equal_text(key, "description") or ByteText::equal_text(key, "license") or ByteText::equal_text(key, "elisa")
                         elif set_kind == 2:
-                            allowed <- bytes_equal_view(key, "name") or bytes_equal_view(key, "kind") or bytes_equal_view(key, "entry")
+                            allowed <- ByteText::equal_text(key, "name") or ByteText::equal_text(key, "kind") or ByteText::equal_text(key, "entry")
                         elif set_kind == 3:
-                            allowed <- bytes_equal_view(key, "lock-version") or bytes_equal_view(key, "resolver") or bytes_equal_view(key, "package") or bytes_equal_view(key, "packages")
+                            allowed <- ByteText::equal_text(key, "lock-version") or ByteText::equal_text(key, "resolver") or ByteText::equal_text(key, "package") or ByteText::equal_text(key, "packages")
                         elif set_kind == 4:
-                            allowed <- bytes_equal_view(key, "name") or bytes_equal_view(key, "version") or bytes_equal_view(key, "source") or bytes_equal_view(key, "archive-size") or bytes_equal_view(key, "archive-digest") or bytes_equal_view(key, "metadata-digest")
+                            allowed <- ByteText::equal_text(key, "name") or ByteText::equal_text(key, "version") or ByteText::equal_text(key, "source") or ByteText::equal_text(key, "archive-size") or ByteText::equal_text(key, "archive-digest") or ByteText::equal_text(key, "metadata-digest")
                         elif set_kind == 5:
-                            allowed <- bytes_equal_view(key, "type") or bytes_equal_view(key, "registry") or bytes_equal_view(key, "archive")
+                            allowed <- ByteText::equal_text(key, "type") or ByteText::equal_text(key, "registry") or ByteText::equal_text(key, "archive")
                         elif set_kind == 6:
-                            allowed <- bytes_equal_view(key, "name") or bytes_equal_view(key, "version") or bytes_equal_view(key, "manifest-digest") or bytes_equal_view(key, "source-digest")
+                            allowed <- ByteText::equal_text(key, "name") or ByteText::equal_text(key, "version") or ByteText::equal_text(key, "manifest-digest") or ByteText::equal_text(key, "source-digest")
                         elif set_kind == 7:
-                            allowed <- bytes_equal_view(key, "path")
+                            allowed <- ByteText::equal_text(key, "path")
                         elif set_kind == 8:
-                            allowed <- bytes_equal_view(key, "registry") or bytes_equal_view(key, "version")
+                            allowed <- ByteText::equal_text(key, "registry") or ByteText::equal_text(key, "version")
                         return false if not allowed
                     in_string <- false
-            return true
-
-        def bytes_less(left: darray[u8]&, right: darray[u8]&) -> bool:
-            limit: usize = left.count if left.count < right.count else right.count
-            for index in 0..<limit |left, right|:
-                return true if left[index] < right[index]
-                return false if left[index] > right[index]
-            return left.count < right.count
-
-        def slice_equals_array(raw: darray[u8]&, start: usize, end: usize, wanted: darray[u8]&) -> bool:
-            return false if end < start or end - start != wanted.count
-            for index in 0..<wanted.count |raw, wanted|:
-                return false if raw[start + index] != wanted[index]
             return true
 
         def slice_less_slice(raw: darray[u8]&, left_start: usize, left_end: usize, right_start: usize, right_end: usize) -> bool:
@@ -1126,7 +1032,7 @@ module Cli:
                 candidate: mutable darray[u8] = []
                 if not queue_field_at(queue, record_starts, record, 1, &candidate):
                     return total
-                if bytes_less(candidate, wanted):
+                if ByteText::less(candidate, wanted):
                     lower <- middle + 1.usize()
                 else:
                     upper <- middle
@@ -1140,7 +1046,7 @@ module Cli:
             if not queue_field_at(queue, record_starts, record, 1, &candidate):
                 insertion_out <- total + 1.usize()
                 return total
-            return record if bytes_equal(candidate, wanted)
+            return record if ByteText::equal(candidate, wanted)
             return total
 
         def queue_insert_sorted_record(sorted_records: mutable darray[usize]&, insertion: usize, record: usize) -> bool can[Memory.Allocate, Abort.Panic]:
@@ -1215,7 +1121,7 @@ module Cli:
                         child_name: mutable darray[u8] = []
                         child_version: mutable darray[u8] = []
                         return false if not load_package_at(&child_root, &child_name, &child_version)
-                        return false if not bytes_equal(alias, child_name)
+                        return false if not ByteText::equal(alias, child_name)
                         insertion: mutable usize = 0.usize()
                         existing: usize = queue_name_record(queue, record_starts, sorted_records, total, child_name, &insertion)
                         return false if insertion > sorted_records.count
@@ -1223,7 +1129,7 @@ module Cli:
                             existing_path: mutable darray[u8] = []
                             existing_version: mutable darray[u8] = []
                             return false if not queue_field_at(queue, record_starts, existing, 0, &existing_path) or not queue_field_at(queue, record_starts, existing, 2, &existing_version)
-                            return false if not bytes_equal(existing_path, child_root) or not bytes_equal(existing_version, child_version)
+                            return false if not ByteText::equal(existing_path, child_root) or not ByteText::equal(existing_version, child_version)
                             edges.push(existing) if parent < total
                             in_string <- false
                             continue
@@ -1272,15 +1178,15 @@ module Cli:
             root_source_bytes: mutable usize = 0.usize()
             return [] if not source_tree_digest_at_bounded(root, &root_source_digest, MAX_BUILD_SNAPSHOT_BYTES, &root_source_bytes)
             graph_source_bytes <- root_source_bytes
-            bytes_push_view(&out, "{\n  \"lock-version\": 2,\n  \"resolver\": \"elisapkg-v2\",\n  \"package\": {\n    \"name\": \"")
-            bytes_push_array(&out, name)
-            bytes_push_view(&out, "\",\n    \"version\": \"")
-            bytes_push_array(&out, version)
-            bytes_push_view(&out, "\",\n    \"manifest-digest\": \"sha256:")
-            bytes_push_array(&out, root_digest)
-            bytes_push_view(&out, "\",\n    \"source-digest\": \"sha256:")
-            bytes_push_array(&out, root_source_digest)
-            bytes_push_view(&out, "\"\n  },\n  \"packages\": [")
+            ByteText::append_text(&out, "{\n  \"lock-version\": 2,\n  \"resolver\": \"elisapkg-v2\",\n  \"package\": {\n    \"name\": \"")
+            ByteText::append(&out, name)
+            ByteText::append_text(&out, "\",\n    \"version\": \"")
+            ByteText::append(&out, version)
+            ByteText::append_text(&out, "\",\n    \"manifest-digest\": \"sha256:")
+            ByteText::append(&out, root_digest)
+            ByteText::append_text(&out, "\",\n    \"source-digest\": \"sha256:")
+            ByteText::append(&out, root_source_digest)
+            ByteText::append_text(&out, "\"\n  },\n  \"packages\": [")
             queue: mutable darray[u8] = []
             record_starts: mutable darray[usize] = []
             sorted_records: mutable darray[usize] = []
@@ -1289,7 +1195,7 @@ module Cli:
             total: mutable usize = 0.usize()
             return [] if not append_local_dependency_records(raw, root, &queue, &record_starts, &sorted_records, &edges, &edge_count, &total, 18446744073709551615.usize())
             if total == 0.usize():
-                bytes_push_view(&out, "]\n}\n")
+                ByteText::append_text(&out, "]\n}\n")
                 return out
             edge_offsets: mutable darray[usize] = []
             edge_offsets.push(0.usize())
@@ -1304,11 +1210,11 @@ module Cli:
                 child_name: mutable darray[u8] = []
                 child_version: mutable darray[u8] = []
                 return [] if not validate_manifest_at(child_raw, &package_root, &child_name, &child_version)
-                return [] if bytes_equal(child_name, name)
+                return [] if ByteText::equal(child_name, name)
                 queued_name: mutable darray[u8] = []
                 queued_version: mutable darray[u8] = []
                 return [] if not queue_field_at(queue, record_starts, processed, 1, &queued_name) or not queue_field_at(queue, record_starts, processed, 2, &queued_version)
-                return [] if not bytes_equal(queued_name, child_name) or not bytes_equal(queued_version, child_version)
+                return [] if not ByteText::equal(queued_name, child_name) or not ByteText::equal(queued_version, child_version)
                 return [] if not append_local_dependency_records(child_raw, &package_root, &queue, &record_starts, &sorted_records, &edges, &edge_count, &total, processed)
                 processed <- processed + 1.usize()
                 edge_offsets.push(edges.count)
@@ -1335,19 +1241,19 @@ module Cli:
                 return [] if Integrity::sha256(selected_manifest, &selected_digest_bytes) != Integrity::DigestCode.Ok
                 return [] if not Integrity::hex_digest(selected_digest_bytes, &selected_digest)
                 out.push(44) if not first
-                bytes_push_view(&out, "\n    {\"name\":\"")
-                bytes_push_array(&out, selected_name)
-                bytes_push_view(&out, "\",\"version\":\"")
-                bytes_push_array(&out, selected_version)
-                bytes_push_view(&out, "\",\"source\":{\"type\":\"path\",\"path\":\"")
-                bytes_push_array(&out, selected_path)
-                bytes_push_view(&out, "\"},\"manifest-digest\":\"sha256:")
-                bytes_push_array(&out, selected_digest)
-                bytes_push_view(&out, "\",\"source-digest\":\"sha256:")
-                bytes_push_array(&out, selected_source_digest)
-                bytes_push_view(&out, "\"}")
+                ByteText::append_text(&out, "\n    {\"name\":\"")
+                ByteText::append(&out, selected_name)
+                ByteText::append_text(&out, "\",\"version\":\"")
+                ByteText::append(&out, selected_version)
+                ByteText::append_text(&out, "\",\"source\":{\"type\":\"path\",\"path\":\"")
+                ByteText::append(&out, selected_path)
+                ByteText::append_text(&out, "\"},\"manifest-digest\":\"sha256:")
+                ByteText::append(&out, selected_digest)
+                ByteText::append_text(&out, "\",\"source-digest\":\"sha256:")
+                ByteText::append(&out, selected_source_digest)
+                ByteText::append_text(&out, "\"}")
                 first <- false
-            bytes_push_view(&out, "\n  ]\n}\n")
+            ByteText::append_text(&out, "\n  ]\n}\n")
             return out
 
         def collect_registry_roots[@r](raw: darray[u8]&, out: mutable darray[Solver::Constraint]& @r, has_local: mutable bool&) -> bool can[Memory.Allocate, Abort.Panic]:
@@ -1400,7 +1306,7 @@ module Cli:
                             registry: mutable darray[u8] = []
                             requirement: mutable darray[u8] @r = []
                             return false if not Json::object_string_value(raw, after, value_end, "registry", &registry) or not Json::object_string_value(raw, after, value_end, "version", &requirement)
-                            return false if not bytes_equal_view(registry, "primary")
+                            return false if not ByteText::equal_text(registry, "primary")
                             return false if out.count >= MAX_DEPENDENCIES
                             out.push(Solver::Constraint{package: alias, requirement: requirement})
                     in_string <- false
@@ -1417,7 +1323,7 @@ module Cli:
                 finish: mutable usize = cursor
                 while finish < queue.count and queue[finish] != 0 |queue, finish|:
                     finish <- finish + 1
-                return true if finish - cursor == wanted.count and bytes_equal_range(queue, cursor, finish, wanted)
+                return true if finish - cursor == wanted.count and ByteText::range_equals(queue, cursor, finish, wanted)
                 cursor <- finish + 1
             return false
 
@@ -1468,7 +1374,7 @@ module Cli:
 
         def registry_candidate_matches(candidates: darray[Solver::Candidate]&, package: darray[u8]&, version: Model::Version) -> bool:
             for index in 0..<candidates.count |candidates, package, version|:
-                return true if bytes_equal(candidates[index].package, package) and SemVer::compare(candidates[index].version, version) == 0
+                return true if ByteText::equal(candidates[index].package, package) and SemVer::compare(candidates[index].version, version) == 0
             return false
 
         # Candidate enumeration drives graph solving before the selected
@@ -1483,7 +1389,7 @@ module Cli:
                 found: mutable bool = false
                 for right_index in 0..<right.count |left, right, used, left_index, found|:
                     continue if used[right_index]
-                    if bytes_equal(left[left_index].package, right[right_index].package) and bytes_equal(left[left_index].requirement, right[right_index].requirement):
+                    if ByteText::equal(left[left_index].package, right[right_index].package) and ByteText::equal(left[left_index].requirement, right[right_index].requirement):
                         used[right_index] <- true
                         found <- true
                         break
@@ -1492,7 +1398,7 @@ module Cli:
 
         def registry_preference_present(preferences: darray[Solver::Preference]&, package: darray[u8]&) -> bool:
             for index in 0..<preferences.count |preferences, package|:
-                return true if bytes_equal(preferences[index].package, package)
+                return true if ByteText::equal(preferences[index].package, package)
             return false
 
         # A prior lock entry is an ordering hint and permits retention of only
@@ -1508,7 +1414,7 @@ module Cli:
                 package: mutable darray[u8] = []
                 version_text: mutable darray[u8] = []
                 continue if not Json::object_string_value(lock, index, object_end, "name", &package) or not Json::object_string_value(lock, index, object_end, "version", &version_text)
-                continue if unlock.count > 0.usize() and bytes_equal(package, unlock)
+                continue if unlock.count > 0.usize() and ByteText::equal(package, unlock)
                 parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
                 continue if not SemVer::parse(version_text, &parsed) or parsed.prerelease
                 continue if not registry_candidate_matches(candidates, package, parsed) or registry_preference_present(preferences, package)
@@ -1632,15 +1538,15 @@ module Cli:
                     out.push(0)
                     return out
                 return [] if solve_status != Solver::SolveCode.Solved
-                bytes_push_view(&out, "{\n  \"lock-version\": 3,\n  \"resolver\": \"elisapkg-registry-v1\",\n  \"package\": {\n    \"name\": \"")
-                bytes_push_array(&out, name)
-                bytes_push_view(&out, "\",\n    \"version\": \"")
-                bytes_push_array(&out, version)
-                bytes_push_view(&out, "\",\n    \"manifest-digest\": \"sha256:")
-                bytes_push_array(&out, root_digest)
-                bytes_push_view(&out, "\",\n    \"source-digest\": \"sha256:")
-                bytes_push_array(&out, root_source_digest)
-                bytes_push_view(&out, "\"\n  },\n  \"packages\": [")
+                ByteText::append_text(&out, "{\n  \"lock-version\": 3,\n  \"resolver\": \"elisapkg-registry-v1\",\n  \"package\": {\n    \"name\": \"")
+                ByteText::append(&out, name)
+                ByteText::append_text(&out, "\",\n    \"version\": \"")
+                ByteText::append(&out, version)
+                ByteText::append_text(&out, "\",\n    \"manifest-digest\": \"sha256:")
+                ByteText::append(&out, root_digest)
+                ByteText::append_text(&out, "\",\n    \"source-digest\": \"sha256:")
+                ByteText::append(&out, root_source_digest)
+                ByteText::append_text(&out, "\"\n  },\n  \"packages\": [")
                 emitted: mutable darray[u8] = []
                 first: mutable bool = true
                 for _step in 0..<selected_indexes.count |selected_indexes, candidates, emitted, out, first|:
@@ -1651,7 +1557,7 @@ module Cli:
                         candidate_index: usize = selected_indexes[item]
                         candidate_name: darray[u8] = candidates[candidate_index].package
                         continue if emitted_contains_slice(emitted, candidate_name, 0, candidate_name.count)
-                        if not found or bytes_less(candidate_name, selected_name):
+                        if not found or ByteText::less(candidate_name, selected_name):
                             selected_slot <- item
                             selected_name.resize(0)
                             for byte_index in 0..<candidate_name.count |selected_name, candidate_name|:
@@ -1663,14 +1569,14 @@ module Cli:
                     if candidate.yanked and persist_trust:
                         warning: mutable darray[u8] = []
                         version_label: mutable darray[u8] = []
-                        bytes_push_view(&warning, "warning: retaining locked yanked release ")
-                        bytes_push_array(&warning, candidate.package)
+                        ByteText::append_text(&warning, "warning: retaining locked yanked release ")
+                        ByteText::append(&warning, candidate.package)
                         warning.push(64)
                         Registry::exact_requirement(candidate.version, &version_label)
-                        bytes_push_array(&warning, version_label)
-                        bytes_push_view(&warning, "; run 'elisapkg update ")
-                        bytes_push_array(&warning, candidate.package)
-                        bytes_push_view(&warning, "' to select a non-yanked release\n")
+                        ByteText::append(&warning, version_label)
+                        ByteText::append_text(&warning, "; run 'elisapkg update ")
+                        ByteText::append(&warning, candidate.package)
+                        ByteText::append_text(&warning, "' to select a non-yanked release\n")
                         write_bytes(2, warning)
                     selected_index_generation: u64 = candidate_index_generations[candidate_index]
                     selected_index_digest: mutable darray[u8] = []
@@ -1691,7 +1597,7 @@ module Cli:
                         out.push(final_status.u8() + 1.u8())
                         return out
                     return [] if final_status != Registry::ResultCode.Ok
-                    if verified_index_generation != selected_index_generation or not bytes_equal(verified_index_digest, selected_index_digest) or not bytes_equal(verified_index_identity, selected_index_identity):
+                    if verified_index_generation != selected_index_generation or not ByteText::equal(verified_index_digest, selected_index_digest) or not ByteText::equal(verified_index_identity, selected_index_identity):
                         if persist_trust:
                             out.push(Registry::ResultCode.RollbackDetected.u8() + 1.u8())
                             return out
@@ -1712,7 +1618,7 @@ module Cli:
                     snapshot_expires: mutable u64 = 0
                     snapshot_dependencies: mutable darray[Solver::Constraint] = []
                     snapshot_status: Registry::ResultCode = Registry::verify_metadata_snapshot(candidate.package, selected_text, metadata_digest, metadata, metadata_signature, &snapshot_archive, &snapshot_digest, &snapshot_size, &snapshot_expires, &snapshot_dependencies)
-                    if snapshot_status != Registry::ResultCode.Ok or not bytes_equal(snapshot_archive, archive) or not bytes_equal(snapshot_digest, digest) or snapshot_size != archive_size or not registry_dependency_sets_equal(snapshot_dependencies, candidate.dependencies):
+                    if snapshot_status != Registry::ResultCode.Ok or not ByteText::equal(snapshot_archive, archive) or not ByteText::equal(snapshot_digest, digest) or snapshot_size != archive_size or not registry_dependency_sets_equal(snapshot_dependencies, candidate.dependencies):
                         if persist_trust:
                             failure: Registry::ResultCode = snapshot_status if snapshot_status != Registry::ResultCode.Ok else Registry::ResultCode.DigestMismatch
                             out.push(failure.u8() + 1.u8())
@@ -1724,24 +1630,24 @@ module Cli:
                             out.push(trust_status.u8() + 1.u8())
                             return out
                     out.push(44) if not first
-                    bytes_push_view(&out, "\n    {\"name\":\"")
-                    bytes_push_array(&out, selected_name)
-                    bytes_push_view(&out, "\",\"version\":\"")
-                    bytes_push_array(&out, selected_text)
-                    bytes_push_view(&out, "\",\"source\":{\"type\":\"registry\",\"registry\":\"primary\",\"archive\":\"")
-                    bytes_push_array(&out, archive)
-                    bytes_push_view(&out, "\"},\"archive-size\":")
+                    ByteText::append_text(&out, "\n    {\"name\":\"")
+                    ByteText::append(&out, selected_name)
+                    ByteText::append_text(&out, "\",\"version\":\"")
+                    ByteText::append(&out, selected_text)
+                    ByteText::append_text(&out, "\",\"source\":{\"type\":\"registry\",\"registry\":\"primary\",\"archive\":\"")
+                    ByteText::append(&out, archive)
+                    ByteText::append_text(&out, "\"},\"archive-size\":")
                     registry_append_decimal(&out, archive_size)
-                    bytes_push_view(&out, ",\"archive-digest\":\"sha256:")
-                    bytes_push_array(&out, digest)
-                    bytes_push_view(&out, "\",\"metadata-digest\":\"sha256:")
-                    bytes_push_array(&out, metadata_digest)
-                    bytes_push_view(&out, "\"}")
+                    ByteText::append_text(&out, ",\"archive-digest\":\"sha256:")
+                    ByteText::append(&out, digest)
+                    ByteText::append_text(&out, "\",\"metadata-digest\":\"sha256:")
+                    ByteText::append(&out, metadata_digest)
+                    ByteText::append_text(&out, "\"}")
                     for byte_index in 0..<selected_name.count |emitted, selected_name|:
                         emitted.push(selected_name[byte_index])
                     emitted.push(0)
                     first <- false
-                bytes_push_view(&out, "\n  ]\n}\n")
+                ByteText::append_text(&out, "\n  ]\n}\n")
                 return out
 
         def canonical_lock_for_manifest(name: darray[u8]&, version: darray[u8]&, raw: darray[u8]&, root: darray[u8]&) -> darray[u8] can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -1773,13 +1679,9 @@ module Cli:
                     return [] if has_local_dependency
                     unlock: mutable darray[u8] = []
                     if Platform::pkg_strlen(options.update_name) > 0.usize():
-                        bytes_push_cstr(&unlock, options.update_name)
+                        ByteText::append_bounded_text(&unlock, options.update_name)
                     return canonical_registry_lock(name, version, raw, root, registry_roots, preferred_lock, unlock, true)
                 return canonical_transitive_local_lock(name, version, raw, root)
-
-        def bytes_push_array(out: mutable darray[u8]&, value: darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
-            for index in 0..<value.count |out, value|:
-                out.push(value[index])
 
         def valid_dependency_path(path: darray[u8]&) -> bool:
             return false if path.count == 0.usize() or path.count > 4096.usize()
@@ -1787,7 +1689,7 @@ module Cli:
             for index in 0..<path.count |path|:
                 byte: u8 = path[index]
                 return false if byte == 0 or byte < 32 or byte == 127 or byte == 34 or byte == 92
-            return false if bytes_count(path, "//") > 0.usize()
+            return false if ByteText::count_text(path, "//") > 0.usize()
             return true
 
         def normalize_relative_path(path: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
@@ -1872,15 +1774,9 @@ module Cli:
                 segment_end: mutable usize = cursor
                 while segment_end < seen.count and seen[segment_end] != 0:
                     segment_end <- segment_end + 1.usize()
-                return true if segment_end - cursor == alias.count and bytes_equal_range(seen, cursor, segment_end, alias)
+                return true if segment_end - cursor == alias.count and ByteText::range_equals(seen, cursor, segment_end, alias)
                 cursor <- segment_end + 1.usize()
             return false
-
-        def bytes_equal_range(raw: darray[u8]&, start: usize, end: usize, wanted: darray[u8]&) -> bool:
-            return false if end - start != wanted.count
-            for index in 0..<wanted.count |raw, wanted|:
-                return false if raw[start + index] != wanted[index]
-            return true
 
         def valid_dependency_object(raw: darray[u8]&, object_start: usize, object_end: usize) -> bool can[Memory.Allocate, Abort.Panic]:
             path_key: mutable darray[u8] = [112, 97, 116, 104]
@@ -1905,7 +1801,7 @@ module Cli:
                 registry: mutable darray[u8] = []
                 requirement: mutable darray[u8] = []
                 return false if not Json::object_string_value(raw, object_start, object_end, "registry", &registry) or not Json::object_string_value(raw, object_start, object_end, "version", &requirement)
-                return false if not bytes_equal_view(registry, "primary")
+                return false if not ByteText::equal_text(registry, "primary")
                 parsed_requirement: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
                 return SemVer::parse_requirement(requirement, &parsed_requirement)
             return false
@@ -2043,10 +1939,10 @@ module Cli:
             out.push(34)
             for alias_index in 0..<alias.count |out, alias|:
                 out.push(alias[alias_index])
-            bytes_push_view(&out, "\": {\"path\": \"")
+            ByteText::append_text(&out, "\": {\"path\": \"")
             for path_index in 0..<path.count |out, path|:
                 out.push(path[path_index])
-            bytes_push_view(&out, "\"}")
+            ByteText::append_text(&out, "\"}")
             for index in dependency_end..<raw.count |out, raw|:
                 out.push(raw[index])
             return out
@@ -2072,10 +1968,10 @@ module Cli:
             out.push(34)
             for alias_index in 0..<alias.count |out, alias|:
                 out.push(alias[alias_index])
-            bytes_push_view(&out, "\": {\"registry\": \"primary\", \"version\": \"")
+            ByteText::append_text(&out, "\": {\"registry\": \"primary\", \"version\": \"")
             for requirement_index in 0..<requirement.count |out, requirement|:
                 out.push(requirement[requirement_index])
-            bytes_push_view(&out, "\"}")
+            ByteText::append_text(&out, "\"}")
             for index in dependency_end..<raw.count |out, raw|:
                 out.push(raw[index])
             return out
@@ -2189,7 +2085,7 @@ module Cli:
             leaf_start: usize = 0.usize() if last_separator == path.count else last_separator + 1.usize()
             for index in leaf_start..<path.count |manifest_leaf, path|:
                 manifest_leaf.push(path[index])
-            return false if not bytes_equal_view(manifest_leaf, "elisapkg.json")
+            return false if not ByteText::equal_text(manifest_leaf, "elisapkg.json")
             parent: mutable darray[u8] = []
             if last_separator == path.count:
                 parent.push(46)
@@ -2215,14 +2111,14 @@ module Cli:
                 index: mutable i64 = 2
                 while index < argc |slots, out, color_seen, index|:
                     argument: cstr = slots[index].cast[cstr]
-                    if cstr_equal(argument, "--quiet"):
+                    if Platform::pkg_cstr_equal(argument, "--quiet"):
                         cli_quiet <- true
                         index <- index + 1
                         continue
-                    if cstr_equal(argument, "--color"):
+                    if Platform::pkg_cstr_equal(argument, "--color"):
                         return -1 if color_seen or index + 1 >= argc
                         color_value: cstr = slots[index + 1].cast[cstr]
-                        return -1 if not cstr_equal(color_value, "auto") and not cstr_equal(color_value, "always") and not cstr_equal(color_value, "never")
+                        return -1 if not Platform::pkg_cstr_equal(color_value, "auto") and not Platform::pkg_cstr_equal(color_value, "always") and not Platform::pkg_cstr_equal(color_value, "never")
                         color_seen <- true
                         index <- index + 2
                         continue
@@ -2239,22 +2135,22 @@ module Cli:
                 path_seen: mutable bool = false
                 for index in 2..<argc |slots, root, target_kind, target_kind_seen, path_seen|:
                     argument: cstr = slots[index].cast[cstr]
-                    if cstr_equal(argument, "--lib"):
-                        return EXIT_USAGE if target_kind_seen and not cstr_equal(target_kind, "lib")
+                    if Platform::pkg_cstr_equal(argument, "--lib"):
+                        return EXIT_USAGE if target_kind_seen and not Platform::pkg_cstr_equal(target_kind, "lib")
                         target_kind <- "lib"
                         target_kind_seen <- true
-                    elif cstr_equal(argument, "--bin"):
-                        return EXIT_USAGE if target_kind_seen and not cstr_equal(target_kind, "bin")
+                    elif Platform::pkg_cstr_equal(argument, "--bin"):
+                        return EXIT_USAGE if target_kind_seen and not Platform::pkg_cstr_equal(target_kind, "bin")
                         target_kind <- "bin"
                         target_kind_seen <- true
-                    elif cstr_equal(argument, "--help"):
+                    elif Platform::pkg_cstr_equal(argument, "--help"):
                         usage()
                         return EXIT_OK
                     elif Platform::pkg_strlen(argument) == 0.usize() or argument[0].u8() == 45 or path_seen:
                         return EXIT_USAGE
                     else:
                         root <- []
-                        bytes_push_cstr(&root, argument)
+                        ByteText::append_bounded_text(&root, argument)
                         path_seen <- true
                 return EXIT_USAGE if root.count == 0.usize()
                 return EXIT_USAGE if root.count > 4096.usize()
@@ -2278,11 +2174,11 @@ module Cli:
                 return EXIT_SOURCE if not make_directory(&root)
                 return EXIT_SOURCE if not make_directory(&source) or not make_directory(&state)
                 manifest: mutable darray[u8] = []
-                bytes_push_view(&manifest, "{\n  \"schema-version\": 1,\n  \"package\": {\n    \"name\": \"app\",\n    \"version\": \"0.1.0\",\n    \"description\": \"An Elisa application\",\n    \"license\": \"MIT\",\n    \"elisa\": \">=0.1.0 <1.0.0\"\n  },\n  \"targets\": [{\"name\": \"app\", \"kind\": \"")
-                bytes_push_cstr(&manifest, target_kind)
-                bytes_push_view(&manifest, "\", \"entry\": \"src/main.elisa\"}],\n  \"dependencies\": {},\n  \"dev-dependencies\": {},\n  \"include\": [\"src/**\", \"elisapkg.json\", \"LICENSE\", \"README.md\"]\n}\n")
+                ByteText::append_text(&manifest, "{\n  \"schema-version\": 1,\n  \"package\": {\n    \"name\": \"app\",\n    \"version\": \"0.1.0\",\n    \"description\": \"An Elisa application\",\n    \"license\": \"MIT\",\n    \"elisa\": \">=0.1.0 <1.0.0\"\n  },\n  \"targets\": [{\"name\": \"app\", \"kind\": \"")
+                ByteText::append_bounded_text(&manifest, target_kind)
+                ByteText::append_text(&manifest, "\", \"entry\": \"src/main.elisa\"}],\n  \"dependencies\": {},\n  \"dev-dependencies\": {},\n  \"include\": [\"src/**\", \"elisapkg.json\", \"LICENSE\", \"README.md\"]\n}\n")
                 entry: mutable darray[u8] = []
-                bytes_push_view(&entry, "def main() -> i64:\n    return 0\n")
+                ByteText::append_text(&entry, "def main() -> i64:\n    return 0\n")
                 return EXIT_USAGE if file_exists(&entry_path)
                 return EXIT_SOURCE if not write_file_noclobber(&manifest_path, &manifest)
                 if not write_file_noclobber(&entry_path, &entry):
@@ -2296,11 +2192,11 @@ module Cli:
         def run_add(argc: i64, slots: mutable cstr&&) -> i64 can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global{Read,Write}:
                 return EXIT_SECURITY if not transaction_recover()
-                local_form: bool = argc == 5 and cstr_equal(slots[3].cast[cstr], "--path")
-                registry_form: bool = argc == 7 and cstr_equal(slots[3].cast[cstr], "--version") and cstr_equal(slots[5].cast[cstr], "--registry") and cstr_equal(slots[6].cast[cstr], "primary")
+                local_form: bool = argc == 5 and Platform::pkg_cstr_equal(slots[3].cast[cstr], "--path")
+                registry_form: bool = argc == 7 and Platform::pkg_cstr_equal(slots[3].cast[cstr], "--version") and Platform::pkg_cstr_equal(slots[5].cast[cstr], "--registry") and Platform::pkg_cstr_equal(slots[6].cast[cstr], "primary")
                 return EXIT_USAGE if not local_form and not registry_form
                 alias: mutable darray[u8] = []
-                bytes_push_cstr(&alias, slots[2].cast[cstr])
+                ByteText::append_bounded_text(&alias, slots[2].cast[cstr])
                 return EXIT_USAGE if not valid_package_name(alias)
                 root: mutable darray[u8] = [46]
                 root_name: mutable darray[u8] = []
@@ -2309,17 +2205,17 @@ module Cli:
                 dependency_path: mutable darray[u8] = []
                 requirement: mutable darray[u8] = []
                 if local_form:
-                    bytes_push_cstr(&dependency_path, slots[4].cast[cstr])
+                    ByteText::append_bounded_text(&dependency_path, slots[4].cast[cstr])
                     return EXIT_USAGE if not valid_dependency_path(dependency_path)
                     dependency_name: mutable darray[u8] = []
                     dependency_version: mutable darray[u8] = []
                     return EXIT_RESOLVE if not load_package_at(&dependency_path, &dependency_name, &dependency_version)
-                    return EXIT_RESOLVE if not bytes_equal(alias, dependency_name) or bytes_equal(alias, root_name)
+                    return EXIT_RESOLVE if not ByteText::equal(alias, dependency_name) or ByteText::equal(alias, root_name)
                 else:
-                    bytes_push_cstr(&requirement, slots[4].cast[cstr])
+                    ByteText::append_bounded_text(&requirement, slots[4].cast[cstr])
                     parsed_requirement: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
                     return EXIT_USAGE if not SemVer::parse_requirement(requirement, &parsed_requirement)
-                    return EXIT_RESOLVE if bytes_equal(alias, root_name)
+                    return EXIT_RESOLVE if ByteText::equal(alias, root_name)
                 raw: mutable darray[u8] = []
                 raw.resize(1048577)
                 return EXIT_USAGE if not read_cstr_into("elisapkg.json", &raw)
@@ -2478,7 +2374,7 @@ module Cli:
                 object_end: usize = Json::object_end(raw, index)
                 continue if object_end <= index
                 package_name: mutable darray[u8] = []
-                return true if Json::object_string_value(raw, index, object_end, "name", &package_name) and bytes_equal(package_name, wanted)
+                return true if Json::object_string_value(raw, index, object_end, "name", &package_name) and ByteText::equal(package_name, wanted)
             return false
 
         def valid_lock_sha256(value: darray[u8]&) -> bool:
@@ -2501,7 +2397,7 @@ module Cli:
                 # metadata or changing trust state.
                 if not lock_version_is(lock, 3):
                     expected: darray[u8] = canonical_lock_for_manifest(name, version, manifest, start)
-                    return expected.count > 0.usize() and bytes_equal(expected, lock)
+                    return expected.count > 0.usize() and ByteText::equal(expected, lock)
                 registry_roots: mutable darray[Solver::Constraint] = []
                 has_local_dependency: mutable bool = false
                 # A v3 lock is emitted only for a registry-only graph. Requiring the same
@@ -2512,14 +2408,14 @@ module Cli:
                 lock_end: usize = Json::object_end(lock, 0)
                 return false if lock_end >= lock.count or not valid_direct_field_set(lock, 0, lock_end, 3)
                 resolver: mutable darray[u8] = []
-                return false if not Json::object_string_value(lock, 0, lock_end, "resolver", &resolver) or not bytes_equal_view(resolver, "elisapkg-registry-v1")
+                return false if not Json::object_string_value(lock, 0, lock_end, "resolver", &resolver) or not ByteText::equal_text(resolver, "elisapkg-registry-v1")
                 package_start: usize = Json::root_value_offset(lock, "package")
                 package_end: usize = Json::object_end(lock, package_start)
                 return false if package_start >= lock.count or package_end <= package_start or not valid_direct_field_set(lock, package_start, package_end, 6)
                 locked_name: mutable darray[u8] = []
                 locked_version: mutable darray[u8] = []
                 return false if not Json::object_string_value(lock, package_start, package_end, "name", &locked_name) or not Json::object_string_value(lock, package_start, package_end, "version", &locked_version)
-                return false if not bytes_equal(locked_name, name) or not bytes_equal(locked_version, version)
+                return false if not ByteText::equal(locked_name, name) or not ByteText::equal(locked_version, version)
                 manifest_digest_bytes: mutable darray[u8] = []
                 manifest_digest: mutable darray[u8] = []
                 return false if Integrity::sha256(manifest, &manifest_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(manifest_digest_bytes, &manifest_digest)
@@ -2548,8 +2444,8 @@ module Cli:
                     # Canonical registry locks sort package records by name and never
                     # serialize the root package itself. Enforce both properties before
                     # trusting any receipt-backed record in an offline build.
-                    return false if bytes_equal(package, name)
-                    return false if has_previous_package and not bytes_less(previous_package, package)
+                    return false if ByteText::equal(package, name)
+                    return false if has_previous_package and not ByteText::less(previous_package, package)
                     parsed_version: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
                     return false if not SemVer::parse(version_text, &parsed_version) or parsed_version.prerelease
                     return false if emitted_contains_slice(seen, package, 0, package.count)
@@ -2559,7 +2455,7 @@ module Cli:
                     source_type: mutable darray[u8] = []
                     registry: mutable darray[u8] = []
                     archive: mutable darray[u8] = []
-                    return false if not Json::object_string_value(lock, source_start, source_end, "type", &source_type) or not bytes_equal_view(source_type, "registry") or not Json::object_string_value(lock, source_start, source_end, "registry", &registry) or not bytes_equal_view(registry, "primary") or not Json::object_string_value(lock, source_start, source_end, "archive", &archive) or not Archive::is_safe_entry(archive)
+                    return false if not Json::object_string_value(lock, source_start, source_end, "type", &source_type) or not ByteText::equal_text(source_type, "registry") or not Json::object_string_value(lock, source_start, source_end, "registry", &registry) or not ByteText::equal_text(registry, "primary") or not Json::object_string_value(lock, source_start, source_end, "archive", &archive) or not Archive::is_safe_entry(archive)
                     archive_size: mutable u64 = 0
                     return false if not Json::object_unsigned_value(lock, cursor, record_end, "archive-size", &archive_size) or archive_size > Archive::max_archive_bytes.u64()
                     archive_digest: mutable darray[u8] = []
@@ -2593,7 +2489,7 @@ module Cli:
             can Global.Read:
                 return EXIT_USAGE if argc < 3
                 wanted: mutable darray[u8] = []
-                bytes_push_cstr(&wanted, slots[2].cast[cstr])
+                ByteText::append_bounded_text(&wanted, slots[2].cast[cstr])
                 return EXIT_USAGE if not valid_package_name(wanted)
                 raw: mutable darray[u8] = []
                 raw.resize(1048577)
@@ -2609,7 +2505,7 @@ module Cli:
                 # `why` reports the root edge. A lockfile also contains transitive
                 # records, so merely finding a name in the lock is insufficient and
                 # would misreport `root -> transitive` as a direct dependency.
-                return EXIT_RESOLVE if bytes_equal(wanted, root_name)
+                return EXIT_RESOLVE if ByteText::equal(wanted, root_name)
                 dependency_start: mutable usize = 0.usize()
                 dependency_end: mutable usize = 0.usize()
                 return EXIT_RESOLVE if not find_dependency_span(raw, wanted, &dependency_start, &dependency_end)
@@ -2688,7 +2584,7 @@ module Cli:
                     return EXIT_RESOLVE if not collect_registry_roots(raw, &registry_roots, &has_local_dependency)
                     return EXIT_RESOLVE if registry_roots.count > 0.usize()
                     local_expected: darray[u8] = canonical_transitive_local_lock(name, version, raw, start)
-                    return EXIT_RESOLVE if local_expected.count == 0.usize() or not bytes_equal(local_expected, preferred_lock)
+                    return EXIT_RESOLVE if local_expected.count == 0.usize() or not ByteText::equal(local_expected, preferred_lock)
                     write_resolved_text(resolved_name_text, resolved_version_text, options) if emit_result
                     return EXIT_OK
                 # Offline resolution may validate and replay an existing lock, but it must
@@ -2748,7 +2644,7 @@ module Cli:
                     existing: mutable darray[u8] = []
                     existing.resize(1048577)
                     return EXIT_RESOLVE if not read_cstr_into("elisapkg.lock", &existing)
-                    return EXIT_RESOLVE if not bytes_equal(existing, lock)
+                    return EXIT_RESOLVE if not ByteText::equal(existing, lock)
                 if not (options.locked or options.frozen):
                     if not transaction_owned:
                         if not transaction_begin_with_lock(raw, lock_state, preferred_lock):
@@ -2837,7 +2733,7 @@ module Cli:
                 selected_name: mutable darray[u8] = []
                 selected_kind: mutable darray[u8] = []
                 selected_entry: mutable darray[u8] = []
-                return EXIT_USAGE if not ManifestTargets::select_target(raw, options.target_name, options.target_kind, &selected_name, &selected_kind, &selected_entry) or not bytes_equal_view(selected_kind, "test")
+                return EXIT_USAGE if not ManifestTargets::select_target(raw, options.target_name, options.target_kind, &selected_name, &selected_kind, &selected_entry) or not ByteText::equal_text(selected_kind, "test")
                 # Reusing the normal build path keeps dependency, lock, and compiler-
                 # environment checks identical while multi-target planning is completed.
                 status: i64 = run_build(start, options)
@@ -2868,7 +2764,7 @@ module Cli:
                 return false if status != 0 and status != -17
             existing: mutable darray[u8] = []
             return false if not Cache::read_registry_signature(metadata_digest, &existing)
-            return bytes_equal(existing, signature)
+            return ByteText::equal(existing, signature)
 
         def registry_cache_read_metadata(metadata_digest: darray[u8]&, metadata_out: mutable darray[u8]&, signature_out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             metadata_out.resize(0)
@@ -2898,7 +2794,7 @@ module Cli:
                 publication_status: i64 = write_cstr_file_noclobber_status(path_name, receipt)
                 return false if publication_status != 0 and publication_status != -17
             existing: mutable darray[u8] = []
-            return Cache::read_registry_receipt(digest, metadata_digest, &existing) and bytes_equal(existing, receipt)
+            return Cache::read_registry_receipt(digest, metadata_digest, &existing) and ByteText::equal(existing, receipt)
 
         def registry_lock_record_starts(lock: darray[u8]&, packages_start: usize, packages_end: usize, out: mutable darray[usize]&) -> bool can[Memory.Allocate, Abort.Panic]:
             out.resize(0)
@@ -2918,7 +2814,7 @@ module Cli:
                 return false if not PackageIdentity::valid_name(package_name)
                 # The record index is searched by name. Strict ordering also
                 # prevents multiple records from representing one package.
-                return false if previous_name.count > 0.usize() and not bytes_less(previous_name, package_name)
+                return false if previous_name.count > 0.usize() and not ByteText::less(previous_name, package_name)
                 previous_name <- package_name
                 starts.push(cursor)
                 cursor <- record_end + 1.usize()
@@ -2942,7 +2838,7 @@ module Cli:
                 record_end: usize = Json::object_end(lock, record_start)
                 package: mutable darray[u8] = []
                 return false if record_end <= record_start or record_end >= lock.count or not Json::object_string_value(lock, record_start, record_end, "name", &package)
-                if bytes_less(package, wanted):
+                if ByteText::less(package, wanted):
                     lower <- middle + 1.usize()
                 else:
                     upper <- middle
@@ -2950,7 +2846,7 @@ module Cli:
             record_start: usize = starts[lower]
             record_end: usize = Json::object_end(lock, record_start)
             package: mutable darray[u8] = []
-            return false if record_end <= record_start or record_end >= lock.count or not Json::object_string_value(lock, record_start, record_end, "name", &package) or not bytes_equal(package, wanted)
+            return false if record_end <= record_start or record_end >= lock.count or not Json::object_string_value(lock, record_start, record_end, "name", &package) or not ByteText::equal(package, wanted)
             out <- lower
             return true
 
@@ -3013,7 +2909,7 @@ module Cli:
                 expires: mutable u64 = 0
                 dependencies: mutable darray[Solver::Constraint] = []
                 status: Registry::ResultCode = Registry::verify_metadata_snapshot(package, version_text, metadata_digest, cached_metadata, cached_signature, &resolved_archive, &resolved_digest, &resolved_size, &expires, &dependencies)
-                return EXIT_SECURITY if status != Registry::ResultCode.Ok or not bytes_equal(resolved_archive, archive) or not bytes_equal(resolved_digest, digest) or resolved_size != archive_size
+                return EXIT_SECURITY if status != Registry::ResultCode.Ok or not ByteText::equal(resolved_archive, archive) or not ByteText::equal(resolved_digest, digest) or resolved_size != archive_size
                 for dependency_index in 0..<dependencies.count |lock, starts, dependencies, queued, pending|:
                     matched_record: i64 = matching_registry_record(lock, starts, dependencies[dependency_index])
                     return EXIT_SECURITY if matched_record < 0
@@ -3060,7 +2956,7 @@ module Cli:
                     source_type: mutable darray[u8] = []
                     registry: mutable darray[u8] = []
                     archive: mutable darray[u8] = []
-                    return EXIT_RESOLVE if not Json::object_string_value(lock, source_start, source_end, "type", &source_type) or not bytes_equal_view(source_type, "registry") or not Json::object_string_value(lock, source_start, source_end, "registry", &registry) or not bytes_equal_view(registry, "primary") or not Json::object_string_value(lock, source_start, source_end, "archive", &archive) or not Archive::is_safe_entry(archive)
+                    return EXIT_RESOLVE if not Json::object_string_value(lock, source_start, source_end, "type", &source_type) or not ByteText::equal_text(source_type, "registry") or not Json::object_string_value(lock, source_start, source_end, "registry", &registry) or not ByteText::equal_text(registry, "primary") or not Json::object_string_value(lock, source_start, source_end, "archive", &archive) or not Archive::is_safe_entry(archive)
                     encoded_digest: mutable darray[u8] = []
                     encoded_metadata_digest: mutable darray[u8] = []
                     digest: mutable darray[u8] = []
@@ -3085,7 +2981,7 @@ module Cli:
                     metadata_expires: mutable u64 = 0
                     metadata_dependencies: mutable darray[Solver::Constraint] = []
                     metadata_status: Registry::ResultCode = Registry::verify_metadata_snapshot(package, version_text, metadata_digest, cached_metadata, cached_signature, &resolved_archive, &resolved_digest, &resolved_size, &metadata_expires, &metadata_dependencies)
-                    return EXIT_SECURITY if metadata_status != Registry::ResultCode.Ok or not bytes_equal(resolved_archive, archive) or not bytes_equal(resolved_digest, digest) or resolved_size != archive_size or metadata_expires != expires
+                    return EXIT_SECURITY if metadata_status != Registry::ResultCode.Ok or not ByteText::equal(resolved_archive, archive) or not ByteText::equal(resolved_digest, digest) or resolved_size != archive_size or metadata_expires != expires
                     for dependency_index in 0..<metadata_dependencies.count |lock, starts, metadata_dependencies, dependency_index|:
                         return EXIT_SECURITY if matching_registry_record(lock, starts, metadata_dependencies[dependency_index]) < 0
                     archive_bytes: mutable darray[u8] = []
@@ -3128,11 +3024,11 @@ module Cli:
                 # that could make fetch operate on a graph different from resolution.
                 expected_lock: darray[u8] = canonical_registry_lock_for_existing_lock(root_name, root_version, manifest, start, lock)
                 return EXIT_SECURITY if expected_lock.count == 0.usize()
-                return EXIT_RESOLVE if not bytes_equal(expected_lock, lock)
+                return EXIT_RESOLVE if not ByteText::equal(expected_lock, lock)
                 lock_end: usize = Json::object_end(lock, 0)
                 return EXIT_RESOLVE if lock_end >= lock.count or not valid_direct_field_set(lock, 0, lock_end, 3)
                 resolver: mutable darray[u8] = []
-                return EXIT_RESOLVE if not Json::object_string_value(lock, 0, Json::object_end(lock, 0), "resolver", &resolver) or not bytes_equal_view(resolver, "elisapkg-registry-v1")
+                return EXIT_RESOLVE if not Json::object_string_value(lock, 0, Json::object_end(lock, 0), "resolver", &resolver) or not ByteText::equal_text(resolver, "elisapkg-registry-v1")
                 package_start: usize = Json::root_value_offset(lock, "package")
                 package_end: usize = Json::object_end(lock, package_start)
                 return EXIT_RESOLVE if package_start >= lock.count or package_end <= package_start
@@ -3140,7 +3036,7 @@ module Cli:
                 locked_name: mutable darray[u8] = []
                 locked_version: mutable darray[u8] = []
                 return EXIT_RESOLVE if not Json::object_string_value(lock, package_start, package_end, "name", &locked_name) or not Json::object_string_value(lock, package_start, package_end, "version", &locked_version)
-                return EXIT_RESOLVE if not bytes_equal(locked_name, root_name) or not bytes_equal(locked_version, root_version)
+                return EXIT_RESOLVE if not ByteText::equal(locked_name, root_name) or not ByteText::equal(locked_version, root_version)
                 manifest_digest_bytes: mutable darray[u8] = []
                 manifest_digest: mutable darray[u8] = []
                 return EXIT_SECURITY if Integrity::sha256(manifest, &manifest_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(manifest_digest_bytes, &manifest_digest)
@@ -3170,7 +3066,7 @@ module Cli:
                     source_type: mutable darray[u8] = []
                     registry: mutable darray[u8] = []
                     archive: mutable darray[u8] = []
-                    return EXIT_RESOLVE if not Json::object_string_value(lock, source_start, source_end, "type", &source_type) or not bytes_equal_view(source_type, "registry") or not Json::object_string_value(lock, source_start, source_end, "registry", &registry) or not bytes_equal_view(registry, "primary") or not Json::object_string_value(lock, source_start, source_end, "archive", &archive) or not Archive::is_safe_entry(archive)
+                    return EXIT_RESOLVE if not Json::object_string_value(lock, source_start, source_end, "type", &source_type) or not ByteText::equal_text(source_type, "registry") or not Json::object_string_value(lock, source_start, source_end, "registry", &registry) or not ByteText::equal_text(registry, "primary") or not Json::object_string_value(lock, source_start, source_end, "archive", &archive) or not Archive::is_safe_entry(archive)
                     encoded_digest: mutable darray[u8] = []
                     encoded_metadata_digest: mutable darray[u8] = []
                     digest: mutable darray[u8] = []
@@ -3202,13 +3098,13 @@ module Cli:
                         write_error("\n")
                         return EXIT_SECURITY if registry_security_status(registry_status)
                         return EXIT_SOURCE
-                    if not bytes_equal(selected, version_text):
+                    if not ByteText::equal(selected, version_text):
                         write_error("error: locked registry version does not match signed metadata\n")
                         return EXIT_SECURITY
-                    if not bytes_equal(resolved_archive, archive):
+                    if not ByteText::equal(resolved_archive, archive):
                         write_error("error: locked registry archive name does not match signed metadata\n")
                         return EXIT_SECURITY
-                    if not bytes_equal(resolved_digest, digest):
+                    if not ByteText::equal(resolved_digest, digest):
                         write_error("error: locked registry archive digest does not match signed metadata\n")
                         return EXIT_SECURITY
                     if resolved_size != archive_size:
@@ -3216,7 +3112,7 @@ module Cli:
                         return EXIT_SECURITY
                     metadata_digest_bytes: mutable darray[u8] = []
                     computed_metadata_digest: mutable darray[u8] = []
-                    if Integrity::sha256(metadata, &metadata_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(metadata_digest_bytes, &computed_metadata_digest) or not bytes_equal(computed_metadata_digest, metadata_digest):
+                    if Integrity::sha256(metadata, &metadata_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(metadata_digest_bytes, &computed_metadata_digest) or not ByteText::equal(computed_metadata_digest, metadata_digest):
                         write_error("error: locked metadata digest does not match signed metadata\n")
                         return EXIT_SECURITY
                     metadata_expires: mutable u64 = 0
@@ -3276,7 +3172,7 @@ module Cli:
                 index: mutable i64 = 2
                 while index < argc:
                     argument: cstr = slots[index].cast[cstr]
-                    if cstr_equal(argument, "--"):
+                    if Platform::pkg_cstr_equal(argument, "--"):
                         index <- index + 1
                         return EXIT_USAGE if index < argc
                         break
@@ -3287,9 +3183,9 @@ module Cli:
                         write_error("error: fetch does not accept command-specific options\n")
                         return EXIT_USAGE
                     if positional_count == 0:
-                        bytes_push_cstr(&package, argument)
+                        ByteText::append_bounded_text(&package, argument)
                     elif positional_count == 1:
-                        bytes_push_cstr(&requirement, argument)
+                        ByteText::append_bounded_text(&requirement, argument)
                     else:
                         write_error("error: fetch accepts at most PACKAGE REQUIREMENT\n")
                         return EXIT_USAGE
@@ -3334,7 +3230,7 @@ module Cli:
                     snapshot_expires: mutable u64 = 0
                     snapshot_dependencies: mutable darray[Solver::Constraint] = []
                     snapshot_status: Registry::ResultCode = Registry::verify_metadata_snapshot(package, selected, metadata_digest, metadata, metadata_signature, &snapshot_archive, &snapshot_digest, &snapshot_size, &snapshot_expires, &snapshot_dependencies)
-                    return EXIT_SECURITY if snapshot_status != Registry::ResultCode.Ok or snapshot_expires != metadata_expires or not bytes_equal(snapshot_archive, archive) or not bytes_equal(snapshot_digest, digest) or snapshot_size != archive_size
+                    return EXIT_SECURITY if snapshot_status != Registry::ResultCode.Ok or snapshot_expires != metadata_expires or not ByteText::equal(snapshot_archive, archive) or not ByteText::equal(snapshot_digest, digest) or snapshot_size != archive_size
                     return EXIT_SECURITY if not registry_cache_store_metadata(metadata_digest, metadata, metadata_signature)
                     archive_bytes: mutable darray[u8] = []
                     archive_status: Registry::ResultCode = Registry::read_archive(package, selected, metadata, archive, digest, archive_size, &archive_bytes)
@@ -3380,7 +3276,7 @@ module Cli:
                 if lock_version_is(lock, 3):
                     return fetch_registry_lock_offline(raw, lock, name, version, start) if options.offline or options.frozen else fetch_registry_lock(raw, lock, name, version, start)
                 expected: darray[u8] = canonical_lock_for_manifest(name, version, raw, start)
-                return EXIT_RESOLVE if expected.count == 0.usize() or not bytes_equal(expected, lock)
+                return EXIT_RESOLVE if expected.count == 0.usize() or not ByteText::equal(expected, lock)
                 write_ok("verified local locked sources\n")
                 return EXIT_OK
 
@@ -3413,15 +3309,15 @@ module Cli:
                 archive: mutable darray[u8] = []
                 return EXIT_SECURITY if not package_archive_bytes(raw, entry, &archive) or not Archive::verify_ustar_archive(archive)
                 archive_repeat: mutable darray[u8] = []
-                return EXIT_SECURITY if not package_archive_bytes(raw, entry, &archive_repeat) or not Archive::verify_ustar_archive(archive_repeat) or not bytes_equal(archive_repeat, archive)
+                return EXIT_SECURITY if not package_archive_bytes(raw, entry, &archive_repeat) or not Archive::verify_ustar_archive(archive_repeat) or not ByteText::equal(archive_repeat, archive)
                 source_digest_after: mutable darray[u8] = []
-                return EXIT_SECURITY if not source_tree_digest_into(&source_digest_after) or not bytes_equal(source_digest_after, source_digest)
+                return EXIT_SECURITY if not source_tree_digest_into(&source_digest_after) or not ByteText::equal(source_digest_after, source_digest)
                 manifest_after: mutable darray[u8] = []
                 manifest_after.resize(1048577)
                 lock_after: mutable darray[u8] = []
                 lock_after.resize(1048577)
                 return EXIT_SECURITY if not read_cstr_into("elisapkg.json", &manifest_after) or not read_cstr_into("elisapkg.lock", &lock_after)
-                return EXIT_SECURITY if not bytes_equal(manifest_after, raw) or not bytes_equal(lock_after, lock)
+                return EXIT_SECURITY if not ByteText::equal(manifest_after, raw) or not ByteText::equal(lock_after, lock)
                 archive_digest_bytes: mutable darray[u8] = []
                 archive_digest: mutable darray[u8] = []
                 return EXIT_SECURITY if Integrity::sha256(archive, &archive_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(archive_digest_bytes, &archive_digest)
@@ -3504,7 +3400,7 @@ module Cli:
                 return false if state < 0 or state.usize() > InstallRecords::max_record_bytes
                 existing: mutable darray[u8] = []
                 return false if not read_trusted_install_file(path, InstallRecords::max_record_bytes, &existing)
-                return false if not bytes_equal(existing, receipt)
+                return false if not ByteText::equal(existing, receipt)
             # Even a matching visible receipt is incomplete evidence until its
             # containing directory has been synced. In particular, the publish
             # above can report a failed fsync after the hard link became visible.
@@ -3555,7 +3451,7 @@ module Cli:
             return false if receipt_state < 0 and receipt_state != -2
             expected_receipt: mutable darray[u8] = []
             InstallRecords::encode_receipt(name, version, destination, expected_digest, &expected_receipt)
-            if bytes_equal_view(operation, "install"):
+            if ByteText::equal_text(operation, "install"):
                 # No target was published: discard the intent and let the caller
                 # retry. A receipt without its expected binary is unexplained and
                 # must be preserved for manual review.
@@ -3567,13 +3463,13 @@ module Cli:
                     return false if not read_trusted_install_file(destination, 67108864.usize(), &artifact)
                     digest_bytes: mutable darray[u8] = []
                     actual_digest: mutable darray[u8] = []
-                    return false if Integrity::sha256(artifact, &digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(digest_bytes, &actual_digest) or not bytes_equal(actual_digest, expected_digest)
+                    return false if Integrity::sha256(artifact, &digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(digest_bytes, &actual_digest) or not ByteText::equal(actual_digest, expected_digest)
                     if receipt_state == -2:
                         return false if Platform::pkg_chmod(destination_name, 493.u16()) != 0
                         return false if not publish_local_install_receipt(receipt_path, expected_receipt)
                     else:
                         existing_receipt: mutable darray[u8] = []
-                        return false if not read_trusted_install_file(receipt_path, InstallRecords::max_record_bytes, &existing_receipt) or not bytes_equal(existing_receipt, expected_receipt)
+                        return false if not read_trusted_install_file(receipt_path, InstallRecords::max_record_bytes, &existing_receipt) or not ByteText::equal(existing_receipt, expected_receipt)
                         return false if Platform::pkg_access(destination_name, 1) != 0
                     # Recovery may observe names published before a previous
                     # process reported a directory-sync failure. Make both names
@@ -3593,7 +3489,7 @@ module Cli:
                     existing_receipt: mutable darray[u8] = []
                     receipt_device: mutable u64 = 0.u64()
                     receipt_inode: mutable u64 = 0.u64()
-                    return false if not read_trusted_install_file_identity(receipt_path, InstallRecords::max_record_bytes, &existing_receipt, &receipt_device, &receipt_inode) or not bytes_equal(existing_receipt, expected_receipt)
+                    return false if not read_trusted_install_file_identity(receipt_path, InstallRecords::max_record_bytes, &existing_receipt, &receipt_device, &receipt_inode) or not ByteText::equal(existing_receipt, expected_receipt)
                     if destination_state >= 0:
                         artifact: mutable darray[u8] = []
                         artifact_device: mutable u64 = 0.u64()
@@ -3601,7 +3497,7 @@ module Cli:
                         return false if not read_trusted_install_file_identity(destination, 67108864.usize(), &artifact, &artifact_device, &artifact_inode)
                         digest_bytes: mutable darray[u8] = []
                         actual_digest: mutable darray[u8] = []
-                        return false if Integrity::sha256(artifact, &digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(digest_bytes, &actual_digest) or not bytes_equal(actual_digest, expected_digest)
+                        return false if Integrity::sha256(artifact, &digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(digest_bytes, &actual_digest) or not ByteText::equal(actual_digest, expected_digest)
                         return false if not remove_trusted_install_file_identity(destination, artifact_device, artifact_inode)
                     return false if not remove_trusted_install_file_identity(receipt_path, receipt_device, receipt_inode)
                     return false if not sync_local_install_entry_parents(destination_name, receipt_name)
@@ -3641,7 +3537,7 @@ module Cli:
                 target_kind: mutable darray[u8] = []
                 target_entry: mutable darray[u8] = []
                 return EXIT_BUILD if not ManifestTargets::select_target(manifest_raw, options.target_name, options.target_kind, &target_name, &target_kind, &target_entry)
-                if not bytes_equal_view(target_kind, "bin"):
+                if not ByteText::equal_text(target_kind, "bin"):
                     write_error("error: install --local requires a binary target\n")
                     return 7
                 name: mutable darray[u8] = []
@@ -3658,14 +3554,14 @@ module Cli:
                 target_name_c: mutable darray[u8] = []
                 path_with_nul_into(&target_name, &target_name_c)
                 target_name_raw: cstr = (&target_name_c[0]).cast[cstr] can Unsafe.PointerCast
-                build_dir: darray[u8] = Build::output_directory(start, cstr_equal(options.profile, "release"))
+                build_dir: darray[u8] = Build::output_directory(start, Platform::pkg_cstr_equal(options.profile, "release"))
                 path_join_into(build_dir, target_name_raw, &artifact)
                 artifact_bytes: mutable darray[u8] = []
                 return 7 if not read_package_file_into(&artifact, &artifact_bytes)
                 digest_bytes: mutable darray[u8] = []
                 digest: mutable darray[u8] = []
                 return 7 if Integrity::sha256(artifact_bytes, &digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(digest_bytes, &digest)
-                if not use_prebuilt_artifact and (expected_build_digest.count != 64.usize() or not bytes_equal(digest, expected_build_digest)):
+                if not use_prebuilt_artifact and (expected_build_digest.count != 64.usize() or not ByteText::equal(digest, expected_build_digest)):
                     write_error("error: build output changed after compilation; refusing to install an unverified artifact\n")
                     return EXIT_BUILD
                 bin_dir: mutable darray[u8] = []
@@ -3685,8 +3581,8 @@ module Cli:
                 path_join_into(receipt_dir, name_raw, &receipt_path)
                 destination_snapshot: mutable darray[u8] = []
                 receipt_snapshot: mutable darray[u8] = []
-                bytes_push_array(&destination_snapshot, destination)
-                bytes_push_array(&receipt_snapshot, receipt_path)
+                ByteText::append(&destination_snapshot, destination)
+                ByteText::append(&receipt_snapshot, receipt_path)
                 prefix_c: mutable darray[u8] = []
                 path_with_nul_into(&prefix, &prefix_c)
                 prefix_name: cstr = (&prefix_c[0]).cast[cstr] can Unsafe.PointerCast
@@ -3702,8 +3598,8 @@ module Cli:
                 if not recover_local_install_transaction(prefix, &recovered_operation, &recovered_name, &recovered_version, &recovered_digest, &recovered_install_published):
                     return finish_local_install_error(lock_fd, "error: an interrupted local installation could not be safely recovered; preserve the journal and files for review\n")
                 destination.resize(0)
-                bytes_push_array(&destination, destination_snapshot)
-                if recovered_install_published and bytes_equal_view(recovered_operation, "install") and bytes_equal(recovered_name, name) and bytes_equal(recovered_version, version) and bytes_equal(recovered_digest, digest):
+                ByteText::append(&destination, destination_snapshot)
+                if recovered_install_published and ByteText::equal_text(recovered_operation, "install") and ByteText::equal(recovered_name, name) and ByteText::equal(recovered_version, version) and ByteText::equal(recovered_digest, digest):
                     return finish_local_install_error(lock_fd, "error: could not close the recovered local installation lock descriptor\n") if not release_install_lock(lock_fd)
                     write_ok("already installed ")
                     write_bytes(1, &name)
@@ -3714,7 +3610,7 @@ module Cli:
                 if file_exists(&destination):
                     return finish_local_install_error(lock_fd, "error: install destination or receipt already exists; refusing to overwrite\n")
                 receipt_path.resize(0)
-                bytes_push_array(&receipt_path, receipt_snapshot)
+                ByteText::append(&receipt_path, receipt_snapshot)
                 if file_exists(&receipt_path):
                     return finish_local_install_error(lock_fd, "error: install destination or receipt already exists; refusing to overwrite\n")
                 receipt: mutable darray[u8] = []
@@ -3730,7 +3626,7 @@ module Cli:
                     return finish_local_install_error(lock_fd, "error: could not durably record the local installation transaction\n")
                 InstallFaults::transaction_boundary("install.journal.durable")
                 destination.resize(0)
-                bytes_push_array(&destination, destination_snapshot)
+                ByteText::append(&destination, destination_snapshot)
                 destination_c: mutable darray[u8] = []
                 path_with_nul_into(&destination, &destination_c)
                 destination_name: mutable cstr = (&destination_c[0]).cast[cstr] can Unsafe.PointerCast
@@ -3738,7 +3634,7 @@ module Cli:
                     return finish_local_install_error(lock_fd, "error: could not publish the local installation binary; recovery will inspect the durable transaction\n")
                 InstallFaults::transaction_boundary("install.binary.durable")
                 destination.resize(0)
-                bytes_push_array(&destination, destination_snapshot)
+                ByteText::append(&destination, destination_snapshot)
                 destination_c.resize(0)
                 path_with_nul_into(&destination, &destination_c)
                 destination_name <- (&destination_c[0]).cast[cstr] can Unsafe.PointerCast
@@ -3746,7 +3642,7 @@ module Cli:
                     return finish_local_install_error(lock_fd, "error: could not set local installation permissions; recovery will inspect the durable transaction\n")
                 InstallFaults::transaction_boundary("install.binary.mode.durable")
                 receipt_path.resize(0)
-                bytes_push_array(&receipt_path, receipt_snapshot)
+                ByteText::append(&receipt_path, receipt_snapshot)
                 if not publish_local_install_receipt(receipt_path, receipt):
                     return finish_local_install_error(lock_fd, "error: could not publish the local installation receipt; recovery will inspect the durable transaction\n")
                 InstallFaults::transaction_boundary("install.receipt.durable")
@@ -3772,10 +3668,10 @@ module Cli:
                 index: mutable i64 = 2
                 while index < argc |slots, index, local_seen, package_seen|:
                     argument: cstr = slots[index].cast[cstr]
-                    if cstr_equal(argument, "--local"):
+                    if Platform::pkg_cstr_equal(argument, "--local"):
                         return EXIT_USAGE if local_seen
                         local_seen <- true
-                    elif cstr_equal(argument, "--bin"):
+                    elif Platform::pkg_cstr_equal(argument, "--bin"):
                         return EXIT_USAGE if index + 1 >= argc
                         # The common option parser has already validated and
                         # stored this target name. Consume its value here so it
@@ -3796,7 +3692,7 @@ module Cli:
         def run_uninstall_local(name_raw_input: cstr) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
                 name: mutable darray[u8] = []
-                bytes_push_cstr(&name, name_raw_input)
+                ByteText::append_bounded_text(&name, name_raw_input)
                 prefix: mutable darray[u8] = []
                 return EXIT_USAGE if not InstallPrefix::read_configured(&prefix)
                 bin_dir: mutable darray[u8] = []
@@ -3815,8 +3711,8 @@ module Cli:
                 path_join_into(receipt_dir, name_raw, &receipt_path)
                 destination_snapshot: mutable darray[u8] = []
                 receipt_snapshot: mutable darray[u8] = []
-                bytes_push_array(&destination_snapshot, destination)
-                bytes_push_array(&receipt_snapshot, receipt_path)
+                ByteText::append(&destination_snapshot, destination)
+                ByteText::append(&receipt_snapshot, receipt_path)
                 prefix_c: mutable darray[u8] = []
                 path_with_nul_into(&prefix, &prefix_c)
                 prefix_name: cstr = (&prefix_c[0]).cast[cstr] can Unsafe.PointerCast
@@ -3831,14 +3727,14 @@ module Cli:
                 recovered_install_published: mutable bool = false
                 if not recover_local_install_transaction(prefix, &recovered_operation, &recovered_name, &recovered_version, &recovered_digest, &recovered_install_published):
                     return finish_local_install_error(lock_fd, "error: an interrupted local installation could not be safely recovered; preserve the journal and files for review\n")
-                if bytes_equal_view(recovered_operation, "uninstall") and bytes_equal(recovered_name, name):
+                if ByteText::equal_text(recovered_operation, "uninstall") and ByteText::equal(recovered_name, name):
                     return finish_local_install_error(lock_fd, "error: could not close the recovered local installation lock\n") if not release_install_lock(lock_fd)
                     write_ok("uninstalled ")
                     write_bytes(1, &name)
                     write_ok("\n")
                     return EXIT_OK
                 destination.resize(0)
-                bytes_push_array(&destination, destination_snapshot)
+                ByteText::append(&destination, destination_snapshot)
                 destination_c: mutable darray[u8] = []
                 path_with_nul_into(&destination, &destination_c)
                 destination_name: cstr = (&destination_c[0]).cast[cstr] can Unsafe.PointerCast
@@ -3848,7 +3744,7 @@ module Cli:
                 if destination_state < 0:
                     return finish_local_install_error(lock_fd, "error: local installation is not a trusted regular file; refusing removal\n")
                 receipt_path.resize(0)
-                bytes_push_array(&receipt_path, receipt_snapshot)
+                ByteText::append(&receipt_path, receipt_snapshot)
                 receipt_c: mutable darray[u8] = []
                 path_with_nul_into(&receipt_path, &receipt_c)
                 receipt_name: cstr = (&receipt_c[0]).cast[cstr] can Unsafe.PointerCast
@@ -3864,11 +3760,11 @@ module Cli:
                 receipt_device: mutable u64 = 0.u64()
                 receipt_inode: mutable u64 = 0.u64()
                 destination.resize(0)
-                bytes_push_array(&destination, destination_snapshot)
+                ByteText::append(&destination, destination_snapshot)
                 if not read_trusted_install_file_identity(destination, 67108864.usize(), &artifact_bytes, &artifact_device, &artifact_inode):
                     return finish_local_install_error(lock_fd, "error: could not read the local installation or its receipt\n")
                 receipt_path.resize(0)
-                bytes_push_array(&receipt_path, receipt_snapshot)
+                ByteText::append(&receipt_path, receipt_snapshot)
                 if not read_trusted_install_file_identity(receipt_path, InstallRecords::max_record_bytes, &receipt, &receipt_device, &receipt_inode):
                     return finish_local_install_error(lock_fd, "error: could not read the local installation or its receipt\n")
                 digest_bytes: mutable darray[u8] = []
@@ -3877,17 +3773,17 @@ module Cli:
                     return finish_local_install_error(lock_fd, "error: could not verify the local installation binary\n")
                 expected_prefix: mutable darray[u8] = []
                 expected_suffix: mutable darray[u8] = []
-                bytes_push_view(&expected_prefix, "elisapkg-install-receipt:1\nname:")
-                bytes_push_array(&expected_prefix, name)
-                bytes_push_view(&expected_prefix, "\nversion:")
-                bytes_push_view(&expected_suffix, "\npath:")
-                bytes_push_array(&expected_suffix, destination_snapshot)
-                bytes_push_view(&expected_suffix, "\nartifact-digest:sha256:")
-                bytes_push_array(&expected_suffix, digest)
-                bytes_push_view(&expected_suffix, "\n")
+                ByteText::append_text(&expected_prefix, "elisapkg-install-receipt:1\nname:")
+                ByteText::append(&expected_prefix, name)
+                ByteText::append_text(&expected_prefix, "\nversion:")
+                ByteText::append_text(&expected_suffix, "\npath:")
+                ByteText::append(&expected_suffix, destination_snapshot)
+                ByteText::append_text(&expected_suffix, "\nartifact-digest:sha256:")
+                ByteText::append(&expected_suffix, digest)
+                ByteText::append_text(&expected_suffix, "\n")
                 version_bytes: mutable darray[u8] = []
                 version_end: usize = receipt.count - expected_suffix.count if receipt.count >= expected_suffix.count else 0.usize()
-                if not bytes_starts_with(receipt, expected_prefix) or not bytes_ends_with(receipt, expected_suffix) or version_end <= expected_prefix.count:
+                if not ByteText::starts_with(receipt, expected_prefix) or not ByteText::ends_with(receipt, expected_suffix) or version_end <= expected_prefix.count:
                     return finish_local_install_error(lock_fd, "error: installation receipt does not match the current file; refusing removal\n")
                 for index in expected_prefix.count..<version_end |receipt, version_bytes|:
                     version_bytes.push(receipt[index])
@@ -3905,12 +3801,12 @@ module Cli:
                     return finish_local_install_error(lock_fd, "error: could not durably record the local uninstallation transaction\n")
                 InstallFaults::transaction_boundary("uninstall.journal.durable")
                 destination.resize(0)
-                bytes_push_array(&destination, destination_snapshot)
+                ByteText::append(&destination, destination_snapshot)
                 if not remove_trusted_install_file_identity(destination, artifact_device, artifact_inode):
                     return finish_local_install_error(lock_fd, "error: could not remove the local installation; recovery will inspect the durable transaction\n")
                 InstallFaults::transaction_boundary("uninstall.binary.removed")
                 receipt_path.resize(0)
-                bytes_push_array(&receipt_path, receipt_snapshot)
+                ByteText::append(&receipt_path, receipt_snapshot)
                 if not remove_trusted_install_file_identity(receipt_path, receipt_device, receipt_inode):
                     return finish_local_install_error(lock_fd, "error: could not remove the local installation receipt; recovery will inspect the durable transaction\n")
                 InstallFaults::transaction_boundary("uninstall.receipt.removed")
@@ -3932,10 +3828,10 @@ module Cli:
                 index: mutable i64 = 2
                 while index < argc:
                     argument: cstr = slots[index].cast[cstr]
-                    if cstr_equal(argument, "--local"):
+                    if Platform::pkg_cstr_equal(argument, "--local"):
                         return EXIT_USAGE if local_seen
                         local_seen <- true
-                    elif cstr_equal(argument, "--") or Platform::pkg_strlen(argument) == 0.usize() or argument[0].u8() == 45 or Platform::pkg_strlen(name) != 0.usize():
+                    elif Platform::pkg_cstr_equal(argument, "--") or Platform::pkg_strlen(argument) == 0.usize() or argument[0].u8() == 45 or Platform::pkg_strlen(name) != 0.usize():
                         write_error("error: invalid uninstall arguments\n")
                         return EXIT_USAGE
                     else:
@@ -3943,7 +3839,7 @@ module Cli:
                     index <- index + 1
                 return EXIT_USAGE if not local_seen or Platform::pkg_strlen(name) == 0.usize()
                 name_bytes: mutable darray[u8] = []
-                bytes_push_cstr(&name_bytes, name)
+                ByteText::append_bounded_text(&name_bytes, name)
                 return EXIT_USAGE if not valid_package_name(name_bytes)
                 return run_uninstall_local(name)
 
@@ -3952,7 +3848,7 @@ module Cli:
                 return EXIT_SECURITY if not transaction_recover()
                 return EXIT_USAGE if argc != 3
                 alias: mutable darray[u8] = []
-                bytes_push_cstr(&alias, slots[2].cast[cstr])
+                ByteText::append_bounded_text(&alias, slots[2].cast[cstr])
                 return EXIT_USAGE if not valid_package_name(alias)
                 root: mutable darray[u8] = [46]
                 root_name: mutable darray[u8] = []
@@ -3993,7 +3889,7 @@ module Cli:
                 return EXIT_USAGE if argc > 3
                 wanted: mutable darray[u8] = []
                 if argc == 3:
-                    bytes_push_cstr(&wanted, slots[2].cast[cstr])
+                    ByteText::append_bounded_text(&wanted, slots[2].cast[cstr])
                     return EXIT_USAGE if not valid_package_name(wanted)
                 root: mutable darray[u8] = [46]
                 raw: mutable darray[u8] = []
@@ -4002,7 +3898,7 @@ module Cli:
                 root_name: mutable darray[u8] = []
                 root_version: mutable darray[u8] = []
                 return EXIT_USAGE if not validate_manifest_at(raw, &root, &root_name, &root_version)
-                return EXIT_USAGE if wanted.count > 0.usize() and bytes_equal(wanted, root_name)
+                return EXIT_USAGE if wanted.count > 0.usize() and ByteText::equal(wanted, root_name)
                 return EXIT_SECURITY if not transaction_begin(raw)
                 options: Model::CommandOptions = Model::CommandOptions{locked: false, offline: false, frozen: false, json: false, verbose: false, profile: "debug", target_name: "", target_kind: "", update_name: ""}
                 if wanted.count > 0.usize():
@@ -4110,7 +4006,7 @@ module Cli:
                     return EXIT_SECURITY if Integrity::sha256(raw, &manifest_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(manifest_digest_bytes, &manifest_digest)
                     return EXIT_SECURITY if Integrity::sha256(lock, &lock_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(lock_digest_bytes, &lock_digest)
                     archive_path: mutable darray[u8] = []
-                    bytes_push_view(&archive_path, ".elisapkg/package.tar")
+                    ByteText::append_text(&archive_path, ".elisapkg/package.tar")
                     return EXIT_SECURITY if not read_package_file_into(&archive_path, &archive_bytes)
                     return EXIT_SECURITY if not Archive::verify_ustar_archive(archive_bytes)
                     archive_digest_bytes: mutable darray[u8] = []
@@ -4118,13 +4014,13 @@ module Cli:
                     receipt.resize(PackageReceipt::max_encode + 1.usize())
                     return EXIT_SECURITY if not read_cstr_into(".elisapkg/package.receipt", &receipt)
                     expected_receipt: darray[u8] = PackageReceipt::encode(name, version, manifest_digest, lock_digest, archive_digest)
-                    return EXIT_SECURITY if not bytes_equal(receipt, expected_receipt)
+                    return EXIT_SECURITY if not ByteText::equal(receipt, expected_receipt)
                 manifest_after: mutable darray[u8] = []
                 manifest_after.resize(1048577)
                 lock_after: mutable darray[u8] = []
                 lock_after.resize(1048577)
                 return EXIT_SECURITY if not read_cstr_into("elisapkg.json", &manifest_after) or not read_cstr_into("elisapkg.lock", &lock_after)
-                return EXIT_SECURITY if not bytes_equal(manifest_after, raw) or not bytes_equal(lock_after, lock)
+                return EXIT_SECURITY if not ByteText::equal(manifest_after, raw) or not ByteText::equal(lock_after, lock)
                 archive_state_after: i64 = Platform::pkg_package_file_size(".elisapkg/package.tar")
                 receipt_state_after: i64 = Platform::pkg_package_file_size(".elisapkg/package.receipt")
                 return EXIT_SECURITY if archive_state_after < 0 and archive_state_after != -2
@@ -4132,7 +4028,7 @@ module Cli:
                 return EXIT_SECURITY if archive_present != (archive_state_after >= 0) or receipt_present != (receipt_state_after >= 0)
                 if archive_present:
                     archive_path_after: mutable darray[u8] = []
-                    bytes_push_view(&archive_path_after, ".elisapkg/package.tar")
+                    ByteText::append_text(&archive_path_after, ".elisapkg/package.tar")
                     # Reuse the first bounded buffer: verify the bytes still at the
                     # pathname without retaining a second full-size archive copy.
                     archive_after_digest_bytes: mutable darray[u8] = []
@@ -4141,7 +4037,7 @@ module Cli:
                     receipt_after.resize(PackageReceipt::max_encode + 1.usize())
                     return EXIT_SECURITY if not read_package_file_into(&archive_path_after, &archive_bytes) or not read_cstr_into(".elisapkg/package.receipt", &receipt_after)
                     return EXIT_SECURITY if Integrity::sha256(archive_bytes, &archive_after_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(archive_after_digest_bytes, &archive_after_digest)
-                    return EXIT_SECURITY if not bytes_equal(archive_after_digest, archive_digest) or not bytes_equal(receipt_after, receipt)
+                    return EXIT_SECURITY if not ByteText::equal(archive_after_digest, archive_digest) or not ByteText::equal(receipt_after, receipt)
                     return EXIT_SECURITY if not Cache::verify_blob(archive_digest)
                 write_ok("cache: local lock and manifest digests verified\n")
                 if archive_present:
@@ -4151,10 +4047,10 @@ module Cli:
 
         def run_cache_gc(argc: i64, slots: mutable cstr&&) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
-                if argc == 4 and cstr_equal(slots[2].cast[cstr], "gc") and cstr_equal(slots[3].cast[cstr], "--dry-run"):
+                if argc == 4 and Platform::pkg_cstr_equal(slots[2].cast[cstr], "gc") and Platform::pkg_cstr_equal(slots[3].cast[cstr], "--dry-run"):
                     write_ok("cache: no shared cache configured; nothing would be collected\n")
                     return EXIT_OK
-                if argc == 3 and cstr_equal(slots[2].cast[cstr], "gc"):
+                if argc == 3 and Platform::pkg_cstr_equal(slots[2].cast[cstr], "gc"):
                     write_error("error: cache garbage collection is disabled until a verified cache store is configured; use `cache gc --dry-run`\n")
                     return 7
                 return EXIT_USAGE
@@ -4187,7 +4083,7 @@ module Cli:
             root_real_length: usize = Platform::pkg_strlen(root_real_name)
             return false if root_real_length == 0.usize() or root_real_length >= 4096.usize()
             root_policy_path: mutable darray[u8] = []
-            bytes_push_cstr(&root_policy_path, root_real_name)
+            ByteText::append_bounded_text(&root_policy_path, root_real_name)
             root_policy_path.push(0)
             return false if PackagePathPolicy::credential_root_forbidden(root_policy_path)
             buffer: mutable darray[u8] = []
@@ -4215,7 +4111,7 @@ module Cli:
                 # These files are represented by dedicated lock/manifest
                 # digests. Including the lock itself would make its source
                 # fingerprint self-referential and impossible to stabilize.
-                continue if bytes_equal_view(logical_path, "elisapkg.json") or bytes_equal_view(logical_path, "elisapkg.lock")
+                continue if ByteText::equal_text(logical_path, "elisapkg.json") or ByteText::equal_text(logical_path, "elisapkg.lock")
                 remaining_bytes: usize = maximum_bytes - bytes_hashed
                 path_c: mutable darray[u8] = []
                 path_with_nul_into(&path, &path_c)
@@ -4266,7 +4162,7 @@ module Cli:
                 else:
                     return false
                 root_policy_path: mutable darray[u8] = []
-                bytes_push_cstr(&root_policy_path, root_real_name)
+                ByteText::append_bounded_text(&root_policy_path, root_real_name)
                 root_policy_path.push(0)
                 return false if PackagePathPolicy::credential_root_forbidden(root_policy_path)
                 buffer: mutable darray[u8] = []
@@ -4294,7 +4190,7 @@ module Cli:
                     return false if cursor >= collected.usize()
                     cursor <- cursor + 1.usize()
                     return false if path.count == 0.usize() or PackageSelection::publish_path_forbidden(path)
-                    required: bool = bytes_equal_view(path, "elisapkg.json") or bytes_equal_view(path, "elisapkg.lock")
+                    required: bool = ByteText::equal_text(path, "elisapkg.json") or ByteText::equal_text(path, "elisapkg.lock")
                     include_selected: mutable bool = required or PackageSelection::include_allows_path(raw, include_start, include_end, path, &glob_work_remaining, &glob_rows_remaining, &glob_budget_exhausted)
                     if glob_budget_exhausted:
                         write_error("error: package include/exclude patterns exceeded the bounded matching budget\n")
@@ -4310,7 +4206,7 @@ module Cli:
                             out.push(path[index])
                         out.push(0)
                         selected <- selected + 1.usize()
-                        target_found <- true if bytes_equal(path, target)
+                        target_found <- true if ByteText::equal(path, target)
                 return selected > 0.usize() and target_found
 
         def package_archive_bytes(raw: darray[u8]&, target: darray[u8]&, out: mutable darray[u8]&) -> bool can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
@@ -4327,7 +4223,7 @@ module Cli:
                     return EXIT_USAGE
                 list_only: mutable bool = false
                 for index in 2..<argc |slots, list_only|:
-                    list_only <- true if cstr_equal(slots[index].cast[cstr], "--list")
+                    list_only <- true if Platform::pkg_cstr_equal(slots[index].cast[cstr], "--list")
                 raw: mutable darray[u8] = []
                 raw.resize(1048577)
                 return EXIT_USAGE if not read_cstr_into("elisapkg.json", &raw)
@@ -4371,12 +4267,12 @@ module Cli:
                 package_source_digest: mutable darray[u8] = []
                 return EXIT_SECURITY if not source_tree_digest_into(&package_source_digest)
                 state_root: mutable darray[u8] = []
-                bytes_push_view(&state_root, ".elisapkg")
+                ByteText::append_text(&state_root, ".elisapkg")
                 return 7 if not make_directory(&state_root)
                 archive: mutable darray[u8] = []
                 return 7 if not package_archive_bytes(raw, entry, &archive)
                 package_source_digest_after: mutable darray[u8] = []
-                return 7 if not source_tree_digest_into(&package_source_digest_after) or not bytes_equal(package_source_digest_after, package_source_digest)
+                return 7 if not source_tree_digest_into(&package_source_digest_after) or not ByteText::equal(package_source_digest_after, package_source_digest)
                 # Manifest and lock bytes are excluded from the source-tree digest
                 # because their dedicated receipt fields would otherwise be
                 # self-referential. Re-read both inputs after archive creation so a
@@ -4387,7 +4283,7 @@ module Cli:
                 lock_after: mutable darray[u8] = []
                 lock_after.resize(1048577)
                 return 7 if not read_cstr_into("elisapkg.json", &manifest_after) or not read_cstr_into("elisapkg.lock", &lock_after)
-                return EXIT_SECURITY if not bytes_equal(manifest_after, raw) or not bytes_equal(lock_after, lock_raw)
+                return EXIT_SECURITY if not ByteText::equal(manifest_after, raw) or not ByteText::equal(lock_after, lock_raw)
                 return 7 if not Archive::verify_ustar_archive(archive)
                 archive_path: mutable darray[u8] = []
                 path_join_into(start, ".elisapkg/package.tar", &archive_path)
@@ -4403,7 +4299,7 @@ module Cli:
                 # published path. Refuse a pathname replacement between the
                 # atomic write and this read unless it still matches the exact tar
                 # that passed the in-memory archive verifier.
-                return 7 if not bytes_equal(persisted_archive, archive)
+                return 7 if not ByteText::equal(persisted_archive, archive)
                 digest_bytes: mutable darray[u8] = []
                 digest: mutable darray[u8] = []
                 return 7 if Integrity::sha256(persisted_archive, &digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(digest_bytes, &digest)
@@ -4417,7 +4313,7 @@ module Cli:
                 quarantine_parent: mutable darray[u8] = []
                 path_with_nul_into(&blob_path, &blob_name_c)
                 path_with_nul_into(&archive_path, &archive_source_c)
-                bytes_push_view(&quarantine_parent, Cache::quarantine_directory)
+                ByteText::append_text(&quarantine_parent, Cache::quarantine_directory)
                 blob_name: cstr = (&blob_name_c[0]).cast[cstr] can Unsafe.PointerCast
                 archive_source_name: cstr = (&archive_source_c[0]).cast[cstr] can Unsafe.PointerCast
                 if cstr_file_exists(blob_name):
@@ -4469,7 +4365,7 @@ module Cli:
                 source_end: mutable usize = 0.usize()
                 return false if not Json::object_value_span(lock, cursor, record_end, "source", &source_start, &source_end)
                 source_type: mutable darray[u8] = []
-                if Json::object_string_value(lock, source_start, source_end, "type", &source_type) and bytes_equal_view(source_type, "path"):
+                if Json::object_string_value(lock, source_start, source_end, "type", &source_type) and ByteText::equal_text(source_type, "path"):
                     relative: mutable darray[u8] = []
                     return false if not Json::object_string_value(lock, source_start, source_end, "path", &relative) or not valid_dependency_path(relative)
                     relative_c: mutable darray[u8] = []
@@ -4575,8 +4471,8 @@ module Cli:
             upper: mutable usize = packages.count
             while lower < upper |packages, wanted, lower, upper|:
                 middle: usize = lower + (upper - lower) / 2.usize()
-                return middle if bytes_equal(packages[middle].name, wanted)
-                if bytes_less(packages[middle].name, wanted):
+                return middle if ByteText::equal(packages[middle].name, wanted)
+                if ByteText::less(packages[middle].name, wanted):
                     lower <- middle + 1.usize()
                 else:
                     upper <- middle
@@ -4602,7 +4498,7 @@ module Cli:
                 kind: mutable darray[u8] = []
                 if not Json::object_string_value(raw, cursor, object_end, "kind", &kind):
                     return false
-                if bytes_equal_view(kind, "lib"):
+                if ByteText::equal_text(kind, "lib"):
                     libraries <- libraries + 1.usize()
                     return false if libraries > 1.usize()
                     return false if not Json::object_string_value(raw, cursor, object_end, "entry", &selected_entry)
@@ -4647,9 +4543,9 @@ module Cli:
                 return false if not Json::object_value_span(lock, cursor, record_end, "source", &source_start, &source_end)
                 source_type: mutable darray[u8] = []
                 relative_path: mutable darray[u8] = []
-                return false if not Json::object_string_value(lock, source_start, source_end, "type", &source_type) or not bytes_equal_view(source_type, "path")
+                return false if not Json::object_string_value(lock, source_start, source_end, "type", &source_type) or not ByteText::equal_text(source_type, "path")
                 return false if not Json::object_string_value(lock, source_start, source_end, "path", &relative_path) or not valid_dependency_path(relative_path)
-                return false if packages.count > 0.usize() and not bytes_less(packages[packages.count - 1.usize()].name, package_name)
+                return false if packages.count > 0.usize() and not ByteText::less(packages[packages.count - 1.usize()].name, package_name)
                 relative_c: mutable darray[u8] = []
                 path_with_nul_into(&relative_path, &relative_c)
                 relative_name: cstr = (&relative_c[0]).cast[cstr] can Unsafe.PointerCast
@@ -4664,7 +4560,7 @@ module Cli:
                 actual_name: mutable darray[u8] = []
                 actual_version: mutable darray[u8] = []
                 return false if not validate_manifest_at(package_manifest, canonical_root, &actual_name, &actual_version)
-                return false if not bytes_equal(actual_name, package_name) or not bytes_equal(actual_version, package_version)
+                return false if not ByteText::equal(actual_name, package_name) or not ByteText::equal(actual_version, package_version)
                 manifest_digest_bytes: mutable darray[u8] = []
                 manifest_digest: mutable darray[u8] = []
                 return false if Integrity::sha256(package_manifest, &manifest_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(manifest_digest_bytes, &manifest_digest)
@@ -4783,11 +4679,11 @@ module Cli:
             out_entry.resize(0)
             return -84 if not Archive::is_safe_entry(relative_entry) or PackageSelection::publish_path_forbidden(relative_entry)
             template: mutable darray[u8] = []
-            bytes_push_array(&template, container)
+            ByteText::append(&template, container)
             if template.count == 0.usize() or template[template.count - 1.usize()] != 47:
                 template.push(47)
-            bytes_push_cstr(&template, label)
-            bytes_push_view(&template, "-XXXXXX")
+            ByteText::append_bounded_text(&template, label)
+            ByteText::append_text(&template, "-XXXXXX")
             template.push(0)
             mkdtemp_status: i64 = Platform::pkg_mkdtemp(&template)
             return mkdtemp_status if mkdtemp_status != 0
@@ -4811,7 +4707,7 @@ module Cli:
             total_bytes <- total_bytes + copied_bytes.usize()
             copied_digest: mutable darray[u8] = []
             return -86 if not source_tree_digest_at(out_root, &copied_digest)
-            return -87 if not bytes_equal(copied_digest, expected_digest)
+            return -87 if not ByteText::equal(copied_digest, expected_digest)
             relative_c: mutable darray[u8] = []
             path_with_nul_into(relative_entry, &relative_c)
             relative_name: cstr = (&relative_c[0]).cast[cstr] can Unsafe.PointerCast
@@ -4846,7 +4742,7 @@ module Cli:
                 if not Sandbox::build_sandbox_available():
                     write_error("error: compiler builds require the macOS Seatbelt sandbox; builds fail closed on this platform\n")
                     return EXIT_BUILD
-                return EXIT_USAGE if not cstr_equal(options.profile, "debug") and not cstr_equal(options.profile, "release")
+                return EXIT_USAGE if not Platform::pkg_cstr_equal(options.profile, "debug") and not Platform::pkg_cstr_equal(options.profile, "release")
                 return EXIT_BUILD if not load_package(start)
                 manifest_raw: mutable darray[u8] = []
                 manifest_raw.resize(1048577)
@@ -4862,8 +4758,8 @@ module Cli:
                 target_kind: mutable darray[u8] = []
                 target_entry: mutable darray[u8] = []
                 return EXIT_BUILD if not ManifestTargets::select_target(manifest_raw, options.target_name, options.target_kind, &target_name, &target_kind, &target_entry)
-                is_library: bool = bytes_equal_view(target_kind, "lib")
-                return EXIT_BUILD if not (is_library or bytes_equal_view(target_kind, "bin") or bytes_equal_view(target_kind, "test"))
+                is_library: bool = ByteText::equal_text(target_kind, "lib")
+                return EXIT_BUILD if not (is_library or ByteText::equal_text(target_kind, "bin") or ByteText::equal_text(target_kind, "test"))
                 target_entry_c: mutable darray[u8] = []
                 path_with_nul_into(&target_entry, &target_entry_c)
                 target_resolved_buffer: mutable darray[u8] = []
@@ -4886,7 +4782,7 @@ module Cli:
                 manifest_after_resolve: mutable darray[u8] = []
                 manifest_after_resolve.resize(1048577)
                 return EXIT_BUILD if not read_cstr_into("elisapkg.json", &manifest_after_resolve)
-                return EXIT_BUILD if not bytes_equal(manifest_after_resolve, manifest_raw)
+                return EXIT_BUILD if not ByteText::equal(manifest_after_resolve, manifest_raw)
                 return EXIT_BUILD if not lock_matches_manifest(manifest_raw, lock_raw, root_name, root_version, start)
                 if lock_version_is(lock_raw, 3):
                     write_error("error: builds with registry dependencies are not supported; local dependency builds require a version 2 local lock\n")
@@ -4936,7 +4832,7 @@ module Cli:
                     build_dir: mutable darray[u8] = []
                     artifact: mutable darray[u8] = []
                     receipt_path: mutable darray[u8] = []
-                    build_dir <- Build::output_directory(start, cstr_equal(options.profile, "release"))
+                    build_dir <- Build::output_directory(start, Platform::pkg_cstr_equal(options.profile, "release"))
                     artifact_label: darray[u8] = ManifestTargets::artifact_leaf(target_name, is_library)
                     artifact_leaf_storage: mutable darray[u8] = []
                     path_with_nul_into(artifact_label, &artifact_leaf_storage)
@@ -5032,8 +4928,8 @@ module Cli:
                     sdk_settings_path_c: mutable darray[u8] = []
                     sdk_settings_name: mutable cstr = ""
                     if sdk_root.count > 0.usize():
-                        bytes_push_array(&sdk_settings_path, sdk_root)
-                        bytes_push_view(&sdk_settings_path, "/SDKSettings.json")
+                        ByteText::append(&sdk_settings_path, sdk_root)
+                        ByteText::append_text(&sdk_settings_path, "/SDKSettings.json")
                         path_with_nul_into(sdk_settings_path, &sdk_settings_path_c)
                         sdk_settings_name <- (&sdk_settings_path_c[0]).cast[cstr] can Unsafe.PointerCast
                     sdk_identity: mutable darray[u8] = []
@@ -5045,14 +4941,14 @@ module Cli:
                     developer_assembler_path_c: mutable darray[u8] = []
                     developer_assembler_name: mutable cstr = ""
                     if developer_dir.count > 0.usize():
-                        bytes_push_array(&developer_linker_path, developer_dir)
-                        bytes_push_array(&developer_assembler_path, developer_dir)
-                        if bytes_equal_view(developer_dir, "/Library/Developer/CommandLineTools"):
-                            bytes_push_view(&developer_linker_path, "/usr/bin/ld")
-                            bytes_push_view(&developer_assembler_path, "/usr/bin/as")
-                        elif bytes_equal_view(developer_dir, "/Applications/Xcode.app/Contents/Developer"):
-                            bytes_push_view(&developer_linker_path, "/Toolchains/XcodeDefault.xctoolchain/usr/bin/ld")
-                            bytes_push_view(&developer_assembler_path, "/Toolchains/XcodeDefault.xctoolchain/usr/bin/as")
+                        ByteText::append(&developer_linker_path, developer_dir)
+                        ByteText::append(&developer_assembler_path, developer_dir)
+                        if ByteText::equal_text(developer_dir, "/Library/Developer/CommandLineTools"):
+                            ByteText::append_text(&developer_linker_path, "/usr/bin/ld")
+                            ByteText::append_text(&developer_assembler_path, "/usr/bin/as")
+                        elif ByteText::equal_text(developer_dir, "/Applications/Xcode.app/Contents/Developer"):
+                            ByteText::append_text(&developer_linker_path, "/Toolchains/XcodeDefault.xctoolchain/usr/bin/ld")
+                            ByteText::append_text(&developer_assembler_path, "/Toolchains/XcodeDefault.xctoolchain/usr/bin/as")
                         else:
                             write_error("error: unsupported macOS developer toolchain directory\n")
                             return EXIT_BUILD
@@ -5073,10 +4969,10 @@ module Cli:
                     # compiler inputs below come from this copied tree, never from a
                     # mutable checkout path.
                     snapshot_template: mutable darray[u8] = []
-                    bytes_push_array(&snapshot_template, build_dir)
+                    ByteText::append(&snapshot_template, build_dir)
                     if snapshot_template.count == 0.usize() or snapshot_template[snapshot_template.count - 1.usize()] != 47:
                         snapshot_template.push(47)
-                    bytes_push_view(&snapshot_template, ".source-snapshots-XXXXXX")
+                    ByteText::append_text(&snapshot_template, ".source-snapshots-XXXXXX")
                     snapshot_template.push(0)
                     if Platform::pkg_mkdtemp(&snapshot_template) != 0:
                         write_error("error: unable to create the private build source snapshot directory\n")
@@ -5115,9 +5011,9 @@ module Cli:
                             write_error("error: selected target path is unsafe for a package source snapshot\n")
                         else:
                             snapshot_error: mutable darray[u8] = []
-                            bytes_push_view(&snapshot_error, "error: project source could not be copied into the verified build snapshot (status ")
-                            bytes_push_i64(&snapshot_error, project_snapshot_status)
-                            bytes_push_view(&snapshot_error, ")\n")
+                            ByteText::append_text(&snapshot_error, "error: project source could not be copied into the verified build snapshot (status ")
+                            ByteText::append_signed_decimal(&snapshot_error, project_snapshot_status)
+                            ByteText::append_text(&snapshot_error, ")\n")
                             snapshot_error.push(0)
                             write_error((&snapshot_error[0]).cast[cstr] can Unsafe.PointerCast)
                         return EXIT_BUILD
@@ -5144,7 +5040,7 @@ module Cli:
                         return EXIT_BUILD
                     snapshot_source_digest_bytes: mutable darray[u8] = []
                     snapshot_source_digest: mutable darray[u8] = []
-                    if Integrity::sha256(snapshot_target_source, &snapshot_source_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(snapshot_source_digest_bytes, &snapshot_source_digest) or not bytes_equal(snapshot_source_digest, source_digest):
+                    if Integrity::sha256(snapshot_target_source, &snapshot_source_digest_bytes) != Integrity::DigestCode.Ok or not Integrity::hex_digest(snapshot_source_digest_bytes, &snapshot_source_digest) or not ByteText::equal(snapshot_source_digest, source_digest):
                         _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
                         write_error("error: selected target changed while creating the verified source snapshot\n")
                         return EXIT_BUILD
@@ -5161,63 +5057,63 @@ module Cli:
                             write_error("error: verified dependency aggregate exceeds the configured build limit\n")
                             return EXIT_BUILD
                     receipt: mutable darray[u8] = []
-                    bytes_push_view(&receipt, "elisapkg-build-receipt:12\nentry:")
-                    bytes_push_array(&receipt, target_entry)
-                    bytes_push_view(&receipt, "\ntarget-kind:")
-                    bytes_push_array(&receipt, target_kind)
-                    bytes_push_view(&receipt, "\nartifact:")
-                    bytes_push_cstr(&receipt, artifact_leaf)
-                    bytes_push_view(&receipt, "\nprofile:")
-                    bytes_push_cstr(&receipt, options.profile)
-                    bytes_push_view(&receipt, "\ncompiler-flags:")
-                    if cstr_equal(options.profile, "release"):
-                        bytes_push_view(&receipt, "-O2")
+                    ByteText::append_text(&receipt, "elisapkg-build-receipt:12\nentry:")
+                    ByteText::append(&receipt, target_entry)
+                    ByteText::append_text(&receipt, "\ntarget-kind:")
+                    ByteText::append(&receipt, target_kind)
+                    ByteText::append_text(&receipt, "\nartifact:")
+                    ByteText::append_bounded_text(&receipt, artifact_leaf)
+                    ByteText::append_text(&receipt, "\nprofile:")
+                    ByteText::append_bounded_text(&receipt, options.profile)
+                    ByteText::append_text(&receipt, "\ncompiler-flags:")
+                    if Platform::pkg_cstr_equal(options.profile, "release"):
+                        ByteText::append_text(&receipt, "-O2")
                     else:
-                        bytes_push_view(&receipt, "-O0,-g")
-                    bytes_push_view(&receipt, "\nsource-tree-digest:sha256:")
-                    bytes_push_array(&receipt, source_tree_digest)
-                    bytes_push_view(&receipt, "\nsource-digest:sha256:")
-                    bytes_push_array(&receipt, source_digest)
-                    bytes_push_view(&receipt, "\nmanifest-digest:sha256:")
-                    bytes_push_array(&receipt, manifest_digest)
-                    bytes_push_view(&receipt, "\nlock-digest:sha256:")
-                    bytes_push_array(&receipt, lock_digest)
+                        ByteText::append_text(&receipt, "-O0,-g")
+                    ByteText::append_text(&receipt, "\nsource-tree-digest:sha256:")
+                    ByteText::append(&receipt, source_tree_digest)
+                    ByteText::append_text(&receipt, "\nsource-digest:sha256:")
+                    ByteText::append(&receipt, source_digest)
+                    ByteText::append_text(&receipt, "\nmanifest-digest:sha256:")
+                    ByteText::append(&receipt, manifest_digest)
+                    ByteText::append_text(&receipt, "\nlock-digest:sha256:")
+                    ByteText::append(&receipt, lock_digest)
                     if has_local_build_dependencies:
-                        bytes_push_view(&receipt, "\ndependency-aggregate-digest:sha256:")
-                        bytes_push_array(&receipt, dependency_aggregate_digest)
+                        ByteText::append_text(&receipt, "\ndependency-aggregate-digest:sha256:")
+                        ByteText::append(&receipt, dependency_aggregate_digest)
                     else:
-                        bytes_push_view(&receipt, "\ndependency-aggregate-digest:none")
-                    bytes_push_view(&receipt, "\ncompiler:")
-                    bytes_push_cstr(&receipt, compiler)
-                    bytes_push_view(&receipt, "\ncompiler-executable:")
-                    bytes_push_cstr(&receipt, compiler_executable)
-                    bytes_push_view(&receipt, "\nstage1-bin:")
-                    bytes_push_cstr(&receipt, stage1_bin)
-                    bytes_push_view(&receipt, "\nruntime-object:")
-                    bytes_push_cstr(&receipt, runtime_obj)
-                    bytes_push_view(&receipt, "\ncompiler-identity:")
-                    bytes_push_array(&receipt, compiler_identity)
-                    bytes_push_view(&receipt, "\nstage1-identity:")
-                    bytes_push_array(&receipt, stage1_identity)
-                    bytes_push_view(&receipt, "\nruntime-identity:")
-                    bytes_push_array(&receipt, runtime_identity)
-                    bytes_push_view(&receipt, "\nclang-tool:")
-                    bytes_push_cstr(&receipt, clang_tool)
-                    bytes_push_view(&receipt, "\nclang-identity:")
-                    bytes_push_array(&receipt, clang_identity)
-                    bytes_push_view(&receipt, "\nmacos-sdk-root:")
-                    bytes_push_array(&receipt, sdk_root)
-                    bytes_push_view(&receipt, "\nmacos-developer-dir:")
-                    bytes_push_array(&receipt, developer_dir)
-                    bytes_push_view(&receipt, "\nmacos-linker-identity:")
-                    bytes_push_array(&receipt, developer_linker_identity)
-                    bytes_push_view(&receipt, "\nmacos-assembler-identity:")
-                    bytes_push_array(&receipt, developer_assembler_identity)
-                    bytes_push_view(&receipt, "\nmacos-sdk-identity:")
-                    bytes_push_array(&receipt, sdk_identity)
-                    bytes_push_view(&receipt, "\nallow-stale:")
-                    bytes_push_cstr(&receipt, allow_stale)
-                    bytes_push_view(&receipt, "\nsemantic-gate:1\nsandbox-policy:macos-seatbelt-v3")
+                        ByteText::append_text(&receipt, "\ndependency-aggregate-digest:none")
+                    ByteText::append_text(&receipt, "\ncompiler:")
+                    ByteText::append_bounded_text(&receipt, compiler)
+                    ByteText::append_text(&receipt, "\ncompiler-executable:")
+                    ByteText::append_bounded_text(&receipt, compiler_executable)
+                    ByteText::append_text(&receipt, "\nstage1-bin:")
+                    ByteText::append_bounded_text(&receipt, stage1_bin)
+                    ByteText::append_text(&receipt, "\nruntime-object:")
+                    ByteText::append_bounded_text(&receipt, runtime_obj)
+                    ByteText::append_text(&receipt, "\ncompiler-identity:")
+                    ByteText::append(&receipt, compiler_identity)
+                    ByteText::append_text(&receipt, "\nstage1-identity:")
+                    ByteText::append(&receipt, stage1_identity)
+                    ByteText::append_text(&receipt, "\nruntime-identity:")
+                    ByteText::append(&receipt, runtime_identity)
+                    ByteText::append_text(&receipt, "\nclang-tool:")
+                    ByteText::append_bounded_text(&receipt, clang_tool)
+                    ByteText::append_text(&receipt, "\nclang-identity:")
+                    ByteText::append(&receipt, clang_identity)
+                    ByteText::append_text(&receipt, "\nmacos-sdk-root:")
+                    ByteText::append(&receipt, sdk_root)
+                    ByteText::append_text(&receipt, "\nmacos-developer-dir:")
+                    ByteText::append(&receipt, developer_dir)
+                    ByteText::append_text(&receipt, "\nmacos-linker-identity:")
+                    ByteText::append(&receipt, developer_linker_identity)
+                    ByteText::append_text(&receipt, "\nmacos-assembler-identity:")
+                    ByteText::append(&receipt, developer_assembler_identity)
+                    ByteText::append_text(&receipt, "\nmacos-sdk-identity:")
+                    ByteText::append(&receipt, sdk_identity)
+                    ByteText::append_text(&receipt, "\nallow-stale:")
+                    ByteText::append_bounded_text(&receipt, allow_stale)
+                    ByteText::append_text(&receipt, "\nsemantic-gate:1\nsandbox-policy:macos-seatbelt-v3")
                     artifact_c: mutable darray[u8] = []
                     receipt_c: mutable darray[u8] = []
                     path_with_nul_into(&artifact, &artifact_c)
@@ -5233,11 +5129,11 @@ module Cli:
                             cached_digest: mutable darray[u8] = []
                             if Integrity::sha256(cached_artifact, &cached_digest_bytes) == Integrity::DigestCode.Ok and Integrity::hex_digest(cached_digest_bytes, &cached_digest):
                                 expected_receipt: mutable darray[u8] = []
-                                bytes_push_array(&expected_receipt, receipt)
-                                bytes_push_view(&expected_receipt, "\nartifact-digest:sha256:")
-                                bytes_push_array(&expected_receipt, cached_digest)
-                                bytes_push_view(&expected_receipt, "\n")
-                                if bytes_equal(cached_receipt, expected_receipt):
+                                ByteText::append(&expected_receipt, receipt)
+                                ByteText::append_text(&expected_receipt, "\nartifact-digest:sha256:")
+                                ByteText::append(&expected_receipt, cached_digest)
+                                ByteText::append_text(&expected_receipt, "\n")
+                                if ByteText::equal(cached_receipt, expected_receipt):
                                     if not remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots):
                                         write_error("error: unable to remove the verified build source snapshots\n")
                                         return EXIT_BUILD
@@ -5255,10 +5151,10 @@ module Cli:
                     # TMPDIR, and caches. It is the only writable subtree; the final
                     # artifact and its receipt stay outside the child's writable set.
                     sandbox_template: mutable darray[u8] = []
-                    bytes_push_array(&sandbox_template, build_dir)
+                    ByteText::append(&sandbox_template, build_dir)
                     if sandbox_template.count == 0.usize() or sandbox_template[sandbox_template.count - 1.usize()] != 47:
                         sandbox_template.push(47)
-                    bytes_push_view(&sandbox_template, ".sandbox-XXXXXX")
+                    ByteText::append_text(&sandbox_template, ".sandbox-XXXXXX")
                     sandbox_template.push(0)
                     if Platform::pkg_mkdtemp(&sandbox_template) != 0:
                         _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
@@ -5290,10 +5186,10 @@ module Cli:
                     aggregate_source_path_c: mutable darray[u8] = []
                     aggregate_compile_source_c: mutable darray[u8] = []
                     if has_local_build_dependencies:
-                        bytes_push_array(&aggregate_source_template, sandbox_work_dir)
+                        ByteText::append(&aggregate_source_template, sandbox_work_dir)
                         if aggregate_source_template.count == 0.usize() or aggregate_source_template[aggregate_source_template.count - 1.usize()] != 47:
                             aggregate_source_template.push(47)
-                        bytes_push_view(&aggregate_source_template, "dependency-aggregate.XXXXXX")
+                        ByteText::append_text(&aggregate_source_template, "dependency-aggregate.XXXXXX")
                         aggregate_source_template.push(0)
                         aggregate_fd: i64 = Platform::pkg_mkstemp(&aggregate_source_template)
                         if aggregate_fd < 0:
@@ -5344,8 +5240,8 @@ module Cli:
                         temp_template.push(sandbox_work_dir[index])
                     if temp_template.count == 0.usize() or temp_template[temp_template.count - 1.usize()] != 47:
                         temp_template.push(47)
-                    bytes_push_cstr(&temp_template, artifact_leaf)
-                    bytes_push_view(&temp_template, ".tmp.XXXXXX")
+                    ByteText::append_bounded_text(&temp_template, artifact_leaf)
+                    ByteText::append_text(&temp_template, ".tmp.XXXXXX")
                     temp_template.push(0)
                     temp_fd: i64 = Platform::pkg_mkstemp(&temp_template)
                     if temp_fd < 0:
@@ -5373,11 +5269,11 @@ module Cli:
                     sandbox_profile.push(0)
                     sandbox_profile_name: cstr = (&sandbox_profile[0]).cast[cstr] can Unsafe.PointerCast
                     callback_parameter: mutable darray[u8] = []
-                    bytes_push_view(&callback_parameter, "CALLBACK_PATH=/private/tmp/elisa-stage1-callback-")
+                    ByteText::append_text(&callback_parameter, "CALLBACK_PATH=/private/tmp/elisa-stage1-callback-")
                     callback_digits_offset: usize = callback_parameter.count
                     for _digit in 0..<20 |callback_parameter|:
                         callback_parameter.push(48)
-                    bytes_push_view(&callback_parameter, ".c")
+                    ByteText::append_text(&callback_parameter, ".c")
                     callback_parameter.push(0)
                     # The compiler was resolved against the fixed child PATH above;
                     # invoking its absolute path keeps execution and sandbox policy aligned.
@@ -5397,53 +5293,53 @@ module Cli:
                     args.push("/usr/bin/env")
                     args.push("-i")
                     args.push(Toolchain::isolated_path_environment)
-                    bytes_push_view(&temporary_env, "TMPDIR=")
-                    bytes_push_cstr(&temporary_env, canonical_sandbox_work_name)
+                    ByteText::append_text(&temporary_env, "TMPDIR=")
+                    ByteText::append_bounded_text(&temporary_env, canonical_sandbox_work_name)
                     temporary_env.push(0)
                     args.push((&temporary_env[0]).cast[cstr] can Unsafe.PointerCast)
                     sandbox_home_env: mutable darray[u8] = []
-                    bytes_push_view(&sandbox_home_env, "HOME=")
-                    bytes_push_cstr(&sandbox_home_env, canonical_sandbox_work_name)
+                    ByteText::append_text(&sandbox_home_env, "HOME=")
+                    ByteText::append_bounded_text(&sandbox_home_env, canonical_sandbox_work_name)
                     sandbox_home_env.push(0)
                     args.push((&sandbox_home_env[0]).cast[cstr] can Unsafe.PointerCast)
                     fixed_home_env: mutable darray[u8] = []
-                    bytes_push_view(&fixed_home_env, "CFFIXED_USER_HOME=")
-                    bytes_push_cstr(&fixed_home_env, canonical_sandbox_work_name)
+                    ByteText::append_text(&fixed_home_env, "CFFIXED_USER_HOME=")
+                    ByteText::append_bounded_text(&fixed_home_env, canonical_sandbox_work_name)
                     fixed_home_env.push(0)
                     args.push((&fixed_home_env[0]).cast[cstr] can Unsafe.PointerCast)
                     cache_home_env: mutable darray[u8] = []
-                    bytes_push_view(&cache_home_env, "XDG_CACHE_HOME=")
-                    bytes_push_cstr(&cache_home_env, canonical_sandbox_work_name)
+                    ByteText::append_text(&cache_home_env, "XDG_CACHE_HOME=")
+                    ByteText::append_bounded_text(&cache_home_env, canonical_sandbox_work_name)
                     cache_home_env.push(0)
                     args.push((&cache_home_env[0]).cast[cstr] can Unsafe.PointerCast)
                     args.push("ELISA_STAGE1_SEMANTIC_GATE=1")
-                    if not cstr_equal(stage1_bin, ""):
-                        bytes_push_view(&stage1_env, "ELISA_STAGE1_BIN=")
-                        bytes_push_cstr(&stage1_env, stage1_bin)
+                    if not Platform::pkg_cstr_equal(stage1_bin, ""):
+                        ByteText::append_text(&stage1_env, "ELISA_STAGE1_BIN=")
+                        ByteText::append_bounded_text(&stage1_env, stage1_bin)
                         stage1_env.push(0)
                         args.push((&stage1_env[0]).cast[cstr] can Unsafe.PointerCast)
-                    if not cstr_equal(runtime_obj, ""):
-                        bytes_push_view(&runtime_env, "ELISA_RUNTIME_OBJ=")
-                        bytes_push_cstr(&runtime_env, runtime_obj)
+                    if not Platform::pkg_cstr_equal(runtime_obj, ""):
+                        ByteText::append_text(&runtime_env, "ELISA_RUNTIME_OBJ=")
+                        ByteText::append_bounded_text(&runtime_env, runtime_obj)
                         runtime_env.push(0)
                         args.push((&runtime_env[0]).cast[cstr] can Unsafe.PointerCast)
-                    if not cstr_equal(allow_stale, ""):
-                        bytes_push_view(&stale_env, "ELISA_ALLOW_STALE_STAGE1=")
-                        bytes_push_cstr(&stale_env, allow_stale)
+                    if not Platform::pkg_cstr_equal(allow_stale, ""):
+                        ByteText::append_text(&stale_env, "ELISA_ALLOW_STALE_STAGE1=")
+                        ByteText::append_bounded_text(&stale_env, allow_stale)
                         stale_env.push(0)
                         args.push((&stale_env[0]).cast[cstr] can Unsafe.PointerCast)
                     if clang_tool[0].u8() != 0:
-                        bytes_push_view(&clang_env, "ELISA_CLANG=")
-                        bytes_push_cstr(&clang_env, clang_tool)
+                        ByteText::append_text(&clang_env, "ELISA_CLANG=")
+                        ByteText::append_bounded_text(&clang_env, clang_tool)
                         clang_env.push(0)
                         args.push((&clang_env[0]).cast[cstr] can Unsafe.PointerCast)
                     if sdk_root.count > 0.usize():
-                        bytes_push_view(&sdkroot_env, "SDKROOT=")
-                        bytes_push_array(&sdkroot_env, sdk_root)
+                        ByteText::append_text(&sdkroot_env, "SDKROOT=")
+                        ByteText::append(&sdkroot_env, sdk_root)
                         sdkroot_env.push(0)
                         args.push((&sdkroot_env[0]).cast[cstr] can Unsafe.PointerCast)
-                        bytes_push_view(&developer_dir_env, "DEVELOPER_DIR=")
-                        bytes_push_array(&developer_dir_env, developer_dir)
+                        ByteText::append_text(&developer_dir_env, "DEVELOPER_DIR=")
+                        ByteText::append(&developer_dir_env, developer_dir)
                         developer_dir_env.push(0)
                         args.push((&developer_dir_env[0]).cast[cstr] can Unsafe.PointerCast)
                     if compiler_is_stage1_wrapper:
@@ -5454,7 +5350,7 @@ module Cli:
                         # applies the process group, resource caps, and deadline.
                         compiler_executable <- stage1_bin
                     args.push(compiler_executable)
-                    if cstr_equal(options.profile, "release"):
+                    if Platform::pkg_cstr_equal(options.profile, "release"):
                         args.push("-O2")
                     else:
                         args.push("-O0")
@@ -5466,10 +5362,10 @@ module Cli:
                     args.push(compiler_source_name)
                     args.push(null)
                     stdout_template: mutable darray[u8] = []
-                    bytes_push_array(&stdout_template, sandbox_work_dir)
+                    ByteText::append(&stdout_template, sandbox_work_dir)
                     if stdout_template.count == 0.usize() or stdout_template[stdout_template.count - 1.usize()] != 47:
                         stdout_template.push(47)
-                    bytes_push_view(&stdout_template, "compiler.stdout.XXXXXX")
+                    ByteText::append_text(&stdout_template, "compiler.stdout.XXXXXX")
                     stdout_template.push(0)
                     compiler_stdout_fd: mutable i64 = Platform::pkg_mkstemp(&stdout_template)
                     if compiler_stdout_fd < 0:
@@ -5494,10 +5390,10 @@ module Cli:
                         compiler_stdout_fd <- raised_stdout_fd
                     compiler_stdout_name: cstr = (&stdout_template[0]).cast[cstr] can Unsafe.PointerCast
                     stderr_template: mutable darray[u8] = []
-                    bytes_push_array(&stderr_template, sandbox_work_dir)
+                    ByteText::append(&stderr_template, sandbox_work_dir)
                     if stderr_template.count == 0.usize() or stderr_template[stderr_template.count - 1.usize()] != 47:
                         stderr_template.push(47)
-                    bytes_push_view(&stderr_template, "compiler.stderr.XXXXXX")
+                    ByteText::append_text(&stderr_template, "compiler.stderr.XXXXXX")
                     stderr_template.push(0)
                     compiler_stderr_fd: mutable i64 = Platform::pkg_mkstemp(&stderr_template)
                     if compiler_stderr_fd < 0:
@@ -5647,7 +5543,7 @@ module Cli:
                         _ = Platform::pkg_rmdir(sandbox_work_name)
                         return EXIT_BUILD
                     temporary_path: mutable darray[u8] = []
-                    bytes_push_cstr(&temporary_path, temp_name)
+                    ByteText::append_bounded_text(&temporary_path, temp_name)
                     artifact_content: mutable darray[u8] = []
                     artifact_digest_bytes: mutable darray[u8] = []
                     artifact_digest: mutable darray[u8] = []
@@ -5694,14 +5590,14 @@ module Cli:
                         _ = remove_optional_build_aggregate(aggregate_source_name)
                         _ = Platform::pkg_rmdir(sandbox_work_name)
                         return EXIT_BUILD
-                    if not bytes_equal(manifest_after_build, manifest_raw) or not bytes_equal(lock_after_build, lock_raw) or not lock_matches_manifest(manifest_raw, lock_raw, root_name, root_version, start):
+                    if not ByteText::equal(manifest_after_build, manifest_raw) or not ByteText::equal(lock_after_build, lock_raw) or not lock_matches_manifest(manifest_raw, lock_raw, root_name, root_version, start):
                         _ = Platform::pkg_unlink(temp_name)
                         _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
                         _ = remove_optional_build_aggregate(aggregate_source_name)
                         _ = Platform::pkg_rmdir(sandbox_work_name)
                         return EXIT_BUILD
                     post_source_tree_digest: mutable darray[u8] = []
-                    if not source_tree_digest_into(&post_source_tree_digest) or not bytes_equal(post_source_tree_digest, source_tree_digest):
+                    if not source_tree_digest_into(&post_source_tree_digest) or not ByteText::equal(post_source_tree_digest, source_tree_digest):
                         _ = Platform::pkg_unlink(temp_name)
                         _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
                         _ = remove_optional_build_aggregate(aggregate_source_name)
@@ -5709,7 +5605,7 @@ module Cli:
                         return EXIT_BUILD
                     if has_local_build_dependencies:
                         aggregate_after_build: mutable darray[u8] = []
-                        if not read_package_file_into(aggregate_source_path, &aggregate_after_build) or not bytes_equal(aggregate_after_build, compiler_dependency_aggregate):
+                        if not read_package_file_into(aggregate_source_path, &aggregate_after_build) or not ByteText::equal(aggregate_after_build, compiler_dependency_aggregate):
                             _ = Platform::pkg_unlink(temp_name)
                             _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
                             _ = remove_optional_build_aggregate(aggregate_source_name)
@@ -5719,19 +5615,19 @@ module Cli:
                     toolchain_unchanged: mutable bool = true
                     post_tool_identity: mutable darray[u8] = []
                     if compiler_identity_ok:
-                        toolchain_unchanged <- tool_file_identity(compiler, true, true, &post_tool_identity) and bytes_equal(post_tool_identity, compiler_identity)
+                        toolchain_unchanged <- tool_file_identity(compiler, true, true, &post_tool_identity) and ByteText::equal(post_tool_identity, compiler_identity)
                     if toolchain_unchanged and stage1_identity_ok:
-                        toolchain_unchanged <- tool_file_identity(stage1_bin, false, true, &post_tool_identity) and bytes_equal(post_tool_identity, stage1_identity)
+                        toolchain_unchanged <- tool_file_identity(stage1_bin, false, true, &post_tool_identity) and ByteText::equal(post_tool_identity, stage1_identity)
                     if toolchain_unchanged and runtime_identity_ok:
-                        toolchain_unchanged <- tool_file_identity(runtime_obj, false, false, &post_tool_identity) and bytes_equal(post_tool_identity, runtime_identity)
+                        toolchain_unchanged <- tool_file_identity(runtime_obj, false, false, &post_tool_identity) and ByteText::equal(post_tool_identity, runtime_identity)
                     if toolchain_unchanged and clang_identity_ok:
-                        toolchain_unchanged <- tool_file_identity(clang_tool, false, true, &post_tool_identity) and bytes_equal(post_tool_identity, clang_identity)
+                        toolchain_unchanged <- tool_file_identity(clang_tool, false, true, &post_tool_identity) and ByteText::equal(post_tool_identity, clang_identity)
                     if toolchain_unchanged and sdk_identity_ok:
-                        toolchain_unchanged <- tool_file_identity(sdk_settings_name, sdk_root.count == 0.usize(), false, &post_tool_identity) and bytes_equal(post_tool_identity, sdk_identity)
+                        toolchain_unchanged <- tool_file_identity(sdk_settings_name, sdk_root.count == 0.usize(), false, &post_tool_identity) and ByteText::equal(post_tool_identity, sdk_identity)
                     if toolchain_unchanged and developer_linker_identity_ok:
-                        toolchain_unchanged <- tool_file_identity(developer_linker_name, sdk_root.count == 0.usize(), true, &post_tool_identity) and bytes_equal(post_tool_identity, developer_linker_identity)
+                        toolchain_unchanged <- tool_file_identity(developer_linker_name, sdk_root.count == 0.usize(), true, &post_tool_identity) and ByteText::equal(post_tool_identity, developer_linker_identity)
                     if toolchain_unchanged and developer_assembler_identity_ok:
-                        toolchain_unchanged <- tool_file_identity(developer_assembler_name, sdk_root.count == 0.usize(), true, &post_tool_identity) and bytes_equal(post_tool_identity, developer_assembler_identity)
+                        toolchain_unchanged <- tool_file_identity(developer_assembler_name, sdk_root.count == 0.usize(), true, &post_tool_identity) and ByteText::equal(post_tool_identity, developer_assembler_identity)
                     if not toolchain_unchanged:
                         _ = remove_optional_build_snapshots(source_snapshot_container_name, source_snapshot_roots)
                         _ = remove_optional_build_aggregate(aggregate_source_name)
@@ -5757,18 +5653,18 @@ module Cli:
                     # after the main compiler exits. Copy the bytes we hashed into a new
                     # parent-owned inode that was not present in the sandbox during build.
                     publish_template: mutable darray[u8] = []
-                    bytes_push_array(&publish_template, build_dir)
+                    ByteText::append(&publish_template, build_dir)
                     if publish_template.count == 0.usize() or publish_template[publish_template.count - 1.usize()] != 47:
                         publish_template.push(47)
-                    bytes_push_cstr(&publish_template, artifact_leaf)
-                    bytes_push_view(&publish_template, ".publish.XXXXXX")
+                    ByteText::append_bounded_text(&publish_template, artifact_leaf)
+                    ByteText::append_text(&publish_template, ".publish.XXXXXX")
                     publish_template.push(0)
                     publish_fd: i64 = Platform::pkg_mkstemp(&publish_template)
                     if publish_fd < 0:
                         _ = Platform::pkg_unlink(temp_name)
                         return EXIT_BUILD
                     publish_name: cstr = (&publish_template[0]).cast[cstr] can Unsafe.PointerCast
-                    output_mode: u16 = 493.u16() if cstr_equal(emit_kind, "exe") else 420.u16()
+                    output_mode: u16 = 493.u16() if Platform::pkg_cstr_equal(emit_kind, "exe") else 420.u16()
                     publish_ok: mutable bool = write_fd_all(publish_fd, artifact_content)
                     publish_ok <- false if Platform::pkg_chmod(publish_name, output_mode) != 0
                     publish_ok <- false if Platform::pkg_access(publish_name, artifact_access_mode) != 0
@@ -5783,9 +5679,9 @@ module Cli:
                         _ = Platform::pkg_unlink(publish_name)
                         _ = Platform::pkg_unlink(temp_name)
                         return EXIT_BUILD
-                    bytes_push_view(&receipt, "\nartifact-digest:sha256:")
-                    bytes_push_array(&receipt, artifact_digest)
-                    bytes_push_view(&receipt, "\n")
+                    ByteText::append_text(&receipt, "\nartifact-digest:sha256:")
+                    ByteText::append(&receipt, artifact_digest)
+                    ByteText::append_text(&receipt, "\n")
                     if not write_cstr_file(receipt_name, &receipt):
                         # The artifact has already been atomically published. Do not unlink
                         # this pathname after a receipt failure: an older artifact may have
@@ -5846,7 +5742,7 @@ module Cli:
                 target_kind: mutable darray[u8] = []
                 target_entry: mutable darray[u8] = []
                 return EXIT_BUILD if not ManifestTargets::select_target(manifest_raw, options.target_name, options.target_kind, &target_name, &target_kind, &target_entry)
-                if not bytes_equal_view(target_kind, expected_kind):
+                if not ByteText::equal_text(target_kind, expected_kind):
                     write_error("error: selected target does not produce an executable\n")
                     return EXIT_BUILD
                 artifact_label: darray[u8] = ManifestTargets::artifact_leaf(target_name, false)
@@ -5854,7 +5750,7 @@ module Cli:
                 path_with_nul_into(artifact_label, &artifact_leaf_storage)
                 artifact_leaf: cstr = (&artifact_leaf_storage[0]).cast[cstr] can Unsafe.PointerCast
                 current_directory: darray[u8] = []
-                build_root: darray[u8] = Build::output_directory(current_directory, cstr_equal(options.profile, "release"))
+                build_root: darray[u8] = Build::output_directory(current_directory, Platform::pkg_cstr_equal(options.profile, "release"))
                 artifact_path: mutable darray[u8] = []
                 path_join_into(build_root, artifact_leaf, &artifact_path)
                 artifact_path_c: mutable darray[u8] = []
@@ -5866,9 +5762,9 @@ module Cli:
                 args.push(Toolchain::isolated_path_environment)
                 args.push(artifact_name)
                 index: mutable i64 = 2
-                while index < argc and not cstr_equal(slots[index].cast[cstr], "--") |slots, index|:
+                while index < argc and not Platform::pkg_cstr_equal(slots[index].cast[cstr], "--") |slots, index|:
                     index <- index + 1
-                index <- index + 1 if index < argc and cstr_equal(slots[index].cast[cstr], "--")
+                index <- index + 1 if index < argc and Platform::pkg_cstr_equal(slots[index].cast[cstr], "--")
                 while index < argc |args, slots, index|:
                     args.push(slots[index].cast[cstr])
                     index <- index + 1
@@ -5908,23 +5804,23 @@ module Cli:
                 separator_seen: mutable bool = false
                 color_seen: mutable bool = false
                 while index < argc |slots, out, index, separator_seen, color_seen|:
-                    if cstr_equal(slots[index].cast[cstr], "--"):
+                    if Platform::pkg_cstr_equal(slots[index].cast[cstr], "--"):
                         separator_seen <- true
                         out.push(slots[index].cast[cstr])
                         index <- index + 1
                         continue
-                    if not separator_seen and cstr_equal(slots[index].cast[cstr], "--quiet"):
+                    if not separator_seen and Platform::pkg_cstr_equal(slots[index].cast[cstr], "--quiet"):
                         cli_quiet <- true
                         index <- index + 1
                         continue
-                    if not separator_seen and cstr_equal(slots[index].cast[cstr], "--color"):
+                    if not separator_seen and Platform::pkg_cstr_equal(slots[index].cast[cstr], "--color"):
                         return -1 if color_seen or index + 1 >= argc
                         color_value: cstr = slots[index + 1].cast[cstr]
-                        return -1 if not cstr_equal(color_value, "auto") and not cstr_equal(color_value, "always") and not cstr_equal(color_value, "never")
+                        return -1 if not Platform::pkg_cstr_equal(color_value, "auto") and not Platform::pkg_cstr_equal(color_value, "always") and not Platform::pkg_cstr_equal(color_value, "never")
                         color_seen <- true
                         index <- index + 2
                         continue
-                    if not separator_seen and cstr_equal(slots[index].cast[cstr], "--manifest-path"):
+                    if not separator_seen and Platform::pkg_cstr_equal(slots[index].cast[cstr], "--manifest-path"):
                         index <- index + 2
                         continue
                     out.push(slots[index].cast[cstr])
@@ -5946,18 +5842,18 @@ module Cli:
             separator_seen: mutable bool = false
             while index < argc |slots, out, index, separator_seen|:
                 argument: cstr = slots[index].cast[cstr]
-                if not separator_seen and cstr_equal(argument, "--"):
+                if not separator_seen and Platform::pkg_cstr_equal(argument, "--"):
                     separator_seen <- true
                     out.push(argument)
                     index <- index + 1
                     continue
-                if not separator_seen and (cstr_equal(argument, "--locked") or cstr_equal(argument, "--offline") or cstr_equal(argument, "--frozen") or cstr_equal(argument, "--json") or cstr_equal(argument, "--verbose") or cstr_equal(argument, "--quiet")):
+                if not separator_seen and (Platform::pkg_cstr_equal(argument, "--locked") or Platform::pkg_cstr_equal(argument, "--offline") or Platform::pkg_cstr_equal(argument, "--frozen") or Platform::pkg_cstr_equal(argument, "--json") or Platform::pkg_cstr_equal(argument, "--verbose") or Platform::pkg_cstr_equal(argument, "--quiet")):
                     index <- index + 1
                     continue
-                if not separator_seen and cstr_equal(argument, "--color"):
+                if not separator_seen and Platform::pkg_cstr_equal(argument, "--color"):
                     index <- index + 2
                     continue
-                if not separator_seen and cstr_equal(argument, "--manifest-path"):
+                if not separator_seen and Platform::pkg_cstr_equal(argument, "--manifest-path"):
                     index <- index + 2
                     continue
                 out.push(argument)
@@ -5976,13 +5872,13 @@ module Cli:
                     usage()
                     return EXIT_USAGE
                 command: cstr = slots[1].cast[cstr]
-                if cstr_equal(command, "--help") or cstr_equal(command, "-h"):
+                if Platform::pkg_cstr_equal(command, "--help") or Platform::pkg_cstr_equal(command, "-h"):
                     usage()
                     return EXIT_OK
-                if cstr_equal(command, "--version"):
+                if Platform::pkg_cstr_equal(command, "--version"):
                     write_ok("elisapkg 0.1.0\n")
                     return EXIT_OK
-                if cstr_equal(command, "init"):
+                if Platform::pkg_cstr_equal(command, "init"):
                     init_slots: mutable darray[cstr] = []
                     init_argc: i64 = compact_output_modes(argc, slots, &init_slots)
                     return EXIT_USAGE if init_argc < 0
@@ -5992,10 +5888,10 @@ module Cli:
                 scan_index: mutable i64 = 2
                 while scan_index < argc |slots, manifest_path, has_manifest_path, scan_index|:
                     scan_flag: cstr = slots[scan_index].cast[cstr]
-                    break if cstr_equal(scan_flag, "--")
-                    if cstr_equal(scan_flag, "--manifest-path"):
+                    break if Platform::pkg_cstr_equal(scan_flag, "--")
+                    if Platform::pkg_cstr_equal(scan_flag, "--manifest-path"):
                         return EXIT_USAGE if has_manifest_path or scan_index + 1 >= argc
-                        bytes_push_cstr(&manifest_path, slots[scan_index + 1].cast[cstr])
+                        ByteText::append_bounded_text(&manifest_path, slots[scan_index + 1].cast[cstr])
                         return EXIT_USAGE if manifest_path.count == 0.usize() or manifest_path.count > 4096.usize()
                         has_manifest_path <- true
                         scan_index <- scan_index + 2
@@ -6010,13 +5906,13 @@ module Cli:
                     effective_argc <- compact_manifest_args(argc, slots, &compacted)
                     return EXIT_USAGE if effective_argc <= 0
                     effective_slots <- (&compacted[0]).cast[mutable cstr&&] can Unsafe.PointerCast
-                if cstr_equal(command, "add") or cstr_equal(command, "remove") or cstr_equal(command, "update"):
+                if Platform::pkg_cstr_equal(command, "add") or Platform::pkg_cstr_equal(command, "remove") or Platform::pkg_cstr_equal(command, "update"):
                     mutation_slots: mutable darray[cstr] = []
                     mutation_argc: i64 = compact_manifest_args(argc, slots, &mutation_slots)
                     return EXIT_USAGE if mutation_argc < 0
                     mutation_effective_slots: mutable cstr&& = (&mutation_slots[0]).cast[mutable cstr&&] can Unsafe.PointerCast
-                    return run_add(mutation_argc, mutation_effective_slots) if cstr_equal(command, "add")
-                    return run_remove(mutation_argc, mutation_effective_slots) if cstr_equal(command, "remove")
+                    return run_add(mutation_argc, mutation_effective_slots) if Platform::pkg_cstr_equal(command, "add")
+                    return run_remove(mutation_argc, mutation_effective_slots) if Platform::pkg_cstr_equal(command, "remove")
                     return run_update(mutation_argc, mutation_effective_slots)
                 return EXIT_SECURITY if not transaction_recover()
                 # `.` means the process working directory and keeps path operations on a
@@ -6033,16 +5929,16 @@ module Cli:
                 index: mutable i64 = 2
                 while index < effective_argc |effective_slots, options, flags_ok, positional_count, separator_seen, profile_seen, publish_dry_run, index|:
                     flag: cstr = effective_slots[index].cast[cstr]
-                    if cstr_equal(flag, "--"):
+                    if Platform::pkg_cstr_equal(flag, "--"):
                         separator_seen <- true
-                        flags_ok <- false if not (cstr_equal(command, "run") or cstr_equal(command, "test"))
+                        flags_ok <- false if not (Platform::pkg_cstr_equal(command, "run") or Platform::pkg_cstr_equal(command, "test"))
                         index <- index + 1
                         continue
                     if separator_seen:
                         index <- index + 1
                         continue
-                    if cstr_equal(flag, "--bin") or cstr_equal(flag, "--lib") or cstr_equal(flag, "--test"):
-                        target_allowed: bool = (cstr_equal(command, "build") and (cstr_equal(flag, "--bin") or cstr_equal(flag, "--lib") or cstr_equal(flag, "--test"))) or (cstr_equal(command, "run") and cstr_equal(flag, "--bin")) or (cstr_equal(command, "test") and cstr_equal(flag, "--test")) or (cstr_equal(command, "install") and cstr_equal(flag, "--bin"))
+                    if Platform::pkg_cstr_equal(flag, "--bin") or Platform::pkg_cstr_equal(flag, "--lib") or Platform::pkg_cstr_equal(flag, "--test"):
+                        target_allowed: bool = (Platform::pkg_cstr_equal(command, "build") and (Platform::pkg_cstr_equal(flag, "--bin") or Platform::pkg_cstr_equal(flag, "--lib") or Platform::pkg_cstr_equal(flag, "--test"))) or (Platform::pkg_cstr_equal(command, "run") and Platform::pkg_cstr_equal(flag, "--bin")) or (Platform::pkg_cstr_equal(command, "test") and Platform::pkg_cstr_equal(flag, "--test")) or (Platform::pkg_cstr_equal(command, "install") and Platform::pkg_cstr_equal(flag, "--bin"))
                         flags_ok <- false if not target_allowed or index + 1 >= effective_argc
                         if flags_ok:
                             target_value: cstr = effective_slots[index + 1].cast[cstr]
@@ -6052,36 +5948,36 @@ module Cli:
                                 target_name_seen <- true
                         index <- index + 2
                         continue
-                    if cstr_equal(flag, "--profile"):
-                        profile_allowed: bool = cstr_equal(command, "build") or cstr_equal(command, "run") or cstr_equal(command, "test") or cstr_equal(command, "install")
+                    if Platform::pkg_cstr_equal(flag, "--profile"):
+                        profile_allowed: bool = Platform::pkg_cstr_equal(command, "build") or Platform::pkg_cstr_equal(command, "run") or Platform::pkg_cstr_equal(command, "test") or Platform::pkg_cstr_equal(command, "install")
                         flags_ok <- false if not profile_allowed or profile_seen or index + 1 >= effective_argc
                         if flags_ok:
                             profile_value: cstr = effective_slots[index + 1].cast[cstr]
-                            flags_ok <- false if not cstr_equal(profile_value, "debug") and not cstr_equal(profile_value, "release")
+                            flags_ok <- false if not Platform::pkg_cstr_equal(profile_value, "debug") and not Platform::pkg_cstr_equal(profile_value, "release")
                             if flags_ok:
                                 profile_seen <- true
                         index <- index + 2
                         continue
-                    options.locked <- true if cstr_equal(flag, "--locked")
-                    options.offline <- true if cstr_equal(flag, "--offline")
-                    options.frozen <- true if cstr_equal(flag, "--frozen")
-                    options.json <- true if cstr_equal(flag, "--json")
-                    options.verbose <- true if cstr_equal(flag, "--verbose")
-                    cli_quiet <- true if cstr_equal(flag, "--quiet")
-                    publish_dry_run <- true if cstr_equal(command, "publish") and cstr_equal(flag, "--dry-run")
-                    if cstr_equal(flag, "--color"):
+                    options.locked <- true if Platform::pkg_cstr_equal(flag, "--locked")
+                    options.offline <- true if Platform::pkg_cstr_equal(flag, "--offline")
+                    options.frozen <- true if Platform::pkg_cstr_equal(flag, "--frozen")
+                    options.json <- true if Platform::pkg_cstr_equal(flag, "--json")
+                    options.verbose <- true if Platform::pkg_cstr_equal(flag, "--verbose")
+                    cli_quiet <- true if Platform::pkg_cstr_equal(flag, "--quiet")
+                    publish_dry_run <- true if Platform::pkg_cstr_equal(command, "publish") and Platform::pkg_cstr_equal(flag, "--dry-run")
+                    if Platform::pkg_cstr_equal(flag, "--color"):
                         flags_ok <- false if color_seen or index + 1 >= effective_argc
                         if flags_ok:
                             color_value: cstr = effective_slots[index + 1].cast[cstr]
-                            flags_ok <- false if not cstr_equal(color_value, "auto") and not cstr_equal(color_value, "always") and not cstr_equal(color_value, "never")
+                            flags_ok <- false if not Platform::pkg_cstr_equal(color_value, "auto") and not Platform::pkg_cstr_equal(color_value, "always") and not Platform::pkg_cstr_equal(color_value, "never")
                             color_seen <- true if flags_ok
                         index <- index + 2
                         continue
                     flag_length: usize = Platform::pkg_strlen(flag)
                     is_positional: bool = flag_length > 0.usize() and flag[0].u8() != 45
-                    positional_allowed: bool = (cstr_equal(command, "why") and positional_count == 0) or (cstr_equal(command, "install") and positional_count == 0) or (cstr_equal(command, "uninstall") and positional_count == 0) or (cstr_equal(command, "cache") and positional_count == 0) or (cstr_equal(command, "fetch") and positional_count < 2)
+                    positional_allowed: bool = (Platform::pkg_cstr_equal(command, "why") and positional_count == 0) or (Platform::pkg_cstr_equal(command, "install") and positional_count == 0) or (Platform::pkg_cstr_equal(command, "uninstall") and positional_count == 0) or (Platform::pkg_cstr_equal(command, "cache") and positional_count == 0) or (Platform::pkg_cstr_equal(command, "fetch") and positional_count < 2)
                     recognized: mutable bool = is_positional and positional_allowed
-                    recognized <- true if not is_positional and (cstr_equal(flag, "--locked") or cstr_equal(flag, "--offline") or cstr_equal(flag, "--frozen") or cstr_equal(flag, "--json") or cstr_equal(flag, "--verbose") or cstr_equal(flag, "--quiet") or (cstr_equal(flag, "--list") and cstr_equal(command, "package")) or (cstr_equal(flag, "--dry-run") and (cstr_equal(command, "cache") or cstr_equal(command, "publish"))) or (cstr_equal(command, "install") and cstr_equal(flag, "--local")) or (cstr_equal(command, "uninstall") and cstr_equal(flag, "--local")))
+                    recognized <- true if not is_positional and (Platform::pkg_cstr_equal(flag, "--locked") or Platform::pkg_cstr_equal(flag, "--offline") or Platform::pkg_cstr_equal(flag, "--frozen") or Platform::pkg_cstr_equal(flag, "--json") or Platform::pkg_cstr_equal(flag, "--verbose") or Platform::pkg_cstr_equal(flag, "--quiet") or (Platform::pkg_cstr_equal(flag, "--list") and Platform::pkg_cstr_equal(command, "package")) or (Platform::pkg_cstr_equal(flag, "--dry-run") and (Platform::pkg_cstr_equal(command, "cache") or Platform::pkg_cstr_equal(command, "publish"))) or (Platform::pkg_cstr_equal(command, "install") and Platform::pkg_cstr_equal(flag, "--local")) or (Platform::pkg_cstr_equal(command, "uninstall") and Platform::pkg_cstr_equal(flag, "--local")))
                     cli_json_output <- true if options.json
                     flags_ok <- false if not recognized
                     positional_count <- positional_count + 1 if recognized and is_positional
@@ -6098,61 +5994,61 @@ module Cli:
                 dispatch_separator_seen: mutable bool = false
                 while dispatch_index < effective_argc |dispatch_slots, dispatch_index, dispatch_separator_seen, options|:
                     dispatch_flag: cstr = dispatch_slots[dispatch_index].cast[cstr]
-                    if cstr_equal(dispatch_flag, "--"):
+                    if Platform::pkg_cstr_equal(dispatch_flag, "--"):
                         dispatch_separator_seen <- true
                         dispatch_index <- dispatch_index + 1
                         continue
                     if dispatch_separator_seen:
                         dispatch_index <- dispatch_index + 1
                         continue
-                    if cstr_equal(dispatch_flag, "--profile"):
+                    if Platform::pkg_cstr_equal(dispatch_flag, "--profile"):
                         options.profile <- dispatch_slots[dispatch_index + 1].cast[cstr]
                         dispatch_index <- dispatch_index + 2
                         continue
-                    if cstr_equal(dispatch_flag, "--bin") or cstr_equal(dispatch_flag, "--lib") or cstr_equal(dispatch_flag, "--test"):
+                    if Platform::pkg_cstr_equal(dispatch_flag, "--bin") or Platform::pkg_cstr_equal(dispatch_flag, "--lib") or Platform::pkg_cstr_equal(dispatch_flag, "--test"):
                         options.target_name <- dispatch_slots[dispatch_index + 1].cast[cstr]
-                        options.target_kind <- "bin" if cstr_equal(dispatch_flag, "--bin")
-                        options.target_kind <- "lib" if cstr_equal(dispatch_flag, "--lib")
-                        options.target_kind <- "test" if cstr_equal(dispatch_flag, "--test")
+                        options.target_kind <- "bin" if Platform::pkg_cstr_equal(dispatch_flag, "--bin")
+                        options.target_kind <- "lib" if Platform::pkg_cstr_equal(dispatch_flag, "--lib")
+                        options.target_kind <- "test" if Platform::pkg_cstr_equal(dispatch_flag, "--test")
                         dispatch_index <- dispatch_index + 2
                         continue
                     dispatch_index <- dispatch_index + 1
-                if cstr_equal(command, "run") and Platform::pkg_strlen(options.target_kind) == 0.usize():
+                if Platform::pkg_cstr_equal(command, "run") and Platform::pkg_strlen(options.target_kind) == 0.usize():
                     options.target_kind <- "bin"
-                if cstr_equal(command, "test") and Platform::pkg_strlen(options.target_kind) == 0.usize():
+                if Platform::pkg_cstr_equal(command, "test") and Platform::pkg_strlen(options.target_kind) == 0.usize():
                     options.target_kind <- "test"
-                if cstr_equal(command, "check-manifest"):
+                if Platform::pkg_cstr_equal(command, "check-manifest"):
                     return run_check(&start, options)
-                if cstr_equal(command, "resolve"):
+                if Platform::pkg_cstr_equal(command, "resolve"):
                     return run_resolve(&start, options, false, true)
-                if cstr_equal(command, "tree"):
+                if Platform::pkg_cstr_equal(command, "tree"):
                     return run_tree(&start, options)
-                if cstr_equal(command, "why"):
+                if Platform::pkg_cstr_equal(command, "why"):
                     return run_why(effective_argc, dispatch_slots, &start, options)
-                if cstr_equal(command, "metadata"):
+                if Platform::pkg_cstr_equal(command, "metadata"):
                     return run_metadata(&start, options)
-                if cstr_equal(command, "doctor"):
+                if Platform::pkg_cstr_equal(command, "doctor"):
                     return run_doctor()
-                if cstr_equal(command, "fetch"):
+                if Platform::pkg_cstr_equal(command, "fetch"):
                     return run_fetch(effective_argc, dispatch_slots, &start, options)
-                if cstr_equal(command, "publish"):
+                if Platform::pkg_cstr_equal(command, "publish"):
                     return run_publish_dry_run(start, options) if publish_dry_run
                     return run_publish()
-                if cstr_equal(command, "install"):
+                if Platform::pkg_cstr_equal(command, "install"):
                     return run_install(effective_argc, dispatch_slots, &start, options)
-                if cstr_equal(command, "uninstall"):
+                if Platform::pkg_cstr_equal(command, "uninstall"):
                     return run_uninstall(effective_argc, dispatch_slots)
-                if cstr_equal(command, "clean"):
+                if Platform::pkg_cstr_equal(command, "clean"):
                     return run_clean()
-                if cstr_equal(command, "cache") and effective_argc == 3 and cstr_equal(effective_slots[2].cast[cstr], "verify"):
+                if Platform::pkg_cstr_equal(command, "cache") and effective_argc == 3 and Platform::pkg_cstr_equal(effective_slots[2].cast[cstr], "verify"):
                     return run_cache_verify(&start)
-                if cstr_equal(command, "cache"):
+                if Platform::pkg_cstr_equal(command, "cache"):
                     return run_cache_gc(effective_argc, dispatch_slots)
-                if cstr_equal(command, "package"):
+                if Platform::pkg_cstr_equal(command, "package"):
                     return run_package(effective_argc, dispatch_slots, &start)
-                if cstr_equal(command, "build") or cstr_equal(command, "run") or cstr_equal(command, "test"):
-                    return run_build(&start, options) if cstr_equal(command, "build")
-                    if cstr_equal(command, "run"):
+                if Platform::pkg_cstr_equal(command, "build") or Platform::pkg_cstr_equal(command, "run") or Platform::pkg_cstr_equal(command, "test"):
+                    return run_build(&start, options) if Platform::pkg_cstr_equal(command, "build")
+                    if Platform::pkg_cstr_equal(command, "run"):
                         build_status: i64 = run_build(&start, options)
                         return build_status if build_status != EXIT_OK
                         return run_program(effective_argc, dispatch_slots, options, "bin")

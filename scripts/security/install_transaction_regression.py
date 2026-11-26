@@ -34,7 +34,7 @@ def check_install_recovery_sync_order() -> None:
     if recovery_start < 0 or recovery_end < 0:
         raise SystemExit("error: local install recovery implementation is missing")
     recovery = source[recovery_start:recovery_end]
-    install_start = recovery.find('if bytes_equal_view(operation, "install"):')
+    install_start = recovery.find('if ByteText::equal_text(operation, "install"):')
     uninstall_start = recovery.find("# Removal intent is durable", install_start)
     copy_outputs_start = recovery.find("for index in 0..<operation.count", uninstall_start)
     if install_start < 0 or uninstall_start < 0 or copy_outputs_start < 0:
@@ -72,7 +72,7 @@ def check_install_recovery_sync_order() -> None:
     if publish_start < 0 or publish_end < 0:
         raise SystemExit("error: local receipt publication helper is missing")
     publish = source[publish_start:publish_end]
-    matching_receipt = publish.find("return false if not bytes_equal(existing, receipt)")
+    matching_receipt = publish.find("return false if not ByteText::equal(existing, receipt)")
     parent_sync = publish.find("Platform::pkg_fsync_parent(path_name)")
     if matching_receipt < 0 or parent_sync <= matching_receipt:
         raise SystemExit("error: receipt publication must sync its parent before success")
