@@ -158,60 +158,40 @@ module NativeFileMutation:
             return 0
 
         def unlink_verified_identity(path: cstr, expected_device: u64, expected_inode: u64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            parent: mutable darray[u8] = []
             leaf: mutable darray[u8] = []
-            return -22 if not PlatformNative::split_parent_leaf(path, &parent, &leaf)
-            leaf_snapshot: mutable darray[u8] = []
-            for index in 0..<leaf.count |leaf_snapshot, leaf|:
-                leaf_snapshot <- leaf_snapshot.push(leaf[index])
-            parent_name: cstr = (&parent[0]).cast[cstr] can Unsafe.PointerCast
-            expected_user_identifier: u64 = native_geteuid().u64()
-            directory: i64 = NativeTrustedPaths::open_trusted_directory(parent_name, expected_user_identifier)
+            directory: i64 =
+                parent: mutable darray[u8] = []
+                -22 if not PlatformNative::split_parent_leaf(path, &parent, &leaf) else NativeTrustedPaths::open_trusted_directory(((&parent[0]).cast[cstr] can Unsafe.PointerCast), native_geteuid().u64())
             return directory if directory < 0
-            leaf_c: mutable darray[u8] = []
-            for index in 0..<leaf_snapshot.count |leaf_c, leaf_snapshot|:
-                leaf_c <- leaf_c.push(leaf_snapshot[index])
-            leaf_c <- leaf_c.push(0)
-            leaf_name: cstr = (&leaf_c[0]).cast[cstr] can Unsafe.PointerCast
-            file_descriptor: i64 = PlatformNative::open_regular_file_at(directory, leaf_name)
+            file_descriptor: i64 = PlatformNative::open_regular_file_at(directory, ((&leaf[0]).cast[cstr] can Unsafe.PointerCast))
             return PlatformNative::close_error(directory, file_descriptor) if file_descriptor < 0
-            return PlatformNative::close_two_error(directory, file_descriptor, -13) if not NativeTrustedPaths::trusted_regular_file_descriptor(file_descriptor, expected_user_identifier)
-            file_descriptor_status: mutable darray[u8] = []
-            file_descriptor_status <- file_descriptor_status.resize(status_buffer_bytes)
-            region file_descriptor_status_raw_scope:
-                file_descriptor_status_raw: mutable void& = (&file_descriptor_status[0]).cast[mutable void&] can Unsafe.PointerCast
-                if native_fstat(file_descriptor, file_descriptor_status_raw) != 0:
-                    errno_value: i64 = NativeErrors::current_errno()
-                    return PlatformNative::close_two_error(directory, file_descriptor, NativeErrors::negative_value(errno_value))
-            file_descriptor_device: u64 = NativeStat::device(file_descriptor_status)
-            region file_descriptor_inode_scope:
-                file_descriptor_inode: u64 = NativeStat::inode(file_descriptor_status)
-                return PlatformNative::close_two_error(directory, file_descriptor, -13) if file_descriptor_device != expected_device or file_descriptor_inode != expected_inode
-            path_status: mutable darray[u8] = []
-            path_status <- path_status.resize(status_buffer_bytes)
-            region path_status_raw_scope:
-                path_status_raw: mutable void& = (&path_status[0]).cast[mutable void&] can Unsafe.PointerCast
-                if native_fstatat(directory, leaf_name, path_status_raw, at_no_follow) != 0:
-                    errno_value: i64 = NativeErrors::current_errno()
-                    return PlatformNative::close_two_error(directory, file_descriptor, NativeErrors::negative_value(errno_value))
-            return PlatformNative::close_two_error(directory, file_descriptor, -13) if NativeStat::file_type(path_status) != NativeStat::regular_mode
-            return PlatformNative::close_two_error(directory, file_descriptor, -13) if not NativeStat::same_identity(path_status, file_descriptor_status)
+            region identity_status_scope:
+                identity_status: i64 = verify_leaf_identity(directory, file_descriptor, leaf, expected_device, expected_inode)
+                return PlatformNative::close_two_error(directory, file_descriptor, identity_status) if identity_status != 0
             # POSIX has no unlink-if-inode primitive: this is the narrowest
             # descriptor-relative check available, but a same-UID actor can
             # still replace the leaf between fstatat and unlinkat.
-            removed: i64 = native_unlinkat(directory, leaf_name, 0)
-            region remove_errno_scope:
-                remove_errno: i64 = NativeErrors::current_errno()
-                return PlatformNative::close_two_error(directory, file_descriptor, NativeErrors::negative_value(remove_errno)) if removed != 0
-            sync_status: i64 = native_fsync(directory)
-            region sync_errno_scope:
-                sync_errno: i64 = NativeErrors::current_errno()
-                if sync_status != 0:
-                    return PlatformNative::close_two_error(directory, file_descriptor, NativeErrors::negative_value(sync_errno))
-            directory_close: i64 = native_close(directory)
-            region file_descriptor_close_scope:
-                file_descriptor_close: i64 = native_close(file_descriptor)
-                return -5 if directory_close != 0 or file_descriptor_close != 0
+            return PlatformNative::close_two_error(directory, file_descriptor, NativeErrors::negative_errno()) if native_unlinkat(directory, ((&leaf[0]).cast[cstr] can Unsafe.PointerCast), 0) != 0
+            return PlatformNative::close_two_error(directory, file_descriptor, NativeErrors::negative_errno()) if native_fsync(directory) != 0
+            region directory_close_scope:
+                directory_close: i64 = native_close(directory)
+                return -5 if native_close(file_descriptor) != 0 or directory_close != 0
+            return 0
+
+        # The open descriptor is a trusted regular file with the expected
+        # identity, and the leaf name still refers to that same file. Returns
+        # 0 or a negative errno.
+        def verify_leaf_identity(directory: i64, file_descriptor: i64, leaf: darray[u8]&, expected_device: u64, expected_inode: u64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            requires directory >= 0 and file_descriptor >= 0
+            return -13 if not NativeTrustedPaths::trusted_regular_file_descriptor(file_descriptor, native_geteuid().u64())
+            file_descriptor_status: mutable darray[u8] = []
+            file_descriptor_status <- file_descriptor_status.resize(status_buffer_bytes)
+            return NativeErrors::negative_errno() if native_fstat(file_descriptor, ((&file_descriptor_status[0]).cast[mutable void&] can Unsafe.PointerCast)) != 0
+            return -13 if NativeStat::device(file_descriptor_status) != expected_device or NativeStat::inode(file_descriptor_status) != expected_inode
+            path_status: mutable darray[u8] = []
+            path_status <- path_status.resize(status_buffer_bytes)
+            return NativeErrors::negative_errno() if native_fstatat(directory, ((&leaf[0]).cast[cstr] can Unsafe.PointerCast), ((&path_status[0]).cast[mutable void&] can Unsafe.PointerCast), at_no_follow) != 0
+            return -13 if NativeStat::file_type(path_status) != NativeStat::regular_mode or not NativeStat::same_identity(path_status, file_descriptor_status)
             return 0
 
         def unlink_kind(path: cstr, flags: i64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
