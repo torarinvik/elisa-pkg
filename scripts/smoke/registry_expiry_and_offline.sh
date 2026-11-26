@@ -91,62 +91,48 @@ subprocess.run([openssl, "pkeyutl", "-sign", "-rawin", "-inkey", private_key,
 (package_dir / "index.sig").chmod(0o600)
 PY
 }
-"$BIN" init "$REGISTRY_EXPIRY_SOURCE" >/dev/null
-(
-  cd "$REGISTRY_EXPIRY_SOURCE"
-  "$BIN" resolve >/dev/null
-  "$BIN" package >/dev/null
-)
-python3 - "$REGISTRY_EXPIRY_ROOT" "$REGISTRY_EXPIRY_SOURCE/.elisapkg/package.tar" "$REGISTRY_EXPIRY_PRIVATE" "$OPENSSL_BIN" <<'PY'
+write_registry_release() {
+  python3 - "$BIN" "$REGISTRY_EXPIRY_ROOT" "$REGISTRY_EXPIRY_SOURCE" "$REGISTRY_EXPIRY_PRIVATE" "$OPENSSL_BIN" "$@" <<'PYTHON'
 from pathlib import Path
 import hashlib, json, subprocess, sys, time
 
-root = Path(sys.argv[1])
-archive = Path(sys.argv[2]).read_bytes()
-private_key = sys.argv[3]
-openssl = sys.argv[4]
-digest = hashlib.sha256(archive).hexdigest()
-root.mkdir(mode=0o700, parents=True, exist_ok=True)
-for version, expires in (("1.0.0", 1), ("1.1.0", int(time.time()) + 3600)):
-    version_dir = root / "foo" / version
-    version_dir.mkdir(mode=0o700, parents=True)
-    (version_dir / "archive.tar").write_bytes(archive)
-    metadata = {
-        "schema-version": 1,
-        "algorithm": "ed25519",
-        "registry": str(root),
-        "package": "foo",
-        "version": version,
-        "archive": "archive.tar",
-        "archive-size": len(archive),
-        "archive-digest": digest,
-        "expires": expires,
-    }
-    metadata_path = version_dir / "metadata.json"
-    metadata_path.write_bytes((json.dumps(metadata, separators=(",", ":")) + "\n").encode())
-    subprocess.run([openssl, "pkeyutl", "-sign", "-rawin", "-inkey", private_key,
-                    "-in", str(metadata_path), "-out", str(version_dir / "metadata.sig")],
-                   check=True)
-unused_dir = root / "unused" / "1.0.0"
-unused_dir.mkdir(parents=True)
-(unused_dir / "archive.tar").write_bytes(archive)
-unused_metadata = {
+binary, root, sources, key, openssl, package, version, expiry = sys.argv[1:]
+root = Path(root)
+project = Path(sources) / package / version
+project.parent.mkdir(parents=True, exist_ok=True)
+subprocess.run([binary, "init", str(project)], check=True, stdout=subprocess.DEVNULL)
+manifest_path = project / "elisapkg.json"
+manifest = json.loads(manifest_path.read_text())
+manifest["package"].update(name=package, version=version)
+manifest_path.write_text(json.dumps(manifest) + "\n")
+for command in ("resolve", "package"):
+    subprocess.run([binary, command], cwd=project, check=True, stdout=subprocess.DEVNULL)
+archive = (project / ".elisapkg/package.tar").read_bytes()
+
+release = root / package / version
+release.mkdir(mode=0o700, parents=True)
+(release / "archive.tar").write_bytes(archive)
+metadata = {
     "schema-version": 1,
     "algorithm": "ed25519",
     "registry": str(root),
-    "package": "unused",
-    "version": "1.0.0",
+    "package": package,
+    "version": version,
     "archive": "archive.tar",
     "archive-size": len(archive),
-    "archive-digest": digest,
-    "expires": int(time.time()) + 3600,
+    "archive-digest": hashlib.sha256(archive).hexdigest(),
+    "expires": int(time.time()) + 3600 if expiry == "current" else int(expiry),
 }
-unused_metadata_path = unused_dir / "metadata.json"
-unused_metadata_path.write_bytes((json.dumps(unused_metadata, separators=(",", ":")) + "\n").encode())
-subprocess.run([openssl, "pkeyutl", "-sign", "-rawin", "-inkey", private_key,
-                "-in", str(unused_metadata_path), "-out", str(unused_dir / "metadata.sig")],
+metadata_path = release / "metadata.json"
+metadata_path.write_text(json.dumps(metadata, separators=(",", ":")) + "\n")
+subprocess.run([openssl, "pkeyutl", "-sign", "-rawin", "-inkey", key,
+                "-in", str(metadata_path), "-out", str(release / "metadata.sig")],
                check=True)
-PY
+PYTHON
+}
+write_registry_release foo 1.0.0 1
+write_registry_release foo 1.1.0 current
+write_registry_release unused 1.0.0 current
 write_registry_index unused 1 1.0.0
 
 write_registry_dependency() {
@@ -428,35 +414,7 @@ test ! -e "$REGISTRY_EXPIRY_MALFORMED_APP/elisapkg.lock"
 # A valid signature does not permit effectively permanent replay. The client
 # caps each release metadata lifetime at 30 days and treats longer signed
 # expiries as a security error instead of silently selecting another version.
-python3 - "$REGISTRY_EXPIRY_ROOT" "$REGISTRY_EXPIRY_SOURCE/.elisapkg/package.tar" "$REGISTRY_EXPIRY_PRIVATE" "$OPENSSL_BIN" <<'PY'
-from pathlib import Path
-import hashlib, json, subprocess, sys
-
-root = Path(sys.argv[1])
-archive = Path(sys.argv[2]).read_bytes()
-private_key = sys.argv[3]
-openssl = sys.argv[4]
-digest = hashlib.sha256(archive).hexdigest()
-version_dir = root / "foo" / "1.2.0"
-version_dir.mkdir(mode=0o700, parents=True)
-(version_dir / "archive.tar").write_bytes(archive)
-metadata = {
-    "schema-version": 1,
-    "algorithm": "ed25519",
-    "registry": str(root),
-    "package": "foo",
-    "version": "1.2.0",
-    "archive": "archive.tar",
-    "archive-size": len(archive),
-    "archive-digest": digest,
-    "expires": 18446744073709551615,
-}
-metadata_path = version_dir / "metadata.json"
-metadata_path.write_bytes((json.dumps(metadata, separators=(",", ":")) + "\n").encode())
-subprocess.run([openssl, "pkeyutl", "-sign", "-rawin", "-inkey", private_key,
-                "-in", str(metadata_path), "-out", str(version_dir / "metadata.sig")],
-               check=True)
-PY
+write_registry_release foo 1.2.0 18446744073709551615
 write_registry_index foo 5 1.0.0,1.1.0,1.2.0
 cat > "$REGISTRY_EXPIRY_SNAPSHOT_PROBE" <<EOF
 include "$ROOT/src/registry.elisa"
