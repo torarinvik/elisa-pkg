@@ -14,21 +14,21 @@ module TrustPaths:
 
     private:
         def trust_state_directory(path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            path_c: mutable darray[u8] = []
-            path_c <- ProjectFiles::with_null_terminator(path)
+            path_c: darray[u8] = ProjectFiles::with_null_terminator(path)
             path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
-            region created_scope:
-                created: i64 = Platform::make_directory(path_name, 448.u16())
-                if created == 0:
-                    return false if Platform::synchronize_parent_directory(path_name) != 0
-                    return Platform::is_trusted_directory(path_name) == 1
-                return Platform::is_trusted_directory(path_name) == 1 if created == -17
-            false
+            created: i64 = Platform::make_directory(path_name, 448.u16())
+            if created == 0:
+                Platform::synchronize_parent_directory(path_name) == 0 and Platform::is_trusted_directory(path_name) == 1
+            elif created == -17:
+                Platform::is_trusted_directory(path_name) == 1
+            else:
+                false
 
         def resolve(root: darray[u8]&, create_directories: bool) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             override: u8&? = Platform::environment_variable("ELISAPKG_TRUST_STATE")
+            home_reference: u8&? = Platform::environment_variable("HOME")
             if override is configured:
-                final_path: mutable darray[u8] =
+                final_path: darray[u8] =
                     value: cstr = configured.cast[cstr]
                     length: usize = Platform::c_string_length(value)
                     return [] if length == 0 or length > 4096 or value[0].u8() != 47
@@ -38,8 +38,7 @@ module TrustPaths:
                         return [] if byte == 0 or byte < 32 or byte == 127 or byte == 92
                         resolved <- resolved.push(byte)
                     return [] if resolved[resolved.count - 1.usize()] == 47
-                    segment_start: mutable usize = 1.usize()
-                    for index in 1..<(length + 1.usize()) |value, segment_start|:
+                    for index in 1..<(length + 1.usize()) |segment_start: usize = 1.usize()|:
                         if index == length or value[index].u8() == 47:
                             region segment_length_scope:
                                 segment_length: usize = index - segment_start
@@ -47,101 +46,81 @@ module TrustPaths:
                             segment_start <- index + 1.usize()
                     return [] if not trusted_state_parent(resolved)
                     [value[index].u8() for index in 0..<length]
-                return final_path
-            home_ref: u8&? = Platform::environment_variable("HOME")
-            if home_ref is home_value:
+                final_path
+            elif home_reference is home_value:
                 home: cstr = home_value.cast[cstr]
-                return prepare_under_home(root, home) if create_directories else lookup_under_home(root, home)
-            []
+                prepare_under_home(root, home) if create_directories else lookup_under_home(root, home)
+            else:
+                []
 
         def trusted_state_parent(path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return false if path.count == 0.usize() or path[0] != 47
-            slash: mutable usize = path.count
-            while slash > 0.usize() and path[slash - 1.usize()] != 47:
-                slash <- slash - 1.usize()
-            return false if slash == 0.usize()
-            parent: mutable darray[u8] = []
-            if slash == 1.usize():
-                parent <- parent.push(47)
+            # The position just after the last slash.
+            slash: usize = while position > 0.usize() and path[position - 1.usize()] != 47 |position: usize = path.count| -> position:
+                position <- position - 1.usize()
+            if slash == 0.usize():
+                false
             else:
-                for index in 0..<(slash - 1.usize()) |parent, path|:
-                    parent <- parent.push(path[index])
-            parent <- parent.push(0)
-            parent_name: cstr = (&parent[0]).cast[cstr] can Unsafe.PointerCast
-            Platform::is_trusted_directory(parent_name) == 1
+                parent: mutable darray[u8] = []
+                if slash == 1.usize():
+                    parent <- parent.push(47)
+                else:
+                    for index in 0..<(slash - 1.usize()) |parent, path|:
+                        parent <- parent.push(path[index])
+                parent <- parent.push(0)
+                parent_name: cstr = (&parent[0]).cast[cstr] can Unsafe.PointerCast
+                Platform::is_trusted_directory(parent_name) == 1
 
         def prepare_under_home(root: darray[u8]&, home: cstr) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             home_length: usize = safe_home_length(home)
             return [] if home_length == 0
-            root_digest: mutable darray[u8] = []
-            return [] if not Integrity::sha256_hex(root, &root_digest)
-            base: mutable darray[u8] = [home[index].u8() for index in 0..<home_length]
-            if home_length > 1.usize():
-                ByteText::append_text(&base, "/.local/share/elisapkg/trust")
-            else:
-                ByteText::append_text(&base, ".local/share/elisapkg/trust")
-            parent: mutable darray[u8] = [home[index].u8() for index in 0..<home_length]
-            if home_length > 1.usize():
-                ByteText::append_text(&parent, "/.local")
-            else:
-                ByteText::append_text(&parent, ".local")
             # Build the final path in a local buffer before calling filesystem
             # helpers. The stage1 ABI can invalidate a caller-owned darray after
             # nested FFI calls; returning this completed value lets the caller's
             # arena own the path and keeps its cursor and allocation metadata valid.
-            resolved_path: mutable darray[u8] = []
-            for index in 0..<base.count |resolved_path, base|:
-                resolved_path <- resolved_path.push(base[index])
-            resolved_path <- resolved_path.push(47)
-            for index in 0..<root_digest.count |resolved_path, root_digest|:
-                resolved_path <- resolved_path.push(root_digest[index])
-            ByteText::append_text(&resolved_path, ".state")
-            return [] if not trust_state_directory(&parent)
-            parent <- parent.resize(home_length)
-            if home_length > 1.usize():
-                ByteText::append_text(&parent, "/.local/share")
+            resolved_path: darray[u8] = trust_state_path(root, home, home_length)
+            # Create and check each directory from the outside in.
+            if resolved_path.count == 0.usize() or not trust_state_directory(home_path(home, home_length, ".local")) or not trust_state_directory(home_path(home, home_length, ".local/share")) or not trust_state_directory(home_path(home, home_length, ".local/share/elisapkg")) or not trust_state_directory(home_path(home, home_length, ".local/share/elisapkg/trust")) or resolved_path.count > 4096:
+                []
             else:
-                ByteText::append_text(&parent, ".local/share")
-            return [] if not trust_state_directory(&parent)
-            parent <- parent.resize(home_length)
-            if home_length > 1.usize():
-                ByteText::append_text(&parent, "/.local/share/elisapkg")
-            else:
-                ByteText::append_text(&parent, ".local/share/elisapkg")
-            return [] if:
-                not trust_state_directory(&parent)
-                not trust_state_directory(&base)
-                resolved_path.count > 4096
-            resolved_path
+                resolved_path
 
         def lookup_under_home(root: darray[u8]&, home: cstr) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             home_length: usize = safe_home_length(home)
-            return [] if home_length == 0
-            root_digest: mutable darray[u8] = []
-            return [] if not Integrity::sha256_hex(root, &root_digest)
-            resolved: mutable darray[u8] = [home[index].u8() for index in 0..<home_length]
-            if home_length > 1.usize():
-                ByteText::append_text(&resolved, "/.local/share/elisapkg/trust")
+            if home_length == 0:
+                []
             else:
-                ByteText::append_text(&resolved, ".local/share/elisapkg/trust")
-            resolved <- resolved.push(47)
-            for index in 0..<root_digest.count |resolved, root_digest|:
-                resolved <- resolved.push(root_digest[index])
-            ByteText::append_text(&resolved, ".state")
-            [] if resolved.count > 4096 else resolved
+                resolved: darray[u8] = trust_state_path(root, home, home_length)
+                [] if resolved.count > 4096 else resolved
+
+        # "HOME/.local/share/elisapkg/trust/DIGEST.state" for `root`, or
+        # empty when `root` cannot be digested.
+        def trust_state_path(root: darray[u8]&, home: cstr, home_length: usize) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
+            digest: mutable darray[u8] = []
+            if not Integrity::sha256_hex(root, &digest):
+                []
+            else:
+                trust_directory: mutable darray[u8] = home_path(home, home_length, ".local/share/elisapkg/trust")
+                trust_directory <- trust_directory.push(47)
+                ByteText::with_text(ByteText::with_bytes(trust_directory, digest), ".state")
+
+        # The first `home_length` bytes of `home` joined with `relative`.
+        def home_path(home: cstr, home_length: usize, relative: cstr) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
+            path: mutable darray[u8] = [home[index].u8() for index in 0..<home_length]
+            path <- path.push(47) if home_length > 1.usize()
+            ByteText::with_text(path, relative)
 
         def safe_home_length(home: cstr) -> usize:
-            normalized: mutable usize =
+            # The length without trailing slashes, keeping a lone "/".
+            normalized: usize =
                 length: usize = Platform::c_string_length(home)
                 return 0 if length == 0 or length > 3800 or home[0].u8() != 47
-                length
-            while normalized > 1 and home[normalized - 1].u8() == 47:
-                normalized <- normalized - 1.usize()
+                while position > 1 and home[position - 1].u8() == 47 |position: usize = length| -> position:
+                    position <- position - 1.usize()
             for index in 0..<normalized |home, normalized|:
                 byte: u8 = home[index].u8()
                 return 0 if byte < 32 or byte == 127 or byte == 92
-            segment_start: mutable usize = 1.usize()
-            for index in 1..<(normalized + 1.usize()) |home, segment_start|:
+            for index in 1..<(normalized + 1.usize()) |segment_start: usize = 1.usize()|:
                 if index == normalized or home[index].u8() == 47:
                     region segment_length_scope:
                         segment_length: usize = index - segment_start
