@@ -331,33 +331,42 @@ module Cli:
 
         def run_install(argument_count: i64, slots: mutable cstr&&, start: darray[u8]&, options: Model::CommandOptions) -> CliStatus::ExitStatus can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global{Read,Write}:
-                local_seen: mutable bool = false
-                package_seen: mutable bool = false
-                index: mutable i64 = 2
-                while index < argument_count |slots, index, local_seen, package_seen|:
-                    region argument_scope:
-                        argument: cstr = slots[index].cast[cstr]
-                        if Platform::c_string_equal(argument, "--local"):
-                            return CliStatus::usage if local_seen
-                            local_seen <- true
-                        elif Platform::c_string_equal(argument, "--bin"):
-                            return CliStatus::usage if index + 1 >= argument_count
-                            # The common option parser has already validated and
-                            # stored this target name. Consume its value here so it
-                            # cannot be mistaken for a remote package argument.
-                            index <- index + 1
-                        elif not package_seen:
-                            package_seen <- true
-                        else:
-                            return CliStatus::usage
-                    index <- index + 1
-                return CliStatus::usage if:
-                    local_seen and package_seen
-                    not local_seen and not package_seen
-                if local_seen:
-                    return run_install_local(start, options)
+                mode: i64 = install_mode(argument_count, slots)
+                return CliStatus::usage if mode == install_usage else run_install_local(start, options) if mode == install_local else refuse_remote_install()
+
+        # Report that remote installation is disabled by the trust policy.
+        def refuse_remote_install() -> CliStatus::ExitStatus can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
                 CliOutput::write_error(Security::install_message())
                 return Security::install_status()
+
+        const install_usage: i64 = 0
+        const install_local: i64 = 1
+        const install_remote: i64 = 2
+
+        # Classify `install` arguments: `--local` alone, one remote package,
+        # or a usage error. `--bin NAME` is consumed and otherwise ignored.
+        def install_mode(argument_count: i64, slots: mutable cstr&&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            local_seen: mutable bool = false
+            package_seen: mutable bool = false
+            while index < argument_count |slots, local_seen, package_seen, index: i64 = 2|:
+                region argument_scope:
+                    argument: cstr = slots[index].cast[cstr]
+                    if Platform::c_string_equal(argument, "--local"):
+                        return install_usage if local_seen
+                        local_seen <- true
+                    elif Platform::c_string_equal(argument, "--bin"):
+                        return install_usage if index + 1 >= argument_count
+                        # The common option parser has already validated and
+                        # stored this target name. Consume its value here so it
+                        # cannot be mistaken for a remote package argument.
+                        index <- index + 1
+                    elif not package_seen:
+                        package_seen <- true
+                    else:
+                        return install_usage
+                index <- index + 1
+            return install_usage if local_seen == package_seen else install_local if local_seen else install_remote
 
         def run_package(argument_count: i64, slots: mutable cstr&&, start: darray[u8]&) -> CliStatus::ExitStatus can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global{Read,Write}:
