@@ -45,20 +45,18 @@ module InstallRecords:
             out_digest.resize(0)
             return false if raw.count > maximum_record_bytes
             journal_operation: mutable darray[u8] = []
-            operation_start: i64 = ByteText::match_text_end(raw, 0.usize(), journal_prefix)
-            return false if operation_start < 0
+            # The operation is `install` or `uninstall`; the name label follows it.
             name_start: usize =
-                name_offset: mutable i64 = -1
-                for operation_index in 0..<2:
-                    operation: cstr = "install" if operation_index == 0 else "uninstall"
-                    operation_end: i64 = ByteText::match_text_end(raw, operation_start.usize(), operation)
-                    continue if operation_end < 0
-                    name_offset <- ByteText::match_text_end(raw, operation_end.usize(), name_label)
-                    if name_offset >= 0:
-                        ByteText::append_text(&journal_operation, operation)
-                        break
-                return false if name_offset < 0
-                name_offset.usize()
+                name_offset: i64 = for operation_index in 0..<2 |journal_operation, operation_start: i64 = ByteText::match_text_end(raw, 0.usize(), journal_prefix), operation_end: i64 = -1, offset: i64 = -1| -> offset:
+                    operation_end <- -1 if operation_start < 0 else ByteText::match_text_end(raw, operation_start.usize(), "install" if operation_index == 0 else "uninstall")
+                    offset <- -1 if operation_end < 0 else ByteText::match_text_end(raw, operation_end.usize(), name_label)
+                    if offset >= 0:
+                        ByteText::append_text(&journal_operation, "install" if operation_index == 0 else "uninstall")
+                    break offset if offset >= 0
+                if name_offset < 0:
+                    return false
+                else:
+                    name_offset.usize()
             name_end: usize =
                 while end < raw.count and end - name_start < PackageIdentity::maximum_name_bytes and raw[end] != 10 |end: usize = name_start| -> end:
                     end <- end + 1.usize()
@@ -72,23 +70,18 @@ module InstallRecords:
             version_end: usize =
                 while end < raw.count and end - version_start < SemVer::maximum_version_bytes and raw[end] != 10 |end: usize = version_start| -> end:
                     end <- end + 1.usize()
-            region parsed_version_scope:
-                parsed_version: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-                return false if:
-                    version_end >= raw.count or raw[version_end] != 10
-                    not SemVer::parse_range(raw, version_start, version_end, &parsed_version)
+            parsed_version: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
+            return false if version_end >= raw.count or raw[version_end] != 10
             digest_start: usize =
                 digest_offset: i64 = ByteText::match_text_end(raw, version_end, digest_label)
                 return false if digest_offset < 0
                 digest_offset.usize()
-            return false if raw.count - digest_start != 65.usize()
-            region digest_end_scope:
-                digest_end: usize = raw.count - 1.usize()
-                return false if:
-                    raw[digest_end] != 10
-                    not Integrity::valid_sha256_hex_range(raw, digest_start, digest_end)
+            # The digest is the final line: 64 hex bytes and a newline.
+            if not SemVer::parse_range(raw, version_start, version_end, &parsed_version) or raw.count - digest_start != 65.usize() or raw[raw.count - 1.usize()] != 10 or not Integrity::valid_sha256_hex_range(raw, digest_start, raw.count - 1.usize()):
+                false
+            else:
                 ByteText::append(out_operation, journal_operation)
                 ByteText::append_range(out_name, raw, name_start, name_end)
                 ByteText::append_range(out_version, raw, version_start, version_end)
-                ByteText::append_range(out_digest, raw, digest_start, digest_end)
-            true
+                ByteText::append_range(out_digest, raw, digest_start, raw.count - 1.usize())
+                true
