@@ -23,186 +23,225 @@ module CheckpointStore:
             RollbackDetected
             TufEquivocationDetected
 
+        # Merge an authenticated checkpoint batch into the registry's trust
+        # state under its lock, after checking the state against its clock.
         def commit_authenticated(registry_identity: darray[u8]&, batch: darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             return Code.InvalidConfiguration if not Tuf::valid_registry_identity_bytes(registry_identity)
-            region batch_status_scope:
-                batch_status: Tuf::ValidationCode = Tuf::validate_checkpoint_batch(batch)
-                return Code.ResourceLimit if batch_status == Tuf::ValidationCode.ResourceLimit
-                return Code.MalformedMetadata if batch_status != Tuf::ValidationCode.WellFormed
-            scope_digest: mutable darray[u8] = []
-            return Code.TrustStateUnavailable if not Integrity::sha256_hex(registry_identity, &scope_digest)
-            state_path_snapshot: mutable darray[u8] = []
-            lock_file_descriptor: i64 = acquire_state_lock(registry_identity, &state_path_snapshot)
-            return Code.TrustStateUnavailable if lock_file_descriptor < 0
-            state_path: mutable darray[u8] = [state_path_snapshot[index] for index in 0..<state_path_snapshot.count]
-            state: mutable darray[u8] = []
-            region read_status_scope:
-                read_status: Code = trust_tuf_state_read(state_path, &state)
-                return finish(lock_file_descriptor, read_status) if read_status != Code.Ok
-            clock_path: darray[u8] = clock_path_for(state_path_snapshot)
-            observed_clock: mutable u64 = 0.u64()
-            clock_missing: mutable bool = false
-            observed_state_digest: mutable darray[u8] = []
-            region clock_status_scope:
-                clock_status: Code = read_clock(clock_path, &observed_clock, &observed_state_digest, &clock_missing)
-                return finish(lock_file_descriptor, clock_status) if clock_status != Code.Ok
-            return finish(lock_file_descriptor, Code.TrustStateUnavailable) if clock_missing and state.count > 0.usize()
-            current_state_digest: mutable darray[u8] = []
-            return finish(lock_file_descriptor, Code.TrustStateUnavailable) if:
-                not Integrity::sha256_hex(state, &current_state_digest)
-                not clock_missing and not ByteText::equal(observed_state_digest, current_state_digest)
-            now: i64 = Platform::wall_clock_seconds()
-            return finish(lock_file_descriptor, Code.ClockUnavailable) if now < 0
-            return finish(lock_file_descriptor, Code.ClockRollback) if observed_clock > now.u64()
+            batch_status: Tuf::ValidationCode = Tuf::validate_checkpoint_batch(batch)
+            Code.ResourceLimit if batch_status == Tuf::ValidationCode.ResourceLimit else Code.MalformedMetadata if batch_status != Tuf::ValidationCode.WellFormed else commit_scoped(registry_identity, batch)
 
-            scoped_batch: mutable darray[u8] = []
-            region scope_status_scope:
-                scope_status: CheckpointRecords::Code = CheckpointRecords::scope_batch(scope_digest, batch, &scoped_batch)
-                return finish(lock_file_descriptor, checkpoint_result(scope_status)) if scope_status != CheckpointRecords::Code.Ok
-            updated_state: mutable darray[u8] = []
-            region merge_status_scope:
-                merge_status: CheckpointRecords::Code = CheckpointRecords::merge(state, scoped_batch, &updated_state)
-                return finish(lock_file_descriptor, checkpoint_result(merge_status)) if merge_status != CheckpointRecords::Code.Ok
-
-            region store_status_scope:
-                store_status: Code = store_updated_state(state_path_snapshot, state, updated_state, current_state_digest, clock_missing or observed_clock < now.u64(), now.u64())
-                return finish(lock_file_descriptor, store_status)
-
+        # Read the checkpoints recorded for one registry as a TUF batch.
         def read(registry_identity: darray[u8]&, out: mutable darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             out.resize(0)
             return Code.InvalidConfiguration if not Tuf::valid_registry_identity_bytes(registry_identity)
-            scope_digest: mutable darray[u8] = []
-            return Code.TrustStateUnavailable if not Integrity::sha256_hex(registry_identity, &scope_digest)
-            state_path_snapshot: mutable darray[u8] = []
-            lock_file_descriptor: i64 = acquire_state_lock(registry_identity, &state_path_snapshot)
-            return Code.TrustStateUnavailable if lock_file_descriptor < 0
-            state_path: mutable darray[u8] = [state_path_snapshot[index] for index in 0..<state_path_snapshot.count]
-            state: mutable darray[u8] = []
-            region read_status_scope:
-                read_status: Code = trust_tuf_state_read(state_path, &state)
-                return finish(lock_file_descriptor, read_status) if read_status != Code.Ok
-            clock_path: darray[u8] = clock_path_for(state_path_snapshot)
-            region clock_status_scope:
-                clock_status: Code = verify_clock(clock_path, state)
-                return finish(lock_file_descriptor, clock_status) if clock_status != Code.Ok
-            return finish(lock_file_descriptor, Code.Ok) if state.count == 0.usize()
             batch: mutable darray[u8] = []
-            return finish(lock_file_descriptor, Code.TrustStateMalformed) if not scoped_batch(state, scope_digest, &batch)
-            region close_status_scope:
-                close_status: Code = finish(lock_file_descriptor, Code.ResourceLimit if batch.count > Tuf::maximum_metadata_file_bytes else Code.Ok)
-                return close_status if close_status != Code.Ok
-            ByteText::append(out, batch)
-            Code.Ok
+            status: Code = read_scoped(registry_identity, &batch)
+            published_batch(status, batch, out)
 
     private:
+        # The clock stored beside a trust state: its time, the digest of the
+        # state it describes, and whether it exists at all.
+        struct ObservedClock:
+            seconds: mutable u64
+            state_digest: mutable darray[u8]
+            missing: mutable bool
+
+        # One parsed trust-state row.
+        struct CheckpointRow:
+            key: mutable darray[u8]
+            version: mutable darray[u8]
+            digest: mutable darray[u8]
+
+        # The cursor returned for a trust-state row that does not parse.
+        const malformed_row: usize = 0.usize()
+
+        def empty_clock() -> ObservedClock:
+            ObservedClock{seconds: 0.u64(), state_digest: [], missing: false}
+
+        # ---------- commit ----------------------------------------------------------------------
+
+        def commit_scoped(registry_identity: darray[u8]&, batch: darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            scope_digest: mutable darray[u8] = []
+            Code.TrustStateUnavailable if not Integrity::sha256_hex(registry_identity, &scope_digest) else commit_under_lock(registry_identity, scope_digest, batch)
+
+        def commit_under_lock(registry_identity: darray[u8]&, scope_digest: darray[u8]&, batch: darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            state_path: mutable darray[u8] = []
+            lock_file_descriptor: i64 = acquire_state_lock(registry_identity, &state_path)
+            Code.TrustStateUnavailable if lock_file_descriptor < 0 else finish(lock_file_descriptor, commit_locked(state_path, scope_digest, batch))
+
+        def commit_locked(state_path: darray[u8]&, scope_digest: darray[u8]&, batch: darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            state: mutable darray[u8] = []
+            read_status: Code = trust_tuf_state_read(state_path, &state)
+            read_status if read_status != Code.Ok else commit_to_state(state_path, state, scope_digest, batch)
+
+        # A non-empty state must have a clock that records its digest.
+        def commit_to_state(state_path: darray[u8]&, state: darray[u8]&, scope_digest: darray[u8]&, batch: darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            clock: mutable ObservedClock = empty_clock()
+            clock_status: Code = read_clock(clock_path_for(state_path), &clock)
+            clock_status if clock_status != Code.Ok else Code.TrustStateUnavailable if clock.missing and state.count > 0.usize() else commit_at_clock(state_path, state, clock, scope_digest, batch)
+
+        def commit_at_clock(state_path: darray[u8]&, state: darray[u8]&, clock: ObservedClock&, scope_digest: darray[u8]&, batch: darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            current_state_digest: mutable darray[u8] = []
+            Code.TrustStateUnavailable if not Integrity::sha256_hex(state, &current_state_digest) or (not clock.missing and not ByteText::equal(clock.state_digest, current_state_digest)) else commit_now(state_path, state, current_state_digest, clock, scope_digest, batch, Platform::wall_clock_seconds())
+
+        def commit_now(state_path: darray[u8]&, state: darray[u8]&, current_state_digest: darray[u8]&, clock: ObservedClock&, scope_digest: darray[u8]&, batch: darray[u8]&, now: i64) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            time_status: Code = clock_time_result(clock.seconds, now)
+            time_status if time_status != Code.Ok else merge_scoped_batch(state_path, state, current_state_digest, clock.missing or clock.seconds < now.u64(), now.u64(), scope_digest, batch)
+
+        def merge_scoped_batch(state_path: darray[u8]&, state: darray[u8]&, current_state_digest: darray[u8]&, advance_clock: bool, now: u64, scope_digest: darray[u8]&, batch: darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            scoped: mutable darray[u8] = []
+            scope_status: CheckpointRecords::Code = CheckpointRecords::scope_batch(scope_digest, batch, &scoped)
+            checkpoint_result(scope_status) if scope_status != CheckpointRecords::Code.Ok else merge_and_store(state_path, state, scoped, current_state_digest, advance_clock, now)
+
+        def merge_and_store(state_path: darray[u8]&, state: darray[u8]&, scoped: darray[u8]&, current_state_digest: darray[u8]&, advance_clock: bool, now: u64) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            updated_state: mutable darray[u8] = []
+            merge_status: CheckpointRecords::Code = CheckpointRecords::merge(state, scoped, &updated_state)
+            checkpoint_result(merge_status) if merge_status != CheckpointRecords::Code.Ok else store_updated_state(state_path, state, updated_state, current_state_digest, advance_clock, now)
+
+        # Persist a merge result. An unchanged state only advances its clock
+        # when `advance_clock` is set; a changed state writes its clock first,
+        # then the state itself.
+        def store_updated_state(state_path: darray[u8]&, state: darray[u8]&, updated_state: darray[u8]&, current_state_digest: darray[u8]&, advance_clock: bool, now: u64) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            store_unchanged_state(state_path, current_state_digest, advance_clock, now) if ByteText::equal(updated_state, state) else store_changed_state(state_path, updated_state, now)
+
+        def store_unchanged_state(state_path: darray[u8]&, current_state_digest: darray[u8]&, advance_clock: bool, now: u64) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            Code.Ok if not advance_clock or TrustStorage::write_clock(clock_path_for(state_path), now, current_state_digest) else Code.TrustStateUnavailable
+
+        def store_changed_state(state_path: darray[u8]&, updated_state: darray[u8]&, now: u64) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            updated_state_digest: mutable darray[u8] = []
+            Code.TrustStateUnavailable if not Integrity::sha256_hex(updated_state, &updated_state_digest) or not TrustStorage::write_clock(clock_path_for(state_path), now, updated_state_digest) or not TrustStorage::write(state_path, updated_state) else Code.Ok
+
+        # ---------- read ------------------------------------------------------------------------
+
+        def read_scoped(registry_identity: darray[u8]&, batch: mutable darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            scope_digest: mutable darray[u8] = []
+            Code.TrustStateUnavailable if not Integrity::sha256_hex(registry_identity, &scope_digest) else read_under_lock(registry_identity, scope_digest, batch)
+
+        def read_under_lock(registry_identity: darray[u8]&, scope_digest: darray[u8]&, batch: mutable darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            state_path: mutable darray[u8] = []
+            lock_file_descriptor: i64 = acquire_state_lock(registry_identity, &state_path)
+            Code.TrustStateUnavailable if lock_file_descriptor < 0 else finish(lock_file_descriptor, read_locked(state_path, scope_digest, batch))
+
+        def read_locked(state_path: darray[u8]&, scope_digest: darray[u8]&, batch: mutable darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            state: mutable darray[u8] = []
+            read_status: Code = trust_tuf_state_read(state_path, &state)
+            read_status if read_status != Code.Ok else read_verified_state(state_path, state, scope_digest, batch)
+
+        def read_verified_state(state_path: darray[u8]&, state: darray[u8]&, scope_digest: darray[u8]&, batch: mutable darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            clock_status: Code = verify_clock(clock_path_for(state_path), state)
+            clock_status if clock_status != Code.Ok else Code.Ok if state.count == 0.usize() else Code.TrustStateMalformed if not scoped_batch(state, scope_digest, batch) else Code.ResourceLimit if batch.count > Tuf::maximum_metadata_file_bytes else Code.Ok
+
+        # Hand the batch to the caller only after the lock closed cleanly.
+        def published_batch(status: Code, batch: darray[u8]&, out: mutable darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic]:
+            ByteText::append(out, batch) if status == Code.Ok
+            status
+
+        # ---------- trust state and clock -------------------------------------------------------
+
+        # A missing state reads as empty.
         def trust_tuf_state_read(path: darray[u8]&, out: mutable darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out.resize(0)
             loaded: mutable darray[u8] = []
-            region read_status_scope:
-                read_status: i64 = RegistryFiles::read_trusted_file(path, CheckpointRecords::maximum_state_bytes, &loaded)
-                if read_status < 0:
-                    return Code.Ok if read_status == -2
-                    return Code.TrustStateUnavailable
-            return Code.TrustStateMalformed if not CheckpointRecords::valid(loaded)
-            for index in 0..<loaded.count |out, loaded|:
-                out.push(loaded[index])
+            read_status: i64 = RegistryFiles::read_trusted_file(path, CheckpointRecords::maximum_state_bytes, &loaded)
+            Code.Ok if read_status == -2 else Code.TrustStateUnavailable if read_status < 0 else Code.TrustStateMalformed if not CheckpointRecords::valid(loaded) else published_state(loaded, out)
+
+        def published_state(loaded: darray[u8]&, out: mutable darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic]:
+            ByteText::append(out, loaded)
             Code.Ok
 
         # An empty state must have no clock. A non-empty state must have a
         # clock that records its digest and does not lie in the future.
         def verify_clock(clock_path: darray[u8]&, state: darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            observed_clock: mutable u64 = 0.u64()
-            clock_missing: mutable bool = false
-            observed_state_digest: mutable darray[u8] = []
-            region clock_status_scope:
-                clock_status: Code = read_clock(clock_path, &observed_clock, &observed_state_digest, &clock_missing)
-                return clock_status if clock_status != Code.Ok
-            return Code.Ok if state.count == 0.usize() and clock_missing
-            return Code.TrustStateUnavailable if state.count == 0.usize() or clock_missing
-            region current_state_digest_scope:
-                current_state_digest: mutable darray[u8] = []
-                return Code.TrustStateUnavailable if not Integrity::sha256_hex(state, &current_state_digest) or not ByteText::equal(observed_state_digest, current_state_digest)
-            region now_scope:
-                now: i64 = Platform::wall_clock_seconds()
-                return Code.ClockUnavailable if now < 0
-                return Code.ClockRollback if observed_clock > now.u64()
-            Code.Ok
+            clock: mutable ObservedClock = empty_clock()
+            clock_status: Code = read_clock(clock_path, &clock)
+            clock_status if clock_status != Code.Ok else Code.Ok if state.count == 0.usize() and clock.missing else Code.TrustStateUnavailable if state.count == 0.usize() or clock.missing else verify_clock_digest(state, clock)
+
+        def verify_clock_digest(state: darray[u8]&, clock: ObservedClock&) -> Code can[Memory.Allocate, Abort.Panic]:
+            current_state_digest: mutable darray[u8] = []
+            Code.TrustStateUnavailable if not Integrity::sha256_hex(state, &current_state_digest) or not ByteText::equal(clock.state_digest, current_state_digest) else clock_time_result(clock.seconds, Platform::wall_clock_seconds())
+
+        # The wall clock must be readable and must not lie before the clock.
+        def clock_time_result(observed_seconds: u64, now: i64) -> Code:
+            Code.ClockUnavailable if now < 0 else Code.ClockRollback if observed_seconds > now.u64() else Code.Ok
+
+        def read_clock(path: darray[u8]&, clock: mutable ObservedClock&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            match TrustStorage::read_clock(path, &clock.seconds, &clock.state_digest, &clock.missing):
+                TrustStorage::Code.Ok: Code.Ok
+                TrustStorage::Code.Unavailable: Code.TrustStateUnavailable
+                TrustStorage::Code.Malformed: Code.TrustStateMalformed
+
+        # ---------- scoped rows -----------------------------------------------------------------
 
         # Collect the rows scoped to one registry as a TUF batch, with the
         # "SCOPE_DIGEST:" key prefix removed. Returns false for a malformed row.
         def scoped_batch(state: darray[u8]&, scope_digest: darray[u8]&, batch: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            prefix: darray[u8] = scope_key_prefix(scope_digest)
+            while cursor < state.count |batch, cursor: usize = CheckpointRecords::header_length()| -> true:
+                cursor <- appended_scoped_row(state, cursor, prefix, batch)
+                return false if cursor == malformed_row
+
+        def scope_key_prefix(scope_digest: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
             prefix: mutable darray[u8] = [scope_digest[index] for index in 0..<scope_digest.count]
             prefix <- prefix.push(58)
-            cursor: mutable usize = CheckpointRecords::header_length()
-            while cursor < state.count |state, cursor, prefix, batch|:
-                key: mutable darray[u8] = []
-                version: mutable darray[u8] = []
-                digest: mutable darray[u8] = []
-                next_cursor: mutable usize = 0.usize()
-                return false if not CheckpointRecords::parse_row(state, cursor, &key, &version, &digest, &next_cursor)
-                if key.count > prefix.count and ByteText::starts_with(key, prefix):
-                    if batch.count == 0.usize():
-                        ByteText::append_text(batch, "elisapkg-tuf-batch:1\n")
-                    ByteText::append_range(batch, key, prefix.count, key.count)
-                    batch.push(32)
-                    ByteText::append(batch, version)
-                    batch.push(32)
-                    ByteText::append(batch, digest)
-                    batch.push(10)
-                cursor <- next_cursor
-            true
+            prefix
+
+        # Parse the row at `cursor` and append it to `batch` when its key
+        # carries `prefix`. Returns the next row's cursor, or `malformed_row`.
+        def appended_scoped_row(state: darray[u8]&, cursor: usize, prefix: darray[u8]&, batch: mutable darray[u8]&) -> usize can[Memory.Allocate, Abort.Panic]:
+            row: mutable CheckpointRow = CheckpointRow{key: [], version: [], digest: []}
+            next_cursor: mutable usize = malformed_row
+            malformed_row if not CheckpointRecords::parse_row(state, cursor, &row.key, &row.version, &row.digest, &next_cursor) else appended_row(row, prefix, batch, next_cursor)
+
+        def appended_row(row: CheckpointRow&, prefix: darray[u8]&, batch: mutable darray[u8]&, next_cursor: usize) -> usize can[Memory.Allocate, Abort.Panic]:
+            append_unscoped_row(row, prefix, batch) if row.key.count > prefix.count and ByteText::starts_with(row.key, prefix)
+            next_cursor
+
+        # Append `row` without its scope prefix, starting the batch header first.
+        def append_unscoped_row(row: CheckpointRow&, prefix: darray[u8]&, batch: mutable darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
+            ByteText::append_text(batch, "elisapkg-tuf-batch:1\n") if batch.count == 0.usize()
+            ByteText::append_range(batch, row.key, prefix.count, row.key.count)
+            batch.push(32)
+            ByteText::append(batch, row.version)
+            batch.push(32)
+            ByteText::append(batch, row.digest)
+            batch.push(10)
+
+        # ---------- lock and paths --------------------------------------------------------------
 
         # Take the trust-state lock for one registry. Fills `state_path` with
         # the registry's ".tuf" state path and returns the lock descriptor,
         # or -1 when the paths are invalid or the lock is unavailable.
         def acquire_state_lock(registry_identity: darray[u8]&, state_path: mutable darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
-            prepared: mutable darray[u8] = TrustPaths::prepare(registry_identity)
-            return -1 if prepared.count == 0 or prepared.count > 4080.usize()
-            ByteText::append_text(&prepared, ".tuf")
-            lock_path: mutable darray[u8] = [prepared[item] for item in 0..<prepared.count]
-            ByteText::append_text(&lock_path, ".lock")
-            return -1 if lock_path.count > 4096.usize()
-            ByteText::append(state_path, prepared)
-            lock_file_descriptor: i64 =
-                lock_c: mutable darray[u8] = []
-                lock_c <- ProjectFiles::with_null_terminator(lock_path)
-                lock_name: cstr = (&lock_c[0]).cast[cstr] can Unsafe.PointerCast
-                Platform::acquire_trust_state_lock(lock_name)
+            prepared: darray[u8] = TrustPaths::prepare(registry_identity)
+            -1 if prepared.count == 0 or prepared.count > 4080.usize() else lock_state_file(with_suffix(prepared, ".tuf"), state_path)
+
+        def lock_state_file(state_file: darray[u8]&, state_path: mutable darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            lock_path: darray[u8] = with_suffix(state_file, ".lock")
+            -1 if lock_path.count > 4096.usize() else locked_descriptor(lock_path, state_file, state_path)
+
+        def locked_descriptor(lock_path: darray[u8]&, state_file: darray[u8]&, state_path: mutable darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            ByteText::append(state_path, state_file)
+            terminated_lock_path: darray[u8] = ProjectFiles::with_null_terminator(lock_path)
+            normalized_descriptor(Platform::acquire_trust_state_lock(((&terminated_lock_path[0]).cast[cstr] can Unsafe.PointerCast)))
+
+        def normalized_descriptor(lock_file_descriptor: i64) -> i64:
             -1 if lock_file_descriptor < 0 else lock_file_descriptor
 
         def clock_path_for(state_path: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
-            clock_path: mutable darray[u8] = [state_path[item] for item in 0..<state_path.count]
-            ByteText::append_text(&clock_path, ".clock")
-            clock_path
+            with_suffix(state_path, ".clock")
 
-        # Persist a merge result. An unchanged state only advances its clock
-        # when `advance_clock` is set; a changed state writes its clock first,
-        # then the state itself.
-        def store_updated_state(state_path: darray[u8]&, state: darray[u8]&, updated_state: darray[u8]&, current_state_digest: darray[u8]&, advance_clock: bool, now: u64) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            if ByteText::equal(updated_state, state):
-                return Code.Ok if not advance_clock
-                return Code.Ok if TrustStorage::write_clock(clock_path_for(state_path), now, current_state_digest)
-                return Code.TrustStateUnavailable
-            region updated_state_digest_scope:
-                updated_state_digest: mutable darray[u8] = []
-                return Code.TrustStateUnavailable if not Integrity::sha256_hex(updated_state, &updated_state_digest)
-                return Code.TrustStateUnavailable if not TrustStorage::write_clock(clock_path_for(state_path), now, updated_state_digest)
-            region state_path_copy_scope:
-                state_path_copy: darray[u8] = [state_path[index] for index in 0..<state_path.count]
-                return Code.TrustStateUnavailable if not TrustStorage::write(state_path_copy, updated_state)
-            Code.Ok
+        def with_suffix(path: darray[u8]&, suffix: cstr) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
+            copy: darray[u8] = [path[item] for item in 0..<path.count]
+            ByteText::with_text(copy, suffix)
 
         def checkpoint_result(status: CheckpointRecords::Code) -> Code:
-            return Code.MalformedMetadata if status == CheckpointRecords::Code.MalformedBatch
-            return Code.ResourceLimit if status == CheckpointRecords::Code.ResourceLimit
-            return Code.RollbackDetected if status == CheckpointRecords::Code.Rollback
-            Code.TufEquivocationDetected if status == CheckpointRecords::Code.Equivocation else Code.TrustStateMalformed if status == CheckpointRecords::Code.MalformedState else Code.Ok
+            match status:
+                CheckpointRecords::Code.Ok: Code.Ok
+                CheckpointRecords::Code.MalformedBatch: Code.MalformedMetadata
+                CheckpointRecords::Code.MalformedState: Code.TrustStateMalformed
+                CheckpointRecords::Code.ResourceLimit: Code.ResourceLimit
+                CheckpointRecords::Code.Rollback: Code.RollbackDetected
+                CheckpointRecords::Code.Equivocation: Code.TufEquivocationDetected
 
         def finish(lock_file_descriptor: i64, code: Code) -> Code:
             Code.TrustStateUnavailable if Platform::close_file_descriptor(lock_file_descriptor) != 0 else code
-
-        def read_clock(path: darray[u8]&, out: mutable u64&, state_digest: mutable darray[u8]&, missing: mutable bool&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            match TrustStorage::read_clock(path, out, state_digest, missing):
-                TrustStorage::Code.Ok: Code.Ok
-                TrustStorage::Code.Unavailable: Code.TrustStateUnavailable
-                TrustStorage::Code.Malformed: Code.TrustStateMalformed
