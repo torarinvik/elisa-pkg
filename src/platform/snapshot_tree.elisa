@@ -237,19 +237,17 @@ module NativeSnapshotTree:
             failed: mutable i64 = copy_file_contents(source_file, destination_file, total_bytes, byte_limit)
             if failed == 0 and native_fsync(destination_file) != 0:
                 failed <- NativeErrors::negative_errno()
-            source_close: i32 = native_close(source_file)
-            region destination_close_scope:
-                destination_close: i32 = native_close(destination_file)
-                if failed == 0 and (source_close != 0 or destination_close != 0):
-                    failed <- -5
+            failed <- -5 if not close_both(source_file, destination_file) and failed == 0
             if failed == 0 and native_fsync(destination_parent) != 0:
                 failed <- NativeErrors::negative_errno()
-            source_parent_close: i32 = native_close(source_parent)
-            region destination_parent_close_scope:
-                destination_parent_close: i32 = native_close(destination_parent)
-                if source_parent_close != 0 or destination_parent_close != 0:
-                    failed <- -5 if failed == 0
+            failed <- -5 if not close_both(source_parent, destination_parent) and failed == 0
             return failed
+
+        # Close `first`, then `second`, skipping a negative descriptor.
+        # Returns whether every close that ran succeeded.
+        def close_both(first: i64, second: i64) -> bool:
+            first_status: i32 = native_close(first) if first >= 0 else 0
+            return (native_close(second) if second >= 0 else 0) == 0 and first_status == 0
 
         # Copy a source descriptor to a destination descriptor, retrying on
         # EINTR and refusing to pass `byte_limit` in total. Returns 0 or a
@@ -293,10 +291,7 @@ module NativeSnapshotTree:
                 cleanup_ok <- NativeStagingTree::remove_directories(destination_root, created_directories) and cleanup_ok
                 cleanup_ok <- native_fsync(destination_root) == 0 and cleanup_ok
                 cleanup_status <- -5 if not cleanup_ok
-            source_close: i32 = native_close(source_root) if source_root >= 0 else 0
-            region destination_close_scope:
-                destination_close: i32 = native_close(destination_root) if destination_root >= 0 else 0
-                return -5 if cleanup_status != 0 or source_close != 0 or destination_close != 0
+            return -5 if not close_both(source_root, destination_root) or cleanup_status != 0
             return original_error if original_error != 0 else -5
 
         def cleanup_package_snapshot_contents(destination: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
