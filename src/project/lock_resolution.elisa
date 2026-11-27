@@ -66,8 +66,8 @@ module LockResolution:
                     out.resize(0)
                     ByteText::append_range(out, queue, cursor, finish)
                     return true
-                cursor <- finish + 1
                 current <- current + 1
+                cursor <- finish + 1
 
         def registry_candidate_matches(candidates: darray[Solver::Candidate]&, package: darray[u8]&, version: Model::Version) -> bool:
             for index in 0..<candidates.count |candidates, package, version|:
@@ -88,17 +88,19 @@ module LockResolution:
             preferences: mutable darray[Solver::Preference] = []
             for index in 0..<lock.count |lock, unlock, candidates, preferences|:
                 continue if lock[index] != 123
-                object_end: usize = Json::object_end(lock, index)
-                continue if object_end <= index
-                package: mutable darray[u8] = []
-                version_text: mutable darray[u8] = []
-                continue if not Json::object_string_value(lock, index, object_end, "name", &package) or not Json::object_string_value(lock, index, object_end, "version", &version_text)
-                continue if unlock.count > 0.usize() and ByteText::equal(package, unlock)
-                parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-                continue if not SemVer::parse(version_text, &parsed) or parsed.prerelease
-                continue if not registry_candidate_matches(candidates, package, parsed) or registry_preference_present(preferences, package)
-                preferences <- preferences.push(Solver::Preference{package: package, version: parsed})
+                if lock_preference_at(lock, index, unlock, candidates, preferences) is preference:
+                    preferences <- preferences.push(preference)
             return preferences
+
+        # The preference the lock record starting at `index` expresses, or
+        # null when the record is malformed, unlocked, a prerelease, not a
+        # candidate, or already preferred.
+        def lock_preference_at(lock: darray[u8]&, index: usize, unlock: darray[u8]&, candidates: darray[Solver::Candidate]&, preferences: darray[Solver::Preference]&) -> Solver::Preference? can[Memory.Allocate, Abort.Panic]:
+            object_end: usize = Json::object_end(lock, index)
+            package: mutable darray[u8] = []
+            version_text: mutable darray[u8] = []
+            parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
+            return null if object_end <= index or not Json::object_string_value(lock, index, object_end, "name", &package) or not Json::object_string_value(lock, index, object_end, "version", &version_text) or (unlock.count > 0.usize() and ByteText::equal(package, unlock)) or not SemVer::parse(version_text, &parsed) or parsed.prerelease or not registry_candidate_matches(candidates, package, parsed) or registry_preference_present(preferences, package) else Solver::Preference{package: package, version: parsed}
 
         # The index evidence a candidate was read under. The final verification
         # compares it with the evidence of the release actually locked, so an
@@ -141,6 +143,11 @@ module LockResolution:
                 selected_indexes: mutable darray[usize] = []
                 if solve(pool.candidates, roots, preferred_lock, unlock, persist_trust, &selected_indexes) is solve_failure:
                     return solve_failure
+                return finished_lock(selected_indexes, pool, persist_trust, out)
+
+        # Append the selected dependency records and the footer to `out`.
+        def finished_lock(selected_indexes: darray[usize]&, pool: CandidatePool&, persist_trust: bool, out: mutable darray[u8]) -> darray[u8] can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            can Global.Read:
                 if append_dependencies(selected_indexes, pool, persist_trust, &out) is dependency_failure:
                     return dependency_failure
                 Lockfile::append_footer(&out)
@@ -152,10 +159,12 @@ module LockResolution:
             can Global.Read:
                 root_digest: mutable darray[u8] = []
                 root_source_digest: mutable darray[u8] = []
-                return [] if not Integrity::sha256_hex(raw, &root_digest) or not SourceFingerprint::at(root, &root_source_digest)
-                header: mutable darray[u8] = []
-                Lockfile::append_header(&header, Lockfile::Format.Registry, name, version, root_digest, root_source_digest)
-                return header
+                return [] if not Integrity::sha256_hex(raw, &root_digest) or not SourceFingerprint::at(root, &root_source_digest) else lock_header(name, version, root_digest, root_source_digest)
+
+        def lock_header(name: darray[u8]&, version: darray[u8]&, root_digest: darray[u8]&, root_source_digest: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
+            header: mutable darray[u8] = []
+            Lockfile::append_header(&header, Lockfile::Format.Registry, name, version, root_digest, root_source_digest)
+            return header
 
         # Read the index of every root package and, transitively, of every
         # package a candidate depends on.
@@ -169,54 +178,76 @@ module LockResolution:
                 while processed < pool.package_total |pool, persist_trust, processed: usize = 0|:
                     package: mutable darray[u8] = []
                     return [] if not registry_queue_field_at(pool.package_queue, processed, &package)
+                    processed <- processed + 1
                     if load_package_candidates(package, persist_trust, pool) is package_failure:
                         return package_failure
-                    processed <- processed + 1
                 return null
+
+        # One package's index: its version lines, their yanked flags, and the
+        # evidence it was read under.
+        struct PackageIndex:
+            data: mutable darray[u8]
+            yanked_flags: mutable darray[u8]
+            evidence: mutable IndexEvidence
 
         # Add every release listed in one package's index. Releases whose
         # metadata expired are skipped but still count toward the check budget.
         def load_package_candidates(package: darray[u8]&, persist_trust: bool, pool: mutable CandidatePool&) -> darray[u8]? can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
-                index_data: mutable darray[u8] = []
-                yanked_flags: mutable darray[u8] = []
-                evidence: mutable IndexEvidence = IndexEvidence{generation: 0, digest: [], identity: []}
-                if status_failure(Registry::read_index_with_yanked(package, &index_data, &yanked_flags, &evidence.generation, &evidence.digest, &evidence.identity), persist_trust) is index_failure:
+                index: mutable PackageIndex = PackageIndex{data: [], yanked_flags: [], evidence: IndexEvidence{generation: 0, digest: [], identity: []}}
+                if status_failure(Registry::read_index_with_yanked(package, &index.data, &index.yanked_flags, &index.evidence.generation, &index.evidence.digest, &index.evidence.identity), persist_trust) is index_failure:
                     return index_failure
+                return add_index_candidates(package, index, persist_trust, pool)
+
+        # Add the release on each index line. Every line needs a yanked flag.
+        def add_index_candidates(package: darray[u8]&, index: PackageIndex&, persist_trust: bool, pool: mutable CandidatePool&) -> darray[u8]? can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
                 version_ordinal: usize =
-                    while cursor < index_data.count |pool, cursor: usize = 0, ordinal: usize = 0| -> ordinal:
+                    while cursor < index.data.count |pool, cursor: usize = 0, ordinal: usize = 0| -> ordinal:
                         # Expired releases still cost a metadata and signature check.
                         return provider_failure(Registry::ResultCode.ResourceLimit, persist_trust) if pool.checked_candidates >= Solver::maximum_candidates
                         pool.checked_candidates <- pool.checked_candidates + 1.usize()
-                        finish: usize = line_finish(index_data, cursor)
-                        line_end: usize = finish - 1 if finish > cursor and index_data[finish - 1] == 13 else finish
-                        return [] if line_end == cursor or line_end - cursor > 128
-                        version_text: darray[u8] = [index_data[item] for item in cursor..<line_end]
-                        parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-                        return [] if:
-                            not SemVer::parse(version_text, &parsed)
-                            ordinal >= yanked_flags.count or yanked_flags[ordinal] > 1
-                        if add_candidate(package, version_text, parsed, yanked_flags[ordinal] == 1, evidence, persist_trust, pool) is candidate_failure:
-                            return candidate_failure
+                        finish: usize = line_finish(index.data, cursor)
+                        if add_index_line(package, index, cursor, finish, ordinal, persist_trust, pool) is line_failure:
+                            return line_failure
                         ordinal <- ordinal + 1.usize()
                         cursor <- finish + 1
-                return [] if version_ordinal != yanked_flags.count else null
+                return [] if version_ordinal != index.yanked_flags.count else null
+
+        # Add the release named on the index line `start..<finish`, the
+        # `ordinal`th version of the package.
+        def add_index_line(package: darray[u8]&, index: PackageIndex&, start: usize, finish: usize, ordinal: usize, persist_trust: bool, pool: mutable CandidatePool&) -> darray[u8]? can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                line_end: usize = finish - 1 if finish > start and index.data[finish - 1] == 13 else finish
+                version_text: darray[u8] = [index.data[item] for item in start..<line_end]
+                parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
+                return [] if line_end == start or line_end - start > 128 or not SemVer::parse(version_text, &parsed) or ordinal >= index.yanked_flags.count or index.yanked_flags[ordinal] > 1 else add_candidate(package, version_text, parsed, index.yanked_flags[ordinal] == 1, index.evidence, persist_trust, pool)
 
         def add_candidate(package: darray[u8]&, version_text: darray[u8]&, parsed: Model::Version, yanked: bool, evidence: IndexEvidence&, persist_trust: bool, pool: mutable CandidatePool&) -> darray[u8]? can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
-                release: mutable VerifiedRelease = VerifiedRelease{selected_text: [], archive: [], digest: [], archive_size: 0, metadata_digest: []}
                 metadata: mutable darray[u8] = []
-                candidate_status: Registry::ResultCode = Registry::resolve_candidate_metadata(package, version_text, &release.selected_text, &release.archive, &release.digest, &release.archive_size, &metadata)
-                return null if candidate_status == Registry::ResultCode.ExpiredMetadata
-                if status_failure(candidate_status, persist_trust) is candidate_failure:
-                    return candidate_failure
-                dependencies: mutable darray[Solver::Constraint] = []
-                return provider_failure(Registry::ResultCode.MalformedMetadata, persist_trust) if not Registry::read_dependencies(metadata, &dependencies)
-                if enqueue_dependencies(dependencies, persist_trust, pool) is enqueue_failure:
-                    return enqueue_failure
-                pool.candidates.push(Solver::Candidate{package: [package[item] for item in 0..<package.count], version: parsed, dependencies: dependencies, yanked: yanked})
-                pool.evidence.push(IndexEvidence{generation: evidence.generation, digest: evidence.digest, identity: evidence.identity})
-                return null
+                candidate_status: Registry::ResultCode = candidate_metadata(package, version_text, &metadata)
+                return null if candidate_status == Registry::ResultCode.ExpiredMetadata else status_failure(candidate_status, persist_trust) if candidate_status != Registry::ResultCode.Ok else add_verified_candidate(package, parsed, yanked, evidence, metadata, persist_trust, pool)
+
+        # Read the signed metadata of one candidate release.
+        def candidate_metadata(package: darray[u8]&, version_text: darray[u8]&, metadata: mutable darray[u8]&) -> Registry::ResultCode can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                release: mutable VerifiedRelease = empty_verified_release()
+                return Registry::resolve_candidate_metadata(package, version_text, &release.selected_text, &release.archive, &release.digest, &release.archive_size, metadata)
+
+        def add_verified_candidate(package: darray[u8]&, parsed: Model::Version, yanked: bool, evidence: IndexEvidence&, metadata: darray[u8]&, persist_trust: bool, pool: mutable CandidatePool&) -> darray[u8]? can[Memory.Allocate, Abort.Panic]:
+            dependencies: mutable darray[Solver::Constraint] = []
+            return provider_failure(Registry::ResultCode.MalformedMetadata, persist_trust) if not Registry::read_dependencies(metadata, &dependencies) else record_candidate(package, parsed, yanked, evidence, dependencies, persist_trust, pool)
+
+        def record_candidate(package: darray[u8]&, parsed: Model::Version, yanked: bool, evidence: IndexEvidence&, dependencies: darray[Solver::Constraint]&, persist_trust: bool, pool: mutable CandidatePool&) -> darray[u8]? can[Memory.Allocate, Abort.Panic]:
+            if enqueue_dependencies(dependencies, persist_trust, pool) is enqueue_failure:
+                return enqueue_failure
+            pool.candidates.push(Solver::Candidate{package: [package[item] for item in 0..<package.count], version: parsed, dependencies: dependencies, yanked: yanked})
+            pool.evidence.push(IndexEvidence{generation: evidence.generation, digest: evidence.digest, identity: evidence.identity})
+            return null
+
+        def empty_verified_release() -> VerifiedRelease:
+            return VerifiedRelease{selected_text: [], archive: [], digest: [], archive_size: 0, metadata_digest: []}
 
         # Count a candidate's dependency constraints against the solver budget
         # and queue every dependency package not seen before.
@@ -236,15 +267,16 @@ module LockResolution:
 
         # Solve the candidate graph, preferring releases the previous lock chose.
         def solve(candidates: darray[Solver::Candidate]&, roots: darray[Solver::Constraint]&, preferred_lock: darray[u8]&, unlock: darray[u8]&, persist_trust: bool, selected_indexes: mutable darray[usize]&) -> darray[u8]? can[Memory.Allocate, Abort.Panic]:
+            conflict: mutable Solver::Conflict = Solver::Conflict{package: [], first_requirement: [], second_requirement: []}
+            solve_status: Solver::SolveCode = run_solver(candidates, roots, preferred_lock, unlock, persist_trust, selected_indexes, &conflict)
+            return unsatisfiable_report(conflict) if solve_status == Solver::SolveCode.Unsatisfiable and persist_trust else provider_failure(Registry::ResultCode.ResourceLimit, persist_trust) if solve_status == Solver::SolveCode.ResourceLimit else provider_failure(Registry::ResultCode.MalformedMetadata, persist_trust) if solve_status == Solver::SolveCode.Malformed else [] if solve_status != Solver::SolveCode.Solved else null
+
+        # Run the solver over the roots, preferring the releases the previous
+        # lock chose. Records the conflict only when `persist_trust` is set.
+        def run_solver(candidates: darray[Solver::Candidate]&, roots: darray[Solver::Constraint]&, preferred_lock: darray[u8]&, unlock: darray[u8]&, persist_trust: bool, selected_indexes: mutable darray[usize]&, conflict: mutable Solver::Conflict&) -> Solver::SolveCode can[Memory.Allocate, Abort.Panic]:
             solve_constraints: darray[Solver::Constraint] = [roots[index] for index in 0..<roots.count]
             lock_preferences: darray[Solver::Preference] = registry_lock_preferences(preferred_lock, unlock, candidates)
-            conflict: mutable Solver::Conflict = Solver::Conflict{package: [], first_requirement: [], second_requirement: []}
-            solve_status: Solver::SolveCode =
-                Solver::solve_with_preferences_and_conflict(candidates, solve_constraints, lock_preferences, selected_indexes, &conflict) if persist_trust else Solver::solve_with_preferences(candidates, solve_constraints, lock_preferences, selected_indexes)
-            return unsatisfiable_report(conflict) if solve_status == Solver::SolveCode.Unsatisfiable and persist_trust
-            return provider_failure(Registry::ResultCode.ResourceLimit, persist_trust) if solve_status == Solver::SolveCode.ResourceLimit
-            return provider_failure(Registry::ResultCode.MalformedMetadata, persist_trust) if solve_status == Solver::SolveCode.Malformed
-            return [] if solve_status != Solver::SolveCode.Solved else null
+            return Solver::solve_with_preferences_and_conflict(candidates, solve_constraints, lock_preferences, selected_indexes, conflict) if persist_trust else Solver::solve_with_preferences(candidates, solve_constraints, lock_preferences, selected_indexes)
 
         # A one-byte status sentinel is reserved for ordinary provider
         # failures. Include three NUL-delimited, already validated fields after
@@ -257,24 +289,33 @@ module LockResolution:
         # Emit the selected releases sorted by package name, verifying each one again.
         def append_dependencies(selected_indexes: darray[usize]&, pool: CandidatePool&, persist_trust: bool, out: mutable darray[u8]&) -> darray[u8]? can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             can Global.Read:
-                emitted: mutable darray[u8] = []
-                for step in 0..<selected_indexes.count |emitted|:
+                while step < selected_indexes.count |step: usize = 0.usize(), emitted: darray[u8] = []|:
                     candidate_index: usize =
                         if next_unemitted(selected_indexes, pool.candidates, emitted) is selected_slot:
                             selected_indexes[selected_slot]
                         else:
                             return []
-                    candidate: Solver::Candidate = pool.candidates[candidate_index]
-                    warn_retained_yanked(candidate) if candidate.yanked and persist_trust
-                    release: mutable VerifiedRelease = VerifiedRelease{selected_text: [], archive: [], digest: [], archive_size: 0, metadata_digest: []}
-                    if verify_release(candidate, pool.evidence[candidate_index], persist_trust, &release) is release_failure:
-                        return release_failure
-                    out.push(44) if step > 0
-                    append_dependency_record(out, candidate.package, release)
-                    # Reserve seven bytes for the closing array, object, and line endings.
-                    return provider_failure(Registry::ResultCode.ResourceLimit, persist_trust) if out.count > Lockfile::maximum_body_bytes
-                    emitted <- with_queue_field(emitted, candidate.package)
+                    if append_selected(pool, candidate_index, step == 0.usize(), persist_trust, out) is selected_failure:
+                        return selected_failure
+                    step <- step + 1.usize()
+                    emitted <- with_queue_field(emitted, pool.candidates[candidate_index].package)
                 return null
+
+        # Verify one selected release again and append its lock record.
+        def append_selected(pool: CandidatePool&, candidate_index: usize, first: bool, persist_trust: bool, out: mutable darray[u8]&) -> darray[u8]? can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            can Global.Read:
+                candidate: Solver::Candidate = pool.candidates[candidate_index]
+                warn_retained_yanked(candidate) if candidate.yanked and persist_trust
+                release: mutable VerifiedRelease = empty_verified_release()
+                if verify_release(candidate, pool.evidence[candidate_index], persist_trust, &release) is release_failure:
+                    return release_failure
+                return append_verified_record(out, first, candidate.package, release, persist_trust)
+
+        # Reserve seven bytes for the closing array, object, and line endings.
+        def append_verified_record(out: mutable darray[u8]&, first: bool, package: darray[u8]&, release: VerifiedRelease&, persist_trust: bool) -> darray[u8]? can[Memory.Allocate, Abort.Panic]:
+            out.push(44) if not first
+            append_dependency_record(out, package, release)
+            return provider_failure(Registry::ResultCode.ResourceLimit, persist_trust) if out.count > Lockfile::maximum_body_bytes else null
 
         # The slot of the lexicographically smallest selected package not yet emitted.
         def next_unemitted(selected_indexes: darray[usize]&, candidates: darray[Solver::Candidate]&, emitted: darray[u8]&) -> usize?:
@@ -292,45 +333,50 @@ module LockResolution:
                 ByteText::append_text(&warning, "warning: retaining locked yanked release ")
                 ByteText::append(&warning, candidate.package)
                 warning <- warning.push(64)
-                region version_label_scope:
-                    version_label: mutable darray[u8] = []
-                    Registry::exact_requirement(candidate.version, &version_label)
-                    ByteText::append(&warning, version_label)
+                ByteText::append(&warning, version_label(candidate.version))
                 ByteText::append_text(&warning, "; run 'elisapkg update ")
                 ByteText::append(&warning, candidate.package)
                 ByteText::append_text(&warning, "' to select a non-yanked release\n")
                 CliOutput::write_bytes(2, warning)
+
+        # The exact requirement text naming `version`.
+        def version_label(version: Model::Version) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
+            label: mutable darray[u8] = []
+            Registry::exact_requirement(version, &label)
+            return label
 
         # Resolve the selected release again and require the same index
         # evidence, metadata snapshot, and signature it was chosen under.
         def verify_release(candidate: Solver::Candidate&, expected: IndexEvidence&, persist_trust: bool, release: mutable VerifiedRelease&) -> darray[u8]? can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
                 metadata: mutable darray[u8] = []
-                exact: mutable darray[u8] = []
-                Registry::exact_requirement(candidate.version, &exact)
+                if resolve_again(candidate, expected, persist_trust, release, &metadata) is resolve_failure:
+                    return resolve_failure
+                return [] if not Integrity::sha256_hex(metadata, &release.metadata_digest) else verify_signed_snapshot(candidate, expected, persist_trust, release, metadata)
+
+        # Resolve the selected release again and require the index evidence
+        # it was chosen under.
+        def resolve_again(candidate: Solver::Candidate&, expected: IndexEvidence&, persist_trust: bool, release: mutable VerifiedRelease&, metadata: mutable darray[u8]&) -> darray[u8]? can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
                 verified: mutable IndexEvidence = IndexEvidence{generation: 0, digest: [], identity: []}
-                if status_failure(Registry::resolve_selected_with_index_evidence(candidate.package, exact, &release.selected_text, &release.archive, &release.digest, &release.archive_size, &metadata, &verified.generation, &verified.digest, &verified.identity), persist_trust) is final_failure:
-                    return final_failure
-                return provider_failure(Registry::ResultCode.RollbackDetected, persist_trust) if:
-                    verified.generation != expected.generation
-                    not ByteText::equal(verified.digest, expected.digest)
-                    not ByteText::equal(verified.identity, expected.identity)
-                return [] if not Integrity::sha256_hex(metadata, &release.metadata_digest)
+                status: Registry::ResultCode = Registry::resolve_selected_with_index_evidence(candidate.package, version_label(candidate.version), &release.selected_text, &release.archive, &release.digest, &release.archive_size, metadata, &verified.generation, &verified.digest, &verified.identity)
+                return status_failure(status, persist_trust) if status != Registry::ResultCode.Ok else provider_failure(Registry::ResultCode.RollbackDetected, persist_trust) if verified.generation != expected.generation or not ByteText::equal(verified.digest, expected.digest) or not ByteText::equal(verified.identity, expected.identity) else null
+
+        def verify_signed_snapshot(candidate: Solver::Candidate&, expected: IndexEvidence&, persist_trust: bool, release: VerifiedRelease&, metadata: darray[u8]&) -> darray[u8]? can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
                 metadata_signature: mutable darray[u8] = []
-                if status_failure(Registry::read_signature(candidate.package, release.selected_text, &metadata_signature), persist_trust) is signature_failure:
-                    return signature_failure
+                signature_status: Registry::ResultCode = Registry::read_signature(candidate.package, release.selected_text, &metadata_signature)
+                return status_failure(signature_status, persist_trust) if signature_status != Registry::ResultCode.Ok else verify_snapshot(candidate, expected, persist_trust, release, metadata, metadata_signature)
+
+        # Require the snapshot to name the selected archive and dependencies,
+        # then record the release in the trust state when `persist_trust` is set.
+        def verify_snapshot(candidate: Solver::Candidate&, expected: IndexEvidence&, persist_trust: bool, release: VerifiedRelease&, metadata: darray[u8]&, metadata_signature: darray[u8]&) -> darray[u8]? can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
                 snapshot_expires: mutable u64 = 0
-                snapshot: mutable VerifiedRelease = VerifiedRelease{selected_text: [], archive: [], digest: [], archive_size: 0, metadata_digest: []}
+                snapshot: mutable VerifiedRelease = empty_verified_release()
                 snapshot_dependencies: mutable darray[Solver::Constraint] = []
-                if status_failure(Registry::verify_metadata_snapshot(candidate.package, release.selected_text, release.metadata_digest, metadata, metadata_signature, &snapshot.archive, &snapshot.digest, &snapshot.archive_size, &snapshot_expires, &snapshot_dependencies), persist_trust) is snapshot_failure:
-                    return snapshot_failure
-                return provider_failure(Registry::ResultCode.DigestMismatch, persist_trust) if:
-                    not ByteText::equal(snapshot.archive, release.archive)
-                    not ByteText::equal(snapshot.digest, release.digest)
-                    snapshot.archive_size != release.archive_size
-                    not ReleaseMetadata::dependency_sets_equal(snapshot_dependencies, candidate.dependencies)
-                return null if not persist_trust
-                return status_failure(Registry::record_trusted_at_index(candidate.package, release.selected_text, release.digest, release.metadata_digest, snapshot_expires, expected.generation, expected.digest, expected.identity), true)
+                snapshot_status: Registry::ResultCode = Registry::verify_metadata_snapshot(candidate.package, release.selected_text, release.metadata_digest, metadata, metadata_signature, &snapshot.archive, &snapshot.digest, &snapshot.archive_size, &snapshot_expires, &snapshot_dependencies)
+                return status_failure(snapshot_status, persist_trust) if snapshot_status != Registry::ResultCode.Ok else provider_failure(Registry::ResultCode.DigestMismatch, persist_trust) if not ByteText::equal(snapshot.archive, release.archive) or not ByteText::equal(snapshot.digest, release.digest) or snapshot.archive_size != release.archive_size or not ReleaseMetadata::dependency_sets_equal(snapshot_dependencies, candidate.dependencies) else null if not persist_trust else status_failure(Registry::record_trusted_at_index(candidate.package, release.selected_text, release.digest, release.metadata_digest, snapshot_expires, expected.generation, expected.digest, expected.identity), true)
 
         # One lock entry, byte for byte in the canonical registry lock format.
         def append_dependency_record(out: mutable darray[u8]&, package: darray[u8]&, release: VerifiedRelease&) -> void can[Memory.Allocate, Abort.Panic]:
