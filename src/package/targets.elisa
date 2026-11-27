@@ -33,67 +33,15 @@ module ManifestTargets:
             name_out.resize(0)
             kind_out.resize(0)
             entry_out.resize(0)
-            targets_start: usize = Json::root_value_offset(raw, "targets")
-            return false if targets_start >= raw.count or raw[targets_start] != 91
-            targets_end: usize = Json::array_end(raw, targets_start)
-            return false if targets_end <= targets_start or targets_end >= raw.count
-            kind_requested: bool = requested_kind[0].u8() != 0
-            cursor: mutable usize = targets_start + 1.usize()
-            while cursor < targets_end |name_requested: bool = requested_name[0].u8() != 0|:
-                cursor <- skip_target_separators(raw, cursor, targets_end)
-                break if cursor >= targets_end
-                return false if raw[cursor] != 123
-                object_end: usize = Json::object_end(raw, cursor)
-                return false if object_end <= cursor or object_end >= targets_end
-                name_start: mutable usize = 0
-                name_end: mutable usize = 0
-                kind_start: mutable usize = 0
-                kind_end: mutable usize = 0
-                entry_start: mutable usize = 0
-                entry_end: mutable usize = 0
-                return false if not:
-                    Json::object_string_span(raw, cursor, object_end, "name", &name_start, &name_end)
-                    Json::object_string_span(raw, cursor, object_end, "kind", &kind_start, &kind_end)
-                    Json::object_string_span(raw, cursor, object_end, "entry", &entry_start, &entry_end)
-                name_matches: bool = not name_requested or ByteText::range_equals_text(raw, name_start, name_end, requested_name)
-                region kind_matches_scope:
-                    kind_matches: bool = not kind_requested or ByteText::range_equals_text(raw, kind_start, kind_end, requested_kind)
-                    if name_matches and kind_matches:
-                        ByteText::append_range(name_out, raw, name_start, name_end)
-                        ByteText::append_range(kind_out, raw, kind_start, kind_end)
-                        ByteText::append_range(entry_out, raw, entry_start, entry_end)
-                        return true
-                cursor <- object_end + 1.usize()
-            false
+            targets: TargetsArray = targets_array(raw)
+            valid_targets_array(raw, targets) and selected_in_targets(raw, targets, requested_name, requested_kind, name_out, kind_out, entry_out)
 
         # Path dependencies require exactly one library target.
         def unique_library_entry(raw: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
             out.resize(0)
-            targets_start: usize = Json::root_value_offset(raw, "targets")
-            return false if targets_start >= raw.count or raw[targets_start] != 91
-            targets_end: usize = Json::array_end(raw, targets_start)
-            return false if targets_end <= targets_start or targets_end >= raw.count
-            found_library: mutable bool = false
-            entry_start: mutable usize = 0
-            entry_end: mutable usize = 0
-            while cursor < targets_end |cursor: usize = targets_start + 1.usize()|:
-                cursor <- skip_target_separators(raw, cursor, targets_end)
-                break if cursor >= targets_end or raw[cursor] == 93
-                return false if raw[cursor] != 123
-                object_end: usize = Json::object_end(raw, cursor)
-                return false if object_end <= cursor or object_end >= targets_end
-                kind_start: mutable usize = 0
-                region kind_end_scope:
-                    kind_end: mutable usize = 0
-                    return false if not Json::object_string_span(raw, cursor, object_end, "kind", &kind_start, &kind_end)
-                    if ByteText::range_equals_text(raw, kind_start, kind_end, "lib"):
-                        return false if found_library
-                        found_library <- true
-                        return false if not Json::object_string_span(raw, cursor, object_end, "entry", &entry_start, &entry_end)
-                cursor <- object_end + 1.usize()
-            return false if not found_library
-            ByteText::append_range(out, raw, entry_start, entry_end)
-            true
+            targets: TargetsArray = targets_array(raw)
+            library: mutable LibraryTarget = LibraryTarget{found: false, entry_start: 0, entry_end: 0}
+            valid_targets_array(raw, targets) and found_unique_library(raw, targets, &library) and published_library_entry(raw, library, out)
 
         def default_entry(raw: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
             name: mutable darray[u8] = []
@@ -105,26 +53,137 @@ module ManifestTargets:
             out.resize(0)
             return false if not Json::valid_document(raw) or not Json::unique_object_keys(raw)
             outputs: mutable darray[darray[u8]] @r = []
-            targets_start: usize = Json::root_value_offset(raw, "targets")
-            return false if targets_start >= raw.count or raw[targets_start] != 91
-            targets_end: usize = Json::array_end(raw, targets_start)
-            return false if targets_end <= targets_start or targets_end >= raw.count
-            while cursor < targets_end |cursor: usize = targets_start + 1.usize()|:
-                cursor <- skip_target_separators(raw, cursor, targets_end)
-                break if cursor >= targets_end
-                return false if raw[cursor] != 123 or outputs.count >= 2.usize() * maximum_targets
-                object_end: usize = Json::object_end(raw, cursor)
-                return false if object_end <= cursor or object_end >= targets_end
-                target_name: mutable darray[u8] = []
-                target_kind: mutable darray[u8] = []
-                return false if not:
-                    Json::object_string_value(raw, cursor, object_end, "name", &target_name)
-                    Json::object_string_value(raw, cursor, object_end, "kind", &target_kind)
-                    PackageIdentity::valid_name(target_name)
-                    valid_kind(target_kind)
-                outputs <- outputs.push(artifact_leaf(target_name, ByteText::equal_text(target_kind, "lib")))
-                outputs <- outputs.push(receipt_leaf(target_name))
-                cursor <- object_end + 1.usize()
-            return false if outputs.count == 0.usize()
+            return false if not collected_output_leaves(raw, &outputs) or outputs.count == 0.usize()
             out <- outputs
+            true
+
+    private:
+        # The bounds of the manifest's "targets" array, from its opening
+        # bracket to its closing one.
+        struct TargetsArray:
+            start: usize
+            finish: usize
+
+        # The name, kind, and entry string spans of one target object.
+        struct TargetSpans:
+            name_start: mutable usize
+            name_end: mutable usize
+            kind_start: mutable usize
+            kind_end: mutable usize
+            entry_start: mutable usize
+            entry_end: mutable usize
+
+        # Whether a library target was seen, and the span of its entry.
+        struct LibraryTarget:
+            found: mutable bool
+            entry_start: mutable usize
+            entry_end: mutable usize
+
+        # The cursor returned for a target object that does not verify.
+        const malformed_target: usize = 0.usize()
+
+        # An array without a valid start keeps `finish` at `start`.
+        def targets_array(raw: darray[u8]&) -> TargetsArray:
+            targets_start: usize = Json::root_value_offset(raw, "targets")
+            TargetsArray{start: targets_start, finish: Json::array_end(raw, targets_start) if targets_start < raw.count and raw[targets_start] == 91 else targets_start}
+
+        def valid_targets_array(raw: darray[u8]&, targets: TargetsArray&) -> bool:
+            targets.finish > targets.start and targets.finish < raw.count
+
+        # ---------- target selection ----------------------------------------------------------
+
+        # Select the first target whose name and kind match the requested
+        # ones; an empty request matches any value.
+        def selected_in_targets(raw: darray[u8]&, targets: TargetsArray&, requested_name: cstr, requested_kind: cstr, name_out: mutable darray[u8]&, kind_out: mutable darray[u8]&, entry_out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            while cursor < targets.finish |name_out, kind_out, entry_out, cursor: usize = targets.start + 1.usize(), selected: bool = false|:
+                cursor <- skip_target_separators(raw, cursor, targets.finish)
+                break if cursor >= targets.finish
+                return false if raw[cursor] != 123
+                cursor <- selected_object_end(raw, cursor, targets.finish, requested_name, requested_kind, &selected, name_out, kind_out, entry_out)
+                return false if cursor == malformed_target
+                return true if selected
+            false
+
+        # Read the target object at `object_start`. Returns the cursor after
+        # it, or `malformed_target`.
+        def selected_object_end(raw: darray[u8]&, object_start: usize, targets_end: usize, requested_name: cstr, requested_kind: cstr, selected: mutable bool&, name_out: mutable darray[u8]&, kind_out: mutable darray[u8]&, entry_out: mutable darray[u8]&) -> usize can[Memory.Allocate, Abort.Panic]:
+            object_end: usize = Json::object_end(raw, object_start)
+            malformed_target if object_end <= object_start or object_end >= targets_end or not read_target(raw, object_start, object_end, requested_name, requested_kind, selected, name_out, kind_out, entry_out) else object_end + 1.usize()
+
+        def read_target(raw: darray[u8]&, object_start: usize, object_end: usize, requested_name: cstr, requested_kind: cstr, selected: mutable bool&, name_out: mutable darray[u8]&, kind_out: mutable darray[u8]&, entry_out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            spans: mutable TargetSpans = TargetSpans{name_start: 0, name_end: 0, kind_start: 0, kind_end: 0, entry_start: 0, entry_end: 0}
+            Json::object_string_span(raw, object_start, object_end, "name", &spans.name_start, &spans.name_end) and Json::object_string_span(raw, object_start, object_end, "kind", &spans.kind_start, &spans.kind_end) and Json::object_string_span(raw, object_start, object_end, "entry", &spans.entry_start, &spans.entry_end) and recorded_selection(raw, spans, target_matches(raw, spans, requested_name, requested_kind), selected, name_out, kind_out, entry_out)
+
+        def recorded_selection(raw: darray[u8]&, spans: TargetSpans&, matches: bool, selected: mutable bool&, name_out: mutable darray[u8]&, kind_out: mutable darray[u8]&, entry_out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            selected <- matches
+            publish_target(raw, spans, name_out, kind_out, entry_out) if matches
+            true
+
+        def target_matches(raw: darray[u8]&, spans: TargetSpans&, requested_name: cstr, requested_kind: cstr) -> bool:
+            name_matches: bool = requested_name[0].u8() == 0 or ByteText::range_equals_text(raw, spans.name_start, spans.name_end, requested_name)
+            name_matches and (requested_kind[0].u8() == 0 or ByteText::range_equals_text(raw, spans.kind_start, spans.kind_end, requested_kind))
+
+        def publish_target(raw: darray[u8]&, spans: TargetSpans&, name_out: mutable darray[u8]&, kind_out: mutable darray[u8]&, entry_out: mutable darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
+            ByteText::append_range(name_out, raw, spans.name_start, spans.name_end)
+            ByteText::append_range(kind_out, raw, spans.kind_start, spans.kind_end)
+            ByteText::append_range(entry_out, raw, spans.entry_start, spans.entry_end)
+
+        # ---------- library entry -------------------------------------------------------------
+
+        def found_unique_library(raw: darray[u8]&, targets: TargetsArray&, library: mutable LibraryTarget&) -> bool:
+            while cursor < targets.finish |library, cursor: usize = targets.start + 1.usize()|:
+                cursor <- skip_target_separators(raw, cursor, targets.finish)
+                break if cursor >= targets.finish or raw[cursor] == 93
+                return false if raw[cursor] != 123
+                cursor <- library_object_end(raw, cursor, targets.finish, library)
+                return false if cursor == malformed_target
+            library.found
+
+        def library_object_end(raw: darray[u8]&, object_start: usize, targets_end: usize, library: mutable LibraryTarget&) -> usize:
+            object_end: usize = Json::object_end(raw, object_start)
+            malformed_target if object_end <= object_start or object_end >= targets_end or not recorded_library(raw, object_start, object_end, library) else object_end + 1.usize()
+
+        # A second library target is malformed.
+        def recorded_library(raw: darray[u8]&, object_start: usize, object_end: usize, library: mutable LibraryTarget&) -> bool:
+            kind_start: mutable usize = 0
+            kind_end: mutable usize = 0
+            Json::object_string_span(raw, object_start, object_end, "kind", &kind_start, &kind_end) and (not ByteText::range_equals_text(raw, kind_start, kind_end, "lib") or first_library_entry(raw, object_start, object_end, library))
+
+        def first_library_entry(raw: darray[u8]&, object_start: usize, object_end: usize, library: mutable LibraryTarget&) -> bool:
+            return false if library.found
+            library.found <- true
+            Json::object_string_span(raw, object_start, object_end, "entry", &library.entry_start, &library.entry_end)
+
+        def published_library_entry(raw: darray[u8]&, library: LibraryTarget&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            ByteText::append_range(out, raw, library.entry_start, library.entry_end)
+            true
+
+        # ---------- cleanup outputs -----------------------------------------------------------
+
+        def collected_output_leaves[@r](raw: darray[u8]&, outputs: mutable darray[darray[u8]]& @r) -> bool can[Memory.Allocate, Abort.Panic]:
+            targets: TargetsArray = targets_array(raw)
+            valid_targets_array(raw, targets) and collected_leaves_in(raw, targets, outputs)
+
+        def collected_leaves_in[@r](raw: darray[u8]&, targets: TargetsArray&, outputs: mutable darray[darray[u8]]& @r) -> bool can[Memory.Allocate, Abort.Panic]:
+            while cursor < targets.finish |outputs, cursor: usize = targets.start + 1.usize()|:
+                cursor <- skip_target_separators(raw, cursor, targets.finish)
+                break if cursor >= targets.finish
+                return false if raw[cursor] != 123 or outputs.count >= 2.usize() * maximum_targets
+                cursor <- leaves_object_end(raw, cursor, targets.finish, outputs)
+                return false if cursor == malformed_target
+            true
+
+        def leaves_object_end[@r](raw: darray[u8]&, object_start: usize, targets_end: usize, outputs: mutable darray[darray[u8]]& @r) -> usize can[Memory.Allocate, Abort.Panic]:
+            object_end: usize = Json::object_end(raw, object_start)
+            malformed_target if object_end <= object_start or object_end >= targets_end or not added_output_leaves(raw, object_start, object_end, outputs) else object_end + 1.usize()
+
+        # Each target owns its artifact and its receipt.
+        def added_output_leaves[@r](raw: darray[u8]&, object_start: usize, object_end: usize, outputs: mutable darray[darray[u8]]& @r) -> bool can[Memory.Allocate, Abort.Panic]:
+            target_name: mutable darray[u8] = []
+            target_kind: mutable darray[u8] = []
+            Json::object_string_value(raw, object_start, object_end, "name", &target_name) and Json::object_string_value(raw, object_start, object_end, "kind", &target_kind) and PackageIdentity::valid_name(target_name) and valid_kind(target_kind) and pushed_output_leaves(outputs, target_name, ByteText::equal_text(target_kind, "lib"))
+
+        def pushed_output_leaves[@r](outputs: mutable darray[darray[u8]]& @r, target_name: darray[u8]&, is_library: bool) -> bool can[Memory.Allocate, Abort.Panic]:
+            outputs.push(artifact_leaf(target_name, is_library))
+            outputs.push(receipt_leaf(target_name))
             true
