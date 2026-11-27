@@ -24,20 +24,51 @@ module CompilerProcess:
                 process_identifier <= 0
                 digits_offset >= value.count
                 value.count - digits_offset <= 22.usize()
-            digit_count: mutable usize = 1.usize()
-            region remaining_scope:
-                remaining: mutable u64 = process_identifier.u64()
-                while remaining >= 10.u64() |remaining, digit_count|:
-                    digit_count <- digit_count + 1.usize()
-                    remaining <- remaining / 10.u64()
-                remaining <- process_identifier.u64()
-                for index in 0..<digit_count |value, digits_offset, digit_count, remaining|:
-                    value[digits_offset + digit_count - index - 1.usize()] <- (48.u64() + remaining % 10.u64()).u8()
-                    remaining <- remaining / 10.u64()
-            value[digits_offset + digit_count] <- 46
-            value[digits_offset + digit_count + 1.usize()] <- 99
-            value[digits_offset + digit_count + 2.usize()] <- 0
+            digit_count: usize = decimal_digit_count(process_identifier.u64())
+            write_decimal(value, digits_offset, digit_count, process_identifier.u64())
+            terminated_callback_suffix(value, digits_offset + digit_count)
+
+        # The number of decimal digits of `number`.
+        def decimal_digit_count(number: u64) -> usize:
+            while remaining >= 10.u64() |remaining: u64 = number, digits: usize = 1.usize()| -> digits:
+                digits <- digits + 1.usize()
+                remaining <- remaining / 10.u64()
+
+        # Write `number` as `digit_count` decimal digits starting at `offset`.
+        def write_decimal(value: mutable darray[u8]&, offset: usize, digit_count: usize, number: u64) -> void:
+            for index in 0..<digit_count |value, remaining: u64 = number|:
+                value[offset + digit_count - index - 1.usize()] <- (48.u64() + remaining % 10.u64()).u8()
+                remaining <- remaining / 10.u64()
+
+        # End the callback filename with ".c" and its terminator at `position`.
+        def terminated_callback_suffix(value: mutable darray[u8]&, position: usize) -> bool:
+            value[position] <- 46
+            value[position + 1.usize()] <- 99
+            value[position + 2.usize()] <- 0
             true
+
+        # The callback file path inside a prepared "CALLBACK_PATH=" parameter.
+        def callback_path(parameter: darray[u8]&) -> cstr can[Unsafe.PointerCast]:
+            (&parameter[Platform::c_string_length(callback_environment_prefix)]).cast[cstr] can Unsafe.PointerCast
+
+        def removed_or_missing(status: i64) -> bool:
+            status == 0 or status == -2
+
+        # Every buffer the child's environment and argument vector point into.
+        # They stay alive in `spawn` until the child has executed.
+        struct ChildEnvironment:
+            callback_parameter: mutable darray[u8]
+            callback_digits_offset: usize
+            temporary: darray[u8]
+            sandbox_home: darray[u8]
+            fixed_home: darray[u8]
+            cache_home: darray[u8]
+            stage1: darray[u8]
+            runtime: darray[u8]
+            stale: darray[u8]
+            clang: darray[u8]
+            sdkroot: darray[u8]
+            developer_directory: darray[u8]
 
     public:
         struct Invocation:
@@ -55,16 +86,9 @@ module CompilerProcess:
 
         def remove_callback_file(process_identifier: i64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return false if process_identifier <= 0
-            status: i64 =
-                parameter: mutable darray[u8] = []
-                region digits_offset_scope:
-                    digits_offset: usize = prepare_callback_parameter(&parameter)
-                    return false if not set_callback_path_process_identifier(&parameter, digits_offset, process_identifier)
-                path: cstr =
-                    path_offset: usize = Platform::c_string_length(callback_environment_prefix)
-                    (&parameter[path_offset]).cast[cstr] can Unsafe.PointerCast
-                Platform::unlink_path(path)
-            status == 0 or status == -2
+            parameter: mutable darray[u8] = []
+            digits_offset: usize = prepare_callback_parameter(&parameter)
+            set_callback_path_process_identifier(&parameter, digits_offset, process_identifier) and removed_or_missing(Platform::unlink_path(callback_path(parameter)))
 
         # Keep the environment buffers alive in this frame through fork and exec.
         # A terminated "NAME=VALUE" environment entry, or an empty array when
@@ -88,8 +112,7 @@ module CompilerProcess:
 
         def with_entry(arguments: mutable darray[cstr], entry: darray[u8]&) -> darray[cstr] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return arguments if entry.count == 0.usize()
-            entry_text: cstr = (&entry[0]).cast[cstr] can Unsafe.PointerCast
-            arguments <- arguments.push(entry_text)
+            arguments <- arguments.push((&entry[0]).cast[cstr] can Unsafe.PointerCast)
             arguments
 
         def with_compiler_arguments(arguments: mutable darray[cstr], invocation: Invocation) -> darray[cstr] can[Memory.Allocate, Abort.Panic]:
@@ -111,61 +134,56 @@ module CompilerProcess:
             # The compiler was resolved against the fixed child PATH above;
             # invoking its absolute path keeps execution and sandbox policy aligned.
             # Every entry buffer stays alive until the child has executed.
+            environment: mutable ChildEnvironment = child_environment(invocation, sdk_root, developer_directory)
+            arguments: mutable darray[cstr] = child_arguments(environment, invocation)
+            forked_compiler(&environment, &arguments, sandbox_work_directory_file_descriptor, compiler_stdout_file_descriptor, compiler_stderr_file_descriptor)
+
+        def child_environment(invocation: Invocation, sdk_root: darray[u8]&, developer_directory: darray[u8]&) -> ChildEnvironment can[Memory.Allocate, Abort.Panic]:
             callback_parameter: mutable darray[u8] = []
             callback_digits_offset: usize = prepare_callback_parameter(&callback_parameter)
-            temporary_environment: darray[u8] = environment_entry("TMPDIR=", invocation.scratch_directory)
-            sandbox_home_environment: darray[u8] = environment_entry("HOME=", invocation.scratch_directory)
-            fixed_home_environment: darray[u8] = environment_entry("CFFIXED_USER_HOME=", invocation.scratch_directory)
-            cache_home_environment: darray[u8] = environment_entry("XDG_CACHE_HOME=", invocation.scratch_directory)
-            stage1_environment: darray[u8] = optional_environment_entry("ELISA_STAGE1_BIN=", invocation.stage1_binary)
-            runtime_environment: darray[u8] = optional_environment_entry("ELISA_RUNTIME_OBJ=", invocation.runtime_object)
-            stale_environment: darray[u8] = optional_environment_entry("ELISA_ALLOW_STALE_STAGE1=", invocation.allow_stale)
-            clang_environment: darray[u8] = optional_environment_entry("ELISA_CLANG=", invocation.clang)
-            sdkroot_environment: darray[u8] = bytes_environment_entry("SDKROOT=", sdk_root) if sdk_root.count > 0.usize() else []
-            developer_directory_environment: darray[u8] = bytes_environment_entry("DEVELOPER_DIR=", developer_directory) if sdk_root.count > 0.usize() else []
-            arguments: mutable darray[cstr] =
-                callback_text: cstr = (&callback_parameter[0]).cast[cstr] can Unsafe.PointerCast
-                ["/usr/bin/sandbox-exec", "-D", callback_text, "-p", invocation.profile, "/usr/bin/env", "-i", Toolchain::isolated_path_environment]
-            arguments <- with_entry(arguments, temporary_environment)
-            arguments <- with_entry(arguments, sandbox_home_environment)
-            arguments <- with_entry(arguments, fixed_home_environment)
-            arguments <- with_entry(arguments, cache_home_environment)
+            ChildEnvironment{callback_parameter: callback_parameter, callback_digits_offset: callback_digits_offset, temporary: environment_entry("TMPDIR=", invocation.scratch_directory), sandbox_home: environment_entry("HOME=", invocation.scratch_directory), fixed_home: environment_entry("CFFIXED_USER_HOME=", invocation.scratch_directory), cache_home: environment_entry("XDG_CACHE_HOME=", invocation.scratch_directory), stage1: optional_environment_entry("ELISA_STAGE1_BIN=", invocation.stage1_binary), runtime: optional_environment_entry("ELISA_RUNTIME_OBJ=", invocation.runtime_object), stale: optional_environment_entry("ELISA_ALLOW_STALE_STAGE1=", invocation.allow_stale), clang: optional_environment_entry("ELISA_CLANG=", invocation.clang), sdkroot: bytes_environment_entry("SDKROOT=", sdk_root) if sdk_root.count > 0.usize() else [], developer_directory: bytes_environment_entry("DEVELOPER_DIR=", developer_directory) if sdk_root.count > 0.usize() else []}
+
+        # The sandbox-exec argument vector; its strings point into `environment`.
+        def child_arguments(environment: ChildEnvironment&, invocation: Invocation) -> darray[cstr] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            arguments: mutable darray[cstr] = ["/usr/bin/sandbox-exec", "-D", ((&environment.callback_parameter[0]).cast[cstr] can Unsafe.PointerCast), "-p", invocation.profile, "/usr/bin/env", "-i", Toolchain::isolated_path_environment]
+            arguments <- with_entry(arguments, environment.temporary)
+            arguments <- with_entry(arguments, environment.sandbox_home)
+            arguments <- with_entry(arguments, environment.fixed_home)
+            arguments <- with_entry(arguments, environment.cache_home)
             arguments <- arguments.push("ELISA_STAGE1_SEMANTIC_GATE=1")
-            arguments <- with_entry(arguments, stage1_environment)
-            arguments <- with_entry(arguments, runtime_environment)
-            arguments <- with_entry(arguments, stale_environment)
-            arguments <- with_entry(arguments, clang_environment)
-            arguments <- with_entry(arguments, sdkroot_environment)
-            arguments <- with_entry(arguments, developer_directory_environment)
-            arguments <- with_compiler_arguments(arguments, invocation)
+            arguments <- with_entry(arguments, environment.stage1)
+            arguments <- with_entry(arguments, environment.runtime)
+            arguments <- with_entry(arguments, environment.stale)
+            arguments <- with_entry(arguments, environment.clang)
+            arguments <- with_entry(arguments, environment.sdkroot)
+            arguments <- with_entry(arguments, environment.developer_directory)
+            with_compiler_arguments(arguments, invocation)
+
+        def forked_compiler(environment: mutable ChildEnvironment&, arguments: mutable darray[cstr]&, sandbox_work_directory_file_descriptor: i64, compiler_stdout_file_descriptor: i64, compiler_stderr_file_descriptor: i64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             child_argument_vector: mutable cstr&& = (&arguments[0]).cast[mutable cstr&&] can Unsafe.PointerCast
-            child_process_identifier: i64 = Platform::fork_process()
-            if child_process_identifier == 0:
-                run_child(&callback_parameter, callback_digits_offset, sandbox_work_directory_file_descriptor, compiler_stdout_file_descriptor, compiler_stderr_file_descriptor, child_argument_vector)
+            started_child(Platform::fork_process(), environment, sandbox_work_directory_file_descriptor, compiler_stdout_file_descriptor, compiler_stderr_file_descriptor, child_argument_vector)
+
+        # The forked child runs the compiler; the parent gets its identifier.
+        def started_child(child_process_identifier: i64, environment: mutable ChildEnvironment&, sandbox_work_directory_file_descriptor: i64, compiler_stdout_file_descriptor: i64, compiler_stderr_file_descriptor: i64, child_argument_vector: mutable cstr&&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            run_child(&environment.callback_parameter, environment.callback_digits_offset, sandbox_work_directory_file_descriptor, compiler_stdout_file_descriptor, compiler_stderr_file_descriptor, child_argument_vector) if child_process_identifier == 0
             child_process_identifier
+
+        # Read standard input from the null device and send output to the captures.
+        def wire_standard_streams(compiler_stdout_file_descriptor: i64, compiler_stderr_file_descriptor: i64) -> void can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            null_file_descriptor: i64 = Platform::open_null_device()
+            if null_file_descriptor < 0 or Platform::duplicate_file_descriptor_to(null_file_descriptor, 0) != 0 or Platform::duplicate_file_descriptor_to(compiler_stdout_file_descriptor, 1) != 1 or Platform::duplicate_file_descriptor_to(compiler_stderr_file_descriptor, 2) != 2:
+                Platform::exit_process(126)
+            if null_file_descriptor > 2:
+                _ = Platform::close_file_descriptor(null_file_descriptor)
 
         # In the forked child: claim the callback file, isolate the process,
         # wire its standard streams, and execute the sandboxed compiler. Never returns.
         def run_child(callback_parameter: mutable darray[u8]&, callback_digits_offset: usize, sandbox_work_directory_file_descriptor: i64, compiler_stdout_file_descriptor: i64, compiler_stderr_file_descriptor: i64, child_argument_vector: mutable cstr&&) -> void can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            region process_identifier_scope:
-                process_identifier: i64 = Platform::process_identifier()
-                if not set_callback_path_process_identifier(callback_parameter, callback_digits_offset, process_identifier):
-                    Platform::exit_process(126)
-            callback_path_offset: usize = Platform::c_string_length(callback_environment_prefix)
-            region callback_file_name_scope:
-                callback_file_name: cstr = (&callback_parameter[callback_path_offset]).cast[cstr] can Unsafe.PointerCast
-                if Platform::create_exclusive_file(callback_file_name) != 0:
-                    Platform::exit_process(126)
-            if Platform::set_process_group() != 0 or Platform::set_process_limits(1) != 0 or Platform::change_directory_to_descriptor(sandbox_work_directory_file_descriptor) != 0:
-                Platform::exit_process(126)
-            region null_file_descriptor_scope:
-                null_file_descriptor: i64 = Platform::open_null_device()
-                if null_file_descriptor < 0 or Platform::duplicate_file_descriptor_to(null_file_descriptor, 0) != 0 or Platform::duplicate_file_descriptor_to(compiler_stdout_file_descriptor, 1) != 1 or Platform::duplicate_file_descriptor_to(compiler_stderr_file_descriptor, 2) != 2:
-                    Platform::exit_process(126)
-                if null_file_descriptor > 2:
-                    _ = Platform::close_file_descriptor(null_file_descriptor)
-            if Platform::close_inherited_file_descriptors() != 0:
-                Platform::exit_process(126)
+            Platform::exit_process(126) if not set_callback_path_process_identifier(callback_parameter, callback_digits_offset, Platform::process_identifier())
+            Platform::exit_process(126) if Platform::create_exclusive_file(callback_path(callback_parameter)) != 0
+            Platform::exit_process(126) if Platform::set_process_group() != 0 or Platform::set_process_limits(1) != 0 or Platform::change_directory_to_descriptor(sandbox_work_directory_file_descriptor) != 0
+            wire_standard_streams(compiler_stdout_file_descriptor, compiler_stderr_file_descriptor)
+            Platform::exit_process(126) if Platform::close_inherited_file_descriptors() != 0
             _ = Platform::execute_program("/usr/bin/sandbox-exec", child_argument_vector)
             Platform::exit_process(127)
 
@@ -216,18 +234,20 @@ module CompilerProcess:
                 path.push(47)
             ByteText::append_text(path, "compiler.stdout.XXXXXX" if capture_stdout else "compiler.stderr.XXXXXX")
             path.push(0)
-            descriptor: i64 = Platform::make_temporary_file(path)
-            if descriptor < 0:
-                diagnostic: cstr = "error: unable to create the private compiler stdout capture\n" if capture_stdout else "error: unable to create the private compiler stderr capture\n"
-                return LogCapture{descriptor: descriptor, diagnostic: diagnostic}
+            capture_for_descriptor(Platform::make_temporary_file(path), capture_stdout, path)
+
+        # Captures must not use the standard stream descriptors 0 to 2.
+        def capture_for_descriptor(descriptor: i64, capture_stdout: bool, path: darray[u8]&) -> LogCapture can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return LogCapture{descriptor: descriptor, diagnostic: "error: unable to create the private compiler stdout capture\n" if capture_stdout else "error: unable to create the private compiler stderr capture\n"} if descriptor < 0
             return LogCapture{descriptor: descriptor, diagnostic: ""} if descriptor >= 3
             raised_descriptor: i64 = Platform::duplicate_file_descriptor_at_least(descriptor, 3)
             _ = Platform::close_file_descriptor(descriptor)
-            if raised_descriptor < 0:
-                _ = Platform::unlink_path((&path[0]).cast[cstr] can Unsafe.PointerCast)
-                diagnostic: cstr = "error: unable to secure the compiler stdout capture descriptor\n" if capture_stdout else "error: unable to secure the compiler stderr capture descriptor\n"
-                return LogCapture{descriptor: raised_descriptor, diagnostic: diagnostic}
-            LogCapture{descriptor: raised_descriptor, diagnostic: ""}
+            raised_capture(raised_descriptor, capture_stdout, path)
+
+        def raised_capture(raised_descriptor: i64, capture_stdout: bool, path: darray[u8]&) -> LogCapture can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return LogCapture{descriptor: raised_descriptor, diagnostic: ""} if raised_descriptor >= 0
+            _ = Platform::unlink_path((&path[0]).cast[cstr] can Unsafe.PointerCast)
+            LogCapture{descriptor: raised_descriptor, diagnostic: "error: unable to secure the compiler stdout capture descriptor\n" if capture_stdout else "error: unable to secure the compiler stderr capture descriptor\n"}
 
         # Attempt every close and unlink even if forwarding fails.
         def collect_logs(stdout_descriptor: i64, stderr_descriptor: i64, stdout_path: cstr, stderr_path: cstr) -> bool can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
