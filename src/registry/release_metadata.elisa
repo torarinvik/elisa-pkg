@@ -45,25 +45,15 @@ module ReleaseMetadata:
             archive_out.resize(0)
             digest_out.resize(0)
             size_out <- 0.u64()
-            return false if not PackageIdentity::valid_version(version)
-            region schema_scope:
-                schema: mutable u64 = 0
-                return false if not unsigned_field(raw, "schema-version", &schema) or schema != 1
+            schema: mutable u64 = 0
             start: usize = Json::root_start(raw)
             finish: usize = Json::root_object_end(raw, start)
-            return false if not:
-                Json::object_string_equals(raw, start, finish, "registry", root)
-                Json::object_string_equals_text(raw, start, finish, "algorithm", "ed25519")
-                Json::object_string_equals(raw, start, finish, "package", package)
-                Json::object_string_equals(raw, start, finish, "version", version)
-                Json::object_string_value(raw, start, finish, "archive", archive_out)
-                Archive::is_safe_entry(archive_out)
-                Json::object_string_value(raw, start, finish, "archive-digest", digest_out)
-                Integrity::valid_sha256_hex(digest_out)
             parsed_size: mutable u64 = 0
-            return false if not Json::object_unsigned_value(raw, start, finish, "archive-size", &parsed_size) or parsed_size > Archive::maximum_archive_bytes.u64()
-            size_out <- parsed_size
-            true
+            if not PackageIdentity::valid_version(version) or not unsigned_field(raw, "schema-version", &schema) or schema != 1 or not Json::object_string_equals(raw, start, finish, "registry", root) or not Json::object_string_equals_text(raw, start, finish, "algorithm", "ed25519") or not Json::object_string_equals(raw, start, finish, "package", package) or not Json::object_string_equals(raw, start, finish, "version", version) or not Json::object_string_value(raw, start, finish, "archive", archive_out) or not Archive::is_safe_entry(archive_out) or not Json::object_string_value(raw, start, finish, "archive-digest", digest_out) or not Integrity::valid_sha256_hex(digest_out) or not Json::object_unsigned_value(raw, start, finish, "archive-size", &parsed_size) or parsed_size > Archive::maximum_archive_bytes.u64():
+                false
+            else:
+                size_out <- parsed_size
+                true
 
         # Validate the release document before any caller consumes its fields.
         def valid_document(raw: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
@@ -86,33 +76,25 @@ module ReleaseMetadata:
             dependency_start: usize = Json::root_value_offset(raw, "dependencies")
             return true if dependency_start == raw.count
             dependency_end: usize = Json::object_end(raw, dependency_start)
-            return false if dependency_end <= dependency_start or dependency_end >= raw.count or raw[dependency_start] != 123
-            cursor: mutable usize = Json::skip_whitespace(raw, dependency_start + 1.usize(), dependency_end)
-            return true if cursor == dependency_end
-            # Each entry either ends the object exactly or the object is malformed.
-            while true:
-                entry: mutable DependencyEntry::Span = DependencyEntry::Span{name_start: 0, name_end: 0, object_start: 0, object_end: 0}
-                return false if not:
-                    DependencyEntry::read(raw, cursor, dependency_end, &entry)
-                    append_dependency(raw, entry, out)
-                cursor <- DependencyEntry::next_start(raw, entry.object_end, dependency_end)
-                return true if cursor == dependency_end
-                return false if cursor > dependency_end
+            if dependency_end <= dependency_start or dependency_end >= raw.count or raw[dependency_start] != 123:
+                false
+            else:
+                # Each entry either ends the object exactly or the object is malformed.
+                while cursor < dependency_end |cursor: usize = Json::skip_whitespace(raw, dependency_start + 1.usize(), dependency_end), entry: DependencyEntry::Span = DependencyEntry::Span{name_start: 0, name_end: 0, object_start: 0, object_end: 0}| -> cursor == dependency_end:
+                    return false if not:
+                        DependencyEntry::read(raw, cursor, dependency_end, &entry)
+                        append_dependency(raw, entry, out)
+                    cursor <- DependencyEntry::next_start(raw, entry.object_end, dependency_end)
 
         def append_dependency(raw: darray[u8]&, entry: DependencyEntry::Span&, out: mutable darray[Solver::Constraint]&) -> bool can[Memory.Allocate, Abort.Panic]:
             requires entry.name_start < entry.name_end and entry.name_end < entry.object_start
             requires entry.object_start < entry.object_end and entry.object_end < raw.count
-            return false if out.count >= maximum_dependencies
-            for existing in 0..<out.count |out, raw, entry|:
-                return false if ByteText::range_equals(raw, entry.name_start, entry.name_end, out[existing].package)
+            duplicate: bool = for existing in 0..<out.count |found: bool = false| -> found:
+                break true if ByteText::range_equals(raw, entry.name_start, entry.name_end, out[existing].package)
             requirement: mutable darray[u8] = []
-            region parsed_scope:
-                parsed: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
-                return false if not:
-                    SchemaFields::valid(raw, entry.object_start, entry.object_end, SchemaFields::Kind.RegistryDependency)
-                    Json::object_string_value(raw, entry.object_start, entry.object_end, "version", &requirement)
-                    SemVer::parse_requirement(requirement, &parsed)
-                    Json::object_string_equals_text(raw, entry.object_start, entry.object_end, "registry", "primary")
-            alias: mutable darray[u8] = [raw[item] for item in entry.name_start..<entry.name_end]
-            out.push(Solver::Constraint{package: alias, requirement: requirement})
-            true
+            parsed: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
+            if out.count >= maximum_dependencies or duplicate or not SchemaFields::valid(raw, entry.object_start, entry.object_end, SchemaFields::Kind.RegistryDependency) or not Json::object_string_value(raw, entry.object_start, entry.object_end, "version", &requirement) or not SemVer::parse_requirement(requirement, &parsed) or not Json::object_string_equals_text(raw, entry.object_start, entry.object_end, "registry", "primary"):
+                false
+            else:
+                out.push(Solver::Constraint{package: [raw[item] for item in entry.name_start..<entry.name_end], requirement: requirement})
+                true
