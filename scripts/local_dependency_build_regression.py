@@ -162,7 +162,7 @@ def main() -> int:
         require(cli(root, "resolve"), 0, "resolve dependency without a library target")
         missing = cli(root, "build", "--frozen")
         require(missing, 6, "reject dependency without a library target")
-        if "library target is invalid" not in missing.stdout:
+        if "local dependency graph is invalid" not in missing.stdout:
             raise SystemExit(f"missing library target failed for an unexpected reason:\n{missing.stdout}")
 
         (leaf / "src" / "extra.elisa").write_text(
@@ -183,7 +183,7 @@ def main() -> int:
         require(cli(root, "resolve"), 0, "resolve dependency with ambiguous libraries")
         ambiguous = cli(root, "build", "--frozen")
         require(ambiguous, 6, "reject dependency with multiple library targets")
-        if "library target is invalid" not in ambiguous.stdout:
+        if "local dependency graph is invalid" not in ambiguous.stdout:
             raise SystemExit(f"ambiguous library targets failed unexpectedly:\n{ambiguous.stdout}")
 
         write_manifest(

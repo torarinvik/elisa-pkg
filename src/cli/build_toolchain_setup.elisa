@@ -47,9 +47,8 @@ module BuildToolchainSetup:
 
         def prepare(setup: mutable Setup&) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
-                region status_scope:
-                    status: i64 = select_compiler(setup)
-                    return status if status != CliStatus::success
+                if CliStatus::failure(select_compiler(setup)) is failed:
+                    return failed
                 return CliStatus::build_failed if not BuildToolchain::read_environment(&setup.environment)
                 setup.clang <- BuildToolchain::select_clang(setup.environment.clang)
                 setup.is_stage1_wrapper <- Toolchain::stage1_wrapper_pair_matches(setup.compiler, setup.environment.stage1_binary)
@@ -93,14 +92,16 @@ module BuildToolchainSetup:
                 if Platform::environment_variable("ELISAPKG_COMPILER") is configured:
                     setup.compiler <- configured.cast[cstr]
                 return CliStatus::build_failed if not Toolchain::valid_compiler_argument(setup.compiler)
-                region resolved_compiler_path_scope:
-                    resolved_compiler_path: mutable darray[u8] = []
-                    if not Toolchain::resolve_build_compiler(setup.compiler, &resolved_compiler_path):
-                        CliOutput::write_error("error: selected compiler was not found as an executable on the isolated build PATH\n")
-                        return CliStatus::build_failed
+                # The storage must outlive this function: a region here would
+                # free it and leave `setup.compiler` dangling.
+                resolved_compiler_path: mutable darray[u8] = []
+                if not Toolchain::resolve_build_compiler(setup.compiler, &resolved_compiler_path):
+                    CliOutput::write_error("error: selected compiler was not found as an executable on the isolated build PATH\n")
+                    CliStatus::build_failed
+                else:
                     setup.compiler_storage <- ProjectFiles::with_null_terminator(resolved_compiler_path)
-                setup.compiler <- (&setup.compiler_storage[0]).cast[cstr] can Unsafe.PointerCast
-                CliStatus::success
+                    setup.compiler <- (&setup.compiler_storage[0]).cast[cstr] can Unsafe.PointerCast
+                    CliStatus::success
 
         # The sandbox may read every tool and execute only the executables.
         def collect_tool_paths(setup: mutable Setup&) -> void can[Memory.Allocate, Abort.Panic]:
@@ -116,15 +117,13 @@ module BuildToolchainSetup:
 
         def identify(setup: mutable Setup&) -> void can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             sdk_optional: bool = setup.sdk_root.count == 0.usize()
-            setup.identities with {
-                compiler <- BuildToolchain::identify_file(setup.compiler, true, true),
-                stage1 <- BuildToolchain::identify_file(setup.environment.stage1_binary, false, true),
-                runtime <- BuildToolchain::identify_file(setup.environment.runtime_object, false, false),
-                clang <- BuildToolchain::identify_file(setup.clang, false, true),
-                sdk_settings <- BuildToolchain::identify_file(sdk_settings_name(setup), sdk_optional, false),
-                developer_linker <- BuildToolchain::identify_file(developer_linker_name(setup), sdk_optional, true),
-                developer_assembler <- BuildToolchain::identify_file(developer_assembler_name(setup), sdk_optional, true)
-            }
+            setup.identities.compiler <- BuildToolchain::identify_file(setup.compiler, true, true)
+            setup.identities.stage1 <- BuildToolchain::identify_file(setup.environment.stage1_binary, false, true)
+            setup.identities.runtime <- BuildToolchain::identify_file(setup.environment.runtime_object, false, false)
+            setup.identities.clang <- BuildToolchain::identify_file(setup.clang, false, true)
+            setup.identities.sdk_settings <- BuildToolchain::identify_file(sdk_settings_name(setup), sdk_optional, false)
+            setup.identities.developer_linker <- BuildToolchain::identify_file(developer_linker_name(setup), sdk_optional, true)
+            setup.identities.developer_assembler <- BuildToolchain::identify_file(developer_assembler_name(setup), sdk_optional, true)
 
         def sdk_settings_name(setup: Setup&) -> cstr can[Unsafe.PointerCast]:
             (&setup.sdk_settings_path[0]).cast[cstr] can Unsafe.PointerCast

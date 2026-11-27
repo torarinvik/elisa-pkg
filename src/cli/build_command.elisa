@@ -59,9 +59,8 @@ module BuildCommand:
                 inputs: mutable BuildExecution::Inputs = BuildExecution::Inputs{lock: [], lock_digest: [], source_tree_digest: [], source_tree_bytes: 0.usize(), source_digest: [],
                                                 dependency_aggregate: [], dependency_aggregate_digest: [], compiler_dependency_aggregate: [],
                                                 has_local_build_dependencies: false}
-                region status_scope:
-                    status: i64 = read_project(start, options, &target, &inputs)
-                    return status if status != CliStatus::success
+                if CliStatus::failure(read_project(start, options, &target, &inputs)) is failed:
+                    return failed
                 region build_state(67108864):
                     # Infer both arrays' storage from this enclosing region so the
                     # planner can allocate nested package buffers in the same scope.
@@ -73,9 +72,8 @@ module BuildCommand:
                     destination: mutable BuildExecution::Destination = BuildExecution::Destination{build_directory: [], artifact_label: [], artifact: [], artifact_c_string: [], receipt_path: []}
                     toolchain: mutable BuildToolchainSetup::Setup = BuildToolchainSetup::empty()
                     access: mutable BuildExecution::SandboxAccess = BuildExecution::SandboxAccess{home_name: "", dependency_roots: []}
-                    region status_scope:
-                        status: i64 = prepare_build(start, options, target, &inputs, &destination, &toolchain, &access)
-                        return status if status != CliStatus::success
+                    if CliStatus::failure(prepare_build(start, options, target, &inputs, &destination, &toolchain, &access)) is failed:
+                        return failed
                     workspace: mutable BuildWorkspace::Workspace = BuildWorkspace::empty()
                     return CliStatus::build_failed if not BuildSources::prepare_root(destination.build_directory, start, inputs.source_tree_digest, target.entry, &workspace.snapshot_template, &workspace.snapshot_root, &workspace.snapshot_roots, &workspace.snapshot_total_bytes, &workspace.root_snapshot_entry)
                     if not BuildSnapshots::create_dependencies(&dependency_packages, dependency_order, workspace.snapshot_root, &workspace.snapshot_roots, &workspace.snapshot_total_bytes):
@@ -95,23 +93,19 @@ module BuildCommand:
                     # root-only artifact.
                     if reuse_cached_artifact(target, destination, toolchain, workspace, receipt, out_artifact_digest) is cached_status:
                         return cached_status
-                    region status_scope:
-                        status: i64 = prepare_workspace(inputs, destination, &workspace)
-                        return status if status != CliStatus::success
-                    region status_scope:
-                        status: i64 = BuildExecution::compile(options, target, toolchain, access, start, &workspace)
-                        return status if status != CliStatus::success
+                    if CliStatus::failure(prepare_workspace(inputs, destination, &workspace)) is failed:
+                        return failed
+                    if CliStatus::failure(BuildExecution::compile(options, target, toolchain, access, start, &workspace)) is failed:
+                        return failed
                     return BuildExecution::verify_and_publish(start, target, inputs, destination, toolchain, &workspace, &receipt, out_artifact_digest)
 
         # Read the manifest, select the target, resolve the lock, and fingerprint the source tree.
         def read_project(start: darray[u8]&, options: Model::CommandOptions, target: mutable BuildTarget::Selection&, inputs: mutable BuildExecution::Inputs&) -> i64 can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global{Read,Write}:
-                region status_scope:
-                    status: i64 = BuildTarget::select(start, options, target)
-                    return status if status != CliStatus::success
-                region status_scope:
-                    status: i64 = BuildInputs::resolve_local_lock(start, options, target.manifest, target.root_name, target.root_version, &inputs.lock, &inputs.lock_digest)
-                    return status if status != CliStatus::success
+                if CliStatus::failure(BuildTarget::select(start, options, target)) is failed:
+                    return failed
+                if CliStatus::failure(BuildInputs::resolve_local_lock(start, options, target.manifest, target.root_name, target.root_version, &inputs.lock, &inputs.lock_digest)) is failed:
+                    return failed
                 CliStatus::build_failed if not BuildInputs::fingerprint_source(&inputs.source_tree_digest, &inputs.source_tree_bytes) else CliStatus::success
 
         # Fingerprint the dependency graph and target, choose the output paths,
@@ -136,9 +130,8 @@ module BuildCommand:
                     receipt_label: darray[u8] = ManifestTargets::receipt_leaf(target.name)
                     ProjectFiles::path_join_bytes_into(destination.build_directory, receipt_label, &destination.receipt_path)
                 return CliStatus::build_failed if not ProjectFiles::make_directory(&destination.build_directory)
-                region status_scope:
-                    status: i64 = BuildToolchainSetup::prepare(toolchain)
-                    return status if status != CliStatus::success
+                if CliStatus::failure(BuildToolchainSetup::prepare(toolchain)) is failed:
+                    return failed
                 if Platform::environment_variable("HOME") is configured_home:
                     access.home_name <- configured_home.cast[cstr]
                 else:
@@ -174,11 +167,9 @@ module BuildCommand:
 
         def prepare_workspace(inputs: BuildExecution::Inputs&, destination: BuildExecution::Destination&, workspace: mutable BuildWorkspace::Workspace&) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
-                region status_scope:
-                    status: i64 = BuildWorkspace::create_directory(destination.build_directory, workspace)
-                    return status if status != CliStatus::success
+                if CliStatus::failure(BuildWorkspace::create_directory(destination.build_directory, workspace)) is failed:
+                    return failed
                 if inputs.has_local_build_dependencies:
-                    region status_scope:
-                        status: i64 = BuildWorkspace::write_aggregate(inputs.compiler_dependency_aggregate, workspace)
-                        return status if status != CliStatus::success
+                    if CliStatus::failure(BuildWorkspace::write_aggregate(inputs.compiler_dependency_aggregate, workspace)) is failed:
+                        return failed
                 BuildWorkspace::create_output_file(destination.artifact_label, workspace)
