@@ -10,35 +10,34 @@ module NativeFileCollection:
     public:
         def collect_files(root: cstr, output: mutable u8&, capacity: usize) -> i64 can[Memory.Allocate, Unsafe.PointerCast]:
             return -22 if native_strlen(root) == 0.usize() or native_strlen(root) > 4096.usize() or capacity == 0.usize()
-            paths: mutable darray[u8] = []
-            region visited_nodes_scope:
-                visited_nodes: mutable usize = 1.usize()
-                if not collect_directory(root, root, &paths, 0.usize(), &visited_nodes):
-                    return -75 if visited_nodes > maximum_collect_traversal_nodes
-                    return -5
-            rows: mutable darray[darray[u8]] = []
-            while cursor < paths.count |cursor: usize = 0.usize()|:
-                row: mutable darray[u8] = []
-                while cursor < paths.count and paths[cursor] != 0:
-                    row <- row.push(paths[cursor])
-                    cursor <- cursor + 1.usize()
-                return -5 if row.count == 0.usize() or cursor >= paths.count
-                rows <- rows.push(row)
-                return -75 if rows.count > 4096.usize()
-                cursor <- cursor + 1.usize()
-            ordered_rows: mutable darray[usize] = []
-            for row_index in 0..<rows.count |ordered_rows|:
-                ordered_rows <- ordered_rows.push(row_index)
-            CollectedPathOrder::sort_indices(&ordered_rows, rows)
             used: mutable usize = 0.usize()
-            for sorted_index in 0..<ordered_rows.count |rows, ordered_rows, output, used, capacity|:
-                row_index: usize = ordered_rows[sorted_index]
-                return -7 if used + rows[row_index].count + 1.usize() > capacity
-                for index in 0..<rows[row_index].count |output, rows, row_index, used|:
-                    output[used + index] <- rows[row_index][index]
-                used <- used + rows[row_index].count
-                output[used] <- 0
-                used <- used + 1.usize()
+            region output_scope:
+                # The collected NUL-terminated paths, one row each.
+                rows: darray[darray[u8]] =
+                    paths: mutable darray[u8] = []
+                    region visited_nodes_scope:
+                        visited_nodes: mutable usize = 1.usize()
+                        if not collect_directory(root, root, &paths, 0.usize(), &visited_nodes):
+                            return -75 if visited_nodes > maximum_collect_traversal_nodes
+                            return -5
+                    while cursor < paths.count |cursor: usize = 0.usize(), split_rows: darray[darray[u8]] = []| -> split_rows:
+                        row: darray[u8] =
+                            while cursor < paths.count and paths[cursor] != 0 |cursor, path_row: darray[u8] = []| -> path_row:
+                                path_row <- path_row.push(paths[cursor])
+                                cursor <- cursor + 1.usize()
+                        return -5 if row.count == 0.usize() or cursor >= paths.count
+                        cursor <- cursor + 1.usize()
+                        return -75 if split_rows.count >= 4096.usize()
+                        split_rows <- split_rows.push(row)
+                ordered_rows: mutable darray[usize] = [row_index for row_index in 0..<rows.count]
+                CollectedPathOrder::sort_indices(&ordered_rows, rows)
+                for sorted_index in 0..<ordered_rows.count |rows, ordered_rows, output, used, capacity|:
+                    row_index: usize = ordered_rows[sorted_index]
+                    return -7 if used + rows[row_index].count + 1.usize() > capacity
+                    for index in 0..<rows[row_index].count |output, rows, row_index, used|:
+                        output[used + index] <- rows[row_index][index]
+                    output[used + rows[row_index].count] <- 0
+                    used <- used + rows[row_index].count + 1.usize()
             used.i64()
 
     private:
@@ -56,36 +55,36 @@ module NativeFileCollection:
                 _ = native_close(directory_file_descriptor)
                 return false
             directory: mutable heap void&? = native_fdopendir(duplicate)
-            region directory_close_status_scope:
-                directory_close_status: i64 = native_close(directory_file_descriptor)
-                if directory_close_status != 0:
-                    if directory is stream:
-                        _ = native_closedir(stream)
-                    else:
-                        _ = native_close(duplicate)
-                    return false
-            if directory is stream:
+            if native_close(directory_file_descriptor) != 0:
+                if directory is stream:
+                    _ = native_closedir(stream)
+                else:
+                    _ = native_close(duplicate)
+                false
+            elif directory is stream:
                 while true |stream, out, path, depth, visited_nodes|:
                     native_errno()[0] <- 0
                     entry: mutable heap void&? = native_readdir(stream)
                     if entry is record:
                         raw: mutable u8& = record.cast[mutable u8&] can Unsafe.PointerCast
                         name_length: usize = dirent_name_length(raw)
-                        return directory_failure(stream) if name_length == 0 or name_length > 255.usize()
-                        continue if PlatformNative::name_is_dot(raw, dirent_name_offset, name_length)
-                        visited_nodes <- visited_nodes + 1.usize()
-                        return directory_failure(stream) if visited_nodes > maximum_collect_traversal_nodes
-                        # Some filesystems report DT_UNKNOWN. Credential
-                        # exclusions must therefore not depend on d_type.
-                        child: darray[u8] = child_path(path, raw, name_length)
-                        child_name: cstr = (&child[0]).cast[cstr] can Unsafe.PointerCast
-                        return directory_failure(stream) if not collect_entry(root, child_name, out, depth, visited_nodes)
+                        if name_length == 0 or name_length > 255.usize():
+                            return directory_failure(stream)
+                        elif not PlatformNative::name_is_dot(raw, dirent_name_offset, name_length):
+                            visited_nodes <- visited_nodes + 1.usize()
+                            return directory_failure(stream) if visited_nodes > maximum_collect_traversal_nodes
+                            # Some filesystems report DT_UNKNOWN. Credential
+                            # exclusions must therefore not depend on d_type.
+                            child: darray[u8] = child_path(path, raw, name_length)
+                            child_name: cstr = (&child[0]).cast[cstr] can Unsafe.PointerCast
+                            return directory_failure(stream) if not collect_entry(root, child_name, out, depth, visited_nodes)
                     else:
                         return directory_failure(stream) if NativeErrors::current_errno() != 0
                         break
-                return native_closedir(stream) == 0
-            _ = native_close(duplicate)
-            false
+                native_closedir(stream) == 0
+            else:
+                _ = native_close(duplicate)
+                false
 
         # "PATH/NAME" as a terminated string, or "NAME" below ".".
         def child_path(path: cstr, raw: u8&, name_length: usize) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
@@ -120,14 +119,15 @@ module NativeFileCollection:
             # it would produce an incomplete source digest.
             file_probe: i64 = PlatformNative::open_package_file(child_name)
             return false if file_probe < 0
-            region regular_scope:
-                regular: bool = PlatformNative::regular_file_descriptor(file_probe)
-                return false if native_close(file_probe) != 0 or not regular
-            return false if out.count + child_length + 1.usize() > 16777216.usize()
-            for index in 0..<child_length |child_name|:
-                out.push(child_name[index].u8())
-            out.push(0)
-            true
+            regular: bool = PlatformNative::regular_file_descriptor(file_probe)
+            # Close first so the probe is closed whatever else fails.
+            if native_close(file_probe) != 0 or not regular or out.count + child_length + 1.usize() > 16777216.usize():
+                false
+            else:
+                for index in 0..<child_length |child_name|:
+                    out.push(child_name[index].u8())
+                out.push(0)
+                true
 
         def directory_failure(stream: heap void&) -> bool:
             _ = native_closedir(stream)
@@ -138,17 +138,22 @@ module NativeFileCollection:
             root_length: usize = native_strlen(root)
             path_length_value: usize = native_strlen(path)
             if PlatformNative::c_string_equal(root, "."):
-                return false if path_length_value == 0 or path_length_value > 4096
-                for index in 0..<path_length_value |out, path|:
-                    out.push(path[index].u8())
-                return true
-            return false if root_length == 0 or path_length_value <= root_length or path_length_value > 4096
-            for index in 0..<root_length |root, path|:
-                return false if root[index].u8() != path[index].u8()
-            relative_start: mutable usize = root_length
-            if root[root_length - 1].u8() != 47:
-                return false if path[root_length].u8() != 47
-                relative_start <- root_length + 1.usize()
-            for index in relative_start..<path_length_value |out, path|:
-                out.push(path[index].u8())
-            out.count > 0.usize()
+                if path_length_value == 0 or path_length_value > 4096:
+                    false
+                else:
+                    for index in 0..<path_length_value |out, path|:
+                        out.push(path[index].u8())
+                    true
+            elif root_length == 0 or path_length_value <= root_length or path_length_value > 4096:
+                false
+            else:
+                prefix_matches: bool = for index in 0..<root_length |matches: bool = true| -> matches:
+                    break false if root[index].u8() != path[index].u8()
+                # A root without a trailing slash must be followed by one.
+                relative_start: usize = root_length if root[root_length - 1].u8() == 47 else root_length + 1.usize()
+                if not prefix_matches or (relative_start > root_length and path[root_length].u8() != 47):
+                    false
+                else:
+                    for index in relative_start..<path_length_value |out, path|:
+                        out.push(path[index].u8())
+                    out.count > 0.usize()
