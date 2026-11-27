@@ -12,7 +12,7 @@ module NativeFileMutation:
             leaf: mutable darray[u8] = []
             directory: i64 = open_parent_directory(path, false, &leaf)
             return directory if directory < 0
-            return sync_and_close(directory) if native_mkdirat(directory, ((&leaf[0]).cast[cstr] can Unsafe.PointerCast), mode.i64()) == 0 else PlatformNative::close_error(directory, NativeErrors::negative_value(NativeErrors::current_errno()))
+            sync_and_close(directory) if native_mkdirat(directory, ((&leaf[0]).cast[cstr] can Unsafe.PointerCast), mode.i64()) == 0 else PlatformNative::close_error(directory, NativeErrors::negative_value(NativeErrors::current_errno()))
 
         # Flushing the containing directory completes the durability contract
         # for an atomic file replacement. The caller never receives the raw
@@ -21,32 +21,30 @@ module NativeFileMutation:
             directory: i64 =
                 leaf: mutable darray[u8] = []
                 open_parent_directory(path, false, &leaf)
-            return directory if directory < 0
-            return sync_and_close(directory)
+            directory if directory < 0 else sync_and_close(directory)
 
         def chmod(path: cstr, mode: u16) -> i64:
             leaf: mutable darray[u8] = []
             directory: i64 = open_parent_directory(path, true, &leaf)
-            return directory if directory < 0
-            return chmod_at(directory, leaf, mode)
+            directory if directory < 0 else chmod_at(directory, leaf, mode)
 
         def unlink(path: cstr) -> i64:
-            return unlink_kind(path, 0)
+            unlink_kind(path, 0)
 
         def unlink_file_identity(path: cstr, device: u64, inode: u64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            return unlink_verified_identity(path, device, inode)
+            unlink_verified_identity(path, device, inode)
 
         def rmdir(path: cstr) -> i64:
-            return unlink_kind(path, at_remove_directory)
+            unlink_kind(path, at_remove_directory)
 
         def link(old_path: cstr, new_path: cstr) -> i64:
-            return link_or_rename(old_path, new_path, false)
+            link_or_rename(old_path, new_path, false)
 
         def rename(old_path: cstr, new_path: cstr) -> i64:
-            return link_or_rename(old_path, new_path, true)
+            link_or_rename(old_path, new_path, true)
 
         def mkstemp(template_path: mutable darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            return create_temporary(template_path, false)
+            create_temporary(template_path, false)
 
         # Reserve a caller-selected name without following a pre-planted symlink.
         # This is used only for the legacy stage1 callback filename, which is
@@ -56,13 +54,13 @@ module NativeFileMutation:
                 file_descriptor: i64 = native_open(path, PlatformNative::flags_write_create_exclusive(), 384)
                 return file_descriptor if file_descriptor < 0
                 return -5 if native_close(file_descriptor) != 0
-            return 0
+            0
 
         # Create a private per-build directory under an already trusted parent.
         # All path traversal uses openat with O_NOFOLLOW; the random leaf is
         # reserved atomically with mkdirat rather than checked before creation.
         def mkdtemp(template_path: mutable darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            return create_temporary(template_path, true)
+            create_temporary(template_path, true)
 
     private:
         # Replace the trailing `XXXXXX` of the null-terminated `template_path`
@@ -72,16 +70,14 @@ module NativeFileMutation:
             return -22 if template_path.count == 0 or template_path.count > 4096.usize() or template_path[template_path.count - 1.usize()] != 0
             leaf: mutable darray[u8] = []
             directory: i64 = open_parent_directory(((&template_path[0]).cast[cstr] can Unsafe.PointerCast), false, &leaf)
-            return directory if directory < 0
-            return PlatformNative::close_error(directory, -22) if not valid_template_leaf(leaf)
-            return reserve_random_leaf(directory, template_path, &leaf, directory_kind)
+            directory if directory < 0 else PlatformNative::close_error(directory, -22) if not valid_template_leaf(leaf) else reserve_random_leaf(directory, template_path, &leaf, directory_kind)
 
         # A template leaf ends in six `X` characters before its terminator.
         def valid_template_leaf(leaf: darray[u8]&) -> bool:
             return false if leaf.count < 7.usize()
             for index in 0..<6 |leaf|:
                 return false if leaf[leaf.count - 7.usize() + index] != 88
-            return true
+            true
 
         def reserve_random_leaf(directory: i64, template_path: mutable darray[u8]&, leaf: mutable darray[u8]&, directory_kind: bool) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             requires directory >= 0
@@ -91,7 +87,7 @@ module NativeFileMutation:
                     created: i64 = native_mkdirat(directory, ((&leaf[0]).cast[cstr] can Unsafe.PointerCast), 448) if directory_kind else native_openat(directory, ((&leaf[0]).cast[cstr] can Unsafe.PointerCast), flags_read_write_create_exclusive(), 384)
                     return finish_reservation(directory, template_path, leaf, created, directory_kind) if created >= 0
                 return PlatformNative::close_error(directory, NativeErrors::negative_errno()) if NativeErrors::current_errno() != 17
-            return PlatformNative::close_error(directory, -17)
+            PlatformNative::close_error(directory, -17)
 
         def fill_random_suffix(leaf: mutable darray[u8]&, attempt: usize) -> void can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             requires leaf.count >= 7.usize()
@@ -115,15 +111,14 @@ module NativeFileMutation:
             if not directory_kind:
                 _ = native_close(created)
             _ = unlink_kind(((&template_path[0]).cast[cstr] can Unsafe.PointerCast), at_remove_directory if directory_kind else 0)
-            return -5
+            -5
 
         # Split `path` into its parent directory and null-terminated leaf, and
         # open the parent. Returns the directory descriptor or a negative errno.
         def open_parent_directory(path: cstr, package_directory: bool, leaf: mutable darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             parent: mutable darray[u8] = []
             return -22 if not PlatformNative::split_parent_leaf(path, &parent, leaf)
-            return PlatformNative::open_package_directory_path((&parent[0]).cast[cstr] can Unsafe.PointerCast) if package_directory
-            return PlatformNative::open_directory_path((&parent[0]).cast[cstr] can Unsafe.PointerCast)
+            PlatformNative::open_package_directory_path((&parent[0]).cast[cstr] can Unsafe.PointerCast) if package_directory else PlatformNative::open_directory_path((&parent[0]).cast[cstr] can Unsafe.PointerCast)
 
         # Change the mode of regular file `leaf` inside `directory`, flush
         # it, and close both descriptors.
@@ -133,17 +128,15 @@ module NativeFileMutation:
             return PlatformNative::close_error(directory, file_descriptor) if file_descriptor < 0
             return PlatformNative::close_two_error(directory, file_descriptor, -21) if not PlatformNative::regular_file_descriptor(file_descriptor)
             return PlatformNative::close_two_error(file_descriptor, directory, NativeErrors::negative_value(NativeErrors::current_errno())) if native_fchmod(file_descriptor, mode.i64()) != 0
-            return PlatformNative::close_two_result(file_descriptor, directory, 0) if native_fsync(file_descriptor) == 0
-            return PlatformNative::close_two_error(file_descriptor, directory, NativeErrors::negative_value(NativeErrors::current_errno()))
+            PlatformNative::close_two_result(file_descriptor, directory, 0) if native_fsync(file_descriptor) == 0 else PlatformNative::close_two_error(file_descriptor, directory, NativeErrors::negative_value(NativeErrors::current_errno()))
 
         # Flush `directory`, close it, and report the flush outcome.
         def sync_and_close(directory: i64) -> i64:
             requires directory >= 0
-            return PlatformNative::close_result(directory, 0) if native_fsync(directory) == 0
-            return PlatformNative::close_error(directory, NativeErrors::negative_value(NativeErrors::current_errno()))
+            PlatformNative::close_result(directory, 0) if native_fsync(directory) == 0 else PlatformNative::close_error(directory, NativeErrors::negative_value(NativeErrors::current_errno()))
 
         def check_replaceable_destination(new_directory: i64, new_leaf: darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            return check_trusted_regular_leaf(new_directory, new_leaf, true)
+            check_trusted_regular_leaf(new_directory, new_leaf, true)
 
         # `leaf` in `directory` is a trusted regular file owned by this user.
         # A missing leaf passes only when `allow_missing`. Returns 0 or a negative errno.
@@ -156,7 +149,7 @@ module NativeFileMutation:
                 regular: bool = NativeTrustedPaths::trusted_regular_file_descriptor(file_descriptor, native_geteuid().u64())
                 return -5 if native_close(file_descriptor) != 0
                 return -21 if not regular
-            return 0
+            0
 
         def unlink_verified_identity(path: cstr, expected_device: u64, expected_inode: u64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             leaf: mutable darray[u8] = []
@@ -177,7 +170,7 @@ module NativeFileMutation:
             region directory_close_scope:
                 directory_close: i64 = native_close(directory)
                 return -5 if native_close(file_descriptor) != 0 or directory_close != 0
-            return 0
+            0
 
         # The open descriptor is a trusted regular file with the expected
         # identity, and the leaf name still refers to that same file. Returns
@@ -192,13 +185,12 @@ module NativeFileMutation:
             path_status: mutable darray[u8] = []
             path_status <- path_status.resize(status_buffer_bytes)
             return NativeErrors::negative_errno() if native_fstatat(directory, ((&leaf[0]).cast[cstr] can Unsafe.PointerCast), ((&path_status[0]).cast[mutable void&] can Unsafe.PointerCast), at_no_follow) != 0
-            return -13 if NativeStat::file_type(path_status) != NativeStat::regular_mode or not NativeStat::same_identity(path_status, file_descriptor_status) else 0
+            -13 if NativeStat::file_type(path_status) != NativeStat::regular_mode or not NativeStat::same_identity(path_status, file_descriptor_status) else 0
 
         def unlink_kind(path: cstr, flags: i64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             leaf: mutable darray[u8] = []
             directory: i64 = open_parent_directory(path, false, &leaf)
-            return directory if directory < 0
-            return sync_and_close(directory) if native_unlinkat(directory, ((&leaf[0]).cast[cstr] can Unsafe.PointerCast), flags) == 0 else PlatformNative::close_error(directory, NativeErrors::negative_errno())
+            directory if directory < 0 else sync_and_close(directory) if native_unlinkat(directory, ((&leaf[0]).cast[cstr] can Unsafe.PointerCast), flags) == 0 else PlatformNative::close_error(directory, NativeErrors::negative_errno())
 
         # Rename (`is_move`) or hard-link `old_path` to `new_path`. A rename
         # may replace a trusted regular file; a link needs an absent name.
@@ -208,8 +200,7 @@ module NativeFileMutation:
             old_directory: i64 = open_parent_directory(old_path, false, &old_leaf)
             return old_directory if old_directory < 0
             new_directory: i64 = open_parent_directory(new_path, false, &new_leaf)
-            return PlatformNative::close_error(old_directory, new_directory) if new_directory < 0
-            return link_or_rename_at(old_directory, new_directory, old_leaf, new_leaf, is_move)
+            PlatformNative::close_error(old_directory, new_directory) if new_directory < 0 else link_or_rename_at(old_directory, new_directory, old_leaf, new_leaf, is_move)
 
         # The source is checked by descriptor and then acted on by name. Both
         # already-open parents must exclude writes by other users, so an
@@ -226,17 +217,17 @@ module NativeFileMutation:
             region result_scope:
                 result: i64 = native_renameat(old_directory, ((&old_leaf[0]).cast[cstr] can Unsafe.PointerCast), new_directory, ((&new_leaf[0]).cast[cstr] can Unsafe.PointerCast)) if is_move else native_linkat(old_directory, ((&old_leaf[0]).cast[cstr] can Unsafe.PointerCast), new_directory, ((&new_leaf[0]).cast[cstr] can Unsafe.PointerCast), 0)
                 return PlatformNative::close_two_result(old_directory, new_directory, 0) if result == 0
-            return PlatformNative::close_two_error(old_directory, new_directory, NativeErrors::negative_errno())
+            PlatformNative::close_two_error(old_directory, new_directory, NativeErrors::negative_errno())
 
         def byte_copy(bytes: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
-            return [bytes[index] for index in 0..<bytes.count]
+            [bytes[index] for index in 0..<bytes.count]
 
         # Keep name-based linkat/renameat operations inside directories that
         # other users cannot mutate, and require the source to be a trusted
         # regular file. Returns 0 or a negative errno.
         def check_trusted_source(old_directory: i64, new_directory: i64, old_leaf: darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return -13 if not NativeTrustedPaths::trusted_directory_file_descriptor(old_directory, native_geteuid().u64()) or not NativeTrustedPaths::trusted_directory_file_descriptor(new_directory, native_geteuid().u64())
-            return check_trusted_regular_leaf(old_directory, old_leaf, false)
+            check_trusted_regular_leaf(old_directory, old_leaf, false)
 
         # A move may replace an existing regular file but never a symlink or
         # another kind of entry; a link requires the name to be absent.
@@ -248,9 +239,7 @@ module NativeFileMutation:
                 new_errno: i64 = NativeErrors::error_code() if native_fstatat(new_directory, ((&new_leaf[0]).cast[cstr] can Unsafe.PointerCast), ((&new_status[0]).cast[mutable void&] can Unsafe.PointerCast), at_no_follow) != 0 else 0
                 return 0 if new_errno == 2
                 return -new_errno if new_errno != 0
-            return -17 if not is_move
-            return -40 if (NativeStat::mode(new_status) & NativeStat::file_type_mask) == NativeStat::symlink_mode
-            return -21 if (NativeStat::mode(new_status) & NativeStat::file_type_mask) != NativeStat::regular_mode else 0
+            -17 if not is_move else -40 if (NativeStat::mode(new_status) & NativeStat::file_type_mask) == NativeStat::symlink_mode else -21 if (NativeStat::mode(new_status) & NativeStat::file_type_mask) != NativeStat::regular_mode else 0
 
         def flags_read_write_create_exclusive() -> i64:
-            return flag_read_write + flag_create + flag_exclusive + flag_no_follow + flag_close_on_exec
+            flag_read_write + flag_create + flag_exclusive + flag_no_follow + flag_close_on_exec
