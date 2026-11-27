@@ -18,15 +18,15 @@ module Toolchain:
 
         def path_without_suffix(path: darray[u8]&, suffix: cstr, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
             out.resize(0)
-            suffix_length: usize = Platform::c_string_length(suffix)
-            return false if suffix_length >= path.count
-            region offset_scope:
-                offset: usize = path.count - suffix_length
-                return false if:
-                    not ByteText::range_equals_text(path, offset, path.count, suffix)
-                    offset == 0.usize() or path[offset - 1.usize()] == 47
+            # Where the suffix would start, or zero when it is not shorter than the path.
+            offset: usize =
+                suffix_length: usize = Platform::c_string_length(suffix)
+                path.count - suffix_length if suffix_length < path.count else 0.usize()
+            if offset == 0.usize() or not ByteText::range_equals_text(path, offset, path.count, suffix) or path[offset - 1.usize()] == 47:
+                false
+            else:
                 ByteText::append_range(out, path, 0, offset)
-            true
+                true
 
     public:
         # Build receipt identities bind both the selected path and executable
@@ -39,38 +39,29 @@ module Toolchain:
                 ByteText::append_text(out, "none" if optional else "unavailable")
                 return optional
             resolved_path: mutable darray[u8] = []
-            if not canonical_path_bytes(path, &resolved_path):
-                ByteText::append_text(out, "unavailable")
-                return false
-            for index in 0..<resolved_path.count |resolved_path|:
-                byte: u8 = resolved_path[index]
-                if byte < 32 or byte == 127:
-                    out.resize(0)
-                    ByteText::append_text(out, "unavailable")
-                    return false
-            if executable:
-                resolved_path_c: mutable darray[u8] = []
-                resolved_path_c <- ProjectFiles::with_null_terminator(&resolved_path)
-                resolved_path_name: cstr = (&resolved_path_c[0]).cast[cstr] can Unsafe.PointerCast
-                if Platform::access_path(resolved_path_name, 1) != 0:
-                    ByteText::append_text(out, "unavailable")
-                    return false
             content: mutable darray[u8] = []
-            if not Platform::read_bounded_file(resolved_path, Integrity::maximum_input, &content):
+            digest: mutable darray[u8] = []
+            # A canonical path without control bytes that is executable when required.
+            usable: bool =
+                printable: bool =
+                    resolved: bool = canonical_path_bytes(path, &resolved_path)
+                    for index in 0..<resolved_path.count |printable: bool = resolved| -> printable:
+                        byte: u8 = resolved_path[index]
+                        break false if byte < 32 or byte == 127
+                if printable and executable:
+                    resolved_path_c: darray[u8] = ProjectFiles::with_null_terminator(&resolved_path)
+                    Platform::access_path(((&resolved_path_c[0]).cast[cstr] can Unsafe.PointerCast), 1) == 0
+                else:
+                    printable
+            if not usable or not Platform::read_bounded_file(resolved_path, Integrity::maximum_input, &content) or not Integrity::sha256_hex(content, &digest):
                 ByteText::append_text(out, "unavailable")
-                return false
-            identity: dstr =
-                digest: mutable darray[u8] = []
-                if not Integrity::sha256_hex(content, &digest):
-                    ByteText::append_text(out, "unavailable")
-                    return false
-                location: sview = sview((&resolved_path[0]).cast[cstr], 0, resolved_path.count)
-                sha256: sview = sview((&digest[0]).cast[cstr], 0, digest.count)
-                f"path:{location};sha256:{sha256}"
-            for index in 0..<identity.count |out, identity|:
-                byte: u8 = identity[index].u8()
-                out.push(byte)
-            true
+                false
+            else:
+                ByteText::append_text(out, "path:")
+                ByteText::append(out, resolved_path)
+                ByteText::append_text(out, ";sha256:")
+                ByteText::append(out, digest)
+                true
 
         # Use the same search order for lookup and for the child environment.
         const isolated_path_environment: cstr = "PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"
@@ -78,81 +69,74 @@ module Toolchain:
         def resolve_build_compiler(path: cstr, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out.resize(0)
             return false if not valid_compiler_argument(path)
-            length: usize = Platform::c_string_length(path)
-            for index in 0..<length |path, length, out|:
-                if path[index].u8() == 47:
-                    canonical: mutable darray[u8] = []
-                    return false if not executable_path(path, &canonical)
+            has_slash: bool = for index in 0..<Platform::c_string_length(path) |found: bool = false| -> found:
+                break true if path[index].u8() == 47
+            if has_slash:
+                canonical: mutable darray[u8] = []
+                if not executable_path(path, &canonical):
+                    false
+                elif path[0].u8() == 47:
                     # Keep an explicit absolute spelling for wrapper recognition.
-                    if path[0].u8() == 47:
-                        for offset in 0..<length |out, path|:
-                            out.push(path[offset].u8())
-                    else:
-                        for index in 0..<canonical.count |out, canonical|:
-                            out.push(canonical[index])
-                    return true
-            search_end: usize = Platform::c_string_length(isolated_path_environment)
-            directory_start: mutable usize = 5.usize()
-            for directory_end in directory_start..=search_end |directory_start, search_end, path, length, out|:
-                if directory_end == search_end or isolated_path_environment[directory_end].u8() == 58:
-                    candidate: mutable darray[u8] = []
-                    for index in directory_start..<directory_end |candidate|:
-                        candidate <- candidate.push(isolated_path_environment[index].u8())
-                    candidate <- candidate.push(47)
-                    for index in 0..<length |candidate, path|:
-                        candidate <- candidate.push(path[index].u8())
-                    candidate <- candidate.push(0)
-                    candidate_name: cstr = (&candidate[0]).cast[cstr] can Unsafe.PointerCast
-                    canonical: mutable darray[u8] = []
-                    if executable_path(candidate_name, &canonical):
-                        candidate <- candidate.resize(candidate.count - 1.usize())
-                        for index in 0..<candidate.count |out, candidate|:
-                            out.push(candidate[index])
-                        return true
-                    directory_start <- directory_end + 1.usize()
-            false
+                    ByteText::append_text(out, path)
+                    true
+                else:
+                    ByteText::append(out, canonical)
+                    true
+            else:
+                # Search each directory of the isolated PATH; the terminator ends the last one.
+                for directory_end in 5.usize()..=Platform::c_string_length(isolated_path_environment) |out, directory_start: usize = 5.usize()|:
+                    if isolated_path_environment[directory_end].u8() == 0 or isolated_path_environment[directory_end].u8() == 58:
+                        candidate: mutable darray[u8] = [isolated_path_environment[index].u8() for index in directory_start..<directory_end]
+                        candidate <- candidate.push(47)
+                        ByteText::append_text(&candidate, path)
+                        candidate <- candidate.push(0)
+                        canonical: mutable darray[u8] = []
+                        if executable_path(((&candidate[0]).cast[cstr] can Unsafe.PointerCast), &canonical):
+                            ByteText::append_range(out, candidate, 0, candidate.count - 1.usize())
+                            return true
+                        else:
+                            directory_start <- directory_end + 1.usize()
+                false
 
         def valid_compiler_argument(value: cstr) -> bool:
-            region length_scope:
-                length: usize = Platform::c_string_length(value)
-                # The compiler is the first utility argument after `env -i`. Reject forms
-                # that the env utility would interpret as an option or NAME=VALUE prefix;
-                # a malformed override must fail before child process construction.
-                return false if length == 0.usize() or length > 4096.usize() or value[0].u8() == 45 or value[0].u8() == 61
-                for index in 0..<length |value|:
+            length: usize = Platform::c_string_length(value)
+            # The compiler is the first utility argument after `env -i`. Reject forms
+            # that the env utility would interpret as an option or NAME=VALUE prefix;
+            # a malformed override must fail before child process construction.
+            if length == 0.usize() or length > 4096.usize() or value[0].u8() == 45 or value[0].u8() == 61:
+                false
+            else:
+                for index in 0..<length |valid: bool = true| -> valid:
                     byte: u8 = value[index].u8()
-                    return false if byte == 61 or byte < 32 or byte == 127
-            true
+                    break false if byte == 61 or byte < 32 or byte == 127
 
         def valid_toolchain_value(value: cstr, maximum: usize) -> bool:
-            region length_scope:
-                length: usize = Platform::c_string_length(value)
-                return false if length > maximum
-                for index in 0..<length |value|:
+            length: usize = Platform::c_string_length(value)
+            if length > maximum:
+                false
+            else:
+                for index in 0..<length |valid: bool = true| -> valid:
                     byte: u8 = value[index].u8()
-                    return false if byte < 32 or byte == 127
-            true
+                    break false if byte < 32 or byte == 127
 
         def canonical_path_bytes(path: cstr, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out.resize(0)
             resolved: mutable darray[u8] = []
-            resolved.resize(4096)
+            resolved <- resolved.resize(4096)
             if Platform::resolve_real_path(path, &resolved) is canonical:
                 length: usize = Platform::c_string_length(canonical)
-                return false if length == 0.usize() or length >= 4096.usize()
-                for index in 0..<length |out, canonical|:
-                    out.push(canonical[index].u8())
-                return true
-            false
+                if length == 0.usize() or length >= 4096.usize():
+                    false
+                else:
+                    ByteText::append_text(out, canonical)
+                    true
+            else:
+                false
 
         def stage1_wrapper_pair_matches(wrapper: cstr, stage1: cstr) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return false if Platform::c_string_length(wrapper) == 0.usize() or Platform::c_string_length(stage1) == 0.usize()
             wrapper_real: mutable darray[u8] = []
             stage1_real: mutable darray[u8] = []
-            return false if not canonical_path_bytes(wrapper, &wrapper_real) or not canonical_path_bytes(stage1, &stage1_real)
             wrapper_root: mutable darray[u8] = []
             stage1_root: mutable darray[u8] = []
-            return false if not:
-                path_without_suffix(wrapper_real, "/scripts/elisac_stage1.sh", &wrapper_root)
-                path_without_suffix(stage1_real, "/bin/elisac-stage1", &stage1_root)
-            ByteText::equal(wrapper_root, stage1_root)
+            canonical_path_bytes(wrapper, &wrapper_real) and canonical_path_bytes(stage1, &stage1_real) and path_without_suffix(wrapper_real, "/scripts/elisac_stage1.sh", &wrapper_root) and path_without_suffix(stage1_real, "/bin/elisac-stage1", &stage1_root) and ByteText::equal(wrapper_root, stage1_root)
