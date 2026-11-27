@@ -45,39 +45,48 @@ module FetchOffline:
                         return status if status != CliStatus::success
                 return CliStatus::success
 
+        # The breadth-first walk over lock records: the queue position of each
+        # record (`starts.count` while unqueued), the queued records in order,
+        # and each queued record's outgoing edges as a flattened adjacency list.
+        struct GraphWalk:
+            queue_positions: mutable darray[usize]
+            pending: mutable darray[usize]
+            edges: mutable darray[usize]
+            edge_offsets: mutable darray[usize]
+
         # Every locked record must be reachable from the manifest's registry
         # roots through cached, authenticated metadata, exactly once, and the
         # resulting dependency graph must be acyclic.
         def verify_graph_closure(manifest: darray[u8]&, lock: darray[u8]&, starts: darray[usize]&) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
-                roots: mutable darray[Solver::Constraint] = []
-                region has_local_scope:
-                    has_local: mutable bool = false
-                    return CliStatus::resolution_failed if not RegistryRoots::collect(manifest, &roots, &has_local) or has_local or roots.count == 0.usize()
-                # The queue position of each lock record, or `starts.count` while unqueued.
-                queue_positions: mutable darray[usize] = [starts.count for _record in 0..<starts.count]
-                pending: mutable darray[usize] = []
-                edges: mutable darray[usize] = []
-                region status_scope:
-                    status: i64 = enqueue_matches(lock, starts, roots, &queue_positions, &pending, null)
-                    return status if status != CliStatus::success
-                edge_offsets: mutable darray[usize] = [0.usize()]
-                while processed < pending.count |processed: usize = 0.usize()|:
-                    dependencies: mutable darray[Solver::Constraint] = []
+                walk: mutable GraphWalk =
+                    started: mutable GraphWalk = GraphWalk{queue_positions: [starts.count for _record in 0..<starts.count], pending: [], edges: [], edge_offsets: [0.usize()]}
                     region status_scope:
-                        status: i64 = read_cached_dependencies(lock, starts[pending[processed]], Solver::maximum_constraints - edges.count, &dependencies)
+                        status: i64 = |started|
+                            roots: mutable darray[Solver::Constraint] = []
+                            collected: bool =
+                                has_local: mutable bool = false
+                                RegistryRoots::collect(manifest, &roots, &has_local) and not has_local and roots.count != 0.usize()
+                            enqueue_matches(lock, starts, roots, &started.queue_positions, &started.pending, null) if collected else CliStatus::resolution_failed
                         return status if status != CliStatus::success
+                    started
+                while processed < walk.pending.count |processed: usize = 0.usize()|:
                     region status_scope:
-                        status: i64 = enqueue_matches(lock, starts, dependencies, &queue_positions, &pending, &edges)
+                        status: i64 = |walk|
+                            dependencies: mutable darray[Solver::Constraint] = []
+                            read_status: i64 = read_cached_dependencies(lock, starts[walk.pending[processed]], Solver::maximum_constraints - walk.edges.count, &dependencies)
+                            read_status if read_status != CliStatus::success else enqueue_matches(lock, starts, dependencies, &walk.queue_positions, &walk.pending, &walk.edges)
                         return status if status != CliStatus::success
-                    edge_offsets <- edge_offsets.push(edges.count)
+                    walk.edge_offsets <- walk.edge_offsets.push(walk.edges.count)
                     processed <- processed + 1.usize()
                 # Only distinct authenticated records enter the queue.
-                return CliStatus::resolution_failed if starts.count != pending.count
-                if not DependencyGraph::is_acyclic(pending.count, edges, edge_offsets):
-                    CliOutput::write_error("error: cached registry dependency graph contains a cycle\n")
-                    return CliStatus::security_failed
-                return CliStatus::success
+                return CliStatus::resolution_failed if starts.count != walk.pending.count
+                return CliStatus::success if DependencyGraph::is_acyclic(walk.pending.count, walk.edges, walk.edge_offsets) else report_cycle()
+
+        def report_cycle() -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                CliOutput::write_error("error: cached registry dependency graph contains a cycle\n")
+                return CliStatus::security_failed
 
         # Queue the lock record matching each constraint, and record an edge
         # to it when `edges` is given.
