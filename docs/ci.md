@@ -118,6 +118,7 @@ Use a Stage1 toolchain that supports
 `-Wnever-leak=strict` and `-emit check`. The command checks the full
 package-manager source graph and reports strict lint diagnostics without
 linking an executable. Use `scripts/build.sh --strict` to produce
-`build/elisapkg-strict` with the same diagnostics enabled. The current CI
+`build/elisapkg-strict` with the same diagnostics enabled. The source tree
+checks clean under `-Wnever-leak=strict`; keep new code warning-free. The current CI
 compiler pin predates this flag. Upgrade and verify that pin before enabling
 strict lint in the release build.
