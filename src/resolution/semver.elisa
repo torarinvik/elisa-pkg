@@ -51,32 +51,25 @@ module SemVer:
         def parse_requirement(value: darray[u8]&, out: mutable Requirement&) -> bool:
             out <- unbounded_requirement()
             return false if value.count == 0.usize() or value.count > maximum_requirement_bytes
-            start: usize = skip_spaces(value, 0.usize(), value.count)
-            finish: usize =
-                while finish > start and is_space(value[finish - 1.usize()]) |finish: usize = value.count| -> finish:
-                    finish <- finish - 1.usize()
-            return false if start >= finish
-
-            operator: mutable u8 = 0
-            operator_length: mutable usize = 0.usize()
-            if value[start] == 94 or value[start] == 126:
-                operator <- value[start]
-                operator_length <- 1.usize()
-            elif value[start] == 60 or value[start] == 62:
-                operator <- value[start]
-                operator_length <- 1.usize()
-                if start + 1.usize() < finish and value[start + 1.usize()] == 61:
-                    operator_length <- 2.usize()
-
-            version_start: usize = skip_spaces(value, start + operator_length, finish)
+            # The text without surrounding spaces, its leading operator (0 for
+            # an exact version), and where the version starts.
+            rebind finish: usize, operator: u8, operator_length: usize, version_start: usize =
+                start: usize = skip_spaces(value, 0.usize(), value.count)
+                trimmed_end: usize =
+                    while end > start and is_space(value[end - 1.usize()]) |end: usize = value.count| -> end:
+                        end <- end - 1.usize()
+                return false if start >= trimmed_end
+                found_operator: u8 = value[start] if value[start] == 94 or value[start] == 126 or value[start] == 60 or value[start] == 62 else 0
+                found_length: usize = 0.usize() if found_operator == 0 else 2.usize() if (found_operator == 60 or found_operator == 62) and start + 1.usize() < trimmed_end and value[start + 1.usize()] == 61 else 1.usize()
+                trimmed_end, found_operator, found_length, skip_spaces(value, start + found_length, trimmed_end)
             version_end: usize = token_end(value, version_start, finish)
-            return false if version_start >= version_end
             parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-            return false if:
-                not parse_range(value, version_start, version_end, &parsed)
-                parsed.prerelease
-
-            parse_bounded_range(value, operator, operator_length, parsed, version_end, finish, out) if version_end < finish else single_bound_requirement(operator, operator_length, parsed, out)
+            if version_start >= version_end or not parse_range(value, version_start, version_end, &parsed) or parsed.prerelease:
+                false
+            elif version_end < finish:
+                parse_bounded_range(value, operator, operator_length, parsed, version_end, finish, out)
+            else:
+                single_bound_requirement(operator, operator_length, parsed, out)
 
         def unbounded_requirement() -> Requirement:
             empty: Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
@@ -85,34 +78,24 @@ module SemVer:
         # A two-sided range such as ">=1.0.0 <2.0.0": one `>` bound and one
         # `<` bound, in either order, forming a non-empty interval.
         def parse_bounded_range(value: darray[u8]&, operator: u8, operator_length: usize, parsed: Model::Version, version_end: usize, finish: usize, out: mutable Requirement&) -> bool:
-            candidate: mutable Requirement = unbounded_requirement()
             return false if operator != 60 and operator != 62
-            cursor: usize = skip_spaces(value, version_end, finish)
-            return false if cursor >= finish or (value[cursor] != 60 and value[cursor] != 62)
-            region second_operator_scope:
-                second_operator: u8 = value[cursor]
-                return false if second_operator == operator
-            second_length: mutable usize = 1.usize()
-            if cursor + 1.usize() < finish and value[cursor + 1.usize()] == 61:
-                second_length <- 2.usize()
-            second_start: usize = skip_spaces(value, cursor + second_length, finish)
+            # The second comparator's operator length and where its version starts.
+            rebind second_length: usize, second_start: usize =
+                cursor: usize = skip_spaces(value, version_end, finish)
+                return false if cursor >= finish or (value[cursor] != 60 and value[cursor] != 62) or value[cursor] == operator
+                length: usize = 2.usize() if cursor + 1.usize() < finish and value[cursor + 1.usize()] == 61 else 1.usize()
+                length, skip_spaces(value, cursor + length, finish)
             second_end: usize = token_end(value, second_start, finish)
-            return false if second_start >= second_end or second_end != finish
             second: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-            return false if:
-                not parse_range(value, second_start, second_end, &second)
-                second.prerelease
-            candidate.lower <- parsed if operator == 62 else second
-            candidate.upper <- parsed if operator == 60 else second
-            candidate.has_lower <- true
-            candidate.has_upper <- true
-            candidate.include_lower <- operator_length == 2.usize() if operator == 62 else second_length == 2.usize()
-            candidate.include_upper <- operator_length == 2.usize() if operator == 60 else second_length == 2.usize()
-            return false if:
-                compare(candidate.lower, candidate.upper) > 0
-                compare(candidate.lower, candidate.upper) == 0 and (not candidate.include_lower or not candidate.include_upper)
-            out <- candidate
-            true
+            if second_start >= second_end or second_end != finish or not parse_range(value, second_start, second_end, &second) or second.prerelease:
+                false
+            else:
+                candidate: Requirement = Requirement{lower: parsed if operator == 62 else second, upper: parsed if operator == 60 else second, has_lower: true, has_upper: true, include_lower: operator_length == 2.usize() if operator == 62 else second_length == 2.usize(), include_upper: operator_length == 2.usize() if operator == 60 else second_length == 2.usize()}
+                if compare(candidate.lower, candidate.upper) > 0 or (compare(candidate.lower, candidate.upper) == 0 and (not candidate.include_lower or not candidate.include_upper)):
+                    false
+                else:
+                    out <- candidate
+                    true
 
         # A single comparator: exact, caret, tilde, or a one-sided bound.
         def single_bound_requirement(operator: u8, operator_length: usize, parsed: Model::Version, out: mutable Requirement&) -> bool:
@@ -142,13 +125,9 @@ module SemVer:
 
         def matches(requirement: Requirement, candidate: Model::Version) -> bool:
             return false if candidate.prerelease
-            region lower_cmp_scope:
-                lower_cmp: i64 = compare(candidate, requirement.lower)
-                return false if requirement.has_lower and (lower_cmp < 0 or (lower_cmp == 0 and not requirement.include_lower))
-            region upper_cmp_scope:
-                upper_cmp: i64 = compare(candidate, requirement.upper)
-                return false if requirement.has_upper and (upper_cmp > 0 or (upper_cmp == 0 and not requirement.include_upper))
-            true
+            lower_comparison: i64 = compare(candidate, requirement.lower)
+            upper_comparison: i64 = compare(candidate, requirement.upper)
+            not (requirement.has_lower and (lower_comparison < 0 or (lower_comparison == 0 and not requirement.include_lower))) and not (requirement.has_upper and (upper_comparison > 0 or (upper_comparison == 0 and not requirement.include_upper)))
 
     private:
         const precedence_contract: cstr = "SemVer 2.0 precedence; build metadata excluded from ordering"
@@ -172,50 +151,36 @@ module SemVer:
             if left.has_pre != right.has_pre:
                 return -1 if left.has_pre else 1
             return 0 if not left.has_pre
-            left_cursor: mutable usize = left.pre_start
-            right_cursor: mutable usize = right.pre_start
-            while left_cursor < left.pre_end or right_cursor < right.pre_end |left_raw, right_raw, left_cursor, right_cursor|:
+            # Compare dot-separated prerelease identifiers in order.
+            while left_cursor < left.pre_end or right_cursor < right.pre_end |left_cursor: usize = left.pre_start, right_cursor: usize = right.pre_start, left_end: usize = 0.usize(), right_end: usize = 0.usize()|:
                 return -1 if left_cursor >= left.pre_end
                 return 1 if right_cursor >= right.pre_end
-                left_end: mutable usize = left_cursor
-                right_end: mutable usize = right_cursor
-                while left_end < left.pre_end and left_raw[left_end] != 46 |left_raw, left_end|:
-                    left_end <- left_end + 1.usize()
-                while right_end < right.pre_end and right_raw[right_end] != 46 |right_raw, right_end|:
-                    right_end <- right_end + 1.usize()
-                left_numeric: mutable bool = true
-                right_numeric: mutable bool = true
-                index: mutable usize = left_cursor
-                while index < left_end |left_raw, left_numeric, index|:
-                    left_numeric <- false if left_raw[index] < 48 or left_raw[index] > 57
-                    index <- index + 1.usize()
-                index <- right_cursor
-                while index < right_end |right_raw, right_numeric, index|:
-                    right_numeric <- false if right_raw[index] < 48 or right_raw[index] > 57
-                    index <- index + 1.usize()
-                if left_numeric != right_numeric:
-                    return -1 if left_numeric else 1
-                if left_numeric:
+                left_end <- while position < left.pre_end and left_raw[position] != 46 |position: usize = left_cursor| -> position:
+                    position <- position + 1.usize()
+                right_end <- while position < right.pre_end and right_raw[position] != 46 |position: usize = right_cursor| -> position:
+                    position <- position + 1.usize()
+                segment_order: i64 =
+                    left_numeric: bool = for index in left_cursor..<left_end |numeric: bool = true| -> numeric:
+                        break false if left_raw[index] < 48 or left_raw[index] > 57
+                    right_numeric: bool = for index in right_cursor..<right_end |numeric: bool = true| -> numeric:
+                        break false if right_raw[index] < 48 or right_raw[index] > 57
                     left_length: usize = left_end - left_cursor
-                    region right_length_scope:
-                        right_length: usize = right_end - right_cursor
-                        return -1 if left_length < right_length
-                        return 1 if left_length > right_length
-                    for digit_index in 0..<left_length |left_raw, right_raw, left_cursor, right_cursor|:
-                        return -1 if left_raw[left_cursor + digit_index] < right_raw[right_cursor + digit_index]
-                        return 1 if left_raw[left_cursor + digit_index] > right_raw[right_cursor + digit_index]
-                else:
-                    region limit_scope:
-                        limit: usize = left_end - left_cursor if left_end - left_cursor < right_end - right_cursor else right_end - right_cursor
-                        index <- 0
-                        while index < limit |left_raw, right_raw, left_cursor, right_cursor, index|:
-                            return -1 if left_raw[left_cursor + index] < right_raw[right_cursor + index]
-                            return 1 if left_raw[left_cursor + index] > right_raw[right_cursor + index]
-                            index <- index + 1.usize()
-                    return -1 if left_end - left_cursor < right_end - right_cursor
-                    return 1 if left_end - left_cursor > right_end - right_cursor
+                    right_length: usize = right_end - right_cursor
+                    if left_numeric != right_numeric:
+                        # Numeric identifiers sort before alphanumeric ones.
+                        -1 if left_numeric else 1
+                    elif left_numeric and left_length != right_length:
+                        -1 if left_length < right_length else 1
+                    else:
+                        # Equal-length numbers, or ASCII text with a shorter
+                        # identifier first when one is a prefix of the other.
+                        prefix_order: i64 = for index in 0..<(left_length if left_length < right_length else right_length) |order: i64 = 0| -> order:
+                            break -1 if left_raw[left_cursor + index] < right_raw[right_cursor + index]
+                            break 1 if left_raw[left_cursor + index] > right_raw[right_cursor + index]
+                        prefix_order if prefix_order != 0 else -1 if left_length < right_length else 1 if left_length > right_length else 0
                 left_cursor <- left_end + 1.usize()
                 right_cursor <- right_end + 1.usize()
+                return segment_order if segment_order != 0
             0
 
         def parse_token_parts(value: darray[u8]&, start: usize, finish: usize, out: mutable ParsedToken&) -> bool:
@@ -236,7 +201,7 @@ module SemVer:
             out.has_pre <- cursor < finish
             out.pre_start <- cursor + 1.usize() if out.has_pre else finish
             out.pre_end <- finish
-            not out.has_pre or valid_prerelease(value, out.pre_start, finish)
+            cursor == finish or valid_prerelease(value, cursor + 1.usize(), finish)
 
         def valid_prerelease(value: darray[u8]&, start: usize, finish: usize) -> bool:
             requires start < finish and finish <= value.count
@@ -266,11 +231,11 @@ module SemVer:
             byte == 32 or byte == 9 or byte == 10 or byte == 13
 
         def skip_spaces(value: darray[u8]&, start: usize, finish: usize) -> usize:
-            return while cursor < finish and is_space(value[cursor]) |cursor: usize = start| -> cursor:
+            while cursor < finish and is_space(value[cursor]) |cursor: usize = start| -> cursor:
                 cursor <- cursor + 1.usize()
 
         def token_end(value: darray[u8]&, start: usize, finish: usize) -> usize:
-            return while cursor < finish and not is_space(value[cursor]) |cursor: usize = start| -> cursor:
+            while cursor < finish and not is_space(value[cursor]) |cursor: usize = start| -> cursor:
                 cursor <- cursor + 1.usize()
 
         def caret_upper(value: Model::Version) -> Model::Version:
