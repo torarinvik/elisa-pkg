@@ -16,51 +16,40 @@ module Manifest:
         # policy check, not a JSON parser: callers must first run
         # Json::valid_document and Json::unique_object_keys.
         def allowed_keys(raw: darray[u8]&) -> bool:
-            region scanner_scope:
-                in_string: mutable bool = false
-                escaped: mutable bool = false
-                string_start: mutable usize = 0.usize()
-                braces: mutable i64 = 0
-                brackets: mutable i64 = 0
-                dependency_depth: mutable i64 = 0
-                pending_dependency_object: mutable bool = false
-                for index in 0..<raw.count |raw, in_string, escaped, string_start, braces, brackets, dependency_depth, pending_dependency_object|:
-                    byte: u8 = raw[index]
-                    if not in_string:
-                        if byte == 34:
-                            in_string <- true
-                            string_start <- index + 1.usize()
-                        elif byte == 123:
-                            braces <- braces + 1
-                            dependency_depth <- braces if pending_dependency_object
-                            pending_dependency_object <- false
-                        elif byte == 125:
-                            dependency_depth <- 0 if dependency_depth == braces
-                            braces <- braces - 1
-                        elif byte == 91:
-                            brackets <- brackets + 1
-                        elif byte == 93:
-                            brackets <- brackets - 1
-                        elif pending_dependency_object:
-                            pending_dependency_object <- false if not Json::is_whitespace(byte) and byte != 58
-                    elif escaped:
-                        escaped <- false
-                    elif byte == 92:
-                        escaped <- true
-                    elif byte == 34:
-                        after: usize = Json::skip_whitespace(raw, index + 1.usize(), raw.count)
-                        if after < raw.count and raw[after] == 58:
-                            region known_scope:
-                                known: mutable bool = top_level_key(raw, string_start, index) or nested_key(raw, string_start, index)
-                                if braces == 1 and brackets == 0:
-                                    top_level_known: bool = top_level_key(raw, string_start, index)
-                                    return false if not top_level_known
-                                known <- true if dependency_depth > 0 and braces == dependency_depth and PackageIdentity::valid_name_segment(raw, string_start, index)
-                                return false if not known
-                            if braces == 1 and (ByteText::range_equals_text(raw, string_start, index, "dependencies") or ByteText::range_equals_text(raw, string_start, index, "dev-dependencies")):
-                                probe: usize = Json::skip_whitespace(raw, after + 1.usize(), raw.count)
-                                pending_dependency_object <- probe < raw.count and raw[probe] == 123
-                        in_string <- false
+            for index in 0..<raw.count |in_string: bool = false, escaped: bool = false, string_start: usize = 0.usize(), braces: i64 = 0, brackets: i64 = 0, dependency_depth: i64 = 0, pending_dependency_object: bool = false|:
+                byte: u8 = raw[index]
+                if not in_string:
+                    if byte == 34:
+                        in_string <- true
+                        string_start <- index + 1.usize()
+                    elif byte == 123:
+                        braces <- braces + 1
+                        dependency_depth <- braces if pending_dependency_object
+                        pending_dependency_object <- false
+                    elif byte == 125:
+                        dependency_depth <- 0 if dependency_depth == braces
+                        braces <- braces - 1
+                    elif byte == 91:
+                        brackets <- brackets + 1
+                    elif byte == 93:
+                        brackets <- brackets - 1
+                    elif pending_dependency_object:
+                        pending_dependency_object <- false if not Json::is_whitespace(byte) and byte != 58
+                elif escaped:
+                    escaped <- false
+                elif byte == 92:
+                    escaped <- true
+                elif byte == 34:
+                    in_string <- false
+                    after: usize = Json::skip_whitespace(raw, index + 1.usize(), raw.count)
+                    if after < raw.count and raw[after] == 58:
+                        # Top-level keys come from the manifest vocabulary; nested
+                        # keys may also name dependency aliases.
+                        return false if braces == 1 and brackets == 0 and not top_level_key(raw, string_start, index)
+                        return false if not (top_level_key(raw, string_start, index) or nested_key(raw, string_start, index) or (dependency_depth > 0 and braces == dependency_depth and PackageIdentity::valid_name_segment(raw, string_start, index)))
+                        if braces == 1 and (ByteText::range_equals_text(raw, string_start, index, "dependencies") or ByteText::range_equals_text(raw, string_start, index, "dev-dependencies")):
+                            probe: usize = Json::skip_whitespace(raw, after + 1.usize(), raw.count)
+                            pending_dependency_object <- probe < raw.count and raw[probe] == 123
             true
 
         # A field name allowed at the top level of a manifest.
@@ -73,12 +62,10 @@ module Manifest:
 
         def is_safe_relative_entry(entry: darray[u8]&) -> bool:
             return false if not Archive::is_safe_entry(entry)
-            region segment_start_scope:
-                segment_start: mutable usize = 0.usize()
-                for index in 0..=entry.count |entry, segment_start|:
-                    if index == entry.count or entry[index] == 47:
-                        return false if index == segment_start or entry[segment_start] == 46
-                        segment_start <- index + 1.usize()
+            for index in 0..=entry.count |segment_start: usize = 0.usize()|:
+                if index == entry.count or entry[index] == 47:
+                    return false if index == segment_start or entry[segment_start] == 46
+                    segment_start <- index + 1.usize()
             true
 
         # Extract NUL-separated aliases from an already validated local manifest.
@@ -88,33 +75,31 @@ module Manifest:
             dependency_start: usize = Json::root_value_offset(raw, "dependencies")
             return 0 if dependency_start >= raw.count
             dependency_end: usize = Json::object_end(raw, dependency_start)
-            return -1 if dependency_end <= dependency_start or dependency_end >= raw.count or raw[dependency_start] != 123
-            cursor: mutable usize = Json::skip_whitespace(raw, dependency_start + 1.usize(), dependency_end)
-            return 0 if cursor == dependency_end
-            while cursor < dependency_end |count: usize = 0.usize()|:
-                return -1 if count >= maximum_edges
-                entry: mutable DependencyEntry::Span = DependencyEntry::Span{name_start: 0, name_end: 0, object_start: 0, object_end: 0}
-                return -1 if not DependencyEntry::read(raw, cursor, dependency_end, &entry)
-                region path_scope:
-                    path: mutable darray[u8] = []
-                    return -1 if not Json::object_string_value(raw, entry.object_start, entry.object_end, "path", &path)
-                ByteText::append_range(out, raw, entry.name_start, entry.name_end)
-                out.push(0)
-                count <- count + 1.usize()
-                cursor <- DependencyEntry::next_start(raw, entry.object_end, dependency_end)
-                return count.i64() if cursor == dependency_end
-            -1
+            if dependency_end <= dependency_start or dependency_end >= raw.count or raw[dependency_start] != 123:
+                -1
+            else:
+                while cursor <= dependency_end |cursor: usize = Json::skip_whitespace(raw, dependency_start + 1.usize(), dependency_end), count: usize = 0.usize(), entry: DependencyEntry::Span = DependencyEntry::Span{name_start: 0, name_end: 0, object_start: 0, object_end: 0}|:
+                    return count.i64() if cursor == dependency_end
+                    return -1 if count >= maximum_edges
+                    return -1 if not DependencyEntry::read(raw, cursor, dependency_end, &entry)
+                    region path_scope:
+                        path: mutable darray[u8] = []
+                        return -1 if not Json::object_string_value(raw, entry.object_start, entry.object_end, "path", &path)
+                    ByteText::append_range(out, raw, entry.name_start, entry.name_end)
+                    out.push(0)
+                    count <- count + 1.usize()
+                    cursor <- DependencyEntry::next_start(raw, entry.object_end, dependency_end)
+                -1
 
         # Find the half-open byte span of a direct dependency in a validated manifest.
         def find_dependency_span(raw: darray[u8]&, alias: darray[u8]&, start_out: mutable usize&, end_out: mutable usize&) -> bool:
             start_out <- 0.usize()
             end_out <- 0.usize()
             dependency_start: usize = Json::root_value_offset(raw, "dependencies")
-            region dependency_end_scope:
-                dependency_end: usize = Json::object_end(raw, dependency_start)
-                return false if:
-                    dependency_start >= raw.count or raw[dependency_start] != 123
-                    dependency_end <= dependency_start or dependency_end >= raw.count
+            dependency_end: usize = Json::object_end(raw, dependency_start)
+            if dependency_start >= raw.count or raw[dependency_start] != 123 or dependency_end <= dependency_start or dependency_end >= raw.count:
+                false
+            else:
                 while cursor < dependency_end |cursor: usize = Json::skip_whitespace(raw, dependency_start + 1.usize(), dependency_end)|:
                     entry: mutable DependencyEntry::Span = DependencyEntry::Span{name_start: 0, name_end: 0, object_start: 0, object_end: 0}
                     return false if not DependencyEntry::read(raw, cursor, dependency_end, &entry)
@@ -123,7 +108,7 @@ module Manifest:
                         end_out <- entry.object_end + 1.usize()
                         return true
                     cursor <- DependencyEntry::next_start(raw, entry.object_end, dependency_end)
-            false
+                false
 
         def valid_dependency_path(path: darray[u8]&) -> bool:
             return false if:
@@ -147,92 +132,84 @@ module Manifest:
             region license_value_scope:
                 license_value: mutable darray[u8] = []
                 return false if Json::object_has_key(raw, package_start, package_end, "license") and not Json::object_string_value(raw, package_start, package_end, "license", &license_value)
-            region elisa_value_scope:
-                elisa_value: mutable darray[u8] = []
-                if Json::object_has_key(raw, package_start, package_end, "elisa"):
-                    return false if not Json::object_string_value(raw, package_start, package_end, "elisa", &elisa_value)
-                    requirement: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
-                    return false if not SemVer::parse_requirement(elisa_value, &requirement)
-            true
+            elisa_value: mutable darray[u8] = []
+            if not Json::object_has_key(raw, package_start, package_end, "elisa"):
+                true
+            elif not Json::object_string_value(raw, package_start, package_end, "elisa", &elisa_value):
+                false
+            else:
+                requirement: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
+                SemVer::parse_requirement(elisa_value, &requirement)
 
         def valid_pattern_array(raw: darray[u8]&, key: cstr) -> bool can[Memory.Allocate, Abort.Panic]:
             pattern_start: usize = Json::root_value_offset(raw, key)
             return true if pattern_start >= raw.count
             return false if raw[pattern_start] != 91
             pattern_end: usize = Json::array_end(raw, pattern_start)
-            return false if pattern_end <= pattern_start or pattern_end >= raw.count
-            cursor: mutable usize = pattern_start + 1.usize()
-            pattern_count: mutable usize = 0.usize()
-            while cursor < pattern_end |raw, cursor, pattern_count|:
-                cursor <- Json::skip_whitespace(raw, cursor, pattern_end)
-                return true if cursor == pattern_end
-                return false if:
-                    pattern_count >= 4096.usize()
-                    raw[cursor] != 34
-                cursor <- cursor + 1.usize()
-                region pattern_scope:
-                    pattern: mutable darray[u8] = []
-                    while cursor < pattern_end and raw[cursor] != 34 |raw, cursor, pattern|:
-                        return false if:
-                            raw[cursor] == 92 or raw[cursor] < 32 or raw[cursor] == 127
-                            pattern.count >= 4096.usize()
-                        pattern <- pattern.push(raw[cursor])
-                        cursor <- cursor + 1.usize()
-                    return false if cursor >= pattern_end or not PackageSelection::valid_publish_pattern(pattern)
-                pattern_count <- pattern_count + 1.usize()
-                cursor <- cursor + 1.usize()
-                cursor <- Json::skip_whitespace(raw, cursor, pattern_end)
-                return true if cursor == pattern_end
-                return false if raw[cursor] != 44
-                cursor <- cursor + 1.usize()
-            false
+            if pattern_end <= pattern_start or pattern_end >= raw.count:
+                false
+            else:
+                while cursor < pattern_end |cursor: usize = pattern_start + 1.usize(), pattern_count: usize = 0.usize()|:
+                    cursor <- Json::skip_whitespace(raw, cursor, pattern_end)
+                    return true if cursor == pattern_end
+                    return false if:
+                        pattern_count >= 4096.usize()
+                        raw[cursor] != 34
+                    cursor <- cursor + 1.usize()
+                    region pattern_scope:
+                        pattern: mutable darray[u8] = []
+                        while cursor < pattern_end and raw[cursor] != 34 |raw, cursor, pattern|:
+                            return false if:
+                                raw[cursor] == 92 or raw[cursor] < 32 or raw[cursor] == 127
+                                pattern.count >= 4096.usize()
+                            pattern <- pattern.push(raw[cursor])
+                            cursor <- cursor + 1.usize()
+                        return false if cursor >= pattern_end or not PackageSelection::valid_publish_pattern(pattern)
+                    pattern_count <- pattern_count + 1.usize()
+                    cursor <- Json::skip_whitespace(raw, cursor + 1.usize(), pattern_end)
+                    return true if cursor == pattern_end
+                    return false if raw[cursor] != 44
+                    cursor <- cursor + 1.usize()
+                false
 
         # Call after checking JSON syntax and unique object keys.
         def valid_dependency_map(raw: darray[u8]&, wanted: cstr) -> bool can[Memory.Allocate, Abort.Panic]:
-            region dependency_span_scope:
-                dependency_start: usize = Json::root_value_offset(raw, wanted)
-                return true if dependency_start >= raw.count
-                dependency_end: usize = Json::object_end(raw, dependency_start)
-                return false if dependency_end <= dependency_start or dependency_end >= raw.count or raw[dependency_start] != 123
-                cursor: mutable usize = Json::skip_whitespace(raw, dependency_start + 1.usize(), dependency_end)
-                return true if cursor == dependency_end
-                while cursor < dependency_end |dependency_count: usize = 0.usize()|:
-                    return false if dependency_count >= maximum_dependencies
-                    entry: mutable DependencyEntry::Span = DependencyEntry::Span{name_start: 0, name_end: 0, object_start: 0, object_end: 0}
-                    return false if not:
-                        DependencyEntry::read(raw, cursor, dependency_end, &entry)
-                        valid_dependency_object(raw, entry.object_start, entry.object_end)
-                    dependency_count <- dependency_count + 1.usize()
-                    cursor <- DependencyEntry::next_start(raw, entry.object_end, dependency_end)
+            dependency_start: usize = Json::root_value_offset(raw, wanted)
+            return true if dependency_start >= raw.count
+            dependency_end: usize = Json::object_end(raw, dependency_start)
+            if dependency_end <= dependency_start or dependency_end >= raw.count or raw[dependency_start] != 123:
+                false
+            else:
+                while cursor <= dependency_end |cursor: usize = Json::skip_whitespace(raw, dependency_start + 1.usize(), dependency_end), dependency_count: usize = 0.usize()|:
                     return true if cursor == dependency_end
-            false
+                    return false if dependency_count >= maximum_dependencies
+                    cursor <-
+                        entry: mutable DependencyEntry::Span = DependencyEntry::Span{name_start: 0, name_end: 0, object_start: 0, object_end: 0}
+                        return false if not:
+                            DependencyEntry::read(raw, cursor, dependency_end, &entry)
+                            valid_dependency_object(raw, entry.object_start, entry.object_end)
+                        DependencyEntry::next_start(raw, entry.object_end, dependency_end)
+                    dependency_count <- dependency_count + 1.usize()
+                false
 
     private:
         const maximum_dependencies: usize = 4096.usize()
 
         def valid_dependency_object(raw: darray[u8]&, object_start: usize, object_end: usize) -> bool can[Memory.Allocate, Abort.Panic]:
-            region has_key_scope:
-                has_path: bool = Json::object_has_key(raw, object_start, object_end, "path")
-                has_registry: bool = Json::object_has_key(raw, object_start, object_end, "registry")
-                has_version: bool = Json::object_has_key(raw, object_start, object_end, "version")
-                has_git: bool = Json::object_has_key(raw, object_start, object_end, "git")
-                has_rev: bool = Json::object_has_key(raw, object_start, object_end, "rev")
-                return false if has_path and (has_registry or has_version)
-                if has_path:
-                    return false if not SchemaFields::valid(raw, object_start, object_end, SchemaFields::Kind.ManifestPathDependency)
-                    path: mutable darray[u8] = []
-                    return false if not Json::object_string_value(raw, object_start, object_end, "path", &path)
-                    return valid_dependency_path(path)
-                if has_registry or has_version:
-                    return false if:
-                        has_git or has_rev or not has_registry or not has_version
-                        not SchemaFields::valid(raw, object_start, object_end, SchemaFields::Kind.RegistryDependency)
-                    registry: mutable darray[u8] = []
-                    requirement: mutable darray[u8] = []
-                    return false if not:
-                        Json::object_string_value(raw, object_start, object_end, "registry", &registry)
-                        Json::object_string_value(raw, object_start, object_end, "version", &requirement)
-                        ByteText::equal_text(registry, "primary")
-                    parsed_requirement: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
-                    return SemVer::parse_requirement(requirement, &parsed_requirement)
-            false
+            has_path: bool = Json::object_has_key(raw, object_start, object_end, "path")
+            has_registry: bool = Json::object_has_key(raw, object_start, object_end, "registry")
+            has_version: bool = Json::object_has_key(raw, object_start, object_end, "version")
+            has_git: bool = Json::object_has_key(raw, object_start, object_end, "git")
+            has_rev: bool = Json::object_has_key(raw, object_start, object_end, "rev")
+            if has_path and (has_registry or has_version):
+                false
+            elif has_path:
+                path: mutable darray[u8] = []
+                SchemaFields::valid(raw, object_start, object_end, SchemaFields::Kind.ManifestPathDependency) and Json::object_string_value(raw, object_start, object_end, "path", &path) and valid_dependency_path(path)
+            elif has_registry or has_version:
+                registry: mutable darray[u8] = []
+                requirement: mutable darray[u8] = []
+                parsed_requirement: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
+                not has_git and not has_rev and has_registry and has_version and SchemaFields::valid(raw, object_start, object_end, SchemaFields::Kind.RegistryDependency) and Json::object_string_value(raw, object_start, object_end, "registry", &registry) and Json::object_string_value(raw, object_start, object_end, "version", &requirement) and ByteText::equal_text(registry, "primary") and SemVer::parse_requirement(requirement, &parsed_requirement)
+            else:
+                false
