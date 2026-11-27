@@ -84,11 +84,15 @@ Each Stage0 and Stage1 rebuild runs through
 `scripts/compiler_rebuild_timeout.py`, which terminates the rebuild process
 group on cancellation and enforces a 30-second wall-clock
 limit, kills the rebuild's entire process group at the deadline, and reports
-elapsed wall time on success. The CI job gives Stage0 a new empty Go build cache
-and Stage1 a new empty SMT proof cache; it also disables the retained analysis
-server so warm state cannot hide fresh-cache seed timing. A timeout fails the
-workflow; profile and optimize the rebuild before retrying it under the same
-limit.
+elapsed wall time on success. The pinned core's `make build` clears its
+environment and limits the Go build to five seconds, which a cold Go cache
+cannot meet. The job therefore first compiles every Stage0 package without a
+time limit, in the same cleared environment, so the timed Stage0 build measures
+an incremental rebuild against the job's own Go cache rather than the cold
+compile. Stage1 gets a new empty SMT proof cache, and the job disables the
+retained analysis server so warm state cannot hide fresh-cache seed timing. A
+timeout fails the workflow; profile and optimize the rebuild before retrying it
+under the same limit.
 
 To update a pin, review the upstream source and compatibility notes, update the
 workflow and this table together, then run the clean seed/build/test sequence
