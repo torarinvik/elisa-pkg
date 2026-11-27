@@ -16,50 +16,57 @@ module RegistryConfiguration:
 
         def configured_root(out: mutable darray[u8]&) -> bool:
             out.resize(0)
-            value_ref: u8&? = Platform::environment_variable("ELISAPKG_REGISTRY_DIR")
-            if value_ref is configured:
+            if Platform::environment_variable("ELISAPKG_REGISTRY_DIR") is configured:
                 value: cstr = configured.cast[cstr]
                 length: usize = Platform::c_string_length(value)
-                return false if length == 0 or length > RegistryRoot::maximum_bytes
-                for index in 0..<length |out, value|:
-                    out.push(value[index].u8())
-                return true
-            false
+                if length == 0 or length > RegistryRoot::maximum_bytes:
+                    false
+                else:
+                    for index in 0..<length |out, value|:
+                        out.push(value[index].u8())
+                    true
+            else:
+                false
 
         def configured_trust_root(registry_root: darray[u8]&, out: mutable darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             # Trust material is configured out of band. Keeping the key next
             # to mutable registry metadata would let a registry replacement
             # replace its own verification root as well.
             out.resize(0)
-            value_ref: u8&? = Platform::environment_variable("ELISAPKG_REGISTRY_TRUST_ROOT")
-            if value_ref is configured:
+            if Platform::environment_variable("ELISAPKG_REGISTRY_TRUST_ROOT") is configured:
                 value: cstr = configured.cast[cstr]
                 length: usize = Platform::c_string_length(value)
-                return Code.InvalidConfiguration if length == 0 or length > RegistryRoot::maximum_bytes or value[0].u8() != 47
-                for index in 0..<length |out, value|:
+                printable: bool = for index in 0..<length |valid: bool = true| -> valid:
                     byte: u8 = value[index].u8()
-                    return Code.InvalidConfiguration if byte == 0 or byte < 32 or byte == 127 or byte == 92
-                    out.push(byte)
-                return Code.InvalidConfiguration if not:
-                    RegistryRoot::valid(out)
-                    not ProjectFiles::path_is_same_or_beneath(out, registry_root)
+                    break false if byte == 0 or byte < 32 or byte == 127 or byte == 92
                 canonical_registry: mutable darray[u8] = []
-                region canonical_trust_scope:
-                    canonical_trust: mutable darray[u8] = []
-                    return Code.InvalidConfiguration if not ProjectFiles::canonical_existing_path(registry_root, &canonical_registry)
-                    return Code.MissingTrustRoot if not ProjectFiles::canonical_existing_path(out, &canonical_trust)
-                    return Code.InvalidConfiguration if ProjectFiles::path_is_same_or_beneath(canonical_trust, canonical_registry)
-                return Code.Ok
-            Code.MissingTrustRoot
+                canonical_trust: mutable darray[u8] = []
+                if length == 0 or length > RegistryRoot::maximum_bytes or value[0].u8() != 47 or not printable:
+                    Code.InvalidConfiguration
+                else:
+                    for index in 0..<length |out, value|:
+                        out.push(value[index].u8())
+                    if not RegistryRoot::valid(out) or ProjectFiles::path_is_same_or_beneath(out, registry_root) or not ProjectFiles::canonical_existing_path(registry_root, &canonical_registry):
+                        Code.InvalidConfiguration
+                    elif not ProjectFiles::canonical_existing_path(out, &canonical_trust):
+                        Code.MissingTrustRoot
+                    elif ProjectFiles::path_is_same_or_beneath(canonical_trust, canonical_registry):
+                        Code.InvalidConfiguration
+                    else:
+                        Code.Ok
+            else:
+                Code.MissingTrustRoot
 
         def configured_trust_key_fingerprint(registry_root: darray[u8]&, out: mutable darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out.resize(0)
             key_path: mutable darray[u8] = []
-            region root_status_scope:
-                root_status: Code = configured_trust_root(registry_root, &key_path)
-                return root_status if root_status != Code.Ok
-            region public_key_scope:
-                public_key: mutable darray[u8] = []
-                return Code.MissingTrustRoot if RegistryFiles::read_trusted_file(key_path, Trust::ed25519_public_key_bytes, &public_key) != Trust::ed25519_public_key_bytes.i64()
-                return Code.TrustStateUnavailable if not Integrity::sha256_hex(public_key, out)
-            Code.Ok
+            public_key: mutable darray[u8] = []
+            root_status: Code = configured_trust_root(registry_root, &key_path)
+            if root_status != Code.Ok:
+                root_status
+            elif RegistryFiles::read_trusted_file(key_path, Trust::ed25519_public_key_bytes, &public_key) != Trust::ed25519_public_key_bytes.i64():
+                Code.MissingTrustRoot
+            elif not Integrity::sha256_hex(public_key, out):
+                Code.TrustStateUnavailable
+            else:
+                Code.Ok
