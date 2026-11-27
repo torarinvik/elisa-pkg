@@ -9,31 +9,28 @@ module NativeTrustedAcl:
             static if ELISA_TARGET_OS_MACOS:
                 native_errno()[0] <- 0
                 if native_acl_get_fd_np(file_descriptor.i32(), 256) is acl:
-                    entry_slot: mutable darray[u8&?] = [null]
-                    entry_out: mutable void& = (&entry_slot[0]).cast[mutable void&] can Unsafe.PointerCast
-                    safe: mutable bool = true
-                    while safe |entry_identifier: i32 = 0|:
-                        native_errno()[0] <- 0
-                        entry_status: i32 = native_acl_get_entry(acl, entry_identifier, entry_out)
-                        if entry_status == 0:
-                            entry_identifier <- -1
-                            if entry_slot[0] is entry:
-                                tag: mutable i32 = 0
-                                if native_acl_get_tag_type(entry, &tag) != 0 or tag != 2:
+                    # Walk every entry; only ACL_EXTENDED_DENY entries are safe.
+                    safe: bool =
+                        entry_slot: mutable darray[u8&?] = [null]
+                        entry_out: mutable void& = (&entry_slot[0]).cast[mutable void&] can Unsafe.PointerCast
+                        while safe |safe: bool = true, entry_identifier: i32 = 0| -> safe:
+                            native_errno()[0] <- 0
+                            entry_status: i32 = native_acl_get_entry(acl, entry_identifier, entry_out)
+                            if entry_status == 0:
+                                entry_identifier <- -1
+                                if entry_slot[0] is entry:
+                                    tag: mutable i32 = 0
                                     # ACL_EXTENDED_DENY is the only extended
                                     # ACE accepted. Any allow or unknown tag
                                     # could grant mutation outside mode bits.
+                                    safe <- false if native_acl_get_tag_type(entry, &tag) != 0 or tag != 2
+                                else:
                                     safe <- false
                             else:
+                                # EINVAL after the first entry marks the end of the list.
+                                break safe if entry_identifier == -1 and NativeErrors::current_errno() == 22
                                 safe <- false
-                        else:
-                            region end_errno_scope:
-                                end_errno: i64 = NativeErrors::current_errno()
-                                if entry_identifier == -1 and end_errno == 22:
-                                    break
-                            safe <- false
-                    acl_value: void& = acl.cast[void&] can Unsafe.PointerCast
-                    return native_acl_free(acl_value) == 0 and safe
+                    return native_acl_free(acl.cast[void&] can Unsafe.PointerCast) == 0 and safe
                 return NativeErrors::current_errno() == 2
             static elif ELISA_TARGET_OS_LINUX:
                 return trusted_linux_acl_file_descriptor(file_descriptor, is_directory)
@@ -50,17 +47,16 @@ module NativeTrustedAcl:
         static if ELISA_TARGET_OS_LINUX:
             def trusted_linux_acl_file_descriptor(file_descriptor: i64, is_directory: bool) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
                 access_acl: mutable darray[u8] = []
-                region access_status_scope:
-                    access_status: i64 = read_linux_acl_xattr(file_descriptor, "system.posix_acl_access", &access_acl)
-                    return false if:
-                        access_status < 0
-                        access_status == 1 and not LinuxAccessAcl::is_safe(access_acl)
-                if is_directory:
+                access_status: i64 = read_linux_acl_xattr(file_descriptor, "system.posix_acl_access", &access_acl)
+                if access_status < 0 or (access_status == 1 and not LinuxAccessAcl::is_safe(access_acl)):
+                    false
+                elif is_directory:
                     default_status: i64 =
                         default_acl: mutable darray[u8] = []
                         read_linux_acl_xattr(file_descriptor, "system.posix_acl_default", &default_acl)
-                    return false if default_status < 0 or default_status == 1
-                true
+                    default_status == 0
+                else:
+                    true
 
             # Return 0 for an absent/unsupported POSIX ACL attribute, 1 for a
             # bounded value, and -1 for every other read or format failure.
@@ -77,9 +73,10 @@ module NativeTrustedAcl:
                 if loaded < 0:
                     errno_value: i64 = NativeErrors::current_errno()
                     out.resize(0)
-                    return 0 if errno_value == 61 or errno_value == 95 else -1
-                if loaded < 4 or loaded > LinuxAccessAcl::read_capacity.i64() or (loaded - 4) % 8 != 0:
+                    0 if errno_value == 61 or errno_value == 95 else -1
+                elif loaded < 4 or loaded > LinuxAccessAcl::read_capacity.i64() or (loaded - 4) % 8 != 0:
                     out.resize(0)
-                    return -1
-                out.resize(loaded.usize())
-                1
+                    -1
+                else:
+                    out.resize(loaded.usize())
+                    1
