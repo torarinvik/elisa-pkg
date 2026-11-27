@@ -29,61 +29,102 @@ def function_source(source: str, name: str) -> str:
     return source[declaration.start():end]
 
 
-def check_install_recovery_sync_order() -> None:
-    source = (ROOT / "src/package/install_transaction.elisa").read_text(encoding="utf-8")
+# Argument spellings change with refactors; these patterns match the call and
+# its qualifier only, so each check asserts the ordering it protects.
+UNLINK_CALL = re.compile(r"\bremove_known_file\(")
+PARENT_SYNC_CALL = re.compile(r"\b(?:ProjectFiles::sync_parent_directory|Platform::synchronize_parent_directory)\(")
+ENTRY_PARENTS_SYNC_CALL = re.compile(r"\bsync_local_install_entry_parents\(")
+JOURNAL_RETIRE_CALL = re.compile(r"\bretire_local_install_transaction\(")
+SYNC_AND_RETIRE_CALL = re.compile(r"\bsync_and_retire\(")
+# The sync result must gate the retirement, not merely precede it.
+GATED_SYNC_AND_RETIRE = re.compile(
+    r"\bsync_local_install_entry_parents\([^\n]*\)\s+and\s+retire_local_install_transaction\("
+)
+SYNC_FAILURE_RETURNS = re.compile(
+    r"if not (?:\w+::)?sync_local_install_entry_parents\([^\n]*\n\s+return "
+)
+
+
+def positions(pattern: re.Pattern[str], text: str) -> list[int]:
+    return [match.start() for match in pattern.finditer(text)]
+
+
+def check_journal_retirement(source: str) -> None:
     retire = function_source(source, "retire_local_install_transaction")
-    unlink = retire.find("remove_known_file(&path_snapshot)")
-    journal_parent_sync = retire.find("Platform::synchronize_parent_directory(path_name)")
-    if unlink < 0 or journal_parent_sync <= unlink:
+    unlinks = positions(UNLINK_CALL, retire)
+    parent_syncs = positions(PARENT_SYNC_CALL, retire)
+    if not unlinks or not parent_syncs or parent_syncs[-1] <= unlinks[0]:
         raise SystemExit("error: transaction journal retirement must sync its parent after unlink")
 
+
+def check_entry_parent_sync(source: str) -> None:
+    sync = function_source(source, "sync_local_install_entry_parents")
+    if len(positions(PARENT_SYNC_CALL, sync)) != 2:
+        raise SystemExit("error: local install entry sync must sync both the binary and receipt directories")
+
+
+def check_recovery_dispatch(source: str) -> None:
     recovery = function_source(source, "recover_local_install_transaction")
     install_start = recovery.find('if ByteText::equal_text(operation, "install"):')
-    uninstall_start = recovery.find("# Removal intent is durable", install_start)
-    copy_outputs_start = recovery.find("for index in 0..<operation.count", uninstall_start)
-    if install_start < 0 or uninstall_start < 0 or copy_outputs_start < 0:
+    install_call = recovery.find("recover_install(", install_start)
+    uninstall_call = recovery.find("recover_uninstall(", install_call)
+    if install_start < 0 or install_call < 0 or uninstall_call < 0:
         raise SystemExit("error: local install recovery branches are missing")
-    install_branch = recovery[install_start:uninstall_start]
-    journal_retire = install_branch.rfind("retire_local_install_transaction(transaction_path)")
-    install_sync = install_branch.rfind("sync_local_install_entry_parents(destination_name, receipt_name)")
-    if install_sync < 0 or install_sync >= journal_retire:
+    if positions(JOURNAL_RETIRE_CALL, recovery) or positions(SYNC_AND_RETIRE_CALL, recovery):
+        raise SystemExit("error: local install recovery must retire its journal only inside the per-operation branches")
+
+
+def check_recovery_retirement(source: str) -> None:
+    sync_and_retire = function_source(source, "sync_and_retire")
+    if not GATED_SYNC_AND_RETIRE.search(sync_and_retire):
+        raise SystemExit("error: recovery must sync both target directories before retiring its journal")
+
+    install = function_source(source, "recover_install")
+    # Only an intent with neither target published may retire without a
+    # directory sync: there is no new name for the sync to make durable.
+    for position in positions(JOURNAL_RETIRE_CALL, install):
+        line_end = install.find("\n", position)
+        line = install[install.rfind("\n", 0, position) + 1:line_end]
+        if "destination_state == -2 and targets.receipt_state == -2" not in line:
+            raise SystemExit("error: install recovery must sync both target directories before retiring its journal")
+    install_retirements = positions(SYNC_AND_RETIRE_CALL, install)
+    published = install.find("published <- true")
+    if not install_retirements or published < 0 or install_retirements[-1] >= published:
         raise SystemExit("error: install recovery must sync both target directories before retiring its journal")
 
-    uninstall_branch = recovery[uninstall_start:copy_outputs_start]
-    retire_positions = []
-    cursor = 0
-    while True:
-        position = uninstall_branch.find("retire_local_install_transaction(transaction_path)", cursor)
-        if position < 0:
-            break
-        retire_positions.append(position)
-        cursor = position + 1
-    if len(retire_positions) != 2:
+    uninstall = function_source(source, "recover_uninstall")
+    if positions(JOURNAL_RETIRE_CALL, uninstall):
+        raise SystemExit("error: uninstall recovery must sync both target directories before retiring its journal")
+    if len(positions(SYNC_AND_RETIRE_CALL, uninstall)) != 2:
         raise SystemExit("error: uninstall recovery journal-retirement paths changed unexpectedly")
-    previous_retire = -1
-    for position in retire_positions:
-        sync = uninstall_branch.rfind(
-            "sync_local_install_entry_parents(destination_name, receipt_name)",
-            previous_retire + 1,
-            position,
-        )
-        if sync < 0:
-            raise SystemExit("error: uninstall recovery must sync both target directories before retiring its journal")
-        previous_retire = position
 
+
+def check_receipt_publication(source: str) -> None:
     publish = function_source(source, "publish_local_install_receipt")
-    matching_receipt = publish.find("not ByteText::equal(existing, receipt)")
-    parent_sync = publish.find("Platform::synchronize_parent_directory(path_name)")
-    if matching_receipt < 0 or parent_sync <= matching_receipt:
+    matching_receipt = publish.find("ByteText::equal(existing, receipt)")
+    parent_syncs = positions(PARENT_SYNC_CALL, publish)
+    if matching_receipt < 0 or not parent_syncs or parent_syncs[-1] <= matching_receipt:
         raise SystemExit("error: receipt publication must sync its parent before success")
 
+
+def check_normal_operations() -> None:
     command_source = (ROOT / "src/cli/local_install.elisa").read_text(encoding="utf-8")
-    for function, label in (("publish_verified", "install"), ("uninstall_local", "uninstall")):
+    for function, label in (("publish_new", "install"), ("remove_installed", "uninstall")):
         operation = function_source(command_source, function)
-        retire = operation.rfind("retire_local_install_transaction(transaction_path)")
-        sync = operation.rfind("sync_local_install_entry_parents(destination_name, receipt_sync_name)" if label == "install" else "sync_local_install_entry_parents(destination_name, receipt_name)")
-        if sync < 0 or sync >= retire:
+        retirements = positions(JOURNAL_RETIRE_CALL, operation)
+        syncs = positions(ENTRY_PARENTS_SYNC_CALL, operation)
+        if len(retirements) != 1 or not syncs or syncs[-1] >= retirements[0] or not SYNC_FAILURE_RETURNS.search(operation):
             raise SystemExit(f"error: normal local {label} must sync target directories before retiring its journal")
+
+
+def check_install_recovery_sync_order() -> None:
+    source = (ROOT / "src/package/install_transaction.elisa").read_text(encoding="utf-8")
+    check_journal_retirement(source)
+    check_entry_parent_sync(source)
+    check_recovery_dispatch(source)
+    check_recovery_retirement(source)
+    check_receipt_publication(source)
+    check_normal_operations()
 
 
 def run(args: list[str], prefix: Path, expected: int, label: str) -> subprocess.CompletedProcess[bytes]:
