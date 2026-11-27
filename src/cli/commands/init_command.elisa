@@ -1,0 +1,79 @@
+# `elisapkg init`: create a package scaffold without overwriting anything.
+include "../../package/manifest_edits.elisa"
+include "../../platform.elisa"
+include "../../project/files.elisa"
+include "../../text/bytes.elisa"
+include "../output.elisa"
+include "../status.elisa"
+
+module InitCommand:
+    public:
+        # Run `init [--lib|--bin] [PATH]`.
+        def run(argument_count: i64, slots: cstr&&) -> CliStatus::ExitStatus can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                root: mutable darray[u8] = [46]
+                target_kind: mutable cstr = "bin"
+                if read_arguments(argument_count, slots, &root, &target_kind) is early_status:
+                    return early_status
+                return CliStatus::usage if root.count == 0.usize() or root.count > 4096.usize() else scaffold(root, Platform::c_string_equal(target_kind, "lib"))
+
+    private:
+        # Parse the `init` arguments. Returns the status to exit with for
+        # invalid arguments or `--help`, or null to continue.
+        def read_arguments(argument_count: i64, slots: cstr&&, root: mutable darray[u8]&, target_kind: mutable cstr&) -> i64? can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                while index < argument_count |index: i64 = 2, target_kind_seen: bool = false, path_seen: bool = false|:
+                    argument: cstr = slots[index].cast[cstr]
+                    index <- index + 1
+                    if Platform::c_string_equal(argument, "--lib"):
+                        return CliStatus::usage if target_kind_seen and not Platform::c_string_equal(target_kind, "lib")
+                        target_kind <- "lib"
+                        target_kind_seen <- true
+                    elif Platform::c_string_equal(argument, "--bin"):
+                        return CliStatus::usage if target_kind_seen and not Platform::c_string_equal(target_kind, "bin")
+                        target_kind <- "bin"
+                        target_kind_seen <- true
+                    elif Platform::c_string_equal(argument, "--help"):
+                        CliOutput::usage()
+                        return CliStatus::success
+                    elif Platform::c_string_length(argument) == 0.usize() or argument[0].u8() == 45 or path_seen:
+                        return CliStatus::usage
+                    else:
+                        root.resize(0)
+                        ByteText::append_bounded_text(root, argument)
+                        path_seen <- true
+                return null
+
+        def scaffold(root: darray[u8]&, library: bool) -> CliStatus::ExitStatus can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                manifest_path: darray[u8] = ProjectFiles::path_join(root, "elisapkg.json")
+                return CliStatus::usage if manifest_root_occupied(root, manifest_path) else create_scaffold(root, manifest_path, library)
+
+        # Keep init consistent with normal project discovery: an existing
+        # compiler manifest and package manifest cannot share one root.
+        def manifest_root_occupied(root: darray[u8]&, manifest_path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            legacy_manifest_path: darray[u8] = ProjectFiles::path_join(root, "manifest.json")
+            return ProjectFiles::path_occupied(manifest_path) or ProjectFiles::path_occupied(legacy_manifest_path)
+
+        # Refuse an existing source file before creating any scaffold
+        # directories, so a failed init leaves the destination untouched.
+        def create_scaffold(root: darray[u8]&, manifest_path: darray[u8]&, library: bool) -> CliStatus::ExitStatus can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                source: darray[u8] = ProjectFiles::path_join(root, "src")
+                state: darray[u8] = ProjectFiles::path_join(root, ".elisapkg")
+                entry_path: darray[u8] = ProjectFiles::path_join(source, "main.elisa")
+                return CliStatus::usage if ProjectFiles::path_occupied(entry_path) else CliStatus::source_failed if not ProjectFiles::make_directory(root) or not ProjectFiles::make_directory(source) or not ProjectFiles::make_directory(state) else publish_scaffold(manifest_path, entry_path, library)
+
+        # The manifest is published exclusively first. It is kept when the
+        # entry file fails: removing it by pathname could delete a file that
+        # another actor installed after the first publication.
+        def publish_scaffold(manifest_path: darray[u8]&, entry_path: darray[u8]&, library: bool) -> CliStatus::ExitStatus can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                manifest: darray[u8] = ManifestEdits::initial_document(library)
+                entry: darray[u8] = ByteText::with_text([], "def main() -> i64:\n    return 0\n")
+                return CliStatus::usage if ProjectFiles::path_occupied(entry_path) else CliStatus::source_failed if ProjectFiles::publish_file_exclusively(manifest_path, manifest) != 0 or ProjectFiles::publish_file_exclusively(entry_path, entry) != 0 else report_created()
+
+        def report_created() -> CliStatus::ExitStatus can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                CliOutput::write_ok("created package\n")
+                return CliStatus::success

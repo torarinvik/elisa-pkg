@@ -1,0 +1,182 @@
+# `elisapkg package` and `elisapkg publish`: archive the package, or
+# validate a release without publishing it.
+include "../../archive.elisa"
+include "../../integrity.elisa"
+include "../../package/assembly.elisa"
+include "../../package/model.elisa"
+include "../../package/targets.elisa"
+include "../../platform.elisa"
+include "../../project/files.elisa"
+include "../../project/lock_validation.elisa"
+include "../../project/manifest.elisa"
+include "../../security.elisa"
+include "../../source/fingerprint.elisa"
+include "../../text/bytes.elisa"
+include "../output.elisa"
+include "../project_context.elisa"
+include "../resolution.elisa"
+include "../status.elisa"
+
+module PackageCommand:
+    public:
+        # Run `package [--list]`: list the package files, or write the archive.
+        def run(argument_count: i64, slots: cstr&&, start: darray[u8]&) -> CliStatus::ExitStatus can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global{Read,Write}:
+                if not ProjectContext::manifest_exists():
+                    return report_missing_manifest()
+                list_only: mutable bool = false
+                for index in 2..<argument_count |slots, list_only|:
+                    list_only <- true if Platform::c_string_equal(slots[index].cast[cstr], "--list")
+                raw: mutable darray[u8] = []
+                package_name: mutable darray[u8] = []
+                package_version: mutable darray[u8] = []
+                entry: mutable darray[u8] = []
+                paths: mutable darray[u8] = []
+                return CliStatus::usage if:
+                    not ProjectFiles::read_project_document("elisapkg.json", &raw)
+                    not ProjectManifest::validate_at(raw, start, &package_name, &package_version)
+                    not ManifestTargets::default_entry(raw, &entry)
+                    not PackageAssembly::collect_paths(raw, entry, &paths)
+                return list_package_files(paths) if list_only else write_package(start, raw, entry, package_name, package_version)
+
+        # Validate the exact local release inputs without writing an archive
+        # or contacting a registry. Publication itself remains trust-gated,
+        # but callers still need a useful preflight command.
+        def publish_dry_run(start: darray[u8]&, options: Model::CommandOptions) -> CliStatus::ExitStatus can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global{Read,Write}:
+                if not ProjectContext::manifest_exists():
+                    return report_missing_manifest()
+                raw: mutable darray[u8] = []
+                return CliStatus::usage if not ProjectFiles::read_project_document("elisapkg.json", &raw) else validate_release(start, options, raw)
+
+        # Refuse publication until signing and authenticated transport exist.
+        def publish() -> CliStatus::ExitStatus can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                CliOutput::write_error(Security::publish_message())
+                return Security::publish_status()
+
+    private:
+        def report_missing_manifest() -> CliStatus::ExitStatus can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                CliOutput::write_error("error: could not find elisapkg.json in the current directory\n")
+                return CliStatus::usage
+
+        # Command options that resolve the existing lock without changing it.
+        def frozen_lock_options() -> Model::CommandOptions:
+            return Model::CommandOptions{locked: true, offline: true, frozen: true, json: false, verbose: false, profile: "debug", target_name: "", target_kind: "", update_name: ""}
+
+        # Print the files `package` would archive, one per line.
+        def list_package_files(paths: darray[u8]&) -> CliStatus::ExitStatus can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                CliOutput::write_ok("package files:\n")
+                while cursor < paths.count |cursor: usize = 0.usize()|:
+                    path_end: usize = while path_end < paths.count and paths[path_end] != 0 |path_end: usize = cursor| -> path_end:
+                        path_end <- path_end + 1.usize()
+                    write_listed_path(paths, cursor, path_end)
+                    cursor <- path_end + 1.usize()
+                CliOutput::write_error("note: signing is required before publish; this command only previews files\n")
+                return CliStatus::success
+
+        def write_listed_path(paths: darray[u8]&, start: usize, finish: usize) -> void can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                line: darray[u8] =
+                    path: darray[u8] = [paths[index] for index in start..<finish]
+                    indented: darray[u8] = ByteText::with_text([], "  ")
+                    ByteText::with_text(ByteText::with_bytes(indented, path), "\n")
+                CliOutput::write_bytes(1, line)
+
+        # Resolve the frozen lock, revalidate it against the manifest, and
+        # write the package archive and its metadata.
+        def write_package(start: darray[u8]&, raw: darray[u8]&, entry: darray[u8]&, package_name: darray[u8]&, package_version: darray[u8]&) -> CliStatus::ExitStatus can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global{Read,Write}:
+                return CliStatus::resolution_failed if ResolutionCommand::resolve(start, frozen_lock_options(), false, false) != CliStatus::success
+                lock_raw: mutable darray[u8] = []
+                manifest_digest: mutable darray[u8] = []
+                lock_digest: mutable darray[u8] = []
+                # Resolution validated the lock before returning, but packaging
+                # reads the source tree afterwards. Revalidate at this boundary so a
+                # source mutation between resolution and archive creation cannot be
+                # published under an older lock identity.
+                return CliStatus::security_failed if:
+                    not ProjectFiles::read_project_document("elisapkg.lock", &lock_raw)
+                    not Integrity::sha256_hex(raw, &manifest_digest)
+                    not Integrity::sha256_hex(lock_raw, &lock_digest)
+                    not LockValidation::matches_manifest(raw, lock_raw, package_name, package_version, start)
+                return match PackageAssembly::write_outputs(start, raw, lock_raw, entry, package_name, package_version, manifest_digest, lock_digest):
+                    PackageAssembly::Code.Ok: CliStatus::success
+                    PackageAssembly::Code.SecurityFailure: CliStatus::security_failed
+                    PackageAssembly::Code.OutputFailure: CliStatus::operation_failed
+
+        # Check the manifest identity, resolve the frozen lock, and require
+        # the lock to match the manifest before validating the release.
+        def validate_release(start: darray[u8]&, options: Model::CommandOptions, raw: darray[u8]&) -> CliStatus::ExitStatus can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global{Read,Write}:
+                lock: mutable darray[u8] = []
+                lock_status: i64 = read_release_lock(start, raw, &lock)
+                return lock_status if lock_status != CliStatus::success else validate_release_sources(options, raw, lock)
+
+        def read_release_lock(start: darray[u8]&, raw: darray[u8]&, lock: mutable darray[u8]&) -> CliStatus::ExitStatus can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global{Read,Write}:
+                package_name: mutable darray[u8] = []
+                package_version: mutable darray[u8] = []
+                return CliStatus::resolution_failed if not ProjectManifest::validate_at(raw, start, &package_name, &package_version) or ResolutionCommand::resolve(start, frozen_lock_options(), false, false) != CliStatus::success else CliStatus::security_failed if not ProjectFiles::read_project_document("elisapkg.lock", lock) or not LockValidation::matches_manifest(raw, lock, package_name, package_version, start) else CliStatus::success
+
+        def validate_release_sources(options: Model::CommandOptions, raw: darray[u8]&, lock: darray[u8]&) -> CliStatus::ExitStatus can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                source_digest: mutable darray[u8] = []
+                return CliStatus::security_failed if not SourceFingerprint::current(&source_digest) else assemble_release(options, raw, lock, source_digest)
+
+        # Build the release archive reproducibly and require the source tree,
+        # manifest, and lock to be unchanged afterwards.
+        def assemble_release(options: Model::CommandOptions, raw: darray[u8]&, lock: darray[u8]&, source_digest: darray[u8]&) -> CliStatus::ExitStatus can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                entry: mutable darray[u8] = []
+                archive: mutable darray[u8] = []
+                return CliStatus::usage if not ManifestTargets::default_entry(raw, &entry) or not package_paths_valid(raw, entry) else CliStatus::security_failed if not reproducible_archive(raw, entry, &archive) or not release_inputs_unchanged(raw, lock, source_digest) else report_release(options, source_digest, archive)
+
+        def package_paths_valid(raw: darray[u8]&, entry: darray[u8]&) -> bool can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                paths: mutable darray[u8] = []
+                return PackageAssembly::collect_paths(raw, entry, &paths)
+
+        # Build the package archive twice; both builds must be valid and
+        # byte-identical.
+        def reproducible_archive(raw: darray[u8]&, entry: darray[u8]&, archive: mutable darray[u8]&) -> bool can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                return false if not PackageAssembly::archive_bytes(raw, entry, archive) or not Archive::verify_ustar_archive(archive)
+                archive_repeat: mutable darray[u8] = []
+                return PackageAssembly::archive_bytes(raw, entry, &archive_repeat) and Archive::verify_ustar_archive(archive_repeat) and ByteText::equal(archive_repeat, archive)
+
+        def release_inputs_unchanged(raw: darray[u8]&, lock: darray[u8]&, source_digest: darray[u8]&) -> bool can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                source_digest_after: mutable darray[u8] = []
+                manifest_after: mutable darray[u8] = []
+                lock_after: mutable darray[u8] = []
+                return SourceFingerprint::current(&source_digest_after) and ByteText::equal(source_digest_after, source_digest) and ProjectFiles::read_project_document("elisapkg.json", &manifest_after) and ProjectFiles::read_project_document("elisapkg.lock", &lock_after) and ByteText::equal(manifest_after, raw) and ByteText::equal(lock_after, lock)
+
+        def report_release(options: Model::CommandOptions, source_digest: darray[u8]&, archive: darray[u8]&) -> CliStatus::ExitStatus can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                archive_digest: mutable darray[u8] = []
+                return CliStatus::security_failed if not Integrity::sha256_hex(archive, &archive_digest) else report_release_json(source_digest, archive.count, archive_digest) if options.json else report_release_text()
+
+        def report_release_json(source_digest: darray[u8]&, archive_size: usize, archive_digest: darray[u8]&) -> CliStatus::ExitStatus can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                CliOutput::write_ok("{\"schema-version\":1,\"command\":\"publish\",\"dry-run\":true,\"valid\":true,\"source-tree-digest\":\"sha256:")
+                CliOutput::write_bytes(1, source_digest)
+                CliOutput::write_ok("\",\"archive-size\":")
+                write_decimal(archive_size.u64())
+                CliOutput::write_ok(",\"archive-digest\":\"sha256:")
+                CliOutput::write_bytes(1, archive_digest)
+                CliOutput::write_ok("\"}\n")
+                return CliStatus::success
+
+        def write_decimal(value: u64) -> void can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                text: darray[u8] = ByteText::with_decimal([], value)
+                CliOutput::write_bytes(1, text)
+
+        def report_release_text() -> CliStatus::ExitStatus can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                CliOutput::write_ok("publish dry-run: manifest, lockfile, source tree, and package file selection are valid\n")
+                CliOutput::write_error("note: signing and authenticated publication are still required\n")
+                return CliStatus::success

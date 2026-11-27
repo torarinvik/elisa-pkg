@@ -31,6 +31,9 @@ include "./cli/fetch.elisa"
 include "./cli/resolution.elisa"
 include "./cli/project_context.elisa"
 include "./cli/local_install.elisa"
+include "./cli/commands/init_command.elisa"
+include "./cli/commands/install_command.elisa"
+include "./cli/commands/package_command.elisa"
 include "./source/fingerprint.elisa"
 include "./project/transaction.elisa"
 include "./project/lock_validation.elisa"
@@ -39,67 +42,6 @@ include "./project/manifest.elisa"
 
 module Cli:
     private:
-        # Package version identities share the SemVer parser's bounded length.
-        # Install metadata then adds only bounded paths, names, and fixed fields.
-        const MAX_INSTALL_VERSION_BYTES: usize = SemVer::maximum_version_bytes
-
-        # ---------- path and file primitives --------------------------------------------------
-
-        def read_package_file_into(path: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            return Platform::read_bounded_file(path, Integrity::maximum_input, out)
-
-        # ---------- semantic versions ---------------------------------------------------------
-
-        def version_compare(left: Model::Version, right: Model::Version) -> i64:
-            return SemVer::compare(left, right)
-
-        # ---------- project discovery and commands -------------------------------------------
-
-        def run_initialize(argument_count: i64, slots: mutable cstr&&) -> CliStatus::ExitStatus can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            can Global.Read:
-                root: mutable darray[u8] = [46]
-                target_kind: mutable cstr = "bin"
-                if read_initialize_arguments(argument_count, slots, &root, &target_kind) is early_status:
-                    return early_status
-                return CliStatus::usage if:
-                    root.count == 0.usize()
-                    root.count > 4096.usize()
-                manifest_path: mutable darray[u8] = []
-                region legacy_manifest_path_scope:
-                    legacy_manifest_path: mutable darray[u8] = []
-                    ProjectFiles::path_join_into(root, "elisapkg.json", &manifest_path)
-                    ProjectFiles::path_join_into(root, "manifest.json", &legacy_manifest_path)
-                    # Keep init consistent with normal project discovery: an existing
-                    # compiler manifest and package manifest cannot share one root.
-                    return CliStatus::usage if:
-                        ProjectFiles::path_occupied(&manifest_path)
-                        ProjectFiles::path_occupied(&legacy_manifest_path)
-                source: mutable darray[u8] = []
-                state: mutable darray[u8] = []
-                entry_path: mutable darray[u8] = []
-                ProjectFiles::path_join_into(root, "src", &source)
-                ProjectFiles::path_join_into(root, ".elisapkg", &state)
-                ProjectFiles::path_join_into(source, "main.elisa", &entry_path)
-                # Refuse an existing source file before creating any scaffold
-                # directories, so a failed init leaves the destination untouched.
-                return CliStatus::usage if ProjectFiles::path_occupied(&entry_path)
-                return CliStatus::source_failed if:
-                    not ProjectFiles::make_directory(&root)
-                    not ProjectFiles::make_directory(&source) or not ProjectFiles::make_directory(&state)
-                manifest: darray[u8] = ManifestEdits::initial_document(Platform::c_string_equal(target_kind, "lib"))
-                region entry_scope:
-                    entry: mutable darray[u8] = []
-                    ByteText::append_text(&entry, "def main() -> i64:\n    return 0\n")
-                    return CliStatus::usage if ProjectFiles::path_occupied(&entry_path)
-                    return CliStatus::source_failed if ProjectFiles::publish_file_exclusively(manifest_path, &manifest) != 0
-                    if ProjectFiles::publish_file_exclusively(entry_path, &entry) != 0:
-                        # The manifest was published exclusively. Keep it when the second
-                        # scaffold file fails: removing by pathname could delete a file that
-                        # another actor installed after the first publication.
-                        return CliStatus::source_failed
-                CliOutput::write_ok("created package\n")
-                return CliStatus::success
-
         def run_check(start: darray[u8]&, options: Model::CommandOptions) -> CliStatus::ExitStatus can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
                 if not ProjectContext::load_package(start):
@@ -119,18 +61,16 @@ module Cli:
                     CliOutput::write_error("error: could not find elisapkg.json in the current directory\n")
                     return CliStatus::usage
                 raw: mutable darray[u8] = []
-                raw <- raw.resize(ProjectFiles::project_document_limit)
-                return CliStatus::usage if not ProjectFiles::read_c_string_into("elisapkg.json", &raw)
                 name: mutable darray[u8] = []
-                region version_scope:
-                    version: mutable darray[u8] = []
-                    return CliStatus::usage if:
-                        not ProjectManifest::validate(raw, &name, &version)
-                        not options.json
-                    CliOutput::write_ok("{\"schema-version\":1,\"package\":{\"name\":\"")
-                    CliOutput::write_bytes(1, &name)
-                    CliOutput::write_ok("\",\"version\":\"")
-                    CliOutput::write_bytes(1, &version)
+                version: mutable darray[u8] = []
+                return CliStatus::usage if not ProjectFiles::read_project_document("elisapkg.json", &raw) or not ProjectManifest::validate(raw, &name, &version) or not options.json else report_metadata(name, version)
+
+        def report_metadata(name: darray[u8]&, version: darray[u8]&) -> CliStatus::ExitStatus can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                CliOutput::write_ok("{\"schema-version\":1,\"package\":{\"name\":\"")
+                CliOutput::write_bytes(1, name)
+                CliOutput::write_ok("\",\"version\":\"")
+                CliOutput::write_bytes(1, version)
                 CliOutput::write_ok("\"}}\n")
                 return CliStatus::success
 
@@ -149,292 +89,36 @@ module Cli:
                 CliOutput::write_ok("compiler: set ELISAPKG_COMPILER to an audited compiler adapter\n")
                 return CliStatus::success
 
-        def run_test(argument_count: i64, slots: mutable cstr&&, start: darray[u8]&, options: Model::CommandOptions) -> CliStatus::ExitStatus can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+        def run_test(argument_count: i64, slots: cstr&&, start: darray[u8]&, options: Model::CommandOptions) -> CliStatus::ExitStatus can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global{Read,Write}:
                 raw: mutable darray[u8] = []
-                raw <- raw.resize(ProjectFiles::project_document_limit)
-                return CliStatus::usage if not ProjectFiles::read_c_string_into("elisapkg.json", &raw)
-                region selected_entry_scope:
-                    selected_name: mutable darray[u8] = []
-                    selected_kind: mutable darray[u8] = []
-                    selected_entry: mutable darray[u8] = []
-                    return CliStatus::usage if not ManifestTargets::select_target(raw, options.target_name, options.target_kind, &selected_name, &selected_kind, &selected_entry) or not ByteText::equal_text(selected_kind, "test")
                 # Reusing the normal build path keeps dependency, lock, and compiler-
                 # environment checks identical while multi-target planning is completed.
-                region status_scope:
-                    status: i64 = BuildCommand::run(start, options)
-                    return status if status != CliStatus::success
-                return ProgramCommand::run(argument_count, slots, options, "test")
+                return CliStatus::usage if not ProjectFiles::read_project_document("elisapkg.json", &raw) or not selects_test_target(raw, options) else build_and_run(argument_count, slots, start, options, "test")
 
-        def run_publish_dry_run(start: darray[u8]&, options: Model::CommandOptions) -> CliStatus::ExitStatus can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+        # Whether the target `options` names is a test target.
+        def selects_test_target(raw: darray[u8]&, options: Model::CommandOptions) -> bool can[Memory.Allocate, Abort.Panic]:
+            selected_name: mutable darray[u8] = []
+            selected_kind: mutable darray[u8] = []
+            selected_entry: mutable darray[u8] = []
+            return ManifestTargets::select_target(raw, options.target_name, options.target_kind, &selected_name, &selected_kind, &selected_entry) and ByteText::equal_text(selected_kind, "test")
+
+        # Build the project, then run the built program of `target_kind`.
+        def build_and_run(argument_count: i64, slots: cstr&&, start: darray[u8]&, options: Model::CommandOptions, target_kind: cstr) -> CliStatus::ExitStatus can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global{Read,Write}:
-                # Validate the exact local release inputs without writing an archive
-                # or contacting a registry. Publication itself remains trust-gated,
-                # but callers still need a useful preflight command.
-                if not ProjectContext::manifest_exists():
-                    CliOutput::write_error("error: could not find elisapkg.json in the current directory\n")
-                    return CliStatus::usage
-                raw: mutable darray[u8] = []
-                raw <- raw.resize(ProjectFiles::project_document_limit)
-                return CliStatus::usage if not ProjectFiles::read_c_string_into("elisapkg.json", &raw)
-                package_name: mutable darray[u8] = []
-                package_version: mutable darray[u8] = []
-                return CliStatus::resolution_failed if not ProjectManifest::validate_at(raw, start, &package_name, &package_version)
-                region lock_options_scope:
-                    lock_options: Model::CommandOptions = Model::CommandOptions{locked: true, offline: true, frozen: true, json: false, verbose: false, profile: "debug", target_name: "", target_kind: "", update_name: ""}
-                    return CliStatus::resolution_failed if ResolutionCommand::resolve(start, lock_options, false, false) != CliStatus::success
-                lock: mutable darray[u8] = []
-                lock <- lock.resize(ProjectFiles::project_document_limit)
-                return CliStatus::security_failed if:
-                    not ProjectFiles::read_c_string_into("elisapkg.lock", &lock)
-                    not LockValidation::matches_manifest(raw, lock, package_name, package_version, start)
-                source_digest: mutable darray[u8] = []
-                return CliStatus::security_failed if not SourceFingerprint::current(&source_digest)
-                entry: mutable darray[u8] = []
-                return CliStatus::usage if not ManifestTargets::default_entry(raw, &entry)
-                region paths_scope:
-                    paths: mutable darray[u8] = []
-                    return CliStatus::usage if not PackageAssembly::collect_paths(raw, entry, &paths)
-                archive: mutable darray[u8] = []
-                return CliStatus::security_failed if not reproducible_archive(raw, entry, &archive)
-                region source_digest_after_scope:
-                    source_digest_after: mutable darray[u8] = []
-                    return CliStatus::security_failed if not SourceFingerprint::current(&source_digest_after) or not ByteText::equal(source_digest_after, source_digest)
-                region lock_after_scope:
-                    manifest_after: mutable darray[u8] = []
-                    manifest_after <- manifest_after.resize(ProjectFiles::project_document_limit)
-                    lock_after: mutable darray[u8] = []
-                    lock_after <- lock_after.resize(ProjectFiles::project_document_limit)
-                    return CliStatus::security_failed if:
-                        not ProjectFiles::read_c_string_into("elisapkg.json", &manifest_after) or not ProjectFiles::read_c_string_into("elisapkg.lock", &lock_after)
-                        not ByteText::equal(manifest_after, raw) or not ByteText::equal(lock_after, lock)
-                region archive_digest_scope:
-                    archive_digest: mutable darray[u8] = []
-                    return CliStatus::security_failed if not Integrity::sha256_hex(archive, &archive_digest)
-                    if options.json:
-                        report_publish_dry_run_json(source_digest, archive.count, archive_digest)
-                        return CliStatus::success
-                CliOutput::write_ok("publish dry-run: manifest, lockfile, source tree, and package file selection are valid\n")
-                CliOutput::write_error("note: signing and authenticated publication are still required\n")
-                return CliStatus::success
-
-        # Build the package archive twice; both builds must be valid and
-        # byte-identical.
-        def reproducible_archive(raw: darray[u8]&, entry: darray[u8]&, archive: mutable darray[u8]&) -> bool can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            can Global.Read:
-                return false if not PackageAssembly::archive_bytes(raw, entry, archive) or not Archive::verify_ustar_archive(archive)
-                archive_repeat: mutable darray[u8] = []
-                return PackageAssembly::archive_bytes(raw, entry, &archive_repeat) and Archive::verify_ustar_archive(archive_repeat) and ByteText::equal(archive_repeat, archive)
-
-        # Parse `init [--lib|--bin] [PATH]`. Returns the status to exit with
-        # for invalid arguments or `--help`, or null to continue.
-        def read_initialize_arguments(argument_count: i64, slots: mutable cstr&&, root: mutable darray[u8]&, target_kind: mutable cstr&) -> i64? can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            can Global.Read:
-                target_kind_seen: mutable bool = false
-                path_seen: mutable bool = false
-                for index in 2..<argument_count |target_kind_seen, path_seen|:
-                    argument: cstr = slots[index].cast[cstr]
-                    if Platform::c_string_equal(argument, "--lib"):
-                        return CliStatus::usage if target_kind_seen and not Platform::c_string_equal(target_kind, "lib")
-                        target_kind <- "lib"
-                        target_kind_seen <- true
-                    elif Platform::c_string_equal(argument, "--bin"):
-                        return CliStatus::usage if target_kind_seen and not Platform::c_string_equal(target_kind, "bin")
-                        target_kind <- "bin"
-                        target_kind_seen <- true
-                    elif Platform::c_string_equal(argument, "--help"):
-                        CliOutput::usage()
-                        return CliStatus::success
-                    elif Platform::c_string_length(argument) == 0.usize() or argument[0].u8() == 45 or path_seen:
-                        return CliStatus::usage
-                    else:
-                        root.resize(0)
-                        ByteText::append_bounded_text(root, argument)
-                        path_seen <- true
-                return null
-
-        def report_publish_dry_run_json(source_digest: darray[u8]&, archive_size: usize, archive_digest: darray[u8]&) -> void can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            can Global.Read:
-                region size_text_scope:
-                    size_text: mutable darray[u8] = []
-                    ByteText::append_decimal(&size_text, archive_size.u64())
-                    CliOutput::write_ok("{\"schema-version\":1,\"command\":\"publish\",\"dry-run\":true,\"valid\":true,\"source-tree-digest\":\"sha256:")
-                    CliOutput::write_bytes(1, source_digest)
-                    CliOutput::write_ok("\",\"archive-size\":")
-                    CliOutput::write_bytes(1, &size_text)
-                CliOutput::write_ok(",\"archive-digest\":\"sha256:")
-                CliOutput::write_bytes(1, archive_digest)
-                CliOutput::write_ok("\"}\n")
-
-        def run_publish() -> CliStatus::ExitStatus can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            can Global.Read:
-                CliOutput::write_error(Security::publish_message())
-                return Security::publish_status()
-
-        # Select the manifest target named by `options`; installation needs a
-        # binary target.
-        def select_binary_target(options: Model::CommandOptions, target_name: mutable darray[u8]&) -> CliStatus::ExitStatus can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            can Global.Read:
-                manifest_raw: mutable darray[u8] = []
-                manifest_raw <- manifest_raw.resize(ProjectFiles::project_document_limit)
-                return CliStatus::build_failed if not ProjectFiles::read_c_string_into("elisapkg.json", &manifest_raw)
-                target_kind: mutable darray[u8] = []
-                region target_entry_scope:
-                    target_entry: mutable darray[u8] = []
-                    return CliStatus::build_failed if not ManifestTargets::select_target(manifest_raw, options.target_name, options.target_kind, target_name, &target_kind, &target_entry)
-                return CliStatus::success if ByteText::equal_text(target_kind, "bin")
-                CliOutput::write_error("error: install --local requires a binary target\n")
-                return CliStatus::operation_failed
-
-        # Read the built artifact and its hex SHA-256 digest.
-        def read_artifact_with_digest(artifact: darray[u8]&, artifact_bytes: mutable darray[u8]&, digest: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            return false if not read_package_file_into(artifact, artifact_bytes)
-            digest_bytes: mutable darray[u8] = []
-            return Integrity::sha256(artifact_bytes, &digest_bytes) == Integrity::DigestCode.Ok and Integrity::hex_digest(digest_bytes, digest)
-
-        def run_install_local(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            can Global{Read,Write}:
-                prefix: mutable darray[u8] = []
-                return CliStatus::usage if not InstallPrefix::read_configured(&prefix)
-                if not InstallPrefix::trusted_existing_ancestor(prefix):
-                    CliOutput::write_error("error: install prefix directories must be owned by root or the current user, without group or other write permission\n")
-                    return CliStatus::operation_failed
-                root: mutable darray[u8] = [46]
-                region resolved_scope:
-                    resolved: i64 = ResolutionCommand::resolve(&root, options, false, false)
-                    return resolved if resolved != CliStatus::success
-                target_name: mutable darray[u8] = []
-                region target_status_scope:
-                    target_status: i64 = select_binary_target(options, &target_name)
-                    return target_status if target_status != CliStatus::success
-                name: mutable darray[u8] = []
-                version: mutable darray[u8] = []
-                return CliStatus::usage if not ProjectManifest::load_at(&root, &name, &version)
-                if version.count > MAX_INSTALL_VERSION_BYTES:
-                    CliOutput::write_error("error: local install package versions exceed the bounded receipt limit\n")
-                    return CliStatus::usage
-                use_prebuilt_artifact: bool = InstallFaults::use_test_prebuilt_artifact()
-                expected_build_digest: mutable darray[u8] = []
-                if not use_prebuilt_artifact:
-                    return CliStatus::build_failed if BuildCommand::run_with_digest(start, options, &expected_build_digest) != CliStatus::success
-                artifact: mutable darray[u8] = []
-                region build_directory_scope:
-                    build_directory: darray[u8] = Build::output_directory(start, Platform::c_string_equal(options.profile, "release"))
-                    ProjectFiles::path_join_bytes_into(build_directory, target_name, &artifact)
-                artifact_bytes: mutable darray[u8] = []
-                digest: mutable darray[u8] = []
-                return CliStatus::operation_failed if not read_artifact_with_digest(artifact, &artifact_bytes, &digest)
-                if not use_prebuilt_artifact and (expected_build_digest.count != 64.usize() or not ByteText::equal(digest, expected_build_digest)):
-                    CliOutput::write_error("error: build output changed after compilation; refusing to install an unverified artifact\n")
-                    return CliStatus::build_failed
-                return LocalInstallCommand::publish_verified(prefix, name, version, artifact_bytes, digest)
-
-        def run_install(argument_count: i64, slots: mutable cstr&&, start: darray[u8]&, options: Model::CommandOptions) -> CliStatus::ExitStatus can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            can Global{Read,Write}:
-                mode: i64 = install_mode(argument_count, slots)
-                return CliStatus::usage if mode == install_usage else run_install_local(start, options) if mode == install_local else refuse_remote_install()
-
-        # Report that remote installation is disabled by the trust policy.
-        def refuse_remote_install() -> CliStatus::ExitStatus can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            can Global.Read:
-                CliOutput::write_error(Security::install_message())
-                return Security::install_status()
-
-        const install_usage: i64 = 0
-        const install_local: i64 = 1
-        const install_remote: i64 = 2
-
-        # Classify `install` arguments: `--local` alone, one remote package,
-        # or a usage error. `--bin NAME` is consumed and otherwise ignored.
-        def install_mode(argument_count: i64, slots: mutable cstr&&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            local_seen: mutable bool = false
-            package_seen: mutable bool = false
-            while index < argument_count |slots, local_seen, package_seen, index: i64 = 2|:
-                region argument_scope:
-                    argument: cstr = slots[index].cast[cstr]
-                    if Platform::c_string_equal(argument, "--local"):
-                        return install_usage if local_seen
-                        local_seen <- true
-                    elif Platform::c_string_equal(argument, "--bin"):
-                        return install_usage if index + 1 >= argument_count
-                        # The common option parser has already validated and
-                        # stored this target name. Consume its value here so it
-                        # cannot be mistaken for a remote package argument.
-                        index <- index + 1
-                    elif not package_seen:
-                        package_seen <- true
-                    else:
-                        return install_usage
-                index <- index + 1
-            return install_usage if local_seen == package_seen else install_local if local_seen else install_remote
-
-        def run_package(argument_count: i64, slots: mutable cstr&&, start: darray[u8]&) -> CliStatus::ExitStatus can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            can Global{Read,Write}:
-                if not ProjectContext::manifest_exists():
-                    CliOutput::write_error("error: could not find elisapkg.json in the current directory\n")
-                    return CliStatus::usage
-                list_only: mutable bool = false
-                for index in 2..<argument_count |slots, list_only|:
-                    list_only <- true if Platform::c_string_equal(slots[index].cast[cstr], "--list")
-                raw: mutable darray[u8] = []
-                raw <- raw.resize(ProjectFiles::project_document_limit)
-                return CliStatus::usage if not ProjectFiles::read_c_string_into("elisapkg.json", &raw)
-                package_name: mutable darray[u8] = []
-                package_version: mutable darray[u8] = []
-                return CliStatus::usage if not ProjectManifest::validate_at(raw, start, &package_name, &package_version)
-                entry: mutable darray[u8] = []
-                return CliStatus::usage if not ManifestTargets::default_entry(raw, &entry)
-                paths: mutable darray[u8] = []
-                return CliStatus::usage if not PackageAssembly::collect_paths(raw, entry, &paths)
-                return list_package_files(paths) if list_only else write_package(start, raw, entry, package_name, package_version)
-
-        # Print the files `package` would archive, one per line.
-        def list_package_files(paths: darray[u8]&) -> CliStatus::ExitStatus can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            can Global.Read:
-                CliOutput::write_ok("package files:\n")
-                while cursor < paths.count |cursor: usize = 0.usize()|:
-                    region path_scope:
-                        path: mutable darray[u8] = []
-                        CliOutput::write_ok("  ")
-                        while cursor < paths.count and paths[cursor] != 0 |paths, cursor, path|:
-                            path <- path.push(paths[cursor])
-                            cursor <- cursor + 1.usize()
-                        CliOutput::write_bytes(1, &path)
-                    CliOutput::write_ok("\n")
-                    cursor <- cursor + 1.usize()
-                CliOutput::write_error("note: signing is required before publish; this command only previews files\n")
-                return CliStatus::success
-
-        # Resolve the frozen lock, revalidate it against the manifest, and
-        # write the package archive and its metadata.
-        def write_package(start: darray[u8]&, raw: darray[u8]&, entry: darray[u8]&, package_name: darray[u8]&, package_version: darray[u8]&) -> CliStatus::ExitStatus can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            can Global{Read,Write}:
-                region lock_options_scope:
-                    lock_options: Model::CommandOptions = Model::CommandOptions{locked: true, offline: true, frozen: true, json: false, verbose: false, profile: "debug", target_name: "", target_kind: "", update_name: ""}
-                    return CliStatus::resolution_failed if ResolutionCommand::resolve(start, lock_options, false, false) != CliStatus::success
-                lock_raw: mutable darray[u8] = []
-                lock_raw <- lock_raw.resize(ProjectFiles::project_document_limit)
-                return CliStatus::security_failed if not ProjectFiles::read_c_string_into("elisapkg.lock", &lock_raw)
-                manifest_digest: mutable darray[u8] = []
-                lock_digest: mutable darray[u8] = []
-                return CliStatus::security_failed if:
-                    not Integrity::sha256_hex(raw, &manifest_digest)
-                    not Integrity::sha256_hex(lock_raw, &lock_digest)
-                # `run_resolve` validated the lock before returning, but packaging
-                # reads the source tree afterwards. Revalidate at this boundary so a
-                # source mutation between resolution and archive creation cannot be
-                # published under an older lock identity.
-                return CliStatus::security_failed if not LockValidation::matches_manifest(raw, lock_raw, package_name, package_version, start)
-                return match PackageAssembly::write_outputs(start, raw, lock_raw, entry, package_name, package_version, manifest_digest, lock_digest):
-                    PackageAssembly::Code.Ok: CliStatus::success
-                    PackageAssembly::Code.SecurityFailure: CliStatus::security_failed
-                    PackageAssembly::Code.OutputFailure: CliStatus::operation_failed
+                build_status: i64 = BuildCommand::run(start, options)
+                return build_status if build_status != CliStatus::success else ProgramCommand::run(argument_count, slots, options, target_kind)
 
         # ---------- command line --------------------------------------------------------------
 
+        # The optional `--manifest-path PATH`, and whether it was given.
+        struct ManifestPathOption:
+            path: mutable darray[u8]
+            present: mutable bool
+
         # Read the optional `--manifest-path PATH` before `--`. Returns false
         # for a repeated, missing, empty, oversized, or flag-like path.
-        def read_manifest_path(argument_count: i64, slots: mutable cstr&&, manifest_path: mutable darray[u8]&, has_manifest_path: mutable bool&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+        def read_manifest_path(argument_count: i64, slots: cstr&&, manifest_path: mutable darray[u8]&, has_manifest_path: mutable bool&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             while scan_index < argument_count |scan_index: i64 = 2|:
                 scan_flag: cstr = slots[scan_index].cast[cstr]
                 break if Platform::c_string_equal(scan_flag, "--")
@@ -451,7 +135,7 @@ module Cli:
             return true
 
         # Run a command that needs a recovered project transaction.
-        def dispatch_project_command(command: cstr, effective_argument_count: i64, dispatch_slots: mutable cstr&&, start: mutable darray[u8]&, options: Model::CommandOptions, publish_dry_run: bool) -> CliStatus::ExitStatus can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+        def dispatch_project_command(command: cstr, argument_count: i64, slots: cstr&&, start: mutable darray[u8]&, options: Model::CommandOptions, publish_dry_run: bool) -> CliStatus::ExitStatus can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global{Read,Write}:
                 if Platform::c_string_equal(command, "check-manifest"):
                     return run_check(start, options)
@@ -460,34 +144,31 @@ module Cli:
                 if Platform::c_string_equal(command, "tree"):
                     return ResolutionCommand::tree(start, options)
                 if Platform::c_string_equal(command, "why"):
-                    return ResolutionCommand::why(effective_argument_count, dispatch_slots, start, options)
+                    return ResolutionCommand::why(argument_count, slots, start, options)
                 if Platform::c_string_equal(command, "metadata"):
                     return run_metadata(start, options)
                 if Platform::c_string_equal(command, "publish"):
-                    return run_publish_dry_run(start, options) if publish_dry_run
-                    return run_publish()
+                    return PackageCommand::publish_dry_run(start, options) if publish_dry_run else PackageCommand::publish()
                 if Platform::c_string_equal(command, "install"):
-                    return run_install(effective_argument_count, dispatch_slots, start, options)
+                    return InstallCommand::run(argument_count, slots, start, options)
                 if Platform::c_string_equal(command, "clean"):
                     return MaintenanceCommand::clean()
                 if Platform::c_string_equal(command, "cache"):
-                    return MaintenanceCommand::run_cache(effective_argument_count, dispatch_slots, start)
+                    return MaintenanceCommand::run_cache(argument_count, slots, start)
                 if Platform::c_string_equal(command, "package"):
-                    return run_package(effective_argument_count, dispatch_slots, start)
-                if Platform::c_string_equal(command, "build") or Platform::c_string_equal(command, "run") or Platform::c_string_equal(command, "test"):
-                    return BuildCommand::run(start, options) if Platform::c_string_equal(command, "build")
-                    if Platform::c_string_equal(command, "run"):
-                        region build_status_scope:
-                            build_status: i64 = BuildCommand::run(start, options)
-                            return build_status if build_status != CliStatus::success
-                        return ProgramCommand::run(effective_argument_count, dispatch_slots, options, "bin")
-                    return run_test(effective_argument_count, dispatch_slots, start, options)
+                    return PackageCommand::run(argument_count, slots, start)
+                if Platform::c_string_equal(command, "build"):
+                    return BuildCommand::run(start, options)
+                if Platform::c_string_equal(command, "run"):
+                    return build_and_run(argument_count, slots, start, options, "bin")
+                if Platform::c_string_equal(command, "test"):
+                    return run_test(argument_count, slots, start, options)
                 CliOutput::write_error("error: unknown command; run `elisapkg --help`\n")
                 return CliStatus::usage
 
         # Help, version, and init run without a project. Returns their status,
         # or null for every other command.
-        def run_project_free_command(argument_count: i64, slots: mutable cstr&&, command: cstr, quiet: mutable bool&) -> i64? can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+        def run_project_free_command(argument_count: i64, slots: cstr&&, command: cstr, quiet: mutable bool&) -> i64? can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global{Read,Write}:
                 if Platform::c_string_equal(command, "--help") or Platform::c_string_equal(command, "-h"):
                     CliOutput::usage()
@@ -500,63 +181,81 @@ module Cli:
                     initialize_argument_count: i64 = CliArguments::compact_output_modes(argument_count, slots, &initialize_slots, quiet)
                     CliOutput::configure(quiet, false)
                     return CliStatus::usage if initialize_argument_count < 0
-                    return run_initialize(initialize_argument_count, (&initialize_slots[0]).cast[mutable cstr&&] can Unsafe.PointerCast)
+                    return InitCommand::run(initialize_argument_count, (&initialize_slots[0]).cast[cstr&&] can Unsafe.PointerCast)
                 return null
 
         def cli_main(argument_count: i64, argument_vector: mutable void&) -> CliStatus::ExitStatus can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global{Read,Write}:
-                slots: mutable cstr&& = argument_vector.cast[mutable cstr&&]
+                slots: cstr&& = argument_vector.cast[cstr&&]
                 CliOutput::configure(false, false)
-                quiet: mutable bool = false
                 if argument_count <= 1:
                     CliOutput::usage()
                     return CliStatus::usage
                 command: cstr = slots[1].cast[cstr]
+                quiet: mutable bool = false
                 if run_project_free_command(argument_count, slots, command, &quiet) is project_free_status:
                     return project_free_status
-                manifest_path: mutable darray[u8] = []
-                has_manifest_path: mutable bool = false
-                return CliStatus::usage if not read_manifest_path(argument_count, slots, &manifest_path, &has_manifest_path)
-                effective_argument_count: mutable i64 = argument_count
-                effective_slots: mutable cstr&& = slots
+                manifest: mutable ManifestPathOption = ManifestPathOption{path: [], present: false}
+                return CliStatus::usage if not read_manifest_path(argument_count, slots, &manifest.path, &manifest.present) else run_with_manifest_path(argument_count, slots, command, manifest, &quiet)
+
+        # Remove `--manifest-path` and the output modes from the arguments when
+        # needed, then run a dependency edit or any other project command.
+        def run_with_manifest_path(argument_count: i64, slots: cstr&&, command: cstr, manifest: ManifestPathOption&, quiet: mutable bool&) -> CliStatus::ExitStatus can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global{Read,Write}:
+                dependency_edit: bool = Platform::c_string_equal(command, "add") or Platform::c_string_equal(command, "remove") or Platform::c_string_equal(command, "update")
+                if not manifest.present and not dependency_edit:
+                    return run_parsed(argument_count, slots, command, manifest, quiet)
                 compacted: mutable darray[cstr] = []
-                region dependency_edit_scope:
-                    dependency_edit: bool = Platform::c_string_equal(command, "add") or Platform::c_string_equal(command, "remove") or Platform::c_string_equal(command, "update")
-                    if has_manifest_path or dependency_edit:
-                        effective_argument_count <- CliArguments::compact_manifest_arguments(argument_count, slots, &compacted, &quiet)
-                        CliOutput::configure(quiet, false)
-                        return CliStatus::usage if effective_argument_count <= 0
-                        effective_slots <- (&compacted[0]).cast[mutable cstr&&] can Unsafe.PointerCast
-                    if dependency_edit:
-                        return CliStatus::usage if has_manifest_path and not ProjectContext::change_to_manifest_path(manifest_path)
-                        return ResolutionCommand::add(effective_argument_count, effective_slots) if Platform::c_string_equal(command, "add")
-                        return ResolutionCommand::remove(effective_argument_count, effective_slots) if Platform::c_string_equal(command, "remove")
-                        return ResolutionCommand::update(effective_argument_count, effective_slots)
+                compacted_count: i64 = CliArguments::compact_manifest_arguments(argument_count, slots, &compacted, quiet)
+                CliOutput::configure(quiet, false)
+                return CliStatus::usage if compacted_count <= 0
+                compacted_slots: cstr&& = (&compacted[0]).cast[cstr&&] can Unsafe.PointerCast
+                return run_dependency_edit(compacted_count, compacted_slots, command, manifest) if dependency_edit else run_parsed(compacted_count, compacted_slots, command, manifest, quiet)
+
+        def run_dependency_edit(argument_count: i64, slots: cstr&&, command: cstr, manifest: ManifestPathOption&) -> CliStatus::ExitStatus can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global{Read,Write}:
+                return CliStatus::usage if manifest.present and not ProjectContext::change_to_manifest_path(manifest.path) else ResolutionCommand::add(argument_count, slots) if Platform::c_string_equal(command, "add") else ResolutionCommand::remove(argument_count, slots) if Platform::c_string_equal(command, "remove") else ResolutionCommand::update(argument_count, slots)
+
+        # Read the common flags and remove the validated global options.
+        def run_parsed(argument_count: i64, slots: cstr&&, command: cstr, manifest: ManifestPathOption&, quiet: mutable bool&) -> CliStatus::ExitStatus can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global{Read,Write}:
+                options: mutable Model::CommandOptions = Model::CommandOptions{locked: false, offline: false, frozen: false, json: false, verbose: false, profile: "debug", target_name: "", target_kind: "", update_name: ""}
+                publish_dry_run: mutable bool = false
+                if not read_flags(argument_count, slots, command, &options, quiet, &publish_dry_run):
+                    return CliStatus::usage
+                parsed_options: mutable darray[cstr] = []
+                parsed_argument_count: i64 = CliArguments::compact_validated_global_options(argument_count, slots, &parsed_options)
+                return CliStatus::usage if parsed_argument_count < 0
+                dispatch_slots: cstr&& = (&parsed_options[0]).cast[cstr&&] can Unsafe.PointerCast
+                return run_dispatch(parsed_argument_count, dispatch_slots, command, manifest, options, publish_dry_run)
+
+        # Read the common flags and configure output, reporting an unknown option.
+        def read_flags(argument_count: i64, slots: cstr&&, command: cstr, options: mutable Model::CommandOptions&, quiet: mutable bool&, publish_dry_run: mutable bool&) -> bool can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global{Read,Write}:
+                flags_ok: bool = CliArguments::read_common_flags(argument_count, slots, command, options, quiet, publish_dry_run)
+                CliOutput::configure(quiet, options.json)
+                return flags_ok or report_unknown_option()
+
+        def report_unknown_option() -> bool can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                CliOutput::write_error("error: unknown option; run `elisapkg --help`\n")
+                return false
+
+        def run_dispatch(argument_count: i64, slots: cstr&&, command: cstr, manifest: ManifestPathOption&, common_options: Model::CommandOptions, publish_dry_run: bool) -> CliStatus::ExitStatus can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global{Read,Write}:
+                options: mutable Model::CommandOptions = common_options
+                CliArguments::read_target_flags(argument_count, slots, command, &options)
                 # `.` means the process working directory and keeps path operations on a
                 # non-empty, well-defined byte buffer.
                 start: mutable darray[u8] = [46]
-                options: mutable Model::CommandOptions = Model::CommandOptions{locked: false, offline: false, frozen: false, json: false, verbose: false, profile: "debug", target_name: "", target_kind: "", update_name: ""}
-                publish_dry_run: mutable bool = false
-                region flags_ok_scope:
-                    flags_ok: bool = CliArguments::read_common_flags(effective_argument_count, effective_slots, command, &options, &quiet, &publish_dry_run)
-                    CliOutput::configure(quiet, options.json)
-                    if not flags_ok:
-                        CliOutput::write_error("error: unknown option; run `elisapkg --help`\n")
-                        return CliStatus::usage
-                parsed_options: mutable darray[cstr] = []
-                parsed_argument_count: i64 = CliArguments::compact_validated_global_options(effective_argument_count, effective_slots, &parsed_options)
-                return CliStatus::usage if parsed_argument_count < 0
-                effective_argument_count <- parsed_argument_count
-                dispatch_slots: mutable cstr&& = (&parsed_options[0]).cast[mutable cstr&&] can Unsafe.PointerCast
-                CliArguments::read_target_flags(effective_argument_count, dispatch_slots, command, &options)
-                return CliStatus::usage if has_manifest_path and not ProjectContext::change_to_manifest_path(manifest_path)
+                return CliStatus::usage if manifest.present and not ProjectContext::change_to_manifest_path(manifest.path)
                 return run_doctor() if Platform::c_string_equal(command, "doctor")
                 if Platform::c_string_equal(command, "uninstall"):
-                    return LocalInstallCommand::uninstall(effective_argument_count, dispatch_slots)
+                    return LocalInstallCommand::uninstall(argument_count, slots)
                 if Platform::c_string_equal(command, "fetch"):
-                    return FetchCommand::run(effective_argument_count, dispatch_slots, &start, options)
+                    return FetchCommand::run(argument_count, slots, &start, options)
                 return CliStatus::security_failed if not ProjectTransaction::recover()
-                return dispatch_project_command(command, effective_argument_count, dispatch_slots, &start, options, publish_dry_run)
+                return dispatch_project_command(command, argument_count, slots, &start, options, publish_dry_run)
 
     public:
         # The only public command surface. Platform, model, and trust-policy

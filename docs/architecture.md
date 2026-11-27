@@ -48,6 +48,10 @@ orchestration short and delegates each phase to a focused module:
 | `ResolutionCommand` | Resolves, edits, and presents dependency locks |
 | `LocalInstallCommand` | Publishes and removes verified local installations under a per-prefix lock |
 | `MaintenanceCommand`, `ProgramCommand` | Cleans outputs, verifies the package cache, and runs built programs |
+| `InitCommand`, `PackageCommand`, `InstallCommand` (`src/cli/commands/`) | Creates a package scaffold, lists or writes the package archive and validates a publish dry run, and installs the built binary target locally |
+
+Command modules read the argument vector as an immutable `cstr&&`. Only the
+child-process argument vectors handed to `execvp` are writable.
 
 The current compiler backend requires foreign declarations at compilation-unit scope, so the declarations live in `src/platform/libc.elisa`. Target constants and directory entry layouts live in `src/platform/abi.elisa`. Only `PlatformNative` calls the foreign functions to implement descriptor-relative operating-system policy. `Platform` exposes only the reviewed wrapper surface. Callers use qualified names such as `Platform::read_package_file`, `Model::Version`, and `Security::remote_fetch_status`; `using` imports are deliberately avoided.
 
