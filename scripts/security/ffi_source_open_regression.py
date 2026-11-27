@@ -125,7 +125,7 @@ def main() -> int:
             sticky_fd, sticky_name = tempfile.mkstemp(prefix="elisapkg-source-open-", dir=sticky_root)
             sticky_file = Path(sticky_name)
             with os.fdopen(sticky_fd, "wb") as stream:
-                stream.write(b"sticky parent\n")
+                stream.write(b"sticky!\n")  # eight bytes, the size accepted_source expects
             sticky_file.chmod(0o700)
 
             good_source = work / "snapshot-good-source"

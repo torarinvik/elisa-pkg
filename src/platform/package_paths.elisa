@@ -241,13 +241,25 @@ extend PlatformNative:
                 region component_scope:
                     component: cstr = (&path_copy[start]).cast[cstr] can Unsafe.PointerCast
                     if not c_string_equal(component, "."):
-                        next: i64 = open_package_directory_component(directory, component) if package_policy else open_plain_directory_component(directory, component)
+                        next: i64 = open_package_parent_directory(directory) if package_policy and c_string_equal(component, "..") else open_package_directory_component(directory, component) if package_policy else open_plain_directory_component(directory, component)
                         return close_error(directory, next) if next < 0
                         return close_error(next, -5) if native_close(directory) != 0
                         directory <- next
                 # The next component starts after the slashes that end this one.
                 start <- while position < length and path_copy[position] == 47 |path_copy, position: usize = finish + 1.usize()| -> position:
                     position <- position + 1.usize()
+
+        # Local dependencies may live beside the package (`../shared`), so
+        # package walks may climb with `..`. It names the real parent and is
+        # never a symlink; the parent must still pass the package source checks.
+        def open_package_parent_directory(directory: i64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            parent: i64 = native_openat(directory, "..", flags_directory() + flag_no_follow)
+            if parent < 0:
+                NativeErrors::negative_errno()
+            elif not package_source_directory_file_descriptor(parent):
+                close_error(parent, -13)
+            else:
+                parent
 
         def open_plain_directory_component(directory: i64, component: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return -22 if c_string_equal(component, "..")
@@ -283,7 +295,7 @@ extend PlatformNative:
                 # A slash after the component makes it a directory on the way.
                 if finish < length:
                     if not c_string_equal(part, "."):
-                        next: i64 = open_package_directory_component(directory, part)
+                        next: i64 = open_package_parent_directory(directory) if c_string_equal(part, "..") else open_package_directory_component(directory, part)
                         return close_error(directory, next) if next < 0
                         return close_error(next, -5) if native_close(directory) != 0
                         directory <- next
