@@ -73,7 +73,7 @@ using whatever compiler happens to be installed on the runner:
 | Elisa compiler | `a0fe756c11064d88d1f7f402ef9b1e38866d9f09` |
 | Elisa core / stage0 | `ffb9ba3661e4aa734cd780089b8d5cc036379522` |
 | Go | `1.25.0`, required by the pinned core `go.mod` |
-| LLVM | `23.1.1`, checked after Homebrew installation |
+| LLVM | `23.1.6`, checked after Homebrew installation |
 | `actions/checkout` | `9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0` |
 | `actions/setup-go` | `b7ad1dad31e06c5925ef5d2fc7ad053ef454303e` (v7.0.0) |
 | `actions/upload-artifact` | `043fb46d1a93c77aae656e7c1c64a875d1fc6a0a` (v7.0.1) |
