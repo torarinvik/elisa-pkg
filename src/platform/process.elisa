@@ -41,11 +41,13 @@ module NativeProcess:
             remaining_raw: mutable void& = (&remaining[0]).cast[mutable void&] can Unsafe.PointerCast
             while true |request, remaining, request_raw, remaining_raw|:
                 return 0 if native_nanosleep(request_raw, remaining_raw) == 0
-                region errno_value_scope:
-                    errno_value: i64 = NativeErrors::current_errno()
-                    return NativeErrors::negative_value(errno_value) if errno_value != 4
-                for index in 0..<16 |request, remaining|:
-                    request[index] <- remaining[index]
+                errno_value: i64 = NativeErrors::current_errno()
+                if errno_value != 4:
+                    return NativeErrors::negative_value(errno_value)
+                else:
+                    # Interrupted: sleep again for the time that remained.
+                    for index in 0..<16 |request, remaining|:
+                        request[index] <- remaining[index]
 
         def process_identifier() -> i64:
             native_getpid()
@@ -67,41 +69,29 @@ module NativeProcess:
             remaining: mutable darray[u8] = NativeProcessValues::timespec_bytes(0, 0)
             remaining_raw: mutable void& = (&remaining[0]).cast[mutable void&] can Unsafe.PointerCast
             while true |process_group, deadline, clock_buffer, pause, pause_raw, remaining, remaining_raw|:
-                region probe_scope:
-                    probe: i64 = native_kill((-process_group).i32(), 0)
-                    if probe != 0:
-                        probe_errno: i64 = NativeErrors::current_errno()
-                        return 0 if probe_errno == 3
-                        return NativeErrors::negative_value(probe_errno)
-                region now_scope:
-                    now: i64 = monotonic_milliseconds_into(&clock_buffer)
-                    return -5 if now < 0
-                    return -110 if now >= deadline
-                if native_nanosleep(pause_raw, remaining_raw) != 0 and NativeErrors::current_errno() != 4:
+                # ESRCH from the probe means the whole group has exited.
+                if native_kill((-process_group).i32(), 0) != 0:
+                    probe_errno: i64 = NativeErrors::current_errno()
+                    return 0 if probe_errno == 3
+                    return NativeErrors::negative_value(probe_errno)
+                now: i64 = monotonic_milliseconds_into(&clock_buffer)
+                if now < 0:
+                    return -5
+                elif now >= deadline:
+                    return -110
+                elif native_nanosleep(pause_raw, remaining_raw) != 0 and NativeErrors::current_errno() != 4:
                     return NativeErrors::negative_errno()
 
         def set_process_limits(profile: i64) -> i64 can[Memory.Allocate, Unsafe.PointerCast]:
-            cpu: mutable i64 = 0
-            file_size: mutable i64 = 0
-            if profile == 1:
-                cpu <- 600
-                file_size <- 134217728
-            elif profile == 2:
-                cpu <- 120
-                file_size <- 67108864
-            return -22 if cpu == 0 or file_size == 0
-            cpu_limit: mutable darray[u8] = NativeProcessValues::limit_bytes(cpu)
-            file_limit: mutable darray[u8] = NativeProcessValues::limit_bytes(file_size)
-            cpu_raw: void& = (&cpu_limit[0]).cast[void&] can Unsafe.PointerCast
-            region file_raw_scope:
-                file_raw: void& = (&file_limit[0]).cast[void&] can Unsafe.PointerCast
-                return NativeErrors::negative_errno() if native_setrlimit(0, cpu_raw) != 0
-                return NativeErrors::negative_errno() if native_setrlimit(1, file_raw) != 0
+            # Profile 1 is the compiler (CPU seconds, file bytes); profile 2 a built program.
+            return -22 if profile != 1 and profile != 2
+            cpu_limit: mutable darray[u8] = NativeProcessValues::limit_bytes(600 if profile == 1 else 120)
+            file_limit: mutable darray[u8] = NativeProcessValues::limit_bytes(134217728 if profile == 1 else 67108864)
             core_limit: mutable darray[u8] = NativeProcessValues::limit_bytes(0)
-            region core_raw_scope:
-                core_raw: void& = (&core_limit[0]).cast[void&] can Unsafe.PointerCast
-                return NativeErrors::negative_errno() if native_setrlimit(4, core_raw) != 0
-            0
+            if native_setrlimit(0, ((&cpu_limit[0]).cast[void&] can Unsafe.PointerCast)) != 0 or native_setrlimit(1, ((&file_limit[0]).cast[void&] can Unsafe.PointerCast)) != 0 or native_setrlimit(4, ((&core_limit[0]).cast[void&] can Unsafe.PointerCast)) != 0:
+                NativeErrors::negative_errno()
+            else:
+                0
 
         # Return zero after reaping the child and put its wait status in status.
         def waitpid_timeout(child_process_identifier: i64, status: mutable i32&, timeout_milliseconds: i64) -> i64 can[Memory.Allocate, Unsafe.PointerCast]:
@@ -121,28 +111,29 @@ module NativeProcess:
             remaining_raw: mutable void& = (&remaining[0]).cast[mutable void&] can Unsafe.PointerCast
             while true |status, child_process_identifier, deadline, clock_buffer, pause, pause_raw, remaining, remaining_raw|:
                 waited: i64 = native_waitpid(child_process_identifier.i32(), status, 1)
+                interrupted: bool = waited < 0 and NativeErrors::current_errno() == 4
                 if waited == child_process_identifier:
                     return 0
-                interrupted: bool = waited < 0 and NativeErrors::current_errno() == 4
-                if waited < 0 and not interrupted:
+                elif waited < 0 and not interrupted:
                     wait_error: i64 = NativeErrors::negative_errno()
                     reap_status: i64 = terminate_and_reap(child_process_identifier, status)
                     return reap_status if reap_status != 0 else wait_error
-                region now_scope:
+                else:
                     now: i64 = monotonic_milliseconds_into(&clock_buffer)
                     if now < 0:
                         reap_status: i64 = terminate_and_reap(child_process_identifier, status)
                         return reap_status if reap_status != 0 else -5
-                    if now >= deadline:
+                    elif now >= deadline:
                         reap_status: i64 = terminate_and_reap(child_process_identifier, status)
                         return reap_status if reap_status != 0 else -110
-                # A stream of signals must not bypass the deadline check.
-                continue if interrupted
-                sleep_status: i64 = native_nanosleep(pause_raw, remaining_raw)
-                if sleep_status != 0 and NativeErrors::current_errno() != 4:
-                    sleep_errno: i64 = NativeErrors::current_errno()
-                    reap_status: i64 = terminate_and_reap(child_process_identifier, status)
-                    return reap_status if reap_status != 0 else NativeErrors::negative_value(sleep_errno)
+                    elif not interrupted:
+                        # A stream of signals must not bypass the deadline check,
+                        # so an interrupted wait retries without sleeping.
+                        sleep_status: i64 = native_nanosleep(pause_raw, remaining_raw)
+                        if sleep_status != 0 and NativeErrors::current_errno() != 4:
+                            sleep_errno: i64 = NativeErrors::current_errno()
+                            reap_status: i64 = terminate_and_reap(child_process_identifier, status)
+                            return reap_status if reap_status != 0 else NativeErrors::negative_value(sleep_errno)
 
         # Waiting for the group leader alone can leave a same-group descendant
         # running after its parent exits. Reap the direct child under the normal
