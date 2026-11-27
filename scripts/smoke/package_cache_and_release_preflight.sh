@@ -3,15 +3,16 @@
   "$BIN" package --list >/dev/null
   cp elisapkg.json elisapkg.exclude.good
   python3 - <<'PY'
+import json
 from pathlib import Path
 
+# Earlier smoke steps reformat the manifest, so edit it as JSON.
 path = Path('elisapkg.json')
-text = path.read_text()
-needle = '  "include": ["src/**", "elisapkg.json", "LICENSE", "README.md"]'
-replacement = needle + ',\n  "exclude": ["src/helper.elisa"]'
-if needle not in text:
+manifest = json.loads(path.read_text())
+if manifest.get('include') != ["src/**", "elisapkg.json", "LICENSE", "README.md"]:
     raise SystemExit('exclude fixture manifest shape missing')
-path.write_text(text.replace(needle, replacement, 1))
+manifest['exclude'] = ['src/helper.elisa']
+path.write_text(json.dumps(manifest, indent=2) + '\n')
 PY
   "$BIN" package --list > package-files-exclude.txt
   if grep -F 'src/helper.elisa' package-files-exclude.txt >/dev/null; then
@@ -194,11 +195,6 @@ PY
     exit 1
   fi
   mv .elisapkg/package.receipt.saved .elisapkg/package.receipt
-  python3 - <<'PY'
-from pathlib import Path
-for name in ("src/.env", "src/config.env", "src/private.pem"):
-    Path(name).unlink()
-PY
   PREFIX="$CASE/local-prefix"
   if ELISAPKG_INSTALL_PREFIX="$CASE/local-prefix/../escape" "$BIN" install --local >/dev/null 2>&1; then
     echo "path traversal install prefix was accepted" >&2
@@ -212,7 +208,9 @@ PY
   else
     test "$?" -eq 2
   fi
-  INSECURE_PREFIX="$CASE/insecure-prefix"
+  # Probe fixtures stay outside the package: its source policy rejects
+  # symlinks and shared-writable directories anywhere in the tree.
+  INSECURE_PREFIX="$TEST_TMP/insecure-prefix"
   mkdir -m 777 "$INSECURE_PREFIX"
   chmod 777 "$INSECURE_PREFIX"
   if ELISAPKG_INSTALL_PREFIX="$INSECURE_PREFIX" "$BIN" install --local >/dev/null 2>&1; then
@@ -222,7 +220,7 @@ PY
     test "$?" -eq 7
   fi
   test ! -e "$INSECURE_PREFIX/bin"
-  INSECURE_PARENT="$CASE/insecure-parent"
+  INSECURE_PARENT="$TEST_TMP/insecure-parent"
   mkdir "$INSECURE_PARENT"
   chmod 777 "$INSECURE_PARENT"
   if ELISAPKG_INSTALL_PREFIX="$INSECURE_PARENT/nested-prefix" "$BIN" install --local >/dev/null 2>&1; then
@@ -232,8 +230,8 @@ PY
     test "$?" -eq 7
   fi
   test ! -e "$INSECURE_PARENT/nested-prefix"
-  SYMLINK_TARGET="$CASE/symlink-target"
-  SYMLINK_PREFIX="$CASE/symlink-prefix"
+  SYMLINK_TARGET="$TEST_TMP/symlink-target"
+  SYMLINK_PREFIX="$TEST_TMP/symlink-prefix"
   mkdir "$SYMLINK_TARGET"
   ln -s "$SYMLINK_TARGET" "$SYMLINK_PREFIX"
   if ELISAPKG_INSTALL_PREFIX="$SYMLINK_PREFIX/nested-prefix" "$BIN" install --local >/dev/null 2>&1; then

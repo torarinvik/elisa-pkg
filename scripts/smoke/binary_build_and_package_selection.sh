@@ -169,7 +169,7 @@ PY
       exit 1
       ;;
   esac
-  missing_clang_log="$CASE/missing-clang-build.log"
+  missing_clang_log="$TEST_TMP/missing-clang-build.log"
   if ELISA_CLANG="$CASE/not-installed-clang" "$BIN" build >"$missing_clang_log" 2>&1; then
     echo "build reused an artifact after selecting an unavailable linker" >&2
     exit 1
@@ -180,7 +180,7 @@ PY
     echo "unavailable selected linker was accepted from the build cache" >&2
     exit 1
   fi
-  alternate_clang_log="$CASE/alternate-clang-build.log"
+  alternate_clang_log="$TEST_TMP/alternate-clang-build.log"
   if ELISA_CLANG=/usr/bin/true "$BIN" build >"$alternate_clang_log" 2>&1; then
     echo "build unexpectedly accepted an unrelated executable as its linker" >&2
     exit 1
@@ -265,14 +265,14 @@ PY
       ;;
   esac
   TOOLCHAIN_MUTATING_WRAPPER="$TEST_TMP/toolchain-mutating-compiler.sh"
-  if run_build_with_parent_mutation "$TOOLCHAIN_MUTATING_WRAPPER" "$CASE/toolchain-mutation-build.log" toolchain "$TOOLCHAIN_MUTATING_WRAPPER"; then
+  if run_build_with_parent_mutation "$TOOLCHAIN_MUTATING_WRAPPER" "$TEST_TMP/toolchain-mutation-build.log" toolchain "$TOOLCHAIN_MUTATING_WRAPPER"; then
     echo "build published output after its compiler changed during compilation" >&2
     exit 1
   else
     test "$?" -eq 6
   fi
-  grep -F 'compiler toolchain changed during the build' "$CASE/toolchain-mutation-build.log" >/dev/null
-  if grep -F '(cached)' "$CASE/toolchain-mutation-build.log" >/dev/null; then
+  grep -F 'compiler toolchain changed during the build' "$TEST_TMP/toolchain-mutation-build.log" >/dev/null
+  if grep -F '(cached)' "$TEST_TMP/toolchain-mutation-build.log" >/dev/null; then
     echo "build reused output after its compiler changed during compilation" >&2
     exit 1
   fi
@@ -304,7 +304,7 @@ PY
   esac
   cp elisapkg.json elisapkg.build-good
   INPUT_MUTATING_WRAPPER="$TEST_TMP/manifest-mutating-compiler.sh"
-  if run_build_with_parent_mutation "$INPUT_MUTATING_WRAPPER" "$CASE/manifest-mutation-build.log" manifest "$CASE/elisapkg.json"; then
+  if run_build_with_parent_mutation "$INPUT_MUTATING_WRAPPER" "$TEST_TMP/manifest-mutation-build.log" manifest "$CASE/elisapkg.json"; then
     echo "build published an artifact after its manifest changed during compilation" >&2
     exit 1
   else
@@ -313,7 +313,7 @@ PY
   mv elisapkg.build-good elisapkg.json
   cp local-util/src/main.elisa local-util/src/main.build-good
   INPUT_MUTATING_WRAPPER="$TEST_TMP/dependency-mutating-compiler.sh"
-  if run_build_with_parent_mutation "$INPUT_MUTATING_WRAPPER" "$CASE/dependency-mutation-build.log" dependency "$CASE/local-util/src/main.elisa"; then
+  if run_build_with_parent_mutation "$INPUT_MUTATING_WRAPPER" "$TEST_TMP/dependency-mutation-build.log" dependency "$CASE/local-util/src/main.elisa"; then
     echo "build published an artifact after a locked local dependency changed during compilation" >&2
     exit 1
   else
