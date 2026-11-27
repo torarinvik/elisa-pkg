@@ -10,44 +10,32 @@ module BuildSnapshots:
         def create_dependencies[@r](packages: mutable darray[LocalBuildGraph::Package]& @r, order: darray[usize]&, container: darray[u8]&, roots: mutable darray[u8]&, total_bytes: mutable usize&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             for order_index in 0..<order.count |packages, order, container, roots, total_bytes|:
                 package_index: usize = order[order_index]
-                return false if package_index >= packages.count
                 snapshot_root: mutable darray[u8] = []
-                status: i64 = create_verified(container, packages[package_index].root, "dependency", packages[package_index].source_digest, packages[package_index].relative_entry, roots, total_bytes, &snapshot_root, &packages[package_index].snapshot_entry)
-                return false if status != 0
+                return false if package_index >= packages.count or create_verified(container, packages[package_index].root, "dependency", packages[package_index].source_digest, packages[package_index].relative_entry, roots, total_bytes, &snapshot_root, &packages[package_index].snapshot_entry) != 0
             true
 
         def remove_aggregate(path_name: cstr) -> bool can[Unsafe.PointerCast]:
             return true if path_name[0].u8() == 0
-            status: i64 = Platform::unlink_path(path_name)
-            status == 0 or status == -2
+            ProjectFiles::removed_or_missing(Platform::unlink_path(path_name))
 
         def remove_all(container_name: cstr, package_roots: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return true if container_name[0].u8() == 0
             cleanup_ok: mutable bool = true
-            cursor: mutable usize = 0.usize()
-            while cursor < package_roots.count |package_roots, cursor, cleanup_ok|:
-                end: mutable usize = cursor
-                while end < package_roots.count and package_roots[end] != 0 |package_roots, end|:
-                    end <- end + 1.usize()
+            while cursor < package_roots.count |package_roots, cursor: usize = 0.usize(), cleanup_ok|:
+                end: usize = while position < package_roots.count and package_roots[position] != 0 |position: usize = cursor| -> position:
+                    position <- position + 1.usize()
                 if end == cursor or end >= package_roots.count:
                     cleanup_ok <- false
                     break
-                path: mutable darray[u8] = []
-                for index in cursor..<end |package_roots, path|:
-                    path <- path.push(package_roots[index])
-                path <- path.push(0)
-                path_name: cstr = (&path[0]).cast[cstr] can Unsafe.PointerCast
-                region cleanup_status_scope:
+                # Clean and remove every snapshot even after an earlier failure.
+                cleanup_ok <-
+                    path: mutable darray[u8] = [package_roots[index] for index in cursor..<end]
+                    path <- path.push(0)
+                    path_name: cstr = (&path[0]).cast[cstr] can Unsafe.PointerCast
                     cleanup_status: i64 = Platform::cleanup_package_snapshot(path_name)
-                    cleanup_ok <- false if cleanup_status != 0
-                region remove_status_scope:
-                    remove_status: i64 = Platform::remove_directory(path_name)
-                    cleanup_ok <- false if remove_status != 0 and remove_status != -2
+                    ProjectFiles::removed_or_missing(Platform::remove_directory(path_name)) and cleanup_status == 0 and cleanup_ok
                 cursor <- end + 1.usize()
-            region container_status_scope:
-                container_status: i64 = Platform::remove_directory(container_name)
-                cleanup_ok <- false if container_status != 0 and container_status != -2
-            cleanup_ok
+            ProjectFiles::removed_or_missing(Platform::remove_directory(container_name)) and cleanup_ok
 
         # Once created, a snapshot is registered in package_roots even if
         # verification fails. The caller uses remove_all on every exit path.
@@ -60,57 +48,52 @@ module BuildSnapshots:
             return -22 if not ProjectFiles::valid_path_bytes(container) or not ProjectFiles::valid_path_bytes(source_root)
             return -75 if total_bytes > SourceFingerprint::maximum_snapshot_bytes
             return -84 if not Archive::is_safe_entry(relative_entry) or PackageSelection::publish_path_forbidden(relative_entry)
-            template: mutable darray[u8] = [container[item] for item in 0..<container.count]
-            if template.count == 0.usize() or template[template.count - 1.usize()] != 47:
-                template <- template.push(47)
             return -22 if not valid_label(label)
-            ByteText::append_text(&template, label)
-            ByteText::append_text(&template, "-XXXXXX")
-            template <- template.push(0)
-            region mkdtemp_status_scope:
-                mkdtemp_status: i64 = Platform::make_temporary_directory(&template)
-                return mkdtemp_status if mkdtemp_status != 0
-            snapshot_length: usize = Platform::c_string_length((&template[0]).cast[cstr] can Unsafe.PointerCast)
-            if snapshot_length == 0.usize() or snapshot_length >= 4096.usize():
-                region cleanup_status_scope:
-                    cleanup_status: i64 = Platform::remove_directory((&template[0]).cast[cstr] can Unsafe.PointerCast)
-                    return -5 if cleanup_status != 0
-                return -36
-            for index in 0..<snapshot_length |out_root, template|:
-                out_root.push(template[index])
-            for index in 0..<out_root.count |package_roots, out_root|:
-                package_roots.push(out_root[index])
-            package_roots.push(0)
-            source_c: mutable darray[u8] = []
-            source_c <- ProjectFiles::with_null_terminator(source_root)
-            source_name: cstr = (&source_c[0]).cast[cstr] can Unsafe.PointerCast
-            destination_name: cstr = (&template[0]).cast[cstr] can Unsafe.PointerCast
-            remaining_bytes: usize = SourceFingerprint::maximum_snapshot_bytes - total_bytes
-            copied_bytes: i64 = Platform::snapshot_package_tree(source_name, destination_name, remaining_bytes)
-            return copied_bytes if copied_bytes < 0
-            return -75 if copied_bytes.usize() > remaining_bytes
-            total_bytes <- total_bytes + copied_bytes.usize()
-            region copied_digest_scope:
+            # The bytes copied into a fresh `<container>/<label>-XXXXXX`
+            # directory, or a negative status.
+            copied_bytes: i64 =
+                template: mutable darray[u8] = [container[item] for item in 0..<container.count]
+                if template.count == 0.usize() or template[template.count - 1.usize()] != 47:
+                    template <- template.push(47)
+                ByteText::append_text(&template, label)
+                ByteText::append_text(&template, "-XXXXXX")
+                template <- template.push(0)
+                snapshot_length: usize =
+                    mkdtemp_status: i64 = Platform::make_temporary_directory(&template)
+                    if mkdtemp_status != 0:
+                        return mkdtemp_status
+                    else:
+                        Platform::c_string_length((&template[0]).cast[cstr] can Unsafe.PointerCast)
+                if snapshot_length == 0.usize() or snapshot_length >= 4096.usize():
+                    -5 if Platform::remove_directory(((&template[0]).cast[cstr] can Unsafe.PointerCast)) != 0 else -36
+                else:
+                    ByteText::append_range(out_root, template, 0.usize(), snapshot_length)
+                    ByteText::append_terminated(package_roots, out_root)
+                    source_c: darray[u8] = ProjectFiles::with_null_terminator(source_root)
+                    Platform::snapshot_package_tree(((&source_c[0]).cast[cstr] can Unsafe.PointerCast), ((&template[0]).cast[cstr] can Unsafe.PointerCast), SourceFingerprint::maximum_snapshot_bytes - total_bytes)
+            if copied_bytes < 0:
+                copied_bytes
+            elif copied_bytes.usize() > SourceFingerprint::maximum_snapshot_bytes - total_bytes:
+                -75
+            else:
+                total_bytes <- total_bytes + copied_bytes.usize()
                 copied_digest: mutable darray[u8] = []
-                return -86 if not SourceFingerprint::at(out_root, &copied_digest)
-                return -87 if not ByteText::equal(copied_digest, expected_digest)
-            entry_path: mutable darray[u8] = []
-            ProjectFiles::path_join_bytes_into(out_root, relative_entry, &entry_path)
-            entry_c: mutable darray[u8] = []
-            entry_c <- ProjectFiles::with_null_terminator(entry_path)
-            region entry_name_scope:
-                entry_name: cstr = (&entry_c[0]).cast[cstr] can Unsafe.PointerCast
-                return -88 if:
-                    Platform::package_file_size(entry_name) < 0
-                    not ProjectFiles::resolve_entry_beneath(out_root, entry_path, out_entry)
-            return 0
+                entry_path: mutable darray[u8] = []
+                if not SourceFingerprint::at(out_root, &copied_digest):
+                    -86
+                elif not ByteText::equal(copied_digest, expected_digest):
+                    -87
+                else:
+                    ProjectFiles::path_join_bytes_into(out_root, relative_entry, &entry_path)
+                    entry_c: darray[u8] = ProjectFiles::with_null_terminator(entry_path)
+                    -88 if Platform::package_file_size(((&entry_c[0]).cast[cstr] can Unsafe.PointerCast)) < 0 or not ProjectFiles::resolve_entry_beneath(out_root, entry_path, out_entry) else 0
 
     private:
         def valid_label(label: cstr) -> bool:
-            region length_scope:
-                length: usize = Platform::c_string_length(label)
-                return false if length == 0.usize() or length > 64.usize()
-                for index in 0..<length |label|:
+            length: usize = Platform::c_string_length(label)
+            if length == 0.usize() or length > 64.usize():
+                false
+            else:
+                for index in 0..<length |valid: bool = true| -> valid:
                     byte: u8 = label[index].u8()
-                    return false if (byte < 97 or byte > 122) and (byte < 48 or byte > 57) and byte != 45
-            true
+                    break false if (byte < 97 or byte > 122) and (byte < 48 or byte > 57) and byte != 45
