@@ -176,39 +176,30 @@ module Platform:
 
             if environment_variable("DEVELOPER_DIR") is configured_developer:
                 developer_length: usize = c_string_length(configured_developer.cast[cstr] can Unsafe.PointerCast)
-                return false if developer_length == 0.usize() or developer_length > 4096.usize()
-                developer: mutable darray[u8] = []
-                for index in 0..<developer_length |developer, configured_developer|:
-                    developer <- developer.push(configured_developer[index])
-                return false if not absolute_path(developer)
-                return true if resolve_macos_sdk_candidate(macos_sdk_candidate(developer, "Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"), out)
-                return resolve_macos_sdk_candidate(macos_sdk_candidate(developer, "SDKs/MacOSX.sdk"), out)
-
-            candidate: mutable darray[u8] = []
-            clt_sdk: cstr = "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
-            clt_sdk_length: usize = c_string_length(clt_sdk)
-            for index in 0..<clt_sdk_length |candidate, clt_sdk|:
-                candidate <- candidate.push(clt_sdk[index].u8())
-            return true if resolve_macos_sdk_candidate(candidate, out)
-
-            # Match the stage1 wrapper's headless-host policy: if Command Line
-            # Tools are installed, use them even when a launcher injected an
-            # unrelated Xcode SDKROOT into the environment.
-            if environment_variable("SDKROOT") is configured_sdk:
-                configured_length: usize = c_string_length(configured_sdk.cast[cstr] can Unsafe.PointerCast)
-                if configured_length > 0.usize():
-                    candidate <- candidate.resize(0)
-                    return false if configured_length > 4096.usize()
-                    for index in 0..<configured_length |candidate, configured_sdk|:
-                        candidate <- candidate.push(configured_sdk[index])
-                    return resolve_macos_sdk_candidate(candidate, out)
-
-            candidate <- candidate.resize(0)
-            xcode_sdk: cstr = "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
-            xcode_sdk_length: usize = c_string_length(xcode_sdk)
-            for index in 0..<xcode_sdk_length |candidate, xcode_sdk|:
-                candidate <- candidate.push(xcode_sdk[index].u8())
-            resolve_macos_sdk_candidate(candidate, out)
+                if developer_length == 0.usize() or developer_length > 4096.usize():
+                    false
+                else:
+                    developer: darray[u8] = [configured_developer[index] for index in 0..<developer_length]
+                    absolute_path(developer) and (resolve_macos_sdk_candidate(macos_sdk_candidate(developer, "Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"), out) or resolve_macos_sdk_candidate(macos_sdk_candidate(developer, "SDKs/MacOSX.sdk"), out))
+            elif resolve_macos_sdk_candidate(bytes_from_view("/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"), out):
+                true
+            else:
+                # Match the stage1 wrapper's headless-host policy: if Command Line
+                # Tools are installed, use them even when a launcher injected an
+                # unrelated Xcode SDKROOT into the environment.
+                configured_sdk: darray[u8] =
+                    if environment_variable("SDKROOT") is configured:
+                        configured_length: usize = c_string_length(configured.cast[cstr] can Unsafe.PointerCast)
+                        if configured_length > 4096.usize():
+                            return false
+                        else:
+                            [configured[index] for index in 0..<configured_length]
+                    else:
+                        []
+                if configured_sdk.count > 0.usize():
+                    resolve_macos_sdk_candidate(configured_sdk, out)
+                else:
+                    resolve_macos_sdk_candidate(bytes_from_view("/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"), out)
 
         # `developer`, a separating slash when it lacks one, then `suffix`.
         def macos_sdk_candidate(developer: darray[u8]&, suffix: cstr) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
@@ -221,38 +212,37 @@ module Platform:
 
         def resolve_macos_sdk_candidate(candidate: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out.resize(0)
-            return false if candidate.count == 0.usize() or candidate.count > 4096.usize() or not absolute_path(candidate)
-            for index in 0..<candidate.count |candidate|:
+            printable: bool = for index in 0..<candidate.count |valid: bool = true| -> valid:
                 byte: u8 = candidate[index]
-                return false if byte == 0 or byte < 32 or byte == 127
-            candidate_c: mutable darray[u8] = [candidate[index] for index in 0..<candidate.count]
-            candidate_c <- candidate_c.push(0)
-            resolved: mutable darray[u8] = []
-            resolved <- resolved.resize(4096)
-            candidate_name: cstr = (&candidate_c[0]).cast[cstr] can Unsafe.PointerCast
-            if resolve_real_path(candidate_name, &resolved) is canonical:
-                canonical_length: usize = c_string_length(canonical)
-                return false if canonical_length == 0.usize() or canonical_length >= 4096.usize() or is_directory(canonical) != 1
-                region canonical_bytes_scope:
-                    canonical_bytes: mutable darray[u8] = [canonical[index].u8() for index in 0..<canonical_length]
-                    return false if not supported_macos_sdk_path(canonical_bytes)
-                    bytes_append_array(out, canonical_bytes)
-                return true
-            false
+                break false if byte == 0 or byte < 32 or byte == 127
+            if candidate.count == 0.usize() or candidate.count > 4096.usize() or not absolute_path(candidate) or not printable:
+                false
+            else:
+                candidate_c: mutable darray[u8] = [candidate[index] for index in 0..<candidate.count]
+                candidate_c <- candidate_c.push(0)
+                resolved: mutable darray[u8] = []
+                resolved <- resolved.resize(4096)
+                if resolve_real_path(((&candidate_c[0]).cast[cstr] can Unsafe.PointerCast), &resolved) is canonical:
+                    canonical_length: usize = c_string_length(canonical)
+                    if canonical_length == 0.usize() or canonical_length >= 4096.usize() or is_directory(canonical) != 1:
+                        false
+                    else:
+                        canonical_bytes: darray[u8] = [canonical[index].u8() for index in 0..<canonical_length]
+                        if not supported_macos_sdk_path(canonical_bytes):
+                            false
+                        else:
+                            bytes_append_array(out, canonical_bytes)
+                            true
+                else:
+                    false
 
         def supported_macos_sdk_path(path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            region prefix_scope:
-                xcode_prefix: darray[u8] = bytes_from_view("/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/")
-                clt_prefix: darray[u8] = bytes_from_view("/Library/Developer/CommandLineTools/SDKs/")
-                return false if not bytes_starts_with(path, xcode_prefix) and not bytes_starts_with(path, clt_prefix)
-            region leaf_start_scope:
-                leaf_start: mutable usize = path.count
-                while leaf_start > 0.usize() and path[leaf_start - 1.usize()] != 47 |path, leaf_start|:
-                    leaf_start <- leaf_start - 1.usize()
-                return false if:
-                    path.count - leaf_start < 7.usize()
-                    path[leaf_start] != 77 or path[leaf_start + 1.usize()] != 97 or path[leaf_start + 2.usize()] != 99 or path[leaf_start + 3.usize()] != 79 or path[leaf_start + 4.usize()] != 83 or path[leaf_start + 5.usize()] != 88
-            true
+            xcode_prefix: darray[u8] = bytes_from_view("/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/")
+            command_line_tools_prefix: darray[u8] = bytes_from_view("/Library/Developer/CommandLineTools/SDKs/")
+            # The leaf must start with `MacOSX`.
+            leaf_start: usize = while position > 0.usize() and path[position - 1.usize()] != 47 |position: usize = path.count| -> position:
+                position <- position - 1.usize()
+            (bytes_starts_with(path, xcode_prefix) or bytes_starts_with(path, command_line_tools_prefix)) and path.count - leaf_start >= 7.usize() and path[leaf_start] == 77 and path[leaf_start + 1.usize()] == 97 and path[leaf_start + 2.usize()] == 99 and path[leaf_start + 3.usize()] == 79 and path[leaf_start + 4.usize()] == 83 and path[leaf_start + 5.usize()] == 88
 
         def absolute_path(path: darray[u8]&) -> bool:
             path.count > 0.usize() and path[0] == 47
