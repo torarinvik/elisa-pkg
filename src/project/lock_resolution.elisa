@@ -20,23 +20,23 @@ module LockResolution:
         def replay_registry(name: darray[u8]&, version: darray[u8]&, raw: darray[u8]&, root: darray[u8]&, preferred_lock: darray[u8]&) -> darray[u8] can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             can Global.Read:
                 registry_roots: mutable darray[Solver::Constraint] = []
-                has_local_dependency: mutable bool = false
-                return [] if not RegistryRoots::collect(raw, &registry_roots, &has_local_dependency) or has_local_dependency or registry_roots.count == 0.usize()
+                region has_local_dependency_scope:
+                    has_local_dependency: mutable bool = false
+                    return [] if not RegistryRoots::collect(raw, &registry_roots, &has_local_dependency) or has_local_dependency or registry_roots.count == 0.usize()
                 empty_unlock: mutable darray[u8] = []
                 return canonical_registry_lock(name, version, raw, root, registry_roots, preferred_lock, empty_unlock, false)
 
         def canonical_with_options(name: darray[u8]&, version: darray[u8]&, raw: darray[u8]&, root: darray[u8]&, options: Model::CommandOptions, preferred_lock: darray[u8]&) -> darray[u8] can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
                 registry_roots: mutable darray[Solver::Constraint] = []
-                has_local_dependency: mutable bool = false
-                return [] if not RegistryRoots::collect(raw, &registry_roots, &has_local_dependency)
-                if registry_roots.count > 0.usize():
-                    return [] if has_local_dependency
-                    unlock: mutable darray[u8] = []
-                    if Platform::c_string_length(options.update_name) > 0.usize():
-                        ByteText::append_bounded_text(&unlock, options.update_name)
-                    return canonical_registry_lock(name, version, raw, root, registry_roots, preferred_lock, unlock, true)
-                return LocalLock::canonical(name, version, raw, root)
+                region has_local_dependency_scope:
+                    has_local_dependency: mutable bool = false
+                    return [] if not RegistryRoots::collect(raw, &registry_roots, &has_local_dependency) or (registry_roots.count > 0.usize() and has_local_dependency)
+                return LocalLock::canonical(name, version, raw, root) if registry_roots.count == 0.usize()
+                unlock: mutable darray[u8] = []
+                if Platform::c_string_length(options.update_name) > 0.usize():
+                    ByteText::append_bounded_text(&unlock, options.update_name)
+                return canonical_registry_lock(name, version, raw, root, registry_roots, preferred_lock, unlock, true)
 
     private:
         def provider_failure(code: Registry::ResultCode, report_failure: bool) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
@@ -58,9 +58,9 @@ module LockResolution:
         def registry_queue_field_at(queue: darray[u8]&, record: usize, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
             cursor: mutable usize = 0
             current: mutable usize = 0
-            while cursor < queue.count |queue, cursor, current, out|:
-                finish: mutable usize = cursor
-                while finish < queue.count and queue[finish] != 0 |queue, finish|:
+            while true |queue, cursor, current, out|:
+                return false if cursor >= queue.count
+                finish: usize = while finish < queue.count and queue[finish] != 0 |finish: usize = cursor| -> finish:
                     finish <- finish + 1
                 if current == record:
                     out.resize(0)
@@ -68,7 +68,6 @@ module LockResolution:
                     return true
                 cursor <- finish + 1
                 current <- current + 1
-            return false
 
         def registry_candidate_matches(candidates: darray[Solver::Candidate]&, package: darray[u8]&, version: Model::Version) -> bool:
             for index in 0..<candidates.count |candidates, package, version|:
