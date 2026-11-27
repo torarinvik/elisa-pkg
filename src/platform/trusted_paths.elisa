@@ -26,9 +26,11 @@ module NativeTrustedPaths:
             directory: i64 =
                 parent: mutable darray[u8] = []
                 -22 if not PlatformNative::split_parent_leaf(path, &parent, &leaf) else open_trusted_directory(((&parent[0]).cast[cstr] can Unsafe.PointerCast), native_geteuid().u64())
-            return directory if directory < 0
-            file_descriptor: i64 = PlatformNative::open_regular_file_at(directory, ((&leaf[0]).cast[cstr] can Unsafe.PointerCast))
-            PlatformNative::close_error(directory, file_descriptor) if file_descriptor < 0 else read_identified_descriptor(directory, file_descriptor, output, capacity, out_device, out_inode)
+            if directory < 0:
+                directory
+            else:
+                file_descriptor: i64 = PlatformNative::open_regular_file_at(directory, ((&leaf[0]).cast[cstr] can Unsafe.PointerCast))
+                PlatformNative::close_error(directory, file_descriptor) if file_descriptor < 0 else read_identified_descriptor(directory, file_descriptor, output, capacity, out_device, out_inode)
 
         def is_trusted_directory(path: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             1 if trusted_directory_status(path) == 0 else 0
@@ -53,11 +55,31 @@ module NativeTrustedPaths:
                 directory: i64 =
                     parent: mutable darray[u8] = []
                     -22 if not PlatformNative::split_parent_leaf(path, &parent, &leaf) else open_executable_directory_path(((&parent[0]).cast[cstr] can Unsafe.PointerCast))
-                return directory if directory < 0
-                return executable_leaf_status(directory, leaf)
+                directory if directory < 0 else executable_leaf_status(directory, leaf)
+            else:
+                file_descriptor: i64 = PlatformNative::open_package_file(path)
+                file_descriptor if file_descriptor < 0 else PlatformNative::close_error(file_descriptor, -21) if not PlatformNative::regular_file_descriptor(file_descriptor) else PlatformNative::close_result(file_descriptor, 0)
 
-            file_descriptor: i64 = PlatformNative::open_package_file(path)
-            file_descriptor if file_descriptor < 0 else PlatformNative::close_error(file_descriptor, -21) if not PlatformNative::regular_file_descriptor(file_descriptor) else PlatformNative::close_result(file_descriptor, 0)
+        def trusted_regular_file_descriptor(file_descriptor: i64, expected_user_identifier: u64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            trusted_file_descriptor(file_descriptor, expected_user_identifier, NativeStat::regular_mode) and NativeTrustedAcl::trusted_acl_file_descriptor(file_descriptor, false)
+
+        def trusted_directory_file_descriptor(file_descriptor: i64, expected_user_identifier: u64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            trusted_file_descriptor(file_descriptor, expected_user_identifier, NativeStat::directory_mode) and NativeTrustedAcl::trusted_acl_file_descriptor(file_descriptor, true)
+
+        def private_staging_directory_file_descriptor(file_descriptor: i64, expected_user_identifier: u64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            stat: mutable darray[u8] = []
+            stat <- stat.resize(status_buffer_bytes)
+            if native_fstat(file_descriptor, ((&stat[0]).cast[mutable void&] can Unsafe.PointerCast)) != 0:
+                false
+            else:
+                mode: u64 = NativeStat::mode(stat)
+                owner: u64 = NativeStat::owner(stat)
+                # mkdtemp creates staging roots as euid-owned 0700 directories.
+                # Reject special bits and every group/other permission as well.
+                (mode & NativeStat::file_type_mask) == NativeStat::directory_mode and owner == expected_user_identifier and (mode & 4095.u64()) == 448.u64() and NativeTrustedAcl::trusted_acl_file_descriptor(file_descriptor, true)
+
+        def open_trusted_directory(path: cstr, expected_user_identifier: u64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            walk_trusted_directory(path, expected_user_identifier, false, false)
 
     private:
         # Read a trusted regular file through its open descriptor, close both
@@ -69,44 +91,49 @@ module NativeTrustedPaths:
             stat <- stat.resize(status_buffer_bytes)
             return PlatformNative::close_two_error(directory, file_descriptor, NativeErrors::negative_errno()) if native_fstat(file_descriptor, ((&stat[0]).cast[mutable void&] can Unsafe.PointerCast)) != 0
             result: i64 = PlatformNative::close_two_result(directory, file_descriptor, PlatformNative::read_regular_descriptor(file_descriptor, output, capacity))
-            return result if result < 0
-            out_device <- NativeStat::device(stat)
-            out_inode <- NativeStat::inode(stat)
-            result
+            if result < 0:
+                result
+            else:
+                out_device <- NativeStat::device(stat)
+                out_inode <- NativeStat::inode(stat)
+                result
 
         def trusted_file_descriptor(file_descriptor: i64, expected_user_identifier: u64, expected_kind: u64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             stat: mutable darray[u8] = []
             stat <- stat.resize(status_buffer_bytes)
-            return false if native_fstat(file_descriptor, ((&stat[0]).cast[mutable void&] can Unsafe.PointerCast)) != 0
-            region mode_scope:
+            if native_fstat(file_descriptor, ((&stat[0]).cast[mutable void&] can Unsafe.PointerCast)) != 0:
+                false
+            else:
                 mode: u64 = NativeStat::mode(stat)
                 owner: u64 = NativeStat::owner(stat)
-                return (mode & NativeStat::file_type_mask) == expected_kind and (owner == 0.u64() or owner == expected_user_identifier) and (mode & NativeStat::group_or_other_write_mask) == 0.u64()
+                (mode & NativeStat::file_type_mask) == expected_kind and (owner == 0.u64() or owner == expected_user_identifier) and (mode & NativeStat::group_or_other_write_mask) == 0.u64()
 
         def trusted_crypto_executable_path(path: cstr, expected_user_identifier: u64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             leaf: mutable darray[u8] = []
             directory: i64 =
                 parent: mutable darray[u8] = []
                 -22 if not PlatformNative::split_parent_leaf(path, &parent, &leaf) else open_crypto_trusted_directory(((&parent[0]).cast[cstr] can Unsafe.PointerCast), expected_user_identifier)
-            return false if directory < 0
-            region file_descriptor_scope:
+            if directory < 0:
+                false
+            else:
                 file_descriptor: i64 = PlatformNative::open_regular_file_at(directory, ((&leaf[0]).cast[cstr] can Unsafe.PointerCast))
                 if file_descriptor < 0:
                     _ = native_close(directory)
-                    return false
-                trusted: bool = trusted_regular_file_descriptor(file_descriptor, expected_user_identifier) and effective_execute_at(directory, ((&leaf[0]).cast[cstr] can Unsafe.PointerCast), file_descriptor) == 0
-                return PlatformNative::close_both(file_descriptor, directory) and trusted
+                    false
+                else:
+                    trusted: bool = trusted_regular_file_descriptor(file_descriptor, expected_user_identifier) and effective_execute_at(directory, ((&leaf[0]).cast[cstr] can Unsafe.PointerCast), file_descriptor) == 0
+                    PlatformNative::close_both(file_descriptor, directory) and trusted
 
         # The regular file `leaf` in the open executable `directory` is
         # executable for the effective user. Closes `directory`.
         def executable_leaf_status(directory: i64, leaf: darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             requires directory >= 0
             file_descriptor: i64 = PlatformNative::open_regular_file_at(directory, ((&leaf[0]).cast[cstr] can Unsafe.PointerCast))
-            return PlatformNative::close_error(directory, file_descriptor) if file_descriptor < 0
-            region access_status_scope:
+            if file_descriptor < 0:
+                PlatformNative::close_error(directory, file_descriptor)
+            else:
                 access_status: i64 = effective_execute_at(directory, ((&leaf[0]).cast[cstr] can Unsafe.PointerCast), file_descriptor)
-                return PlatformNative::close_two_error(directory, file_descriptor, access_status) if access_status != 0
-            PlatformNative::close_two_result(directory, file_descriptor, 0)
+                PlatformNative::close_two_error(directory, file_descriptor, access_status) if access_status != 0 else PlatformNative::close_two_result(directory, file_descriptor, 0)
 
         # libc applies effective-credential and ACL rules that cannot be
         # reproduced by inspecting mode bits. The parent descriptor is held
@@ -115,78 +142,48 @@ module NativeTrustedPaths:
         def effective_execute_at(directory: i64, leaf_name: cstr, file_descriptor: i64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             file_descriptor_status: mutable darray[u8] = []
             file_descriptor_status <- file_descriptor_status.resize(status_buffer_bytes)
-            region file_descriptor_status_raw_scope:
-                file_descriptor_status_raw: mutable void& = (&file_descriptor_status[0]).cast[mutable void&] can Unsafe.PointerCast
-                if native_fstat(file_descriptor, file_descriptor_status_raw) != 0:
-                    return NativeErrors::negative_errno()
-            return -21 if (NativeStat::file_type(file_descriptor_status)) != NativeStat::regular_mode
-            region access_status_scope:
-                access_status: i32 = native_faccessat(directory.i32(), leaf_name, 1, access_effective_identifiers + access_no_follow)
-                return NativeErrors::negative_errno() if access_status != 0
             path_status: mutable darray[u8] = []
             path_status <- path_status.resize(status_buffer_bytes)
-            region path_status_raw_scope:
-                path_status_raw: mutable void& = (&path_status[0]).cast[mutable void&] can Unsafe.PointerCast
-                if native_fstatat(directory, leaf_name, path_status_raw, at_no_follow) != 0:
-                    return NativeErrors::negative_errno()
-            -21 if (NativeStat::file_type(path_status)) != NativeStat::regular_mode else -13 if not NativeStat::same_identity(path_status, file_descriptor_status) else 0
+            if native_fstat(file_descriptor, ((&file_descriptor_status[0]).cast[mutable void&] can Unsafe.PointerCast)) != 0:
+                NativeErrors::negative_errno()
+            elif NativeStat::file_type(file_descriptor_status) != NativeStat::regular_mode:
+                -21
+            elif native_faccessat(directory.i32(), leaf_name, 1, access_effective_identifiers + access_no_follow) != 0:
+                NativeErrors::negative_errno()
+            elif native_fstatat(directory, leaf_name, ((&path_status[0]).cast[mutable void&] can Unsafe.PointerCast), at_no_follow) != 0:
+                NativeErrors::negative_errno()
+            elif NativeStat::file_type(path_status) != NativeStat::regular_mode:
+                -21
+            elif not NativeStat::same_identity(path_status, file_descriptor_status):
+                -13
+            else:
+                0
 
-    public:
-        def trusted_regular_file_descriptor(file_descriptor: i64, expected_user_identifier: u64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            trusted_file_descriptor(file_descriptor, expected_user_identifier, NativeStat::regular_mode) and NativeTrustedAcl::trusted_acl_file_descriptor(file_descriptor, false)
-
-    public:
-        def trusted_directory_file_descriptor(file_descriptor: i64, expected_user_identifier: u64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            trusted_file_descriptor(file_descriptor, expected_user_identifier, NativeStat::directory_mode) and NativeTrustedAcl::trusted_acl_file_descriptor(file_descriptor, true)
-
-    public:
-        def private_staging_directory_file_descriptor(file_descriptor: i64, expected_user_identifier: u64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            stat: mutable darray[u8] = []
-            stat <- stat.resize(status_buffer_bytes)
-            region raw_scope:
-                raw: mutable void& = (&stat[0]).cast[mutable void&] can Unsafe.PointerCast
-                return false if native_fstat(file_descriptor, raw) != 0
-            mode: u64 = NativeStat::mode(stat)
-            region owner_scope:
-                owner: u64 = NativeStat::owner(stat)
-                # mkdtemp creates staging roots as euid-owned 0700 directories.
-                # Reject special bits and every group/other permission as well.
-                return false if (mode & NativeStat::file_type_mask) != NativeStat::directory_mode or owner != expected_user_identifier or (mode & 4095.u64()) != 448.u64()
-            NativeTrustedAcl::trusted_acl_file_descriptor(file_descriptor, true)
-
-    private:
-    public:
-        def open_trusted_directory(path: cstr, expected_user_identifier: u64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            walk_trusted_directory(path, expected_user_identifier, false, false)
-
-    private:
         def walk_trusted_directory(path: cstr, expected_user_identifier: u64, create_missing: bool, crypto_policy: bool) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            length: usize = native_strlen(path)
-            return -22 if length == 0 or length > 4096 or path[0].u8() != 47
-            path_copy: mutable darray[u8] = [path[index].u8() for index in 0..<length]
-            path_copy <- path_copy.push(0)
-            effective_length: mutable usize = length
-            while effective_length > 1.usize() and path_copy[effective_length - 1.usize()] == 47:
-                effective_length <- effective_length - 1.usize()
-            directory: mutable i64 = native_open("/", PlatformNative::flags_directory())
-            return -NativeErrors::error_code() if directory < 0
-            if not directory_trusted_by_policy(directory, expected_user_identifier, crypto_policy):
-                return PlatformNative::close_error(directory, -13)
-            while start < effective_length |start: usize = 1.usize()|:
-                finish: mutable usize = start
-                while finish < effective_length and path_copy[finish] != 47 |path_copy, finish|:
-                    finish <- finish + 1.usize()
-                return PlatformNative::close_error(directory, -22) if finish == start
-                part_storage: mutable darray[u8] = []
-                for index in start..<finish |part_storage, path_copy|:
-                    part_storage <- part_storage.push(path_copy[index])
-                part_storage <- part_storage.push(0)
-                directory <- open_trusted_child(directory, ((&part_storage[0]).cast[cstr] can Unsafe.PointerCast), expected_user_identifier, create_missing, crypto_policy)
-                return directory if directory < 0
-                break if finish == effective_length
-                start <- finish + 1.usize()
-                return PlatformNative::close_error(directory, -22) if start == effective_length or path_copy[start] == 47
-            directory
+            path_copy: darray[u8] = [path[index].u8() for index in 0..<native_strlen(path)]
+            return -22 if path_copy.count == 0 or path_copy.count > 4096 or path_copy[0] != 47
+            # The path without trailing slashes, keeping the root slash.
+            effective_length: usize = while trimmed > 1.usize() and path_copy[trimmed - 1.usize()] == 47 |trimmed: usize = path_copy.count| -> trimmed:
+                trimmed <- trimmed - 1.usize()
+            directory: i64 = native_open("/", PlatformNative::flags_directory())
+            if directory < 0:
+                -NativeErrors::error_code()
+            elif not directory_trusted_by_policy(directory, expected_user_identifier, crypto_policy):
+                PlatformNative::close_error(directory, -13)
+            else:
+                # Each pass replaces `current` with its trusted child component.
+                while start < effective_length |current: i64 = directory, start: usize = 1.usize(), finish: usize = 0.usize()| -> current:
+                    finish <- while position < effective_length and path_copy[position] != 47 |position: usize = start| -> position:
+                        position <- position + 1.usize()
+                    return PlatformNative::close_error(current, -22) if finish == start
+                    current <-
+                        part_storage: mutable darray[u8] = [path_copy[index] for index in start..<finish]
+                        part_storage <- part_storage.push(0)
+                        open_trusted_child(current, ((&part_storage[0]).cast[cstr] can Unsafe.PointerCast), expected_user_identifier, create_missing, crypto_policy)
+                    return current if current < 0
+                    break current if finish == effective_length
+                    start <- finish + 1.usize()
+                    return PlatformNative::close_error(current, -22) if start == effective_length or path_copy[start] == 47
 
         # Open the trusted child directory `part` of `directory`, creating it
         # when `create_missing`. On success `directory` is closed and the child
@@ -194,18 +191,22 @@ module NativeTrustedPaths:
         def open_trusted_child(directory: i64, part: cstr, expected_user_identifier: u64, create_missing: bool, crypto_policy: bool) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             requires directory >= 0
             return PlatformNative::close_error(directory, -22) if PlatformNative::c_string_equal(part, ".") or PlatformNative::c_string_equal(part, "..")
-            next: mutable i64 = native_openat(directory, part, PlatformNative::flags_directory() + flag_no_follow)
-            region needs_parent_sync_scope:
-                needs_parent_sync: bool = next < 0 and create_missing and NativeErrors::current_errno() == 2
-                if needs_parent_sync:
-                    return PlatformNative::close_error(directory, NativeErrors::negative_errno()) if native_mkdirat(directory, part, 493) != 0 and NativeErrors::current_errno() != 17
-                    next <- native_openat(directory, part, PlatformNative::flags_directory() + flag_no_follow)
-                return PlatformNative::close_error(directory, NativeErrors::negative_errno()) if next < 0
-                return PlatformNative::close_two_error(directory, next, -13) if not directory_trusted_by_policy(next, expected_user_identifier, crypto_policy)
-                # An EEXIST result may come from another installer that created
-                # the directory but has not synced the parent yet.
-                return PlatformNative::close_two_error(directory, next, NativeErrors::negative_errno()) if needs_parent_sync and native_fsync(directory) != 0
-            PlatformNative::close_error(next, -5) if native_close(directory) != 0 else next
+            first_open: i64 = native_openat(directory, part, PlatformNative::flags_directory() + flag_no_follow)
+            needs_parent_sync: bool = first_open < 0 and create_missing and NativeErrors::current_errno() == 2
+            if needs_parent_sync and native_mkdirat(directory, part, 493) != 0 and NativeErrors::current_errno() != 17:
+                PlatformNative::close_error(directory, NativeErrors::negative_errno())
+            else:
+                next: i64 = native_openat(directory, part, PlatformNative::flags_directory() + flag_no_follow) if needs_parent_sync else first_open
+                if next < 0:
+                    PlatformNative::close_error(directory, NativeErrors::negative_errno())
+                elif not directory_trusted_by_policy(next, expected_user_identifier, crypto_policy):
+                    PlatformNative::close_two_error(directory, next, -13)
+                elif needs_parent_sync and native_fsync(directory) != 0:
+                    # An EEXIST result may come from another installer that created
+                    # the directory but has not synced the parent yet.
+                    PlatformNative::close_two_error(directory, next, NativeErrors::negative_errno())
+                else:
+                    PlatformNative::close_error(next, -5) if native_close(directory) != 0 else next
 
         # Crypto providers may live below a Homebrew prefix whose euid-owned
         # Cellar directories are group-writable (for example 0775). Permit
@@ -216,29 +217,31 @@ module NativeTrustedPaths:
         def crypto_trusted_directory_file_descriptor(file_descriptor: i64, expected_user_identifier: u64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             stat: mutable darray[u8] = []
             stat <- stat.resize(status_buffer_bytes)
-            return false if native_fstat(file_descriptor, ((&stat[0]).cast[mutable void&] can Unsafe.PointerCast)) != 0
-            region owner_scope:
-                mode: u64 = NativeStat::mode(stat)
-                owner: u64 = NativeStat::owner(stat)
-                return false if (mode & NativeStat::file_type_mask) != NativeStat::directory_mode
-                if owner == 0.u64():
-                    return false if (mode & NativeStat::group_or_other_write_mask) != 0.u64()
-                else:
-                    return false if:
-                        expected_user_identifier == 0.u64() or owner != expected_user_identifier
-                        (mode & 2.u64()) != 0.u64()
-                    if (mode & 16.u64()) != 0.u64():
+            if native_fstat(file_descriptor, ((&stat[0]).cast[mutable void&] can Unsafe.PointerCast)) != 0:
+                false
+            else:
+                trusted_ownership: bool =
+                    mode: u64 = NativeStat::mode(stat)
+                    owner: u64 = NativeStat::owner(stat)
+                    if (mode & NativeStat::file_type_mask) != NativeStat::directory_mode:
+                        false
+                    elif owner == 0.u64():
+                        (mode & NativeStat::group_or_other_write_mask) == 0.u64()
+                    elif expected_user_identifier == 0.u64() or owner != expected_user_identifier or (mode & 2.u64()) != 0.u64():
+                        false
+                    elif (mode & 16.u64()) != 0.u64():
                         # Homebrew's default Apple Silicon Cellar may be group-
                         # writable by macOS administrators. Accept that boundary
                         # only for the well-known `admin` group; members can
                         # already obtain root, while ordinary local accounts
                         # cannot replace the provider through this directory.
-                        static if ELISA_TARGET_OS_MACOS:
-                            return false if NativeStat::group(stat) != macos_admin_group_identifier()
-                        static else:
-                            return false
-            NativeTrustedAcl::trusted_acl_file_descriptor(file_descriptor, true)
+                        # Other systems have no admin group identifier to match.
+                        NativeStat::group(stat) == macos_admin_group_identifier()
+                    else:
+                        true
+                trusted_ownership and NativeTrustedAcl::trusted_acl_file_descriptor(file_descriptor, true)
 
+        # The `admin` group identifier on macOS; elsewhere a value no group has.
         def macos_admin_group_identifier() -> u64:
             static if ELISA_TARGET_OS_MACOS:
                 group_name: cstr = "admin"
@@ -260,27 +263,23 @@ module NativeTrustedPaths:
         def open_executable_directory_component(directory: i64, component: cstr, expected_user_identifier: u64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             before: mutable darray[u8] = []
             before <- before.resize(status_buffer_bytes)
-            region before_raw_scope:
-                before_raw: mutable void& = (&before[0]).cast[mutable void&] can Unsafe.PointerCast
-                if native_fstatat(directory, component, before_raw, at_no_follow) != 0:
-                    return NativeErrors::negative_errno()
-            region before_mode_scope:
-                before_mode: u64 = NativeStat::file_type(before)
-                if before_mode != NativeStat::directory_mode:
-                    return -symlink_error if before_mode == NativeStat::symlink_mode
-                    return -20
-            next: i64 = native_openat(directory, component, PlatformNative::flags_directory() + flag_no_follow)
-            return NativeErrors::negative_errno() if next < 0
-            after: mutable darray[u8] = []
-            after <- after.resize(status_buffer_bytes)
-            region after_raw_scope:
-                after_raw: mutable void& = (&after[0]).cast[mutable void&] can Unsafe.PointerCast
-                if native_fstat(next, after_raw) != 0:
+            if native_fstatat(directory, component, ((&before[0]).cast[mutable void&] can Unsafe.PointerCast), at_no_follow) != 0:
+                NativeErrors::negative_errno()
+            elif NativeStat::file_type(before) != NativeStat::directory_mode:
+                -symlink_error if NativeStat::file_type(before) == NativeStat::symlink_mode else -20
+            else:
+                next: i64 = native_openat(directory, component, PlatformNative::flags_directory() + flag_no_follow)
+                after: mutable darray[u8] = []
+                after <- after.resize(status_buffer_bytes)
+                if next < 0:
+                    NativeErrors::negative_errno()
+                elif native_fstat(next, ((&after[0]).cast[mutable void&] can Unsafe.PointerCast)) != 0:
                     errno_value: i64 = NativeErrors::negative_errno()
-                    return PlatformNative::close_error(next, errno_value)
-            if (NativeStat::file_type(after)) != NativeStat::directory_mode or not NativeStat::same_identity(before, after) or not executable_source_directory_file_descriptor(next, expected_user_identifier):
-                return PlatformNative::close_error(next, -13)
-            next
+                    PlatformNative::close_error(next, errno_value)
+                elif (NativeStat::file_type(after)) != NativeStat::directory_mode or not NativeStat::same_identity(before, after) or not executable_source_directory_file_descriptor(next, expected_user_identifier):
+                    PlatformNative::close_error(next, -13)
+                else:
+                    next
 
         def open_executable_directory_path(path: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             length: usize = native_strlen(path)
@@ -288,26 +287,26 @@ module NativeTrustedPaths:
             path_copy: mutable darray[u8] = [path[index].u8() for index in 0..<length]
             path_copy <- path_copy.push(0)
             expected_user_identifier: u64 = native_geteuid().u64()
-            directory: mutable i64 = native_open("/" if path_copy[0] == 47 else ".", PlatformNative::flags_directory())
-            return -NativeErrors::error_code() if directory < 0
-            return PlatformNative::close_error(directory, -13) if not executable_source_directory_file_descriptor(directory, expected_user_identifier)
-            start: mutable usize = 0.usize()
-            while start < length and path_copy[start] == 47 |path_copy, start|:
-                start <- start + 1.usize()
-            # Each pass opens one component; the walk ends after the last one.
-            while true:
-                return directory if start >= length
-                finish: mutable usize = start
-                while finish < length and path_copy[finish] != 47 |path_copy, start, finish|:
-                    finish <- finish + 1.usize()
-                path_copy[finish] <- 0
-                region component_scope:
-                    component: cstr = (&path_copy[start]).cast[cstr] can Unsafe.PointerCast
-                    if not PlatformNative::c_string_equal(component, "."):
-                        next: i64 = open_executable_directory_component(directory, component, expected_user_identifier)
-                        return PlatformNative::close_error(directory, next) if next < 0
-                        return PlatformNative::close_error(next, -5) if native_close(directory) != 0
-                        directory <- next
-                start <- finish + 1.usize()
-                while start < length and path_copy[start] == 47 |path_copy, start|:
-                    start <- start + 1.usize()
+            directory: i64 = native_open("/" if path_copy[0] == 47 else ".", PlatformNative::flags_directory())
+            if directory < 0:
+                -NativeErrors::error_code()
+            elif not executable_source_directory_file_descriptor(directory, expected_user_identifier):
+                PlatformNative::close_error(directory, -13)
+            else:
+                first_component: usize = while position < length and path_copy[position] == 47 |position: usize = 0.usize()| -> position:
+                    position <- position + 1.usize()
+                # Each pass opens one component; the walk ends after the last one.
+                while true |path_copy, current: i64 = directory, start: usize = first_component, finish: usize = 0.usize()| -> current:
+                    break current if start >= length
+                    finish <- while position < length and path_copy[position] != 47 |position: usize = start| -> position:
+                        position <- position + 1.usize()
+                    path_copy[finish] <- 0
+                    # The component now ends at `finish`; skip to the next one.
+                    component_start: usize = start
+                    start <- while position < length and path_copy[position] == 47 |position: usize = finish + 1.usize()| -> position:
+                        position <- position + 1.usize()
+                    if not PlatformNative::c_string_equal(((&path_copy[component_start]).cast[cstr] can Unsafe.PointerCast), "."):
+                        next: i64 = open_executable_directory_component(current, ((&path_copy[component_start]).cast[cstr] can Unsafe.PointerCast), expected_user_identifier)
+                        return PlatformNative::close_error(current, next) if next < 0
+                        return PlatformNative::close_error(next, -5) if native_close(current) != 0
+                        current <- next
