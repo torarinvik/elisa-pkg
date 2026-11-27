@@ -24,63 +24,69 @@ module FetchCommand:
             can Global{Read,Write}:
                 package: mutable darray[u8] = []
                 requirement: mutable darray[u8] = []
-                region positional_count_scope:
-                    positional_count: i64 = read_arguments(argument_count, slots, &package, &requirement)
-                    return CliStatus::usage if positional_count < 0
-                    return fetch_named(package, requirement, positional_count, options) if positional_count > 0
-                fetch_project(start, options)
+                positional_count: i64 = read_arguments(argument_count, slots, &package, &requirement)
+                if positional_count < 0:
+                    CliStatus::usage
+                elif positional_count > 0:
+                    fetch_named(package, requirement, positional_count, options)
+                else:
+                    fetch_project(start, options)
 
     private:
         # Read `fetch [PACKAGE REQUIREMENT]` and return the number of
         # positional arguments, or -1 after reporting a usage error.
         def read_arguments(argument_count: i64, slots: cstr&&, package: mutable darray[u8]&, requirement: mutable darray[u8]&) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
-                return while index < argument_count |index: i64 = 2, positional_count: i64 = 0| -> positional_count:
-                    region argument_scope:
-                        argument: cstr = slots[index].cast[cstr]
-                        if Platform::c_string_equal(argument, "--"):
-                            return -1 if index + 1 < argument_count
-                            break
-                        if Platform::c_string_length(argument) == 0.usize():
-                            CliOutput::write_error("error: fetch does not accept empty arguments\n")
-                            return -1
-                        if argument[0].u8() == 45:
-                            CliOutput::write_error("error: fetch does not accept command-specific options\n")
-                            return -1
+                while index < argument_count |index: i64 = 2, positional_count: i64 = 0| -> positional_count:
+                    argument: cstr = slots[index].cast[cstr]
+                    if Platform::c_string_equal(argument, "--"):
+                        return -1 if index + 1 < argument_count
+                        break
+                    elif Platform::c_string_length(argument) == 0.usize():
+                        CliOutput::write_error("error: fetch does not accept empty arguments\n")
+                        return -1
+                    elif argument[0].u8() == 45:
+                        CliOutput::write_error("error: fetch does not accept command-specific options\n")
+                        return -1
+                    elif positional_count >= 2:
+                        CliOutput::write_error("error: fetch accepts at most PACKAGE REQUIREMENT\n")
+                        return -1
+                    else:
                         if positional_count == 0:
                             ByteText::append_bounded_text(package, argument)
-                        elif positional_count == 1:
-                            ByteText::append_bounded_text(requirement, argument)
                         else:
-                            CliOutput::write_error("error: fetch accepts at most PACKAGE REQUIREMENT\n")
-                            return -1
-                    positional_count <- positional_count + 1
-                    index <- index + 1
+                            ByteText::append_bounded_text(requirement, argument)
+                        positional_count <- positional_count + 1
+                        index <- index + 1
 
         # `fetch PACKAGE VERSION` verifies and caches one exact release.
         def fetch_named(package: darray[u8]&, requirement: darray[u8]&, positional_count: i64, options: Model::CommandOptions) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
-                return CliStatus::usage if positional_count != 2
-                if not PackageIdentity::valid_name(package):
-                    CliOutput::write_error("error: fetch requires a valid package name\n")
-                    return CliStatus::usage
-                region exact_version_scope:
-                    exact_version: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-                    if not SemVer::parse(requirement, &exact_version) or exact_version.prerelease:
-                        CliOutput::write_error("error: named fetch requires an exact stable version such as 1.2.3\n")
-                        return CliStatus::usage
-                if options.offline or options.frozen:
-                    CliOutput::write_error("error: offline fetch requires an existing lockfile; package-specific registry fetch is unavailable\n")
-                    return CliStatus::resolution_failed
-                if options.locked:
-                    CliOutput::write_error("error: fetch --locked takes its package selections from elisapkg.lock; omit PACKAGE VERSION\n")
-                    return CliStatus::resolution_failed
+                exact_version: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
                 resolved: mutable FetchRelease::ResolvedRelease = FetchRelease::empty_resolved()
-                region resolve_status_scope:
-                    resolve_status: i64 = FetchRelease::resolve(package, requirement, "", CliStatus::resolution_failed, &resolved)
-                    return resolve_status if resolve_status != CliStatus::success
                 metadata_digest: mutable darray[u8] = []
-                CliStatus::security_failed if not metadata_digest_hex(resolved.metadata, &metadata_digest) else FetchRelease::verify_and_cache(package, resolved.selected, resolved, metadata_digest, false)
+                if positional_count != 2:
+                    CliStatus::usage
+                elif not PackageIdentity::valid_name(package):
+                    CliOutput::write_error("error: fetch requires a valid package name\n")
+                    CliStatus::usage
+                elif not SemVer::parse(requirement, &exact_version) or exact_version.prerelease:
+                    CliOutput::write_error("error: named fetch requires an exact stable version such as 1.2.3\n")
+                    CliStatus::usage
+                elif options.offline or options.frozen:
+                    CliOutput::write_error("error: offline fetch requires an existing lockfile; package-specific registry fetch is unavailable\n")
+                    CliStatus::resolution_failed
+                elif options.locked:
+                    CliOutput::write_error("error: fetch --locked takes its package selections from elisapkg.lock; omit PACKAGE VERSION\n")
+                    CliStatus::resolution_failed
+                else:
+                    resolve_status: i64 = FetchRelease::resolve(package, requirement, "", CliStatus::resolution_failed, &resolved)
+                    if resolve_status != CliStatus::success:
+                        resolve_status
+                    elif not metadata_digest_hex(resolved.metadata, &metadata_digest):
+                        CliStatus::security_failed
+                    else:
+                        FetchRelease::verify_and_cache(package, resolved.selected, resolved, metadata_digest, false)
 
         # `fetch` without arguments verifies every source the lockfile names.
         def fetch_project(start: darray[u8]&, options: Model::CommandOptions) -> i64 can[Global{Read,Write}, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -95,17 +101,18 @@ module FetchCommand:
                 name: mutable darray[u8] = []
                 version: mutable darray[u8] = []
                 return CliStatus::resolution_failed if not ProjectManifest::validate_at(raw, start, &name, &version)
-                region lock_scope:
-                    lock: mutable darray[u8] = []
-                    lock <- lock.resize(ProjectFiles::project_document_limit)
-                    return CliStatus::resolution_failed if not ProjectFiles::read_c_string_into("elisapkg.lock", &lock)
-                    if not LockValidation::matches_manifest(raw, lock, name, version, start):
-                        CliOutput::write_error("error: elisapkg.lock is invalid or does not match the current project\n")
-                        return CliStatus::resolution_failed
-                    if Lockfile::version_is(lock, Lockfile::registry_version):
-                        return FetchOffline::fetch_registry_lock(raw, lock) if options.offline or options.frozen else fetch_registry_lock(raw, lock, name, version, start)
-                CliOutput::write_ok("verified local locked sources\n")
-                CliStatus::success
+                lock: mutable darray[u8] = []
+                lock <- lock.resize(ProjectFiles::project_document_limit)
+                if not ProjectFiles::read_c_string_into("elisapkg.lock", &lock):
+                    CliStatus::resolution_failed
+                elif not LockValidation::matches_manifest(raw, lock, name, version, start):
+                    CliOutput::write_error("error: elisapkg.lock is invalid or does not match the current project\n")
+                    CliStatus::resolution_failed
+                elif Lockfile::version_is(lock, Lockfile::registry_version):
+                    FetchOffline::fetch_registry_lock(raw, lock) if options.offline or options.frozen else fetch_registry_lock(raw, lock, name, version, start)
+                else:
+                    CliOutput::write_ok("verified local locked sources\n")
+                    CliStatus::success
 
         def metadata_digest_hex(metadata: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
             digest_bytes: mutable darray[u8] = []
@@ -118,29 +125,29 @@ module FetchCommand:
                 # registry metadata and compare bytes before any cache mutation. This
                 # rejects duplicate, omitted, reordered, or otherwise hand-edited records
                 # that could make fetch operate on a graph different from resolution.
-                region expected_lock_scope:
-                    expected_lock: darray[u8] = LockResolution::replay_registry(root_name, root_version, manifest, start, lock)
-                    return CliStatus::security_failed if expected_lock.count == 0.usize()
-                    return CliStatus::resolution_failed if not ByteText::equal(expected_lock, lock)
+                expected_lock: darray[u8] = LockResolution::replay_registry(root_name, root_version, manifest, start, lock)
                 packages_start: usize = Json::root_value_offset(lock, "packages")
                 packages_end: usize = Json::array_end(lock, packages_start)
-                return CliStatus::resolution_failed if packages_start >= lock.count or packages_end <= packages_start
-                while cursor < packages_end |cursor: usize = packages_start + 1.usize(), fetched: usize = 0.usize()|:
-                    cursor <- Json::skip_whitespace(lock, cursor, packages_end)
-                    break if cursor == packages_end
-                    return CliStatus::resolution_failed if lock[cursor] != 123
-                    record_end: usize = Json::object_end(lock, cursor)
-                    return CliStatus::resolution_failed if record_end <= cursor or record_end >= packages_end
-                    region status_scope:
-                        status: i64 = fetch_locked_record(lock, cursor, record_end)
+                if expected_lock.count == 0.usize():
+                    CliStatus::security_failed
+                elif not ByteText::equal(expected_lock, lock) or packages_start >= lock.count or packages_end <= packages_start:
+                    CliStatus::resolution_failed
+                else:
+                    while cursor < packages_end |cursor: usize = packages_start + 1.usize(), record_end: usize = 0.usize(), status: i64 = 0, fetched: usize = 0.usize()|:
+                        cursor <- Json::skip_whitespace(lock, cursor, packages_end)
+                        break if cursor == packages_end
+                        return CliStatus::resolution_failed if lock[cursor] != 123
+                        record_end <- Json::object_end(lock, cursor)
+                        return CliStatus::resolution_failed if record_end <= cursor or record_end >= packages_end
+                        status <- fetch_locked_record(lock, cursor, record_end)
                         return status if status != CliStatus::success
-                    fetched <- fetched + 1.usize()
-                    return CliStatus::resolution_failed if fetched > 4096.usize()
-                    cursor <- Json::skip_whitespace(lock, record_end + 1.usize(), packages_end)
-                    if cursor < packages_end:
-                        return CliStatus::resolution_failed if lock[cursor] != 44
-                        cursor <- cursor + 1.usize()
-                CliStatus::success
+                        fetched <- fetched + 1.usize()
+                        return CliStatus::resolution_failed if fetched > 4096.usize()
+                        cursor <- Json::skip_whitespace(lock, record_end + 1.usize(), packages_end)
+                        if cursor < packages_end:
+                            return CliStatus::resolution_failed if lock[cursor] != 44
+                            cursor <- cursor + 1.usize()
+                    CliStatus::success
 
         # Resolve one locked release again and require that the signed
         # metadata still names exactly what the lock records.
@@ -149,13 +156,13 @@ module FetchCommand:
                 locked: mutable FetchRelease::LockedRelease = FetchRelease::empty_locked()
                 return CliStatus::resolution_failed if not FetchRelease::read_locked(lock, start, finish, &locked)
                 resolved: mutable FetchRelease::ResolvedRelease = FetchRelease::empty_resolved()
-                region resolve_status_scope:
-                    resolve_status: i64 =
-                        exact: mutable darray[u8] = []
-                        Registry::exact_requirement(locked.parsed_version, &exact)
-                        FetchRelease::resolve(locked.package, exact, " while verifying locked ", CliStatus::source_failed, &resolved)
-                    return resolve_status if resolve_status != CliStatus::success
-                region mismatch_scope:
+                resolve_status: i64 =
+                    exact: mutable darray[u8] = []
+                    Registry::exact_requirement(locked.parsed_version, &exact)
+                    FetchRelease::resolve(locked.package, exact, " while verifying locked ", CliStatus::source_failed, &resolved)
+                if resolve_status != CliStatus::success:
+                    resolve_status
+                else:
                     mismatch: cstr =
                         if not ByteText::equal(resolved.selected, locked.version):
                             "error: locked registry version does not match signed metadata\n"
@@ -167,12 +174,12 @@ module FetchCommand:
                             "error: locked registry archive size does not match signed metadata\n"
                         else:
                             ""
+                    computed_metadata_digest: mutable darray[u8] = []
                     if mismatch[0].u8() != 0:
                         CliOutput::write_error(mismatch)
-                        return CliStatus::security_failed
-                region computed_metadata_digest_scope:
-                    computed_metadata_digest: mutable darray[u8] = []
-                    if not metadata_digest_hex(resolved.metadata, &computed_metadata_digest) or not ByteText::equal(computed_metadata_digest, locked.metadata_digest):
+                        CliStatus::security_failed
+                    elif not metadata_digest_hex(resolved.metadata, &computed_metadata_digest) or not ByteText::equal(computed_metadata_digest, locked.metadata_digest):
                         CliOutput::write_error("error: locked metadata digest does not match signed metadata\n")
-                        return CliStatus::security_failed
-                FetchRelease::verify_and_cache(locked.package, locked.version, resolved, locked.metadata_digest, true)
+                        CliStatus::security_failed
+                    else:
+                        FetchRelease::verify_and_cache(locked.package, locked.version, resolved, locked.metadata_digest, true)
