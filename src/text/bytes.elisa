@@ -53,12 +53,9 @@ module ByteText:
 
         # `out` followed by the canonical decimal digits of `value`.
         def with_decimal(out: mutable darray[u8], value: u64) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
-            divisor: mutable u64 = 1
-            while value / divisor >= 10 |divisor|:
-                divisor <- divisor * 10
-            while divisor > 0 |out, divisor|:
-                out <- out.push(48 + ((value / divisor) % 10).u8())
-                divisor <- divisor / 10
+            while place > 0 |out, place: u64 = highest_decimal_place(value)|:
+                out <- out.push(48 + ((value / place) % 10).u8())
+                place <- place / 10
             return out
 
         # Make `out` an exact copy of `value`.
@@ -67,12 +64,8 @@ module ByteText:
             append(out, value)
 
         def starts_with_text(value: darray[u8]&, expected: cstr) -> bool:
-            region length_scope:
-                length: usize = text_length(expected)
-                return false if value.count < length
-                for index in 0..<length |value, expected|:
-                    return false if value[index] != expected[index].u8()
-            return true
+            length: usize = text_length(expected)
+            return value.count >= length and range_equals_text(value, 0.usize(), length, expected)
 
         def append_range(out: mutable darray[u8]&, source: darray[u8]&, start: usize, finish: usize) -> void can[Memory.Allocate, Abort.Panic]:
             requires start <= finish and finish <= source.count
@@ -86,33 +79,24 @@ module ByteText:
                 while end < finish and raw[end] >= 48 and raw[end] <= 57 |end: usize = start, value: u64 = 0| -> (end, value):
                     digit: u64 = (raw[end] - 48).u64()
                     return false if value > (18446744073709551615.u64() - digit) / 10.u64()
-                    value <- value * 10.u64() + digit
                     end <- end + 1.usize()
-            return false if end == start
-            end_out <- end
-            value_out <- value
-            return true
+                    value <- value * 10.u64() + digit
+            return end != start and published_scan(end, value, end_out, value_out)
 
         # Require every byte in the span to be a decimal digit.
         def parse_unsigned_decimal(raw: darray[u8]&, start: usize, finish: usize, out: mutable u64&) -> bool:
-            out <- 0.u64()
-            end: mutable usize = start
             value: mutable u64 = 0.u64()
-            return false if:
-                not scan_unsigned_decimal(raw, start, finish, &end, &value)
-                end != finish
-            out <- value
-            return true
+            parsed: bool = |value|
+                end: mutable usize = start
+                scan_unsigned_decimal(raw, start, finish, &end, &value) and end == finish
+            return published(parsed, value, out)
 
         # Scan a canonical decimal prefix without consuming its delimiter.
         def scan_canonical_unsigned_decimal(raw: darray[u8]&, start: usize, finish: usize, end_out: mutable usize&, value_out: mutable u64&) -> bool:
             return false if start >= finish or finish > raw.count
             if raw[start] == 48:
                 next: usize = start + 1.usize()
-                return false if next < finish and raw[next] >= 48 and raw[next] <= 57
-                end_out <- next
-                value_out <- 0.u64()
-                return true
+                return not (next < finish and raw[next] >= 48 and raw[next] <= 57) and published_scan(next, 0.u64(), end_out, value_out)
             # Include one extra byte to distinguish a delimiter from another digit.
             scan_end: usize =
                 scan_bytes: usize = maximum_unsigned_decimal_digits + 1.usize()
@@ -121,37 +105,21 @@ module ByteText:
 
         # Parse the decimal representation emitted by append_decimal.
         def parse_canonical_unsigned_decimal(raw: darray[u8]&, start: usize, finish: usize, out: mutable u64&) -> bool:
-            out <- 0.u64()
-            end: mutable usize = start
             value: mutable u64 = 0.u64()
-            return false if:
-                not scan_canonical_unsigned_decimal(raw, start, finish, &end, &value)
-                end != finish
-            out <- value
-            return true
+            parsed: bool = |value|
+                end: mutable usize = start
+                scan_canonical_unsigned_decimal(raw, start, finish, &end, &value) and end == finish
+            return published(parsed, value, out)
 
         def append_decimal(out: mutable darray[u8]&, value: u64) -> void can[Memory.Allocate, Abort.Panic]:
+            digit_count: usize = decimal_digit_count(value)
             start: usize = out.count
-            out.resize(start + maximum_unsigned_decimal_digits)
-            number: mutable u64 = value
-            cursor: mutable usize = start
-            if number == 0:
-                out[cursor] <- 48
-                cursor <- cursor + 1.usize()
-            else:
-                while number > 0 |out, number, cursor|:
-                    out[cursor] <- 48 + (number % 10).u8()
-                    cursor <- cursor + 1.usize()
-                    number <- number / 10
-                left: mutable usize = start
-                right: mutable usize = cursor
-                while left < right and right - left > 1.usize() |out, left, right|:
-                    right <- right - 1.usize()
-                    temporary: u8 = out[left]
-                    out[left] <- out[right]
-                    out[right] <- temporary
-                    left <- left + 1.usize()
-            out.resize(cursor)
+            out.resize(start + digit_count)
+            # Write the digits from the last one back to the first.
+            while index < digit_count |out, index: usize = 0.usize(), number: u64 = value|:
+                out[start + digit_count - 1.usize() - index] <- 48 + (number % 10).u8()
+                number <- number / 10
+                index <- index + 1.usize()
 
         def append_signed_decimal(out: mutable darray[u8]&, value: i64) -> void can[Memory.Allocate, Abort.Panic]:
             if value < 0:
@@ -184,20 +152,13 @@ module ByteText:
             return true
 
         def ends_with(value: darray[u8]&, suffix: darray[u8]&) -> bool:
-            return false if suffix.count > value.count
-            region offset_scope:
-                offset: usize = value.count - suffix.count
-                for index in 0..<suffix.count |value, suffix, offset|:
-                    return false if value[offset + index] != suffix[index]
-            return true
+            return suffix.count <= value.count and range_equals(value, value.count - suffix.count, value.count, suffix)
 
         def less(left: darray[u8]&, right: darray[u8]&) -> bool:
-            region limit_scope:
-                limit: usize = left.count if left.count < right.count else right.count
-                for index in 0..<limit |left, right|:
-                    return true if left[index] < right[index]
-                    return false if left[index] > right[index]
-            return left.count < right.count
+            limit: usize = left.count if left.count < right.count else right.count
+            index: usize = while index < limit and left[index] == right[index] |index: usize = 0.usize()| -> index:
+                index <- index + 1.usize()
+            return left[index] < right[index] if index < limit else left.count < right.count
 
         def contains_null_terminator_field(queue: darray[u8]&, wanted: darray[u8]&) -> bool:
             while cursor < queue.count |cursor: usize = 0|:
@@ -221,3 +182,25 @@ module ByteText:
 
     private:
         const maximum_unsigned_decimal_digits: usize = 20.usize()
+
+        # The place value of the leading decimal digit of `value`.
+        def highest_decimal_place(value: u64) -> u64:
+            return while value / place >= 10 |place: u64 = 1| -> place:
+                place <- place * 10
+
+        # The number of decimal digits in `value`, which is 1 for zero.
+        def decimal_digit_count(value: u64) -> usize:
+            return while number >= 10 |number: u64 = value, count: usize = 1.usize()| -> count:
+                number <- number / 10
+                count <- count + 1.usize()
+
+        # Store a scanned span end and value, and report success.
+        def published_scan(end: usize, value: u64, end_out: mutable usize&, value_out: mutable u64&) -> bool:
+            end_out <- end
+            value_out <- value
+            return true
+
+        # Store `value` in `out` when `parsed`, otherwise zero, and return `parsed`.
+        def published(parsed: bool, value: u64, out: mutable u64&) -> bool:
+            out <- value if parsed else 0.u64()
+            return parsed
