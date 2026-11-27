@@ -35,111 +35,146 @@ module Archive:
         def write_ustar_from_paths(paths: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out.resize(0)
             return false if paths.count == 0.usize() or paths.count > PackagePathPolicy::maximum_package_archive_entries * 100.usize()
-            if not write_selected_paths(paths, out):
-                out.resize(0)
-                return false
-            true
+            written: bool = write_selected_paths(paths, out)
+            out.resize(0) if not written
+            written
 
     private:
+        # Entries seen while scanning an archive, and the payload span of the
+        # one selected for extraction.
+        struct ArchiveScan:
+            entries: mutable usize
+            seen: mutable darray[u8]
+            selected_payload_start: mutable usize
+            selected_payload_size: mutable usize
+
+        # The next-entry offset returned for a malformed entry.
+        const malformed_entry: usize = 0.usize()
+
+        const maximum_embedded_manifest_size: usize = 1048576
+
+        # ---------- writing -------------------------------------------------------------------
+
         def write_selected_paths(paths: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            region entry_count_scope:
-                entry_count: mutable usize = 0.usize()
-                seen: mutable darray[u8] = []
-                while cursor < paths.count |cursor: usize = 0.usize()|:
-                    return false if entry_count >= PackagePathPolicy::maximum_package_archive_entries
-                    entry: mutable darray[u8] = []
-                    while cursor < paths.count and paths[cursor] != 0 |paths, cursor, entry|:
-                        return false if entry.count == 99.usize()
-                        entry <- entry.push(paths[cursor])
-                        cursor <- cursor + 1.usize()
-                    return false if cursor >= paths.count
-                    cursor <- cursor + 1.usize()
-                    return false if not is_safe_entry(entry) or UstarFields::archive_name_seen(seen, entry)
-                    archive_push_array(&seen, entry)
-                    seen <- seen.push(0)
-                    entry_count <- entry_count + 1.usize()
-                    return false if not append_file_entry(entry, out)
+            while cursor < paths.count |out, cursor: usize = 0.usize(), entry_count: usize = 0.usize(), seen: darray[u8] = []|:
+                return false if entry_count >= PackagePathPolicy::maximum_package_archive_entries
+                entry: darray[u8] = [paths[index] for index in cursor..<path_end(paths, cursor)]
+                return false if entry.count > 99.usize() or cursor + entry.count >= paths.count
+                cursor <- cursor + entry.count + 1.usize()
+                return false if not is_safe_entry(entry) or UstarFields::archive_name_seen(seen, entry)
+                seen <- with_recorded_name(seen, entry)
+                entry_count <- entry_count + 1.usize()
+                return false if not append_file_entry(entry, out)
             out.resize(out.count + 1024.usize())
             out.count <= UstarFields::maximum_archive_bytes
 
-        def append_file_entry(entry: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            terminated_path: mutable darray[u8] = [entry[index] for index in 0..<entry.count]
-            terminated_path <- terminated_path.push(0)
-            entry_name: cstr = (&terminated_path[0]).cast[cstr] can Unsafe.PointerCast
-            entry_size: i64 = Platform::package_file_size(entry_name)
-            return false if entry_size < 0 or entry_size > UstarFields::maximum_payload_bytes.i64()
-            payload_size: usize = entry_size.usize()
-            padding: usize = UstarFields::padding_bytes(payload_size)
-            padded_payload: usize = payload_size + padding
-            return false if:
-                padded_payload > UstarFields::maximum_payload_bytes
-                out.count > UstarFields::maximum_payload_bytes - padded_payload
-            region header_scope:
-                header: darray[u8] = tar_file_header(entry, payload_size)
-                return false if header.count != 512.usize()
-                archive_push_array(out, header)
+        # `seen` followed by `name` and its NUL terminator.
+        def with_recorded_name(seen: mutable darray[u8], name: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
+            for index in 0..<name.count |seen, name|:
+                seen <- seen.push(name[index])
+            seen <- seen.push(0)
+            seen
 
-            # The reader requires a spare byte to distinguish EOF from growth.
-            # Use the first padding byte when present, or reserve one extra.
+        def path_end(paths: darray[u8]&, start: usize) -> usize:
+            while position < paths.count and paths[position] != 0 |position: usize = start| -> position:
+                position <- position + 1.usize()
+
+        def append_file_entry(entry: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            terminated_path: darray[u8] = terminated_copy(entry)
+            entry_size: i64 = Platform::package_file_size((&terminated_path[0]).cast[cstr] can Unsafe.PointerCast)
+            entry_size >= 0 and entry_size <= UstarFields::maximum_payload_bytes.i64() and appended_sized_entry(entry, terminated_path, entry_size.usize(), out)
+
+        def terminated_copy(entry: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
+            terminated: mutable darray[u8] = [entry[index] for index in 0..<entry.count]
+            terminated <- terminated.push(0)
+            terminated
+
+        def appended_sized_entry(entry: darray[u8]&, terminated_path: darray[u8]&, payload_size: usize, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            padded_payload: usize = payload_size + UstarFields::padding_bytes(payload_size)
+            padded_payload <= UstarFields::maximum_payload_bytes and out.count <= UstarFields::maximum_payload_bytes - padded_payload and appended_header(entry, payload_size, out) and appended_payload(terminated_path, payload_size, padded_payload, out)
+
+        def appended_header(entry: darray[u8]&, payload_size: usize, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            header: darray[u8] = tar_file_header(entry, payload_size)
+            header.count == 512.usize() and appended(out, header)
+
+        # The reader requires a spare byte to distinguish EOF from growth.
+        # Use the first padding byte when present, or reserve one extra.
+        def appended_payload(terminated_path: darray[u8]&, payload_size: usize, padded_payload: usize, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             payload_start: usize = out.count
-            payload_capacity: usize = payload_size + 1.usize()
-            reserved: usize = padded_payload if padding > 0.usize() else payload_capacity
-            out.resize(payload_start + reserved)
-            payload: mutable u8& = (&out[payload_start]).cast[mutable u8&] can Unsafe.PointerCast
-            region read_size_scope:
-                read_size: i64 = Platform::read_package_file(entry_name, payload, payload_capacity)
-                return false if read_size != entry_size
-            out.resize(payload_start + padded_payload)
+            out.resize(payload_start + (padded_payload if padded_payload > payload_size else payload_size + 1.usize()))
+            read_and_trimmed(terminated_path, payload_start, payload_size, padded_payload, out)
+
+        def read_and_trimmed(terminated_path: darray[u8]&, payload_start: usize, payload_size: usize, padded_payload: usize, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            read_size: i64 = Platform::read_package_file(((&terminated_path[0]).cast[cstr] can Unsafe.PointerCast), ((&out[payload_start]).cast[mutable u8&] can Unsafe.PointerCast), payload_size + 1.usize())
+            trimmed(out, payload_start + padded_payload) and read_size == payload_size.i64()
+
+        def trimmed(out: mutable darray[u8]&, count: usize) -> bool can[Memory.Allocate, Abort.Panic]:
+            out.resize(count)
             true
 
-        const maximum_embedded_manifest_size: usize = 1048576
+        def appended(out: mutable darray[u8]&, value: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            archive_push_array(out, value)
+            true
+
+        # ---------- scanning ------------------------------------------------------------------
 
         def scan_ustar_archive(archive: darray[u8]&, wanted: darray[u8]&, out: mutable darray[u8]&, extract: bool) -> bool can[Memory.Allocate, Abort.Panic]:
             out.resize(0)
             return false if:
                 archive.count < 1024.usize() or archive.count > UstarFields::maximum_archive_bytes
                 archive.count % 512.usize() != 0.usize()
-            entries: mutable usize = 0.usize()
-            seen: mutable darray[u8] = []
-            selected_payload_start: mutable usize = 0.usize()
-            selected_payload_size: mutable usize = 0.usize()
-            while cursor + 512.usize() <= archive.count |cursor: usize = 0.usize()|:
-                if UstarFields::archive_block_zero(archive, cursor):
-                    region valid_end_scope:
-                        valid_end: bool = UstarFields::archive_block_zero(archive, cursor + 512.usize()) and cursor + 1024.usize() == archive.count and entries > 0.usize()
-                        return valid_end if not extract
-                        return false if not valid_end or selected_payload_start == 0.usize()
-                    out.resize(selected_payload_size)
-                    for index in 0..<selected_payload_size |archive, selected_payload_start, out|:
-                        out[index] <- archive[selected_payload_start + index]
-                    return true
-                return false if:
-                    entries >= PackagePathPolicy::maximum_package_archive_entries
-                    cursor + 512.usize() > archive.count
-                name: mutable darray[u8] = []
-                name_end: mutable usize = 0.usize()
-                while name_end < 100.usize() and archive[cursor + name_end] != 0:
-                    name <- name.push(archive[cursor + name_end])
-                    name_end <- name_end + 1.usize()
-                return false if:
-                    name_end == 0.usize() or name_end == 100.usize() or not is_safe_entry(name)
-                    UstarFields::archive_name_seen(seen, name)
-                for index in 0..<name.count |seen, name|:
-                    seen <- seen.push(name[index])
-                seen <- seen.push(0)
-                size: usize =
-                    payload_size: i64 = UstarFields::normalized_payload_size(archive, cursor, name_end)
-                    return false if payload_size < 0
-                    payload_size.usize()
-                next_offset: usize = UstarFields::next_entry_offset(archive, cursor, size)
-                return false if next_offset == 0.usize()
-                if extract and archive_entry_equal(name, wanted):
-                    return false if selected_payload_start != 0.usize() or size > maximum_embedded_manifest_size
-                    selected_payload_start <- cursor + 512.usize()
-                    selected_payload_size <- size
-                cursor <- next_offset
-                entries <- entries + 1.usize()
+            while cursor + 512.usize() <= archive.count |out, cursor: usize = 0.usize(), scan: ArchiveScan = ArchiveScan{entries: 0.usize(), seen: [], selected_payload_start: 0.usize(), selected_payload_size: 0.usize()}|:
+                return finished_scan(archive, cursor, scan, extract, out) if UstarFields::archive_block_zero(archive, cursor)
+                return false if scan.entries >= PackagePathPolicy::maximum_package_archive_entries
+                cursor <- scanned_entry(archive, cursor, wanted, extract, &scan)
+                return false if cursor == malformed_entry
             false
+
+        # Two zero blocks must end the archive exactly after at least one
+        # entry; extraction also needs the selected entry.
+        def finished_scan(archive: darray[u8]&, cursor: usize, scan: ArchiveScan&, extract: bool, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            valid_end: bool = UstarFields::archive_block_zero(archive, cursor + 512.usize()) and cursor + 1024.usize() == archive.count and scan.entries > 0.usize()
+            valid_end if not extract else valid_end and scan.selected_payload_start != 0.usize() and copied_payload(archive, scan, out)
+
+        def copied_payload(archive: darray[u8]&, scan: ArchiveScan&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            out.resize(scan.selected_payload_size)
+            for index in 0..<scan.selected_payload_size |archive, scan, out|:
+                out[index] <- archive[scan.selected_payload_start + index]
+            true
+
+        # Check the header at `cursor` and record its entry. Returns the next
+        # entry's offset, or `malformed_entry`.
+        def scanned_entry(archive: darray[u8]&, cursor: usize, wanted: darray[u8]&, extract: bool, scan: mutable ArchiveScan&) -> usize can[Memory.Allocate, Abort.Panic]:
+            name_end: usize = entry_name_end(archive, cursor)
+            name: darray[u8] = [archive[cursor + index] for index in 0..<name_end]
+            malformed_entry if name_end == 0.usize() or name_end == 100.usize() or not is_safe_entry(name) or UstarFields::archive_name_seen(scan.seen, name) else recorded_entry(archive, cursor, name, wanted, extract, scan)
+
+        def entry_name_end(archive: darray[u8]&, cursor: usize) -> usize:
+            while name_end < 100.usize() and archive[cursor + name_end] != 0 |name_end: usize = 0.usize()| -> name_end:
+                name_end <- name_end + 1.usize()
+
+        def recorded_entry(archive: darray[u8]&, cursor: usize, name: darray[u8]&, wanted: darray[u8]&, extract: bool, scan: mutable ArchiveScan&) -> usize can[Memory.Allocate, Abort.Panic]:
+            archive_push_array(&scan.seen, name)
+            scan.seen.push(0)
+            payload_size: i64 = UstarFields::normalized_payload_size(archive, cursor, name.count)
+            malformed_entry if payload_size < 0 else next_entry(archive, cursor, name, wanted, extract, payload_size.usize(), scan)
+
+        def next_entry(archive: darray[u8]&, cursor: usize, name: darray[u8]&, wanted: darray[u8]&, extract: bool, size: usize, scan: mutable ArchiveScan&) -> usize:
+            next_offset: usize = UstarFields::next_entry_offset(archive, cursor, size)
+            malformed_entry if next_offset == 0.usize() or not selection_recorded(cursor, name, wanted, extract, size, scan) else counted_entry(scan, next_offset)
+
+        # Remember the payload of the wanted entry; it may appear only once
+        # and must fit the embedded-manifest bound.
+        def selection_recorded(cursor: usize, name: darray[u8]&, wanted: darray[u8]&, extract: bool, size: usize, scan: mutable ArchiveScan&) -> bool:
+            return true if not extract or not archive_entry_equal(name, wanted)
+            return false if scan.selected_payload_start != 0.usize() or size > maximum_embedded_manifest_size
+            scan.selected_payload_start <- cursor + 512.usize()
+            scan.selected_payload_size <- size
+            true
+
+        def counted_entry(scan: mutable ArchiveScan&, next_offset: usize) -> usize:
+            scan.entries <- scan.entries + 1.usize()
+            next_offset
 
         def archive_entry_equal(left: darray[u8]&, right: darray[u8]&) -> bool:
             return false if left.count != right.count
