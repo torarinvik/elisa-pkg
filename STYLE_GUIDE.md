@@ -94,6 +94,22 @@ return false if not:
     ProjectFiles::valid_path_bytes(artifact)
 ```
 
+### The final value of a function
+
+End a function with its value as a bare expression; the last expression is
+returned implicitly. When a function would end with a return guard followed by
+a final return, merge the two into one conditional expression:
+
+```elisa
+# Instead of
+#     return [] if not report_failure
+#     return [code.u8() + 1.u8()]
+[code.u8() + 1.u8()] if report_failure else []
+```
+
+A chain of guards that each pick a value for one enum case reads better as an
+exhaustive `match` than as a long conditional expression.
+
 ## 2. Block expressions
 
 A binding whose initializer is an indented block; the last line is the value, and locals
