@@ -10,54 +10,50 @@ module BuildPaths:
             out.resize(0)
             relative_out.resize(0)
             selected_entry: mutable darray[u8] = []
-            return false if not ManifestTargets::unique_library_entry(raw, &selected_entry) or not Manifest::is_safe_relative_entry(selected_entry)
-            region joined_scope:
-                joined: mutable darray[u8] = []
-                ProjectFiles::path_join_bytes_into(package_root, selected_entry, &joined)
-                return false if not ProjectFiles::resolve_entry_beneath(package_root, joined, out)
-            ByteText::append(relative_out, selected_entry)
-            true
+            if not ManifestTargets::unique_library_entry(raw, &selected_entry) or not Manifest::is_safe_relative_entry(selected_entry):
+                false
+            else:
+                joined: darray[u8] = ProjectFiles::path_join_bytes(package_root, selected_entry)
+                if not ProjectFiles::resolve_entry_beneath(package_root, joined, out):
+                    false
+                else:
+                    ByteText::append(relative_out, selected_entry)
+                    true
 
         def resolve_local_source(lock: darray[u8]&, source_start: usize, source_end: usize, project_root: darray[u8]&,
                                  out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out.resize(0)
             relative: mutable darray[u8] = []
-            return false if not Json::object_string_value(lock, source_start, source_end, "path", &relative) or not Manifest::valid_dependency_path(relative)
-            joined: mutable darray[u8] = []
-            ProjectFiles::path_join_bytes_into(project_root, relative, &joined)
-            return ProjectFiles::canonical_existing_path(joined, out)
+            if not Json::object_string_value(lock, source_start, source_end, "path", &relative) or not Manifest::valid_dependency_path(relative):
+                false
+            else:
+                joined: darray[u8] = ProjectFiles::path_join_bytes(project_root, relative)
+                ProjectFiles::canonical_existing_path(joined, out)
 
         def sandbox_dependency_roots(lock: darray[u8]&, start: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out.resize(0)
             return true if not Lockfile::version_is(lock, Lockfile::local_version)
             packages_start: usize = Json::root_value_offset(lock, "packages")
             packages_end: usize = Json::array_end(lock, packages_start)
-            return false if packages_start >= lock.count or packages_end <= packages_start or packages_end >= lock.count or lock[packages_start] != 91
-            cursor: mutable usize = packages_start + 1.usize()
-            count: mutable usize = 0.usize()
-            while cursor < packages_end |lock, cursor, count, out, start|:
-                cursor <- Json::skip_whitespace(lock, cursor, packages_end)
-                break if cursor >= packages_end or lock[cursor] == 93
-                return false if lock[cursor] != 123 or count >= maximum_dependencies
-                record_end: usize = Json::object_end(lock, cursor)
-                return false if record_end <= cursor or record_end >= packages_end
-                source_start: mutable usize = 0.usize()
-                source_end: mutable usize = 0.usize()
-                return false if not Json::object_value_span(lock, cursor, record_end, "source", &source_start, &source_end)
-                source_type: mutable darray[u8] = []
-                if Json::object_string_value(lock, source_start, source_end, "type", &source_type) and ByteText::equal_text(source_type, "path"):
-                    region canonical_root_scope:
-                        canonical_root: mutable darray[u8] = []
+            if packages_start >= lock.count or packages_end <= packages_start or packages_end >= lock.count or lock[packages_start] != 91:
+                false
+            else:
+                # Each path dependency contributes its canonical root and a NUL.
+                while cursor < packages_end |out, cursor: usize = packages_start + 1.usize(), count: usize = 0.usize(), record_end: usize = 0.usize(), source_start: usize = 0.usize(), source_end: usize = 0.usize(), source_type: darray[u8] = [], canonical_root: darray[u8] = []|:
+                    cursor <- Json::skip_whitespace(lock, cursor, packages_end)
+                    break if cursor >= packages_end or lock[cursor] == 93
+                    return false if lock[cursor] != 123 or count >= maximum_dependencies
+                    record_end <- Json::object_end(lock, cursor)
+                    return false if record_end <= cursor or record_end >= packages_end or not Json::object_value_span(lock, cursor, record_end, "source", &source_start, &source_end)
+                    if Json::object_string_value(lock, source_start, source_end, "type", &source_type) and ByteText::equal_text(source_type, "path"):
                         return false if not resolve_local_source(lock, source_start, source_end, start, &canonical_root)
-                        ByteText::append(out, canonical_root)
-                    out.push(0)
-                cursor <- record_end + 1.usize()
-                cursor <- Json::skip_whitespace(lock, cursor, packages_end)
-                if cursor < packages_end:
-                    return false if lock[cursor] != 44
-                    cursor <- cursor + 1.usize()
-                count <- count + 1.usize()
-            true
+                        ByteText::append_terminated(out, canonical_root)
+                    cursor <- Json::skip_whitespace(lock, record_end + 1.usize(), packages_end)
+                    if cursor < packages_end:
+                        return false if lock[cursor] != 44
+                        cursor <- cursor + 1.usize()
+                    count <- count + 1.usize()
+                true
 
     private:
         const maximum_dependencies: usize = 4096.usize()
