@@ -15,60 +15,31 @@ module CliArguments:
             return -1 if argument_count < 2
             out.push(slots[0].cast[cstr])
             out.push(slots[1].cast[cstr])
-            color_seen: mutable bool = false
-            index: mutable i64 = 2
-            while index < argument_count |slots, out, color_seen, index|:
-                argument: cstr = slots[index].cast[cstr]
-                if Platform::c_string_equal(argument, "--quiet"):
-                    quiet <- true
-                    index <- index + 1
-                    continue
-                if Platform::c_string_equal(argument, "--color"):
-                    return -1 if color_seen or index + 1 >= argument_count
-                    region color_value_scope:
-                        color_value: cstr = slots[index + 1].cast[cstr]
-                        return -1 if not valid_color_mode(color_value)
+            while index < argument_count |slots, out, index: i64 = 2, color_seen: bool = false|:
+                if Platform::c_string_equal(slots[index].cast[cstr], "--color"):
+                    return -1 if color_seen or index + 1 >= argument_count or not valid_color_mode(slots[index + 1].cast[cstr])
                     color_seen <- true
-                    index <- index + 2
-                    continue
-                out.push(argument)
-                index <- index + 1
-            out.push(null)
-            out.count.i64() - 1
+                quiet <- true if Platform::c_string_equal(slots[index].cast[cstr], "--quiet")
+                dropped: i64 = output_mode_width(slots[index].cast[cstr])
+                out.push(slots[index].cast[cstr]) if dropped == 0
+                index <- index + consumed_slots(dropped)
+            terminated_count(out)
 
         def compact_manifest_arguments(argument_count: i64, slots: cstr&&, out: mutable darray[cstr]&, quiet: mutable bool&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out.resize(0)
             return 0 if argument_count < 2
             out.push(slots[0].cast[cstr])
             out.push(slots[1].cast[cstr])
-            index: mutable i64 = 2
-            separator_seen: mutable bool = false
-            color_seen: mutable bool = false
-            while index < argument_count |slots, out, index, separator_seen, color_seen|:
-                if Platform::c_string_equal(slots[index].cast[cstr], "--"):
-                    separator_seen <- true
-                    out.push(slots[index].cast[cstr])
-                    index <- index + 1
-                    continue
-                if not separator_seen and Platform::c_string_equal(slots[index].cast[cstr], "--quiet"):
-                    quiet <- true
-                    index <- index + 1
-                    continue
+            while index < argument_count |slots, out, index: i64 = 2, separator_seen: bool = false, color_seen: bool = false|:
                 if not separator_seen and Platform::c_string_equal(slots[index].cast[cstr], "--color"):
-                    return -1 if color_seen or index + 1 >= argument_count
-                    region color_value_scope:
-                        color_value: cstr = slots[index + 1].cast[cstr]
-                        return -1 if not valid_color_mode(color_value)
+                    return -1 if color_seen or index + 1 >= argument_count or not valid_color_mode(slots[index + 1].cast[cstr])
                     color_seen <- true
-                    index <- index + 2
-                    continue
-                if not separator_seen and Platform::c_string_equal(slots[index].cast[cstr], "--manifest-path"):
-                    index <- index + 2
-                    continue
-                out.push(slots[index].cast[cstr])
-                index <- index + 1
-            out.push(null)
-            out.count.i64() - 1
+                quiet <- true if not separator_seen and Platform::c_string_equal(slots[index].cast[cstr], "--quiet")
+                dropped: i64 = 0 if separator_seen else manifest_option_width(slots[index].cast[cstr])
+                separator_seen <- true if Platform::c_string_equal(slots[index].cast[cstr], "--")
+                out.push(slots[index].cast[cstr]) if dropped == 0
+                index <- index + consumed_slots(dropped)
+            terminated_count(out)
 
         # The common parser has already copied these modes into `options` or
         # process-local output state. Remove them before dispatch so handlers
@@ -80,133 +51,152 @@ module CliArguments:
             return -1 if argument_count < 2
             out.push(slots[0].cast[cstr])
             out.push(slots[1].cast[cstr])
-            index: mutable i64 = 2
-            separator_seen: mutable bool = false
-            while index < argument_count |slots, out, index, separator_seen|:
-                argument: cstr = slots[index].cast[cstr]
-                if not separator_seen and Platform::c_string_equal(argument, "--"):
-                    separator_seen <- true
-                    out.push(argument)
-                    index <- index + 1
-                    continue
-                if not separator_seen and (Platform::c_string_equal(argument, "--locked") or Platform::c_string_equal(argument, "--offline") or Platform::c_string_equal(argument, "--frozen") or Platform::c_string_equal(argument, "--json") or Platform::c_string_equal(argument, "--verbose") or Platform::c_string_equal(argument, "--quiet")):
-                    index <- index + 1
-                    continue
-                if not separator_seen and Platform::c_string_equal(argument, "--color"):
-                    index <- index + 2
-                    continue
-                if not separator_seen and Platform::c_string_equal(argument, "--manifest-path"):
-                    index <- index + 2
-                    continue
-                out.push(argument)
-                index <- index + 1
-            out.push(null)
-            out.count.i64() - 1
+            while index < argument_count |slots, out, index: i64 = 2, separator_seen: bool = false|:
+                dropped: i64 = 0 if separator_seen else global_option_width(slots[index].cast[cstr])
+                separator_seen <- true if Platform::c_string_equal(slots[index].cast[cstr], "--")
+                out.push(slots[index].cast[cstr]) if dropped == 0
+                index <- index + consumed_slots(dropped)
+            terminated_count(out)
 
         def read_common_flags(argument_count: i64, slots: cstr&&, command: cstr, options: mutable Model::CommandOptions&, quiet: mutable bool&, publish_dry_run: mutable bool&) -> bool can[Unsafe.PointerCast]:
-            flags_ok: mutable bool = true
-            positional_count: mutable i64 = 0
-            separator_seen: mutable bool = false
-            profile_seen: mutable bool = false
-            target_name_seen: mutable bool = false
-            color_seen: mutable bool = false
-            index: mutable i64 = 2
-            while index < argument_count |slots, options, flags_ok, positional_count, separator_seen, profile_seen, target_name_seen, publish_dry_run, index|:
-                flag: cstr = slots[index].cast[cstr]
-                if Platform::c_string_equal(flag, "--"):
-                    separator_seen <- true
-                    flags_ok <- false if not (Platform::c_string_equal(command, "run") or Platform::c_string_equal(command, "test"))
-                    index <- index + 1
-                    continue
-                if separator_seen:
-                    index <- index + 1
-                    continue
-                if Platform::c_string_equal(flag, "--bin") or Platform::c_string_equal(flag, "--lib") or Platform::c_string_equal(flag, "--test"):
-                    flags_ok <- false if not flags_ok or not target_flag_valid(argument_count, slots, index, command, flag) or target_name_seen
-                    target_name_seen <- true if flags_ok
-                    index <- index + 2
-                    continue
-                if Platform::c_string_equal(flag, "--profile"):
-                    flags_ok <- false if not flags_ok or profile_seen or not profile_flag_valid(argument_count, slots, index, command)
-                    profile_seen <- true if flags_ok
-                    index <- index + 2
-                    continue
-                options.locked <- true if Platform::c_string_equal(flag, "--locked")
-                options.offline <- true if Platform::c_string_equal(flag, "--offline")
-                options.frozen <- true if Platform::c_string_equal(flag, "--frozen")
-                options.json <- true if Platform::c_string_equal(flag, "--json")
-                options.verbose <- true if Platform::c_string_equal(flag, "--verbose")
-                quiet <- true if Platform::c_string_equal(flag, "--quiet")
-                publish_dry_run <- true if Platform::c_string_equal(command, "publish") and Platform::c_string_equal(flag, "--dry-run")
-                if Platform::c_string_equal(flag, "--color"):
-                    flags_ok <- false if color_seen or index + 1 >= argument_count
-                    if flags_ok:
-                        region color_value_scope:
-                            color_value: cstr = slots[index + 1].cast[cstr]
-                            flags_ok <- false if not valid_color_mode(color_value)
-                        color_seen <- true if flags_ok
-                    index <- index + 2
-                    continue
-                is_positional: bool =
-                    flag_length: usize = Platform::c_string_length(flag)
-                    flag_length > 0.usize() and flag[0].u8() != 45
-                positional_allowed: bool = (Platform::c_string_equal(command, "why") and positional_count == 0) or (Platform::c_string_equal(command, "install") and positional_count == 0) or (Platform::c_string_equal(command, "uninstall") and positional_count == 0) or (Platform::c_string_equal(command, "cache") and positional_count == 0) or (Platform::c_string_equal(command, "fetch") and positional_count < 2)
-                region recognized_scope:
-                    recognized: mutable bool = is_positional and positional_allowed
-                    recognized <- true if not is_positional and (Platform::c_string_equal(flag, "--locked") or Platform::c_string_equal(flag, "--offline") or Platform::c_string_equal(flag, "--frozen") or Platform::c_string_equal(flag, "--json") or Platform::c_string_equal(flag, "--verbose") or Platform::c_string_equal(flag, "--quiet") or (Platform::c_string_equal(flag, "--list") and Platform::c_string_equal(command, "package")) or (Platform::c_string_equal(flag, "--dry-run") and (Platform::c_string_equal(command, "cache") or Platform::c_string_equal(command, "publish"))) or (Platform::c_string_equal(command, "install") and Platform::c_string_equal(flag, "--local")) or (Platform::c_string_equal(command, "uninstall") and Platform::c_string_equal(flag, "--local")))
-                    flags_ok <- false if not recognized
-                    positional_count <- positional_count + 1 if recognized and is_positional
-                index <- index + 1
-            flags_ok
+            finished: FlagScan = while scan.index < argument_count |options, publish_dry_run, scan: FlagScan = FlagScan{index: 2, flags_ok: true, positional_count: 0, separator_seen: false, profile_seen: false, target_name_seen: false, color_seen: false}| -> scan:
+                scan <- next_common_flag(argument_count, slots, command, options, quiet, publish_dry_run, scan)
+            finished.flags_ok
 
         # A target flag the command accepts, followed by a short name that is
         # not itself a flag.
         def target_flag_valid(argument_count: i64, slots: cstr&&, index: i64, command: cstr, flag: cstr) -> bool can[Unsafe.PointerCast]:
-            region target_allowed_scope:
-                target_allowed: bool = (Platform::c_string_equal(command, "build") and (Platform::c_string_equal(flag, "--bin") or Platform::c_string_equal(flag, "--lib") or Platform::c_string_equal(flag, "--test"))) or (Platform::c_string_equal(command, "run") and Platform::c_string_equal(flag, "--bin")) or (Platform::c_string_equal(command, "test") and Platform::c_string_equal(flag, "--test")) or (Platform::c_string_equal(command, "install") and Platform::c_string_equal(flag, "--bin"))
-                return false if not target_allowed or index + 1 >= argument_count
+            return false if not target_flag_allowed(command, flag) or index + 1 >= argument_count
             target_value: cstr = slots[index + 1].cast[cstr]
             target_length: usize = Platform::c_string_length(target_value)
             target_length > 0.usize() and target_length <= 64.usize() and target_value[0].u8() != 45
 
         # `--profile debug` or `--profile release` on a building command.
         def profile_flag_valid(argument_count: i64, slots: cstr&&, index: i64, command: cstr) -> bool can[Unsafe.PointerCast]:
-            region profile_allowed_scope:
-                profile_allowed: bool = Platform::c_string_equal(command, "build") or Platform::c_string_equal(command, "run") or Platform::c_string_equal(command, "test") or Platform::c_string_equal(command, "install")
-                return false if not profile_allowed or index + 1 >= argument_count
-            profile_value: cstr = slots[index + 1].cast[cstr]
-            Platform::c_string_equal(profile_value, "debug") or Platform::c_string_equal(profile_value, "release")
+            builds_with_profile(command) and index + 1 < argument_count and (Platform::c_string_equal(slots[index + 1].cast[cstr], "debug") or Platform::c_string_equal(slots[index + 1].cast[cstr], "release"))
 
         def read_target_flags(argument_count: i64, dispatch_slots: cstr&&, command: cstr, options: mutable Model::CommandOptions&) -> void can[Unsafe.PointerCast]:
-            dispatch_index: mutable i64 = 2
-            dispatch_separator_seen: mutable bool = false
-            while dispatch_index < argument_count |dispatch_slots, dispatch_index, dispatch_separator_seen, options|:
-                region dispatch_flag_scope:
-                    dispatch_flag: cstr = dispatch_slots[dispatch_index].cast[cstr]
-                    if Platform::c_string_equal(dispatch_flag, "--"):
-                        dispatch_separator_seen <- true
-                        dispatch_index <- dispatch_index + 1
-                        continue
-                    if dispatch_separator_seen:
-                        dispatch_index <- dispatch_index + 1
-                        continue
-                    if Platform::c_string_equal(dispatch_flag, "--profile"):
-                        options.profile <- dispatch_slots[dispatch_index + 1].cast[cstr]
-                        dispatch_index <- dispatch_index + 2
-                        continue
-                    if Platform::c_string_equal(dispatch_flag, "--bin") or Platform::c_string_equal(dispatch_flag, "--lib") or Platform::c_string_equal(dispatch_flag, "--test"):
-                        options.target_name <- dispatch_slots[dispatch_index + 1].cast[cstr]
-                        options.target_kind <- "bin" if Platform::c_string_equal(dispatch_flag, "--bin")
-                        options.target_kind <- "lib" if Platform::c_string_equal(dispatch_flag, "--lib")
-                        options.target_kind <- "test" if Platform::c_string_equal(dispatch_flag, "--test")
-                        dispatch_index <- dispatch_index + 2
-                        continue
-                dispatch_index <- dispatch_index + 1
-            if Platform::c_string_equal(command, "run") and Platform::c_string_length(options.target_kind) == 0.usize():
-                options.target_kind <- "bin"
-            if Platform::c_string_equal(command, "test") and Platform::c_string_length(options.target_kind) == 0.usize():
-                options.target_kind <- "test"
+            while index < argument_count |dispatch_slots, options, index: i64 = 2, separator_seen: bool = false|:
+                consumed: i64 = 1 if separator_seen or Platform::c_string_equal(dispatch_slots[index].cast[cstr], "--") else recorded_target_flag(dispatch_slots, index, options)
+                separator_seen <- true if Platform::c_string_equal(dispatch_slots[index].cast[cstr], "--")
+                index <- index + consumed
+            options.target_kind <- "bin" if Platform::c_string_equal(command, "run") and Platform::c_string_length(options.target_kind) == 0.usize()
+            options.target_kind <- "test" if Platform::c_string_equal(command, "test") and Platform::c_string_length(options.target_kind) == 0.usize()
 
     private:
+        # The state of the common flag parser after each argument.
+        struct FlagScan:
+            index: i64
+            flags_ok: bool
+            positional_count: i64
+            separator_seen: bool
+            profile_seen: bool
+            target_name_seen: bool
+            color_seen: bool
+
         def valid_color_mode(value: cstr) -> bool:
             Platform::c_string_equal(value, "auto") or Platform::c_string_equal(value, "always") or Platform::c_string_equal(value, "never")
+
+        # ---------- compaction ----------------------------------------------------------------
+
+        # The number of argument slots an output-only mode removes: 1 for
+        # `--quiet`, 2 for `--color MODE`, and 0 for an argument that stays.
+        def output_mode_width(argument: cstr) -> i64:
+            1 if Platform::c_string_equal(argument, "--quiet") else 2 if Platform::c_string_equal(argument, "--color") else 0
+
+        # Output modes plus `--manifest-path PATH`.
+        def manifest_option_width(argument: cstr) -> i64:
+            2 if Platform::c_string_equal(argument, "--manifest-path") else output_mode_width(argument)
+
+        # Every validated global option, with or without a value.
+        def global_option_width(argument: cstr) -> i64:
+            1 if value_free_global_flag(argument) else manifest_option_width(argument)
+
+        def value_free_global_flag(argument: cstr) -> bool:
+            Platform::c_string_equal(argument, "--locked") or Platform::c_string_equal(argument, "--offline") or Platform::c_string_equal(argument, "--frozen") or Platform::c_string_equal(argument, "--json") or Platform::c_string_equal(argument, "--verbose") or Platform::c_string_equal(argument, "--quiet")
+
+        # A kept argument advances by one slot; a removed option by its width.
+        def consumed_slots(dropped_width: i64) -> i64:
+            1 if dropped_width == 0 else dropped_width
+
+        # Terminate the compacted vector and return its argument count.
+        def terminated_count(out: mutable darray[cstr]&) -> i64 can[Memory.Allocate, Abort.Panic]:
+            out.push(null)
+            out.count.i64() - 1
+
+        # ---------- common flags --------------------------------------------------------------
+
+        def next_common_flag(argument_count: i64, slots: cstr&&, command: cstr, options: mutable Model::CommandOptions&, quiet: mutable bool&, publish_dry_run: mutable bool&, scan: FlagScan) -> FlagScan can[Unsafe.PointerCast]:
+            flag: cstr = slots[scan.index].cast[cstr]
+            separator_step(command, scan) if Platform::c_string_equal(flag, "--") else forwarded_step(scan) if scan.separator_seen else target_step(argument_count, slots, command, flag, scan) if target_flag(flag) else profile_step(argument_count, slots, command, scan) if Platform::c_string_equal(flag, "--profile") else option_step(argument_count, slots, command, flag, options, quiet, publish_dry_run, scan)
+
+        # After `--` every argument belongs to the forwarded tail.
+        def forwarded_step(scan: FlagScan) -> FlagScan:
+            FlagScan{index: scan.index + 1, flags_ok: scan.flags_ok, positional_count: scan.positional_count, separator_seen: scan.separator_seen, profile_seen: scan.profile_seen, target_name_seen: scan.target_name_seen, color_seen: scan.color_seen}
+
+        # Only run and test forward the arguments after `--`.
+        def separator_step(command: cstr, scan: FlagScan) -> FlagScan:
+            FlagScan{index: scan.index + 1, flags_ok: scan.flags_ok and (Platform::c_string_equal(command, "run") or Platform::c_string_equal(command, "test")), positional_count: scan.positional_count, separator_seen: true, profile_seen: scan.profile_seen, target_name_seen: scan.target_name_seen, color_seen: scan.color_seen}
+
+        def target_step(argument_count: i64, slots: cstr&&, command: cstr, flag: cstr, scan: FlagScan) -> FlagScan can[Unsafe.PointerCast]:
+            accepted: bool = scan.flags_ok and target_flag_valid(argument_count, slots, scan.index, command, flag) and not scan.target_name_seen
+            FlagScan{index: scan.index + 2, flags_ok: accepted, positional_count: scan.positional_count, separator_seen: scan.separator_seen, profile_seen: scan.profile_seen, target_name_seen: scan.target_name_seen or accepted, color_seen: scan.color_seen}
+
+        def profile_step(argument_count: i64, slots: cstr&&, command: cstr, scan: FlagScan) -> FlagScan can[Unsafe.PointerCast]:
+            accepted: bool = scan.flags_ok and not scan.profile_seen and profile_flag_valid(argument_count, slots, scan.index, command)
+            FlagScan{index: scan.index + 2, flags_ok: accepted, positional_count: scan.positional_count, separator_seen: scan.separator_seen, profile_seen: scan.profile_seen or accepted, target_name_seen: scan.target_name_seen, color_seen: scan.color_seen}
+
+        # Record a value-free option, then check `--color` or a positional.
+        def option_step(argument_count: i64, slots: cstr&&, command: cstr, flag: cstr, options: mutable Model::CommandOptions&, quiet: mutable bool&, publish_dry_run: mutable bool&, scan: FlagScan) -> FlagScan can[Unsafe.PointerCast]:
+            record_option_flag(command, flag, options, quiet, publish_dry_run)
+            color_step(argument_count, slots, scan) if Platform::c_string_equal(flag, "--color") else positional_step(command, flag, scan)
+
+        def record_option_flag(command: cstr, flag: cstr, options: mutable Model::CommandOptions&, quiet: mutable bool&, publish_dry_run: mutable bool&) -> void:
+            options.locked <- true if Platform::c_string_equal(flag, "--locked")
+            options.offline <- true if Platform::c_string_equal(flag, "--offline")
+            options.frozen <- true if Platform::c_string_equal(flag, "--frozen")
+            options.json <- true if Platform::c_string_equal(flag, "--json")
+            options.verbose <- true if Platform::c_string_equal(flag, "--verbose")
+            quiet <- true if Platform::c_string_equal(flag, "--quiet")
+            publish_dry_run <- true if Platform::c_string_equal(command, "publish") and Platform::c_string_equal(flag, "--dry-run")
+
+        def color_step(argument_count: i64, slots: cstr&&, scan: FlagScan) -> FlagScan can[Unsafe.PointerCast]:
+            accepted: bool = scan.flags_ok and not scan.color_seen and scan.index + 1 < argument_count and valid_color_mode(slots[scan.index + 1].cast[cstr])
+            FlagScan{index: scan.index + 2, flags_ok: accepted, positional_count: scan.positional_count, separator_seen: scan.separator_seen, profile_seen: scan.profile_seen, target_name_seen: scan.target_name_seen, color_seen: scan.color_seen or accepted}
+
+        # A positional the command still accepts, or a flag it recognizes.
+        def positional_step(command: cstr, flag: cstr, scan: FlagScan) -> FlagScan:
+            is_positional: bool = Platform::c_string_length(flag) > 0.usize() and flag[0].u8() != 45
+            recognized: bool = positional_allowed(command, scan.positional_count) if is_positional else recognized_flag(command, flag)
+            FlagScan{index: scan.index + 1, flags_ok: scan.flags_ok and recognized, positional_count: (scan.positional_count + 1 if recognized and is_positional else scan.positional_count), separator_seen: scan.separator_seen, profile_seen: scan.profile_seen, target_name_seen: scan.target_name_seen, color_seen: scan.color_seen}
+
+        def positional_allowed(command: cstr, positional_count: i64) -> bool:
+            ((Platform::c_string_equal(command, "why") or Platform::c_string_equal(command, "install") or Platform::c_string_equal(command, "uninstall") or Platform::c_string_equal(command, "cache")) and positional_count == 0) or (Platform::c_string_equal(command, "fetch") and positional_count < 2)
+
+        def recognized_flag(command: cstr, flag: cstr) -> bool:
+            value_free_global_flag(flag) or (Platform::c_string_equal(flag, "--list") and Platform::c_string_equal(command, "package")) or (Platform::c_string_equal(flag, "--dry-run") and (Platform::c_string_equal(command, "cache") or Platform::c_string_equal(command, "publish"))) or ((Platform::c_string_equal(command, "install") or Platform::c_string_equal(command, "uninstall")) and Platform::c_string_equal(flag, "--local"))
+
+        def target_flag(flag: cstr) -> bool:
+            Platform::c_string_equal(flag, "--bin") or Platform::c_string_equal(flag, "--lib") or Platform::c_string_equal(flag, "--test")
+
+        def target_flag_allowed(command: cstr, flag: cstr) -> bool:
+            (Platform::c_string_equal(command, "build") and target_flag(flag)) or (Platform::c_string_equal(command, "run") and Platform::c_string_equal(flag, "--bin")) or (Platform::c_string_equal(command, "test") and Platform::c_string_equal(flag, "--test")) or (Platform::c_string_equal(command, "install") and Platform::c_string_equal(flag, "--bin"))
+
+        def builds_with_profile(command: cstr) -> bool:
+            Platform::c_string_equal(command, "build") or Platform::c_string_equal(command, "run") or Platform::c_string_equal(command, "test") or Platform::c_string_equal(command, "install")
+
+        # ---------- target flags --------------------------------------------------------------
+
+        # Record `--profile` or a target flag at `index`; returns the slots it used.
+        def recorded_target_flag(slots: cstr&&, index: i64, options: mutable Model::CommandOptions&) -> i64 can[Unsafe.PointerCast]:
+            flag: cstr = slots[index].cast[cstr]
+            recorded_profile(slots, index, options) if Platform::c_string_equal(flag, "--profile") else recorded_target(slots, index, flag, options) if target_flag(flag) else 1
+
+        def recorded_profile(slots: cstr&&, index: i64, options: mutable Model::CommandOptions&) -> i64 can[Unsafe.PointerCast]:
+            options.profile <- slots[index + 1].cast[cstr]
+            2
+
+        def recorded_target(slots: cstr&&, index: i64, flag: cstr, options: mutable Model::CommandOptions&) -> i64 can[Unsafe.PointerCast]:
+            options.target_name <- slots[index + 1].cast[cstr]
+            options.target_kind <- "bin" if Platform::c_string_equal(flag, "--bin") else "lib" if Platform::c_string_equal(flag, "--lib") else "test"
+            2
