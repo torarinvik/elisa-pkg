@@ -21,31 +21,32 @@ module BuildPublication:
             publish_file_descriptor: i64 = Platform::make_temporary_file(&publish_template)
             if publish_file_descriptor < 0:
                 _ = Platform::unlink_path(temporary_name)
-                return false
-            publish_name: cstr = (&publish_template[0]).cast[cstr] can Unsafe.PointerCast
-            output_mode: u16 = 493.u16() if Platform::c_string_equal(emit_kind, "exe") else 420.u16()
-            publish_ok: mutable bool = ProjectFiles::write_file_descriptor_all(publish_file_descriptor, artifact_content)
-            publish_ok <- false if Platform::change_mode(publish_name, output_mode) != 0
-            publish_ok <- false if Platform::access_path(publish_name, artifact_access_mode) != 0
-            publish_ok <- false if Platform::synchronize_file(publish_file_descriptor) != 0
-            region publish_close_status_scope:
+                false
+            else:
+                publish_name: cstr = (&publish_template[0]).cast[cstr] can Unsafe.PointerCast
+                # Every step runs, so the descriptor is closed after a failure too.
+                publish_ok: bool =
+                    written: bool = ProjectFiles::write_file_descriptor_all(publish_file_descriptor, artifact_content)
+                    mode_set: bool = Platform::change_mode(publish_name, 493.u16() if Platform::c_string_equal(emit_kind, "exe") else 420.u16()) == 0
+                    accessible: bool = Platform::access_path(publish_name, artifact_access_mode) == 0
+                    synchronized: bool = Platform::synchronize_file(publish_file_descriptor) == 0
+                    written and mode_set and accessible and synchronized
                 publish_close_status: i64 = Platform::close_file_descriptor(publish_file_descriptor)
                 if not publish_ok or publish_close_status != 0:
                     _ = Platform::unlink_path(publish_name)
                     _ = Platform::unlink_path(temporary_name)
                     CliOutput::write_error("error: unable to create a normalized parent-owned build artifact\n") can Global.Read
-                    return false
-            if Platform::rename_path(publish_name, artifact_name) != 0:
-                _ = Platform::unlink_path(publish_name)
-                _ = Platform::unlink_path(temporary_name)
-                return false
-            BuildReceipt::append_receipt_digest(receipt, artifact_digest)
-            if not ProjectFiles::replace_file(receipt_path, receipt):
-                # The artifact has already been atomically published. Do not unlink
-                # this pathname after a receipt failure: an older artifact may have
-                # been replaced by the rename, and removing it would destroy package
-                # output whose ownership is no longer distinguishable at this point.
-                # The missing or stale receipt makes the next build reject the cache
-                # and re-establish the pair before reuse.
-                return false
-            true
+                    false
+                elif Platform::rename_path(publish_name, artifact_name) != 0:
+                    _ = Platform::unlink_path(publish_name)
+                    _ = Platform::unlink_path(temporary_name)
+                    false
+                else:
+                    BuildReceipt::append_receipt_digest(receipt, artifact_digest)
+                    # The artifact has already been atomically published. Do not unlink
+                    # this pathname after a receipt failure: an older artifact may have
+                    # been replaced by the rename, and removing it would destroy package
+                    # output whose ownership is no longer distinguishable at this point.
+                    # The missing or stale receipt makes the next build reject the cache
+                    # and re-establish the pair before reuse.
+                    ProjectFiles::replace_file(receipt_path, receipt)
