@@ -80,6 +80,12 @@ module RollbackStore:
             compare_key: bool
             recheck_root_key_after_clock: bool
 
+        # A recorded release: its version and both digests.
+        struct History:
+            version: mutable darray[u8]
+            digest: mutable darray[u8]
+            metadata_digest: mutable darray[u8]
+
         # What a locked trust-state operation read before deciding.
         struct Observation:
             state: mutable darray[u8]
@@ -150,64 +156,77 @@ module RollbackStore:
         # configuration must still name the state file that was locked.
         def verify_locked(release: Release&, parsed: Model::Version, expires: u64, lock_path: darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             key_fingerprint: mutable darray[u8] = []
-            region key_status_scope:
-                key_status: Code =
-                    root_after_lock: mutable darray[u8] = []
-                    return Code.InvalidConfiguration if not read_environment_root(&root_after_lock)
-                    read_key_fingerprint(root_after_lock, &key_fingerprint)
-                return key_status if key_status != Code.Ok
+            key_status: Code = locked_key_fingerprint(&key_fingerprint)
+            key_status if key_status != Code.Ok else verify_with_key(release, parsed, expires, lock_path, key_fingerprint)
+
+        def locked_key_fingerprint(key_fingerprint: mutable darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            root_after_lock: mutable darray[u8] = []
+            Code.InvalidConfiguration if not read_environment_root(&root_after_lock) else read_key_fingerprint(root_after_lock, key_fingerprint)
+
+        def verify_with_key(release: Release&, parsed: Model::Version, expires: u64, lock_path: darray[u8]&, key_fingerprint: darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             root_after_key: mutable darray[u8] = []
-            return Code.TrustStateUnavailable if not RegistryConfiguration::configured_root(&root_after_key)
             root_key_identity: mutable darray[u8] = []
-            return Code.TrustStateUnavailable if not TrustIdentity::root_key(root_after_key, &root_key_identity)
-            state_path: darray[u8] = TrustPaths::lookup(root_after_key)
+            Code.TrustStateUnavailable if not RegistryConfiguration::configured_root(&root_after_key) or not TrustIdentity::root_key(root_after_key, &root_key_identity) else verify_at_state(release, parsed, expires, lock_path, key_fingerprint, root_key_identity, TrustPaths::lookup(root_after_key))
+
+        def verify_at_state(release: Release&, parsed: Model::Version, expires: u64, lock_path: darray[u8]&, key_fingerprint: darray[u8]&, root_key_identity: darray[u8]&, state_path: darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return Code.TrustStateUnavailable if not ByteText::equal(lock_path_for(state_path), lock_path)
             observation: mutable Observation = empty_observation()
-            region observe_status_scope:
-                observe_status: Code = observe(state_path, root_key_identity, key_fingerprint, PinPolicy{require_existing: true, compare_key: true, recheck_root_key_after_clock: true}, expires, &observation)
-                return observe_status if observe_status != Code.Ok
-            previous_version: mutable darray[u8] = []
-            previous_digest: mutable darray[u8] = []
-            previous_metadata_digest: mutable darray[u8] = []
-            region find_status_scope:
-                find_status: Code = trust_state_find_package_history(observation.state, observation.root_after_clock, release.package, &previous_version, &previous_digest, &previous_metadata_digest)
-                return find_status if find_status != Code.Ok
-            return Code.TrustStateUnavailable if previous_version.count == 0.usize()
-            region previous_scope:
-                previous: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-                return Code.TrustStateMalformed if not SemVer::parse(previous_version, &previous)
-                return Code.RollbackDetected if SemVer::compare(parsed, previous) < 0
-                return Code.DigestMismatch if SemVer::compare(parsed, previous) == 0 and (not ByteText::equal(previous_digest, release.digest) or not ByteText::equal(previous_metadata_digest, release.metadata_digest))
-                return Code.TrustStateUnavailable if SemVer::compare(parsed, previous) > 0
-            Code.Ok if observation.now <= observation.observed_clock else Code.TrustStateUnavailable if not TrustStorage::write_clock(clock_path_for(state_path), observation.now, observation.current_state_digest) else Code.Ok
+            observe_status: Code = observe(state_path, root_key_identity, key_fingerprint, PinPolicy{require_existing: true, compare_key: true, recheck_root_key_after_clock: true}, expires, &observation)
+            observe_status if observe_status != Code.Ok else verify_observed(release, parsed, observation, state_path)
+
+        # A verified release must already be the recorded release.
+        def verify_observed(release: Release&, parsed: Model::Version, observation: Observation&, state_path: darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            previous: mutable History = empty_history()
+            find_status: Code = trust_state_find_package_history(observation.state, observation.root_after_clock, release.package, &previous.version, &previous.digest, &previous.metadata_digest)
+            find_status if find_status != Code.Ok else Code.TrustStateUnavailable if previous.version.count == 0.usize() else verified_against_history(release, parsed, previous, observation, state_path)
+
+        def verified_against_history(release: Release&, parsed: Model::Version, previous: History&, observation: Observation&, state_path: darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            previous_parsed: mutable Model::Version = zero_version()
+            Code.TrustStateMalformed if not SemVer::parse(previous.version, &previous_parsed) else verified_ordering(release, SemVer::compare(parsed, previous_parsed), previous, observation, state_path)
+
+        def verified_ordering(release: Release&, ordering: i64, previous: History&, observation: Observation&, state_path: darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            Code.RollbackDetected if ordering < 0 else Code.DigestMismatch if ordering == 0 and not same_digests(previous, release) else Code.TrustStateUnavailable if ordering > 0 else Code.Ok if observation.now <= observation.observed_clock else Code.TrustStateUnavailable if not TrustStorage::write_clock(clock_path_for(state_path), observation.now, observation.current_state_digest) else Code.Ok
 
         def record_locked(release: Release&, parsed: Model::Version, expires: u64, guard: IndexGuard&, key_fingerprint: darray[u8]&, lock_path: darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            region root_after_lock_scope:
-                root_after_lock: mutable darray[u8] = []
-                return Code.TrustStateUnavailable if not RegistryConfiguration::configured_root(&root_after_lock)
+            Code.TrustStateUnavailable if not configured_root_readable() else record_with_root(release, parsed, expires, guard, key_fingerprint, lock_path)
+
+        def configured_root_readable() -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            root_after_lock: mutable darray[u8] = []
+            RegistryConfiguration::configured_root(&root_after_lock)
+
+        def record_with_root(release: Release&, parsed: Model::Version, expires: u64, guard: IndexGuard&, key_fingerprint: darray[u8]&, lock_path: darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             root_after_fingerprint: mutable darray[u8] = []
             return Code.TrustStateUnavailable if not RegistryConfiguration::configured_root(&root_after_fingerprint)
-            if guard.enabled:
-                current_index_identity: mutable darray[u8] = []
-                return Code.TrustStateUnavailable if not TrustIdentity::index(root_after_fingerprint, release.package, &current_index_identity)
-                return Code.InvalidConfiguration if not ByteText::equal(current_index_identity, guard.identity)
+            index_status: Code = current_index_status(root_after_fingerprint, release, guard)
+            index_status if index_status != Code.Ok else record_for_identity(release, parsed, expires, guard, key_fingerprint, lock_path, root_after_fingerprint)
+
+        # A guarded release must still belong to the index that selected it.
+        def current_index_status(root: darray[u8]&, release: Release&, guard: IndexGuard&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return Code.Ok if not guard.enabled
+            current_index_identity: mutable darray[u8] = []
+            Code.TrustStateUnavailable if not TrustIdentity::index(root, release.package, &current_index_identity) else Code.InvalidConfiguration if not ByteText::equal(current_index_identity, guard.identity) else Code.Ok
+
+        def record_for_identity(release: Release&, parsed: Model::Version, expires: u64, guard: IndexGuard&, key_fingerprint: darray[u8]&, lock_path: darray[u8]&, root: darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             state_identity: mutable darray[u8] = []
-            if PackageIdentity::valid_name(release.package):
-                return Code.TrustStateUnavailable if not TrustIdentity::package(root_after_fingerprint, release.package, &state_identity)
-            else:
-                ByteText::append(&state_identity, release.package)
             root_key_identity: mutable darray[u8] = []
-            return Code.TrustStateUnavailable if not TrustIdentity::root_key_from_history(state_identity, &root_key_identity)
-            state_path: darray[u8] = TrustPaths::prepare(root_after_fingerprint)
+            Code.TrustStateUnavailable if not state_identity_for(root, release.package, &state_identity) or not TrustIdentity::root_key_from_history(state_identity, &root_key_identity) else record_at_state(release, parsed, expires, guard, key_fingerprint, lock_path, state_identity, root_key_identity, TrustPaths::prepare(root))
+
+        # Package names are scoped to the registry; index identities are
+        # already scoped.
+        def state_identity_for(root: darray[u8]&, package: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            TrustIdentity::package(root, package, out) if PackageIdentity::valid_name(package) else appended_bytes(out, package)
+
+        def record_at_state(release: Release&, parsed: Model::Version, expires: u64, guard: IndexGuard&, key_fingerprint: darray[u8]&, lock_path: darray[u8]&, state_identity: darray[u8]&, root_key_identity: darray[u8]&, state_path: darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return Code.TrustStateUnavailable if not ByteText::equal(lock_path_for(state_path), lock_path)
             observation: mutable Observation = empty_observation()
-            region observe_status_scope:
-                observe_status: Code = observe(state_path, root_key_identity, key_fingerprint, PinPolicy{require_existing: guard.enabled, compare_key: not guard.enabled, recheck_root_key_after_clock: false}, expires, &observation)
-                return observe_status if observe_status != Code.Ok
-            if guard.enabled:
-                region index_status_scope:
-                    index_status: Code = check_index_floor(observation.state, guard)
-                    return index_status if index_status != Code.Ok
+            observe_status: Code = observe(state_path, root_key_identity, key_fingerprint, PinPolicy{require_existing: guard.enabled, compare_key: not guard.enabled, recheck_root_key_after_clock: false}, expires, &observation)
+            observe_status if observe_status != Code.Ok else record_observed(release, parsed, guard, key_fingerprint, state_identity, root_key_identity, observation, state_path)
+
+        def record_observed(release: Release&, parsed: Model::Version, guard: IndexGuard&, key_fingerprint: darray[u8]&, state_identity: darray[u8]&, root_key_identity: darray[u8]&, observation: Observation&, state_path: darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            index_status: Code = check_index_floor(observation.state, guard) if guard.enabled else Code.Ok
+            index_status if index_status != Code.Ok else record_against_history(release, parsed, key_fingerprint, state_identity, root_key_identity, observation, state_path)
+
+        def record_against_history(release: Release&, parsed: Model::Version, key_fingerprint: darray[u8]&, state_identity: darray[u8]&, root_key_identity: darray[u8]&, observation: Observation&, state_path: darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             if check_release_history(observation, release, parsed, state_path) is decided:
                 return decided
             append_and_write(observation, release, state_identity, root_key_identity, key_fingerprint, state_path)
@@ -215,141 +234,164 @@ module RollbackStore:
         def empty_observation() -> Observation:
             Observation{state: [], key_pin_found: false, observed_clock: 0, clock_missing: false, current_state_digest: [], now: 0, root_after_clock: []}
 
+        def empty_history() -> History:
+            History{version: [], digest: [], metadata_digest: []}
+
+        def zero_version() -> Model::Version:
+            Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
+
+        def same_digests(previous: History&, release: Release&) -> bool:
+            ByteText::equal(previous.digest, release.digest) and ByteText::equal(previous.metadata_digest, release.metadata_digest)
+
+        # ---------- observation ---------------------------------------------------------------
+
         # Read the state, its root-key pin, and its clock sidecar, and require
         # that they agree with each other, the wall clock, and the metadata expiry.
         def observe(state_path: darray[u8]&, root_key_identity: darray[u8]&, key_fingerprint: darray[u8]&, policy: PinPolicy, expires: u64, out: mutable Observation&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            region read_status_scope:
-                read_status: Code = trust_state_read(state_path, &out.state)
-                return read_status if read_status != Code.Ok
-            region key_pin_status_scope:
-                key_pin_status: Code = trust_state_check_root_pin(out.state, root_key_identity, key_fingerprint, policy.require_existing, policy.compare_key, &out.key_pin_found)
-                return key_pin_status if key_pin_status != Code.Ok
-            region legacy_override_status_scope:
-                legacy_override_status: Code = rollback_result(RollbackRecords::legacy_override_status(out.state, trust_state_has_override()))
-                return legacy_override_status if legacy_override_status != Code.Ok
+            state_status: Code = observe_state(state_path, root_key_identity, key_fingerprint, policy, out)
+            state_status if state_status != Code.Ok else observe_clock(state_path, root_key_identity, policy, expires, out)
+
+        def observe_state(state_path: darray[u8]&, root_key_identity: darray[u8]&, key_fingerprint: darray[u8]&, policy: PinPolicy, out: mutable Observation&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            read_status: Code = trust_state_read(state_path, &out.state)
+            read_status if read_status != Code.Ok else state_pin_status(root_key_identity, key_fingerprint, policy, out)
+
+        def state_pin_status(root_key_identity: darray[u8]&, key_fingerprint: darray[u8]&, policy: PinPolicy, out: mutable Observation&) -> Code can[Memory.Allocate, Abort.Panic]:
+            key_pin_status: Code = trust_state_check_root_pin(out.state, root_key_identity, key_fingerprint, policy.require_existing, policy.compare_key, &out.key_pin_found)
+            key_pin_status if key_pin_status != Code.Ok else rollback_result(RollbackRecords::legacy_override_status(out.state, trust_state_has_override()))
+
+        def observe_clock(state_path: darray[u8]&, root_key_identity: darray[u8]&, policy: PinPolicy, expires: u64, out: mutable Observation&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             observed_state_digest: mutable darray[u8] = []
-            region clock_status_scope:
-                clock_status: Code = read_rollback_clock(clock_path_for(state_path), &out.observed_clock, &observed_state_digest, &out.clock_missing)
-                return clock_status if clock_status != Code.Ok
-            return Code.TrustStateUnavailable if not RegistryConfiguration::configured_root(&out.root_after_clock)
-            if policy.recheck_root_key_after_clock:
-                region clock_root_key_identity_scope:
-                    clock_root_key_identity: mutable darray[u8] = []
-                    return Code.TrustStateUnavailable if not TrustIdentity::root_key(out.root_after_clock, &clock_root_key_identity) or not ByteText::equal(clock_root_key_identity, root_key_identity)
+            clock_status: Code = read_rollback_clock(clock_path_for(state_path), &out.observed_clock, &observed_state_digest, &out.clock_missing)
+            clock_status if clock_status != Code.Ok else observe_after_clock(root_key_identity, policy, expires, observed_state_digest, out)
+
+        def observe_after_clock(root_key_identity: darray[u8]&, policy: PinPolicy, expires: u64, observed_state_digest: darray[u8]&, out: mutable Observation&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return Code.TrustStateUnavailable if not RegistryConfiguration::configured_root(&out.root_after_clock) or (policy.recheck_root_key_after_clock and not root_key_unchanged(out.root_after_clock, root_key_identity))
             return Code.TrustStateUnavailable if out.clock_missing and out.state.count > 23.usize()
             return Code.TrustStateUnavailable if:
                 not Integrity::sha256_hex(out.state, &out.current_state_digest)
                 not out.clock_missing and not ByteText::equal(observed_state_digest, out.current_state_digest)
-            region now_scope:
-                now: i64 = Platform::wall_clock_seconds()
-                return Code.TrustStateUnavailable if now < 0
-                out.now <- now.u64()
+            observed_now(expires, Platform::wall_clock_seconds(), out)
+
+        def root_key_unchanged(root: darray[u8]&, root_key_identity: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            clock_root_key_identity: mutable darray[u8] = []
+            TrustIdentity::root_key(root, &clock_root_key_identity) and ByteText::equal(clock_root_key_identity, root_key_identity)
+
+        def observed_now(expires: u64, now: i64, out: mutable Observation&) -> Code:
+            return Code.TrustStateUnavailable if now < 0
+            out.now <- now.u64()
             Code.ClockRollback if out.observed_clock > out.now else metadata_expiry_status(expires, out.now)
+
+        # ---------- index floor and release history -------------------------------------------
 
         # The stored index floor must equal the generation and digest the
         # caller resolved; a newer stored floor means the index rolled back.
         def check_index_floor(state: darray[u8]&, guard: IndexGuard&) -> Code can[Memory.Allocate, Abort.Panic]:
-            observed_index_version: mutable darray[u8] = []
-            observed_index_digest: mutable darray[u8] = []
-            observed_index_metadata_digest: mutable darray[u8] = []
-            region index_find_status_scope:
-                index_find_status: Code = trust_state_find(state, guard.identity, &observed_index_version, &observed_index_digest, &observed_index_metadata_digest) if state.count > 0 else Code.Ok
-                return index_find_status if index_find_status != Code.Ok
-            return Code.TrustStateUnavailable if observed_index_version.count == 0
-            region parsed_scope:
-                expected_index_version: mutable darray[u8] = []
-                ByteText::append_text(&expected_index_version, "0.0.")
-                ByteText::append_decimal(&expected_index_version, guard.generation)
-                expected_index_parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-                observed_index_parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-                return Code.TrustStateMalformed if not SemVer::parse(expected_index_version, &expected_index_parsed) or not SemVer::parse(observed_index_version, &observed_index_parsed)
-                return Code.RollbackDetected if SemVer::compare(observed_index_parsed, expected_index_parsed) > 0
-                return Code.TrustStateUnavailable if SemVer::compare(observed_index_parsed, expected_index_parsed) < 0
-            Code.DigestMismatch if not ByteText::equal(observed_index_digest, guard.digest) or not ByteText::equal(observed_index_metadata_digest, guard.digest) else Code.Ok
+            observed: mutable History = empty_history()
+            find_status: Code = trust_state_find(state, guard.identity, &observed.version, &observed.digest, &observed.metadata_digest) if state.count > 0 else Code.Ok
+            find_status if find_status != Code.Ok else Code.TrustStateUnavailable if observed.version.count == 0 else index_floor_status(observed, guard)
+
+        def index_floor_status(observed: History&, guard: IndexGuard&) -> Code can[Memory.Allocate, Abort.Panic]:
+            expected_parsed: mutable Model::Version = zero_version()
+            observed_parsed: mutable Model::Version = zero_version()
+            Code.TrustStateMalformed if not SemVer::parse(index_floor_version(guard.generation), &expected_parsed) or not SemVer::parse(observed.version, &observed_parsed) else index_ordering_status(SemVer::compare(observed_parsed, expected_parsed), observed, guard)
+
+        # Index generations are recorded as "0.0.GENERATION".
+        def index_floor_version(generation: u64) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
+            version: mutable darray[u8] = []
+            ByteText::append_text(&version, "0.0.")
+            ByteText::append_decimal(&version, generation)
+            version
+
+        def index_ordering_status(ordering: i64, observed: History&, guard: IndexGuard&) -> Code:
+            Code.RollbackDetected if ordering > 0 else Code.TrustStateUnavailable if ordering < 0 else Code.DigestMismatch if not ByteText::equal(observed.digest, guard.digest) or not ByteText::equal(observed.metadata_digest, guard.digest) else Code.Ok
 
         # Compare the release with its recorded history. Returns null when a
         # new record must be appended, or the final code otherwise.
         def check_release_history(observation: Observation&, release: Release&, parsed: Model::Version, state_path: darray[u8]&) -> Code? can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            previous_version: mutable darray[u8] = []
-            previous_digest: mutable darray[u8] = []
-            previous_metadata_digest: mutable darray[u8] = []
-            region find_status_scope:
-                find_status: Code =
-                    if observation.state.count == 0:
-                        Code.Ok
-                    elif PackageIdentity::valid_name(release.package):
-                        trust_state_find_package_history(observation.state, observation.root_after_clock, release.package, &previous_version, &previous_digest, &previous_metadata_digest)
-                    else:
-                        trust_state_find(observation.state, release.package, &previous_version, &previous_digest, &previous_metadata_digest)
-                return find_status if find_status != Code.Ok
-            return null if previous_version.count == 0.usize()
-            region previous_scope:
-                previous: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-                return Code.TrustStateMalformed if not SemVer::parse(previous_version, &previous)
-                return Code.RollbackDetected if SemVer::compare(parsed, previous) < 0
-                return Code.DigestMismatch if SemVer::compare(parsed, previous) == 0 and (not ByteText::equal(previous_digest, release.digest) or not ByteText::equal(previous_metadata_digest, release.metadata_digest))
-                return null if SemVer::compare(parsed, previous) != 0 or not observation.key_pin_found
-            # The same release is already recorded under a pinned key: only advance the clock.
-            Code.Ok if observation.observed_clock == observation.now else Code.TrustStateUnavailable if not TrustStorage::write_clock(clock_path_for(state_path), observation.now, observation.current_state_digest) else Code.Ok
+            previous: mutable History = empty_history()
+            find_status: Code = recorded_history_status(observation, release, &previous)
+            find_status if find_status != Code.Ok else decided_by_history(observation, release, parsed, previous, state_path)
+
+        def recorded_history_status(observation: Observation&, release: Release&, previous: mutable History&) -> Code can[Memory.Allocate, Abort.Panic]:
+            Code.Ok if observation.state.count == 0 else trust_state_find_package_history(observation.state, observation.root_after_clock, release.package, &previous.version, &previous.digest, &previous.metadata_digest) if PackageIdentity::valid_name(release.package) else trust_state_find(observation.state, release.package, &previous.version, &previous.digest, &previous.metadata_digest)
+
+        def decided_by_history(observation: Observation&, release: Release&, parsed: Model::Version, previous: History&, state_path: darray[u8]&) -> Code? can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return null if previous.version.count == 0.usize()
+            previous_parsed: mutable Model::Version = zero_version()
+            Code.TrustStateMalformed if not SemVer::parse(previous.version, &previous_parsed) else decided_by_ordering(observation, release, SemVer::compare(parsed, previous_parsed), previous, state_path)
+
+        # The same release already recorded under a pinned key only advances
+        # the clock; a newer release, or one without a pin, is appended.
+        def decided_by_ordering(observation: Observation&, release: Release&, ordering: i64, previous: History&, state_path: darray[u8]&) -> Code? can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            Code.RollbackDetected if ordering < 0 else Code.DigestMismatch if ordering == 0 and not same_digests(previous, release) else null if ordering != 0 or not observation.key_pin_found else Code.Ok if observation.observed_clock == observation.now else Code.TrustStateUnavailable if not TrustStorage::write_clock(clock_path_for(state_path), observation.now, observation.current_state_digest) else Code.Ok
+
+        # ---------- appending -----------------------------------------------------------------
 
         # Append the root-key pin (when missing) and the release record, then
         # publish the clock sidecar and the state.
         def append_and_write(observation: Observation&, release: Release&, state_identity: darray[u8]&, root_key_identity: darray[u8]&, key_fingerprint: darray[u8]&, state_path: darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             state: mutable darray[u8] = []
-            region upgrade_status_scope:
-                upgrade_status: Code = rollback_result(RollbackRecords::upgrade_to_v4(observation.root_after_clock, observation.state, trust_state_has_override(), &state))
-                return upgrade_status if upgrade_status != Code.Ok
-            if not observation.key_pin_found:
-                return Code.TrustStateUnavailable if not TrustIdentity::valid_root_key(root_key_identity)
-                region pin_record_size_scope:
-                    pin_record_size: usize = root_key_identity.count + 9.usize() + key_fingerprint.count * 2.usize()
-                    return Code.TrustStateUnavailable if pin_record_size > 1048576.usize() or state.count > 1048576.usize() - pin_record_size
-                ByteText::append(&state, root_key_identity)
-                ByteText::append_text(&state, " 0.0.0 ")
-                ByteText::append(&state, key_fingerprint)
-                state <- state.push(32)
-                ByteText::append(&state, key_fingerprint)
-                state <- state.push(10)
-            region record_size_scope:
-                record_size: usize = state_identity.count + release.version.count + release.digest.count + release.metadata_digest.count + 4.usize()
-                return Code.TrustStateUnavailable if record_size > 1048576.usize() or state.count > 1048576.usize() - record_size
-            ByteText::append(&state, state_identity)
-            state <- state.push(32)
-            ByteText::append(&state, release.version)
-            state <- state.push(32)
-            ByteText::append(&state, release.digest)
-            state <- state.push(32)
-            ByteText::append(&state, release.metadata_digest)
-            state <- state.push(10)
-            region updated_state_digest_scope:
-                updated_state_digest: mutable darray[u8] = []
-                return Code.TrustStateUnavailable if not Integrity::sha256_hex(state, &updated_state_digest)
-                # Bind the proposed state bytes into the sidecar before publishing
-                # the state. A crash between these atomic writes leaves a mismatch,
-                # which fails closed instead of accepting either history.
-                return Code.TrustStateUnavailable if:
-                    not TrustStorage::write_clock(clock_path_for(state_path), observation.now, updated_state_digest)
-                    not TrustStorage::write(state_path, state)
-            Code.Ok
+            upgrade_status: Code = rollback_result(RollbackRecords::upgrade_to_v4(observation.root_after_clock, observation.state, trust_state_has_override(), &state))
+            upgrade_status if upgrade_status != Code.Ok else Code.TrustStateUnavailable if not appended_root_pin(observation, root_key_identity, key_fingerprint, &state) or not appended_release_record(state_identity, release, &state) else published_state(observation, state, state_path)
 
+        def appended_root_pin(observation: Observation&, root_key_identity: darray[u8]&, key_fingerprint: darray[u8]&, state: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            return true if observation.key_pin_found
+            return false if not TrustIdentity::valid_root_key(root_key_identity) or not fits_in_state(state, root_key_identity.count + 9.usize() + key_fingerprint.count * 2.usize())
+            ByteText::append(state, root_key_identity)
+            ByteText::append_text(state, " 0.0.0 ")
+            ByteText::append(state, key_fingerprint)
+            state.push(32)
+            ByteText::append(state, key_fingerprint)
+            state.push(10)
+            true
+
+        def appended_release_record(state_identity: darray[u8]&, release: Release&, state: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            return false if not fits_in_state(state, state_identity.count + release.version.count + release.digest.count + release.metadata_digest.count + 4.usize())
+            ByteText::append(state, state_identity)
+            state.push(32)
+            ByteText::append(state, release.version)
+            state.push(32)
+            ByteText::append(state, release.digest)
+            state.push(32)
+            ByteText::append(state, release.metadata_digest)
+            state.push(10)
+            true
+
+        # A record of `record_size` bytes keeps the state within 1 MiB.
+        def fits_in_state(state: darray[u8]&, record_size: usize) -> bool:
+            record_size <= 1048576.usize() and state.count <= 1048576.usize() - record_size
+
+        # Bind the proposed state bytes into the sidecar before publishing
+        # the state. A crash between these atomic writes leaves a mismatch,
+        # which fails closed instead of accepting either history.
+        def published_state(observation: Observation&, state: darray[u8]&, state_path: darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            updated_state_digest: mutable darray[u8] = []
+            Code.TrustStateUnavailable if not Integrity::sha256_hex(state, &updated_state_digest) or not TrustStorage::write_clock(clock_path_for(state_path), observation.now, updated_state_digest) or not TrustStorage::write(state_path, state) else Code.Ok
+
+        # ---------- state files ---------------------------------------------------------------
+
+        # Only the descriptor-relative ENOENT result is an empty history.
+        # Insecure parents, symlinks, and unreadable files must never reset
+        # rollback protection.
         def trust_state_read(path: darray[u8]&, out: mutable darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out.resize(0)
             loaded: mutable darray[u8] = []
-            region read_status_scope:
-                read_status: i64 = RegistryFiles::read_trusted_file(path, 1048576.usize(), &loaded)
-                if read_status < 0:
-                    # Only the descriptor-relative ENOENT result is an empty
-                    # history. Insecure parents, symlinks, and unreadable files
-                    # must never reset rollback protection.
-                    return Code.Ok if read_status == -2
-                    return Code.TrustStateUnavailable
-            # Version 2 is accepted only for safe migration. Versions 3 and 4
-            # scope package identities to the registry root; v4 also records
-            # each registry's configured signing-key fingerprint.
-            return Code.TrustStateMalformed if loaded.count == 0 or loaded.count > 1048576 or (not RollbackRecords::version_2(loaded) and not RollbackRecords::version_3(loaded) and not RollbackRecords::version_4(loaded))
-            for index in 0..<loaded.count |out, loaded|:
-                out.push(loaded[index])
+            read_status: i64 = RegistryFiles::read_trusted_file(path, 1048576.usize(), &loaded)
+            Code.Ok if read_status == -2 else Code.TrustStateUnavailable if read_status < 0 else Code.TrustStateMalformed if not supported_state(loaded) else copied_state(loaded, out)
+
+        # Version 2 is accepted only for safe migration. Versions 3 and 4
+        # scope package identities to the registry root; v4 also records
+        # each registry's configured signing-key fingerprint.
+        def supported_state(loaded: darray[u8]&) -> bool:
+            loaded.count > 0 and loaded.count <= 1048576 and (RollbackRecords::version_2(loaded) or RollbackRecords::version_3(loaded) or RollbackRecords::version_4(loaded))
+
+        def copied_state(loaded: darray[u8]&, out: mutable darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic]:
+            ByteText::append(out, loaded)
             Code.Ok
+
+        def appended_bytes(out: mutable darray[u8]&, value: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            ByteText::append(out, value)
+            true
 
         def rollback_result(status: RollbackRecords::Code) -> Code:
             match status:
@@ -376,29 +418,27 @@ module RollbackStore:
             version_out.resize(0)
             digest_out.resize(0)
             metadata_digest_out.resize(0)
+            scoped_status: Code = scoped_package_history(state, root, package, version_out, digest_out, metadata_digest_out)
+            scoped_status if scoped_status != Code.Ok or version_out.count > 0 else legacy_package_history(state, package, version_out, digest_out, metadata_digest_out)
+
+        def scoped_package_history(state: darray[u8]&, root: darray[u8]&, package: darray[u8]&, version_out: mutable darray[u8]&, digest_out: mutable darray[u8]&, metadata_digest_out: mutable darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic]:
             scoped_identity: mutable darray[u8] = []
-            return Code.TrustStateUnavailable if not TrustIdentity::package(root, package, &scoped_identity)
-            region scoped_status_scope:
-                scoped_status: Code = trust_state_find(state, scoped_identity, version_out, digest_out, metadata_digest_out) if state.count > 0 else Code.Ok
-                return scoped_status if scoped_status != Code.Ok or version_out.count > 0
-            # V3 rows are exclusively scoped identities, so a missing scoped
-            # row is a genuinely new package for this registry. Only v2 can
-            # carry a legacy plain-name row that is eligible for safe default
-            # path migration.
+            Code.TrustStateUnavailable if not TrustIdentity::package(root, package, &scoped_identity) else trust_state_find(state, scoped_identity, version_out, digest_out, metadata_digest_out) if state.count > 0 else Code.Ok
+
+        # V3 rows are exclusively scoped identities, so a missing scoped row
+        # is a genuinely new package for this registry. Only v2 can carry a
+        # legacy plain-name row that is eligible for safe default path
+        # migration.
+        def legacy_package_history(state: darray[u8]&, package: darray[u8]&, version_out: mutable darray[u8]&, digest_out: mutable darray[u8]&, metadata_digest_out: mutable darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic]:
             return Code.Ok if not RollbackRecords::version_2(state)
-            legacy_version: mutable darray[u8] = []
-            legacy_digest: mutable darray[u8] = []
-            legacy_metadata_digest: mutable darray[u8] = []
-            region legacy_status_scope:
-                legacy_status: Code = trust_state_find(state, package, &legacy_version, &legacy_digest, &legacy_metadata_digest) if state.count > 0 else Code.Ok
-                return legacy_status if legacy_status != Code.Ok or legacy_version.count == 0
-            return Code.TrustStateUnavailable if trust_state_has_override()
-            for index in 0..<legacy_version.count |version_out, legacy_version|:
-                version_out.push(legacy_version[index])
-            for index in 0..<legacy_digest.count |digest_out, legacy_digest|:
-                digest_out.push(legacy_digest[index])
-            for index in 0..<legacy_metadata_digest.count |metadata_digest_out, legacy_metadata_digest|:
-                metadata_digest_out.push(legacy_metadata_digest[index])
+            legacy: mutable History = empty_history()
+            legacy_status: Code = trust_state_find(state, package, &legacy.version, &legacy.digest, &legacy.metadata_digest) if state.count > 0 else Code.Ok
+            legacy_status if legacy_status != Code.Ok or legacy.version.count == 0 else Code.TrustStateUnavailable if trust_state_has_override() else copied_history(legacy, version_out, digest_out, metadata_digest_out)
+
+        def copied_history(history: History&, version_out: mutable darray[u8]&, digest_out: mutable darray[u8]&, metadata_digest_out: mutable darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic]:
+            ByteText::append(version_out, history.version)
+            ByteText::append(digest_out, history.digest)
+            ByteText::append(metadata_digest_out, history.metadata_digest)
             Code.Ok
 
         def trust_state_finish(lock_file_descriptor: i64, code: Code) -> Code:
