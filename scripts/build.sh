@@ -36,11 +36,12 @@ if [[ ! -x "$STAGE1" ]]; then
   exit 2
 fi
 # Lint the full include graph without invoking code generation or the linker.
+# Strict never-leak findings are errors here, so any new finding fails the check.
 if [[ ${1:-} == --check ]]; then
   ELISA_STAGE1_BIN="$STAGE1" \
   ELISA_ALLOW_STALE_STAGE1="${ELISA_ALLOW_STALE_STAGE1:-0}" \
   ELISA_STAGE1_SEMANTIC_GATE=1 \
-    exec "$WRAPPER" -Wnever-leak=strict -emit check "$ROOT/src/main.elisa"
+    exec "$WRAPPER" -Werror=never-leak=strict -emit check "$ROOT/src/main.elisa"
 fi
 if [[ ! -f "$RUNTIME" ]]; then
   echo "error: Elisa runtime object is missing: $RUNTIME" >&2

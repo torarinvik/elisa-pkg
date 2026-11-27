@@ -309,6 +309,11 @@ Tuple types are named (`darray[(a: i64, b: i64)]`); `darray[(i64, i64)]` is an e
 stage0. Dicts and sets need the stage1 runtime (`include "elisacore_std/elisacore_runtime.elisa"`).
 Bracket-free generators (`sum(x for x in xs)`) do not exist; write a loop expression.
 
+To copy a whole container, write `path.clone()` rather than `[path[index] for index in
+0..<path.count]`. `clone` makes an independent deep copy and reads through a reference, so a
+borrowed `darray[u8]&` gives an owned `darray[u8]`. Keep a comprehension when it copies only a
+sub-range or transforms the elements.
+
 ## 6. Value-threading
 
 **[working]** (stage1). For an owned value, thread it through the call instead of lending it:

@@ -70,8 +70,8 @@ using whatever compiler happens to be installed on the runner:
 
 | Input | Pinned identity |
 | --- | --- |
-| Elisa compiler | `f0d9e9c70da95933a8ce62ee004e0ac048f50301` |
-| Elisa core / stage0 | `68c06b4e0eb1306585ba40d1447b91366e03fdca` |
+| Elisa compiler | `a0fe756c11064d88d1f7f402ef9b1e38866d9f09` |
+| Elisa core / stage0 | `ffb9ba3661e4aa734cd780089b8d5cc036379522` |
 | Go | `1.25.0`, required by the pinned core `go.mod` |
 | LLVM | `23.1.1`, checked after Homebrew installation |
 | `actions/checkout` | `9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0` |
@@ -108,17 +108,18 @@ GitHub references: [artifact attestations](https://docs.github.com/en/actions/ho
 ## Strict Elisa lint
 
 The macOS workflow checks the repository layout, FFI boundary, and rebuild
-timeout supervisor before fetching or rebuilding the compiler.
+timeout supervisor before fetching or rebuilding the compiler. After seeding
+Stage1 from the pinned sources, it runs `make lint`, so a strict never-leak
+finding fails the workflow before the regression suite runs.
 
 Run `make lint` to check the 600-line source limit and 20-file directory limit
 before checking Elisa semantics. The layout check also runs independently with
 `python3 scripts/check_source_layout.py`.
 
-Use a Stage1 toolchain that supports
-`-Wnever-leak=strict` and `-emit check`. The command checks the full
-package-manager source graph and reports strict lint diagnostics without
-linking an executable. Use `scripts/build.sh --strict` to produce
-`build/elisapkg-strict` with the same diagnostics enabled. The source tree
-checks clean under `-Wnever-leak=strict`; keep new code warning-free. The current CI
-compiler pin predates this flag. Upgrade and verify that pin before enabling
-strict lint in the release build.
+The semantic step, `scripts/build.sh --check`, needs a Stage1 toolchain that
+supports `-Werror=never-leak=strict` and `-emit check`; the pinned compiler
+does. It checks the full package-manager source graph without linking an
+executable and treats every strict never-leak finding as an error. Use
+`scripts/build.sh --strict` to produce `build/elisapkg-strict` with the same
+diagnostics reported as warnings. The source tree checks clean under
+`-Wnever-leak=strict`; keep new code warning-free.
