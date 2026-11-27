@@ -28,24 +28,27 @@ module ManifestEdits:
             append_entry(raw, alias, entry)
 
         def remove(raw: darray[u8]&, alias: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
-            dependency_start: usize = Json::root_value_offset(raw, "dependencies")
-            dependency_end: usize = Json::object_end(raw, dependency_start)
             start: mutable usize = 0.usize()
             end: mutable usize = 0.usize()
-            return [] if not Manifest::find_dependency_span(raw, alias, &start, &end)
-            region probe_scope:
-                probe: mutable usize = end
-                probe <- Json::skip_whitespace(raw, probe, dependency_end)
-                if probe < dependency_end and raw[probe] == 44:
-                    end <- probe + 1.usize()
+            if not Manifest::find_dependency_span(raw, alias, &start, &end):
+                []
+            else:
+                dependency_start: usize = Json::root_value_offset(raw, "dependencies")
+                dependency_end: usize = Json::object_end(raw, dependency_start)
+                following: usize = Json::skip_whitespace(raw, end, dependency_end)
+                if following < dependency_end and raw[following] == 44:
+                    # Drop the entry together with the comma that follows it.
+                    kept: mutable darray[u8] = [raw[item] for item in 0..<start]
+                    ByteText::with_range(kept, raw, following + 1.usize(), raw.count)
                 else:
-                    probe <- start
-                    while probe > dependency_start + 1.usize() and Json::is_whitespace(raw[probe - 1.usize()]) |raw, probe|:
-                        probe <- probe - 1.usize()
-                    start <- probe - 1.usize() if probe > dependency_start and raw[probe - 1.usize()] == 44
-            out: mutable darray[u8] = [raw[item] for item in 0..<start]
-            ByteText::append_range(&out, raw, end, raw.count)
-            out
+                    # The last entry: drop the comma before it, if any.
+                    kept: mutable darray[u8] =
+                        removal_start: usize =
+                            preceding: usize = while probe > dependency_start + 1.usize() and Json::is_whitespace(raw[probe - 1.usize()]) |probe: usize = start| -> probe:
+                                probe <- probe - 1.usize()
+                            preceding - 1.usize() if preceding > dependency_start and raw[preceding - 1.usize()] == 44 else start
+                        [raw[item] for item in 0..<removal_start]
+                    ByteText::with_range(kept, raw, end, raw.count)
 
     private:
         # `out` followed by the bytes of `text`.
@@ -55,46 +58,47 @@ module ManifestEdits:
             out
 
         def valid_string_value(value: darray[u8]&) -> bool:
-            return false if:
-                value.count == 0.usize() or value.count > Json::maximum_document_bytes
-                not Json::valid_utf8(value)
-            for index in 0..<value.count |value|:
-                byte: u8 = value[index]
-                return false if byte < 32 or byte == 34 or byte == 92
-            true
+            if value.count == 0.usize() or value.count > Json::maximum_document_bytes or not Json::valid_utf8(value):
+                false
+            else:
+                for index in 0..<value.count |valid: bool = true| -> valid:
+                    byte: u8 = value[index]
+                    break false if byte < 32 or byte == 34 or byte == 92
 
         def append_entry(raw: darray[u8]&, alias: darray[u8]&, entry: dstr&) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
             dependency_start: usize = Json::root_value_offset(raw, "dependencies")
             if dependency_start >= raw.count:
-                return append_object_member(raw, Json::root_start(raw), entry, true)
-            previous_start: mutable usize = 0.usize()
-            region previous_end_scope:
+                append_object_member(raw, Json::root_start(raw), entry, true)
+            else:
+                previous_start: mutable usize = 0.usize()
                 previous_end: mutable usize = 0.usize()
-                return [] if Manifest::find_dependency_span(raw, alias, &previous_start, &previous_end)
-            out: darray[u8] = append_object_member(raw, dependency_start, entry, false)
-            [] if not Manifest::valid_dependency_map(out, "dependencies") else out
+                if Manifest::find_dependency_span(raw, alias, &previous_start, &previous_end):
+                    []
+                else:
+                    out: darray[u8] = append_object_member(raw, dependency_start, entry, false)
+                    [] if not Manifest::valid_dependency_map(out, "dependencies") else out
 
         def append_object_member(raw: darray[u8]&, object_start: usize, entry: dstr&, create_dependencies: bool) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
-            insertion: mutable usize =
+            # Insert after the last non-whitespace byte before the closing brace.
+            insertion: usize =
                 object_end: usize = Json::object_end(raw, object_start)
-                return [] if object_start >= object_end or object_end >= raw.count
-                object_end
-            while insertion > object_start + 1.usize() and Json::is_whitespace(raw[insertion - 1.usize()]) |raw, insertion|:
-                insertion <- insertion - 1.usize()
+                if object_start >= object_end or object_end >= raw.count:
+                    return []
+                else:
+                    while probe > object_start + 1.usize() and Json::is_whitespace(raw[probe - 1.usize()]) |probe: usize = object_end| -> probe:
+                        probe <- probe - 1.usize()
             has_existing: bool = insertion > object_start + 1.usize()
-            separator_bytes: usize = 2.usize() if has_existing else 0.usize()
-            wrapper_bytes: usize = 18.usize() if create_dependencies else 0.usize()
-            return [] if raw.count > Json::maximum_document_bytes
-            region remaining_scope:
-                remaining: usize = Json::maximum_document_bytes - raw.count
-                return [] if separator_bytes + wrapper_bytes > remaining or entry.count > remaining - separator_bytes - wrapper_bytes
-            out: mutable darray[u8] = [raw[item] for item in 0..<insertion]
-            if has_existing:
-                ByteText::append_text(&out, ", ")
-            if create_dependencies:
-                ByteText::append_text(&out, "\"dependencies\": {")
-            out <- with_text(out, entry)
-            if create_dependencies:
-                out <- out.push(125)
-            ByteText::append_range(&out, raw, insertion, raw.count)
-            out
+            # A `, ` separator and the `"dependencies": {` ... `}` wrapper.
+            framing_bytes: usize = (2.usize() if has_existing else 0.usize()) + (18.usize() if create_dependencies else 0.usize())
+            if raw.count > Json::maximum_document_bytes or framing_bytes > Json::maximum_document_bytes - raw.count or entry.count > Json::maximum_document_bytes - raw.count - framing_bytes:
+                []
+            else:
+                out: mutable darray[u8] = [raw[item] for item in 0..<insertion]
+                if has_existing:
+                    ByteText::append_text(&out, ", ")
+                if create_dependencies:
+                    ByteText::append_text(&out, "\"dependencies\": {")
+                out <- with_text(out, entry)
+                if create_dependencies:
+                    out <- out.push(125)
+                ByteText::with_range(out, raw, insertion, raw.count)
