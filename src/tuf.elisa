@@ -53,71 +53,33 @@ module Tuf:
         # authenticated role set deterministic and lets storage merge it with
         # existing floors in linear time.
         def validate_checkpoint_batch(batch: darray[u8]&) -> ValidationCode can[Memory.Allocate, Abort.Panic]:
-            header: cstr = "elisapkg-tuf-batch:1\n"
-            cursor: mutable usize =
-                header_length: usize = ByteText::text_length(header)
-                return ValidationCode.ResourceLimit if batch.count > maximum_metadata_file_bytes
-                return ValidationCode.MalformedCheckpointBatch if batch.count <= header_length or not ByteText::starts_with_text(batch, header)
-                header_length
-            previous_role: mutable darray[u8] = []
-            role_count: mutable usize = 0.usize()
-            while cursor < batch.count |batch, cursor, role_count|:
-                finish: mutable usize = cursor
-                while finish < batch.count and batch[finish] != 10 |batch, finish|:
-                    finish <- finish + 1.usize()
-                return ValidationCode.MalformedCheckpointBatch if finish == cursor or finish == batch.count
-                region role_scope:
-                    role: mutable darray[u8] = []
-                    region line_status_scope:
-                        line_status: ValidationCode = validate_batch_line(batch, cursor, finish, &role)
-                        return line_status if line_status != ValidationCode.WellFormed
-                    return ValidationCode.ResourceLimit if role_count >= maximum_checkpoint_roles
-                    return ValidationCode.MalformedCheckpointBatch if role_count > 0.usize() and compare_checkpoint_role(previous_role, role) >= 0
-                    ByteText::replace(&previous_role, role)
-                role_count <- role_count + 1.usize()
-                cursor <- finish + 1.usize()
-            ValidationCode.MalformedCheckpointBatch if role_count == 0.usize() else ValidationCode.WellFormed
+            return ValidationCode.ResourceLimit if batch.count > maximum_metadata_file_bytes
+            return ValidationCode.MalformedCheckpointBatch if batch.count <= ByteText::text_length(checkpoint_batch_header) or not ByteText::starts_with_text(batch, checkpoint_batch_header)
+            validated_batch_lines(batch, ByteText::text_length(checkpoint_batch_header))
 
         # Check one "ROLE VERSION DIGEST" batch line spanning `cursor..<finish`
         # and return its role.
         def validate_batch_line(batch: darray[u8]&, cursor: usize, finish: usize, role: mutable darray[u8]&) -> ValidationCode can[Memory.Allocate, Abort.Panic]:
             requires cursor < finish and finish < batch.count
-            first_separator: usize = while position < finish and batch[position] != 32 |position: usize = cursor| -> position:
-                position <- position + 1.usize()
-            second_separator: usize = while position < finish and batch[position] != 32 |position: usize = first_separator + 1.usize()| -> position:
-                position <- position + 1.usize()
+            first_separator: usize = space_position(batch, cursor, finish)
+            second_separator: usize = space_position(batch, first_separator + 1.usize(), finish)
             return ValidationCode.MalformedCheckpointBatch if:
                 first_separator == cursor or second_separator >= finish or first_separator + 1.usize() == second_separator or second_separator + 1.usize() == finish
                 contains_byte_between(batch, second_separator + 1.usize(), finish, 32)
             ByteText::append_range(role, batch, cursor, first_separator)
             return ValidationCode.MalformedCheckpointBatch if not valid_checkpoint_role(role)
-            region version_scope:
-                version: darray[u8] = [batch[index] for index in (first_separator + 1.usize())..<second_separator]
-                parsed_version: mutable u64 = 0.u64()
-                return ValidationCode.MalformedCheckpointBatch if not parse_checkpoint_version(version, &parsed_version)
-            ValidationCode.MalformedHash if not Integrity::valid_sha256_hex_range(batch, second_separator + 1.usize(), finish) else ValidationCode.WellFormed
+            ValidationCode.MalformedCheckpointBatch if not valid_version_field(batch, first_separator + 1.usize(), second_separator) else ValidationCode.MalformedHash if not Integrity::valid_sha256_hex_range(batch, second_separator + 1.usize(), finish) else ValidationCode.WellFormed
 
         def valid_checkpoint_role(role: darray[u8]&) -> bool:
             return false if role.count == 0.usize() or role.count > maximum_checkpoint_role_bytes
-            first: u8 = role[0]
-            region last_scope:
-                last: u8 = role[role.count - 1.usize()]
-                return false if not checkpoint_role_alphanumeric(first) or not checkpoint_role_alphanumeric(last)
-            for index in 0..<role.count |role, index|:
-                byte: u8 = role[index]
-                return false if not checkpoint_role_alphanumeric(byte) and byte != 45 and byte != 46 and byte != 95
-            true
+            checkpoint_role_alphanumeric(role[0]) and checkpoint_role_alphanumeric(role[role.count - 1.usize()]) and checkpoint_role_bytes_allowed(role)
 
         # Parse one canonical, positive TUF metadata version without allowing
         # decimal truncation, leading zeroes, or uint64 overflow.
         def parse_checkpoint_version(raw: darray[u8]&, out: mutable u64&) -> bool:
             out <- 0.u64()
             value: mutable u64 = 0.u64()
-            return false if:
-                not ByteText::parse_canonical_unsigned_decimal(raw, 0, raw.count, &value)
-                value == 0.u64()
-            out <- value
-            true
+            ByteText::parse_canonical_unsigned_decimal(raw, 0, raw.count, &value) and value != 0.u64() and stored_version(out, value)
 
         # These limits bound a single repository refresh under the current
         # package-scoped delegation model. Changing them requires independent
@@ -153,39 +115,15 @@ module Tuf:
         # maps. This bounded lexical pass runs after general JSON validation;
         # it does not replace the upstream schema or target-length checks.
         def precheck_sha256_hashes(raw: darray[u8]&) -> ValidationCode can[Memory.Allocate, Abort.Panic]:
-            region syntax_status_scope:
-                syntax_status: ValidationCode = precheck_metadata_json(raw)
-                return syntax_status if syntax_status != ValidationCode.WellFormed
-            cursor: mutable usize = 0.usize()
-            while cursor < raw.count |raw, cursor|:
-                if raw[cursor] == 34:
-                    content_end: usize = json_string_content_end(raw, cursor)
-                    return ValidationCode.MalformedJson if content_end >= raw.count
-                    after_string: usize = Json::skip_whitespace(raw, content_end + 1.usize(), raw.count)
-                    if after_string < raw.count and raw[after_string] == 58 and ByteText::range_equals_text(raw, cursor + 1.usize(), content_end, "hashes"):
-                        hashes_start: usize = Json::skip_whitespace(raw, after_string + 1.usize(), raw.count)
-                        return ValidationCode.MalformedHash if hashes_start >= raw.count or raw[hashes_start] != 123
-                        hashes_end: mutable usize = hashes_start
-                        region hash_status_scope:
-                            hash_status: ValidationCode = validate_sha256_hash_map(raw, hashes_start, &hashes_end)
-                            return hash_status if hash_status != ValidationCode.WellFormed
-                        cursor <- hashes_end
-                        continue
-                    cursor <- content_end + 1.usize()
-                    continue
-                cursor <- cursor + 1.usize()
-            ValidationCode.WellFormed
+            syntax_status: ValidationCode = precheck_metadata_json(raw)
+            syntax_status if syntax_status != ValidationCode.WellFormed else hashes_status(raw)
 
         # Registry identities are stable configuration labels, never URLs or
         # credentials. TUF targets must echo this configured token exactly.
         def valid_registry_identity_bytes(value: darray[u8]&) -> bool:
-            return false if value.count == 0.usize() or value.count > maximum_registry_identity_bytes
-            region first_scope:
-                first: u8 = value[0]
-                return false if not ((first >= 48 and first <= 57) or (first >= 97 and first <= 122))
+            return false if value.count == 0.usize() or value.count > maximum_registry_identity_bytes or not checkpoint_role_alphanumeric(value[0])
             for index in 0..<value.count |value, index|:
-                byte: u8 = value[index]
-                return false if not ((byte >= 48 and byte <= 57) or (byte >= 97 and byte <= 122) or byte == 46 or byte == 95 or byte == 58 or byte == 45)
+                return false if not registry_identity_byte(value[index])
             true
 
         # The selected profile accepts stable 1.0.P versions through the pinned
@@ -195,15 +133,10 @@ module Tuf:
             return ValidationCode.UnsupportedSpecVersion if:
                 value.count < 5.usize() or value.count > 6.usize()
                 value[0] != 49 or value[1] != 46 or value[2] != 48 or value[3] != 46
-            patch_start: usize = 4.usize()
             return ValidationCode.UnsupportedSpecVersion if:
-                value[patch_start] < 48 or value[patch_start] > 57
-                value.count == 6.usize() and (value[patch_start] == 48 or value[5] < 48 or value[5] > 57)
-            region patch_scope:
-                patch: mutable u64 = (value[patch_start] - 48).u64()
-                patch <- patch * 10.u64() + (value[5] - 48).u64() if value.count == 6.usize()
-                return ValidationCode.UnsupportedSpecVersion if patch > 36.u64()
-            ValidationCode.WellFormed
+                value[4] < 48 or value[4] > 57
+                value.count == 6.usize() and (value[4] == 48 or value[5] < 48 or value[5] > 57)
+            ValidationCode.UnsupportedSpecVersion if spec_patch(value) > 36.u64() else ValidationCode.WellFormed
 
         # Validate the shape of the authorized and supplied signature key-identifier
         # lists. Each input is a flat sequence of 64-byte lowercase SHA-256
@@ -214,37 +147,104 @@ module Tuf:
         def precheck_signature_key_identifiers(authorized_identifiers: darray[u8]&, supplied_identifiers: darray[u8]&, threshold: u64) -> ValidationCode:
             return ValidationCode.ResourceLimit if authorized_identifiers.count > maximum_authorized_keys_per_role * 64.usize() or supplied_identifiers.count > maximum_signatures_per_metadata * 64.usize()
             return ValidationCode.MalformedKeyId if authorized_identifiers.count % 64.usize() != 0.usize() or supplied_identifiers.count % 64.usize() != 0.usize()
-            authorized_count: usize = authorized_identifiers.count / 64.usize()
-            supplied_count: usize = supplied_identifiers.count / 64.usize()
-            return ValidationCode.InvalidThreshold if threshold == 0.u64() or threshold > authorized_count.u64()
-            region authorized_status_scope:
-                authorized_status: ValidationCode = validate_key_identifier_list(authorized_identifiers)
-                return authorized_status if authorized_status != ValidationCode.WellFormed
-            region supplied_status_scope:
-                supplied_status: ValidationCode = validate_key_identifier_list(supplied_identifiers)
-                return supplied_status if supplied_status != ValidationCode.WellFormed
-            region authorized_signatures_scope:
-                authorized_signatures: mutable usize = 0.usize()
-                for supplied_index in 0..<supplied_count |authorized_identifiers, supplied_identifiers, supplied_index, authorized_signatures|:
-                    supplied_offset: usize = supplied_index * 64.usize()
-                    for authorized_index in 0..<authorized_count |authorized_identifiers, supplied_identifiers, supplied_offset, authorized_index, authorized_signatures|:
-                        authorized_offset: usize = authorized_index * 64.usize()
-                        if key_identifier_equal(authorized_identifiers, authorized_offset, supplied_identifiers, supplied_offset):
-                            authorized_signatures <- authorized_signatures + 1.usize()
-                            break
-                return ValidationCode.ThresholdInsufficient if authorized_signatures.u64() < threshold
-            ValidationCode.WellFormed
+            return ValidationCode.InvalidThreshold if threshold == 0.u64() or threshold > (authorized_identifiers.count / 64.usize()).u64()
+            authorized_status: ValidationCode = validate_key_identifier_list(authorized_identifiers)
+            authorized_status if authorized_status != ValidationCode.WellFormed else supplied_threshold_status(authorized_identifiers, supplied_identifiers, threshold)
 
     private:
         const key_identifier_size: usize = 64.usize()
 
+        const checkpoint_batch_header: cstr = "elisapkg-tuf-batch:1\n"
+
+        # The position returned for a rejected number or a failed step.
+        const rejected_position: usize = 18446744073709551615.usize()
+
+        # The lexical state of the number scan: the cursor and whether it is
+        # inside a string or just after a backslash there.
+        struct LexState:
+            cursor: usize
+            in_string: bool
+            escaped: bool
+
+        # Check each batch line in order; roles must be strictly increasing.
+        def validated_batch_lines(batch: darray[u8]&, start: usize) -> ValidationCode can[Memory.Allocate, Abort.Panic]:
+            role_count: usize = while cursor < batch.count |cursor: usize = start, count: usize = 0.usize(), previous_role: darray[u8] = [], failure: ValidationCode = ValidationCode.WellFormed| -> count:
+                cursor <- next_batch_line(batch, cursor, count, &previous_role, &failure)
+                return failure if failure != ValidationCode.WellFormed
+                count <- count + 1.usize()
+            ValidationCode.MalformedCheckpointBatch if role_count == 0.usize() else ValidationCode.WellFormed
+
+        # Check the line at `cursor` into `failure` and return the next line start.
+        def next_batch_line(batch: darray[u8]&, cursor: usize, role_count: usize, previous_role: mutable darray[u8]&, failure: mutable ValidationCode&) -> usize can[Memory.Allocate, Abort.Panic]:
+            finish: usize = line_end(batch, cursor)
+            failure <- batch_line_status(batch, cursor, finish, role_count, previous_role)
+            finish + 1.usize()
+
+        def line_end(batch: darray[u8]&, start: usize) -> usize:
+            while finish < batch.count and batch[finish] != 10 |finish: usize = start| -> finish:
+                finish <- finish + 1.usize()
+
+        def batch_line_status(batch: darray[u8]&, cursor: usize, finish: usize, role_count: usize, previous_role: mutable darray[u8]&) -> ValidationCode can[Memory.Allocate, Abort.Panic]:
+            return ValidationCode.MalformedCheckpointBatch if finish == cursor or finish == batch.count
+            role: mutable darray[u8] = []
+            line_status: ValidationCode = validate_batch_line(batch, cursor, finish, &role)
+            line_status if line_status != ValidationCode.WellFormed else ValidationCode.ResourceLimit if role_count >= maximum_checkpoint_roles else ValidationCode.MalformedCheckpointBatch if role_count > 0.usize() and compare_checkpoint_role(previous_role, role) >= 0 else replaced_role(previous_role, role)
+
+        def replaced_role(previous_role: mutable darray[u8]&, role: darray[u8]&) -> ValidationCode can[Memory.Allocate, Abort.Panic]:
+            ByteText::replace(previous_role, role)
+            ValidationCode.WellFormed
+
+        def space_position(batch: darray[u8]&, start: usize, finish: usize) -> usize:
+            while position < finish and batch[position] != 32 |position: usize = start| -> position:
+                position <- position + 1.usize()
+
+        def valid_version_field(batch: darray[u8]&, start: usize, finish: usize) -> bool can[Memory.Allocate, Abort.Panic]:
+            version: darray[u8] = [batch[index] for index in start..<finish]
+            parsed_version: mutable u64 = 0.u64()
+            parse_checkpoint_version(version, &parsed_version)
+
+        def stored_version(out: mutable u64&, value: u64) -> bool:
+            out <- value
+            true
+
+        def checkpoint_role_bytes_allowed(role: darray[u8]&) -> bool:
+            for index in 0..<role.count |role, index|:
+                return false if not checkpoint_role_byte(role[index])
+            true
+
+        def checkpoint_role_byte(byte: u8) -> bool:
+            checkpoint_role_alphanumeric(byte) or byte == 45 or byte == 46 or byte == 95
+
+        def registry_identity_byte(byte: u8) -> bool:
+            checkpoint_role_alphanumeric(byte) or byte == 46 or byte == 95 or byte == 58 or byte == 45
+
+        # The patch number of a "1.0.P" or "1.0.PP" spec version.
+        def spec_patch(value: darray[u8]&) -> u64:
+            (value[4] - 48).u64() * 10.u64() + (value[5] - 48).u64() if value.count == 6.usize() else (value[4] - 48).u64()
+
+        def supplied_threshold_status(authorized_identifiers: darray[u8]&, supplied_identifiers: darray[u8]&, threshold: u64) -> ValidationCode:
+            supplied_status: ValidationCode = validate_key_identifier_list(supplied_identifiers)
+            supplied_status if supplied_status != ValidationCode.WellFormed else ValidationCode.ThresholdInsufficient if matching_signatures(authorized_identifiers, supplied_identifiers).u64() < threshold else ValidationCode.WellFormed
+
+        # Each supplied identifier counts once when it is authorized.
+        def matching_signatures(authorized_identifiers: darray[u8]&, supplied_identifiers: darray[u8]&) -> usize:
+            for supplied_index in 0..<(supplied_identifiers.count / key_identifier_size) |matches: usize = 0.usize()| -> matches:
+                matches <- matches + 1.usize() if identifier_listed(authorized_identifiers, supplied_identifiers, supplied_index * key_identifier_size)
+
+        def identifier_listed(authorized_identifiers: darray[u8]&, supplied_identifiers: darray[u8]&, supplied_offset: usize) -> bool:
+            for authorized_index in 0..<(authorized_identifiers.count / key_identifier_size) |authorized_identifiers, supplied_identifiers, supplied_offset|:
+                return true if key_identifier_equal(authorized_identifiers, authorized_index * key_identifier_size, supplied_identifiers, supplied_offset)
+            false
+
         def compare_checkpoint_role(left: darray[u8]&, right: darray[u8]&) -> i64:
-            region common_scope:
-                common: usize = left.count if left.count < right.count else right.count
-                for index in 0..<common |left, right|:
-                    return -1 if left[index] < right[index]
-                    return 1 if left[index] > right[index]
-            -1 if left.count < right.count else 1 if left.count > right.count else 0
+            prefix_order: i64 = common_prefix_order(left, right, left.count if left.count < right.count else right.count)
+            prefix_order if prefix_order != 0 else -1 if left.count < right.count else 1 if left.count > right.count else 0
+
+        def common_prefix_order(left: darray[u8]&, right: darray[u8]&, common: usize) -> i64:
+            for index in 0..<common |left, right|:
+                return -1 if left[index] < right[index]
+                return 1 if left[index] > right[index]
+            0
 
         def contains_byte_between(value: darray[u8]&, start: usize, finish: usize, wanted: u8) -> bool:
             for index in start..<finish |value|:
@@ -254,83 +254,116 @@ module Tuf:
         def checkpoint_role_alphanumeric(byte: u8) -> bool:
             (byte >= 48 and byte <= 57) or (byte >= 97 and byte <= 122)
 
+        # TUF canonical JSON allows integers only: no fractions, exponents,
+        # or negative zero.
         def tuf_integer_numbers_only(raw: darray[u8]&) -> bool:
-            in_string: mutable bool = false
-            escaped: mutable bool = false
-            cursor: mutable usize = 0.usize()
-            while cursor < raw.count |raw, in_string, escaped, cursor|:
-                byte: u8 = raw[cursor]
-                if in_string:
-                    if escaped:
-                        escaped <- false
-                    elif byte == 92:
-                        escaped <- true
-                    elif byte == 34:
-                        in_string <- false
-                    cursor <- cursor + 1.usize()
-                    continue
-                if byte == 34:
-                    in_string <- true
-                    cursor <- cursor + 1.usize()
-                    continue
-                if byte == 45 or (byte >= 48 and byte <= 57):
-                    region start_scope:
-                        start: usize = cursor
-                        cursor <- cursor + 1.usize()
-                        while cursor < raw.count and ((raw[cursor] >= 48 and raw[cursor] <= 57) or raw[cursor] == 46 or raw[cursor] == 69 or raw[cursor] == 101 or raw[cursor] == 43 or raw[cursor] == 45) |raw, cursor|:
-                            return false if raw[cursor] == 46 or raw[cursor] == 69 or raw[cursor] == 101
-                            cursor <- cursor + 1.usize()
-                        return false if cursor - start == 2.usize() and raw[start] == 45 and raw[start + 1.usize()] == 48
-                    continue
+            final_state: LexState = while state.cursor < raw.count |state: LexState = LexState{cursor: 0.usize(), in_string: false, escaped: false}| -> state:
+                state <- next_lex_state(raw, state)
+                return false if state.cursor == rejected_position
+            not final_state.in_string and not final_state.escaped
+
+        def next_lex_state(raw: darray[u8]&, state: LexState) -> LexState:
+            byte: u8 = raw[state.cursor]
+            string_lex_state(byte, state) if state.in_string else LexState{cursor: state.cursor + 1.usize(), in_string: true, escaped: state.escaped} if byte == 34 else LexState{cursor: number_end(raw, state.cursor), in_string: false, escaped: state.escaped} if byte == 45 or (byte >= 48 and byte <= 57) else LexState{cursor: state.cursor + 1.usize(), in_string: false, escaped: state.escaped}
+
+        # Inside a string, a backslash escapes the next byte and an unescaped
+        # quote ends the string.
+        def string_lex_state(byte: u8, state: LexState) -> LexState:
+            LexState{cursor: state.cursor + 1.usize(), in_string: state.escaped or byte != 34, escaped: not state.escaped and byte == 92}
+
+        # The position after the number starting at `start`, or
+        # `rejected_position` for a fraction, an exponent, or "-0".
+        def number_end(raw: darray[u8]&, start: usize) -> usize:
+            finish: usize = while cursor < raw.count and number_byte(raw[cursor]) |cursor: usize = start + 1.usize()| -> cursor:
+                break rejected_position if raw[cursor] == 46 or raw[cursor] == 69 or raw[cursor] == 101
                 cursor <- cursor + 1.usize()
-            not in_string and not escaped
+            rejected_position if finish == rejected_position or (finish - start == 2.usize() and raw[start] == 45 and raw[start + 1.usize()] == 48) else finish
+
+        def number_byte(byte: u8) -> bool:
+            (byte >= 48 and byte <= 57) or byte == 46 or byte == 69 or byte == 101 or byte == 43 or byte == 45
+
+        # Walk every string; validate the value of each "hashes" key.
+        def hashes_status(raw: darray[u8]&) -> ValidationCode:
+            while cursor < raw.count |cursor: usize = 0.usize(), failure: ValidationCode = ValidationCode.WellFormed|:
+                cursor <- next_hashes_cursor(raw, cursor, &failure)
+                return failure if failure != ValidationCode.WellFormed
+            ValidationCode.WellFormed
+
+        def next_hashes_cursor(raw: darray[u8]&, cursor: usize, failure: mutable ValidationCode&) -> usize:
+            return cursor + 1.usize() if raw[cursor] != 34
+            content_end: usize = json_string_content_end(raw, cursor)
+            return failed_at(failure, ValidationCode.MalformedJson) if content_end >= raw.count
+            after_string: usize = Json::skip_whitespace(raw, content_end + 1.usize(), raw.count)
+            hashes_cursor(raw, after_string + 1.usize(), failure) if after_string < raw.count and raw[after_string] == 58 and ByteText::range_equals_text(raw, cursor + 1.usize(), content_end, "hashes") else content_end + 1.usize()
+
+        def hashes_cursor(raw: darray[u8]&, start: usize, failure: mutable ValidationCode&) -> usize:
+            hashes_start: usize = Json::skip_whitespace(raw, start, raw.count)
+            failed_at(failure, ValidationCode.MalformedHash) if hashes_start >= raw.count or raw[hashes_start] != 123 else hash_map_end(raw, hashes_start, failure)
+
+        def hash_map_end(raw: darray[u8]&, hashes_start: usize, failure: mutable ValidationCode&) -> usize:
+            hashes_end: mutable usize = hashes_start
+            failure <- validate_sha256_hash_map(raw, hashes_start, &hashes_end)
+            hashes_end
+
+        # Record `code` and stop the scan.
+        def failed_at(failure: mutable ValidationCode&, code: ValidationCode) -> usize:
+            failure <- code
+            rejected_position
 
         def validate_sha256_hash_map(raw: darray[u8]&, object_start: usize, end_out: mutable usize&) -> ValidationCode:
             end_out <- 0.usize()
-            region cursor_scope:
-                cursor: mutable usize = Json::skip_whitespace(raw, object_start + 1.usize(), raw.count)
-                return ValidationCode.MalformedHash if cursor >= raw.count or raw[cursor] == 125
-                while cursor < raw.count |raw, cursor|:
-                    return ValidationCode.MalformedHash if raw[cursor] != 34
-                    key_end: usize = json_string_content_end(raw, cursor)
-                    return ValidationCode.MalformedHash if key_end >= raw.count
-                    return ValidationCode.UnsupportedHashAlgorithm if not ByteText::range_equals_text(raw, cursor + 1.usize(), key_end, "sha256")
-                    cursor <- Json::skip_whitespace(raw, key_end + 1.usize(), raw.count)
-                    return ValidationCode.MalformedHash if cursor >= raw.count or raw[cursor] != 58
-                    cursor <- Json::skip_whitespace(raw, cursor + 1.usize(), raw.count)
-                    return ValidationCode.MalformedHash if cursor >= raw.count or raw[cursor] != 34
-                    digest_end: usize = json_string_content_end(raw, cursor)
-                    return ValidationCode.MalformedHash if digest_end >= raw.count or not Integrity::valid_sha256_hex_range(raw, cursor + 1.usize(), digest_end)
-                    cursor <- Json::skip_whitespace(raw, digest_end + 1.usize(), raw.count)
-                    if cursor < raw.count and raw[cursor] == 125:
-                        end_out <- cursor + 1.usize()
-                        return ValidationCode.WellFormed
-                    return ValidationCode.MalformedHash if cursor >= raw.count or raw[cursor] != 44
-                    cursor <- Json::skip_whitespace(raw, cursor + 1.usize(), raw.count)
+            first_entry: usize = Json::skip_whitespace(raw, object_start + 1.usize(), raw.count)
+            return ValidationCode.MalformedHash if first_entry >= raw.count or raw[first_entry] == 125
+            hash_entries_status(raw, first_entry, end_out)
+
+        def hash_entries_status(raw: darray[u8]&, start: usize, end_out: mutable usize&) -> ValidationCode:
+            while cursor < raw.count |cursor: usize = start, status: ValidationCode = ValidationCode.WellFormed|:
+                cursor <- hash_entry_end(raw, cursor, &status)
+                return status if status != ValidationCode.WellFormed
+                return closed_hash_map(end_out, cursor) if cursor < raw.count and raw[cursor] == 125
+                return ValidationCode.MalformedHash if cursor >= raw.count or raw[cursor] != 44
+                cursor <- Json::skip_whitespace(raw, cursor + 1.usize(), raw.count)
             ValidationCode.MalformedHash
 
+        def closed_hash_map(end_out: mutable usize&, cursor: usize) -> ValidationCode:
+            end_out <- cursor + 1.usize()
+            ValidationCode.WellFormed
+
+        # One `"sha256": "DIGEST"` entry; returns the position after it.
+        def hash_entry_end(raw: darray[u8]&, cursor: usize, status: mutable ValidationCode&) -> usize:
+            return failed_at(status, ValidationCode.MalformedHash) if raw[cursor] != 34
+            key_end: usize = json_string_content_end(raw, cursor)
+            return failed_at(status, ValidationCode.MalformedHash) if key_end >= raw.count
+            return failed_at(status, ValidationCode.UnsupportedHashAlgorithm) if not ByteText::range_equals_text(raw, cursor + 1.usize(), key_end, "sha256")
+            hash_value_end(raw, Json::skip_whitespace(raw, key_end + 1.usize(), raw.count), status)
+
+        def hash_value_end(raw: darray[u8]&, colon: usize, status: mutable ValidationCode&) -> usize:
+            return failed_at(status, ValidationCode.MalformedHash) if colon >= raw.count or raw[colon] != 58
+            value_start: usize = Json::skip_whitespace(raw, colon + 1.usize(), raw.count)
+            return failed_at(status, ValidationCode.MalformedHash) if value_start >= raw.count or raw[value_start] != 34
+            digest_end: usize = json_string_content_end(raw, value_start)
+            failed_at(status, ValidationCode.MalformedHash) if digest_end >= raw.count or not Integrity::valid_sha256_hex_range(raw, value_start + 1.usize(), digest_end) else Json::skip_whitespace(raw, digest_end + 1.usize(), raw.count)
+
         def json_string_content_end(raw: darray[u8]&, quote_start: usize) -> usize:
-            region cursor_scope:
-                cursor: mutable usize = quote_start + 1.usize()
-                while cursor < raw.count |raw, cursor|:
-                    if raw[cursor] == 92:
-                        cursor <- cursor + 2.usize()
-                        continue
-                    return cursor if raw[cursor] == 34
-                    cursor <- cursor + 1.usize()
+            while cursor < raw.count |raw, cursor: usize = quote_start + 1.usize()|:
+                if raw[cursor] == 92:
+                    cursor <- cursor + 2.usize()
+                    continue
+                return cursor if raw[cursor] == 34
+                cursor <- cursor + 1.usize()
             raw.count
 
         def validate_key_identifier_list(identifiers: darray[u8]&) -> ValidationCode:
-            region count_scope:
-                count: usize = identifiers.count / key_identifier_size
-                for index in 0..<count |identifiers, count|:
-                    offset: usize = index * key_identifier_size
-                    for byte_index in 0..<key_identifier_size |identifiers, offset|:
-                        byte: u8 = identifiers[offset + byte_index]
-                        return ValidationCode.MalformedKeyId if not ((byte >= 48 and byte <= 57) or (byte >= 97 and byte <= 102))
-                    for previous in 0..<index |identifiers, offset|:
-                        return ValidationCode.DuplicateKeyId if key_identifier_equal(identifiers, previous * key_identifier_size, identifiers, offset)
+            for index in 0..<(identifiers.count / key_identifier_size) |identifiers|:
+                offset: usize = index * key_identifier_size
+                for byte_index in 0..<key_identifier_size |identifiers, offset|:
+                    return ValidationCode.MalformedKeyId if not lowercase_hex(identifiers[offset + byte_index])
+                for previous in 0..<index |identifiers, offset|:
+                    return ValidationCode.DuplicateKeyId if key_identifier_equal(identifiers, previous * key_identifier_size, identifiers, offset)
             ValidationCode.WellFormed
+
+        def lowercase_hex(byte: u8) -> bool:
+            (byte >= 48 and byte <= 57) or (byte >= 97 and byte <= 102)
 
         def tuf_bytes_equal(left: darray[u8]&, right: darray[u8]&) -> bool:
             return false if left.count != right.count
