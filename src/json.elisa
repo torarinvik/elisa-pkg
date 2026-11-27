@@ -14,7 +14,7 @@ module Json:
         def skip_whitespace(raw: darray[u8]&, start: usize, finish: usize) -> usize:
             requires start <= finish and finish <= raw.count
             ensure result >= start and result <= finish
-            return while cursor < finish and is_whitespace(raw[cursor]) |cursor: usize = start| -> cursor:
+            while cursor < finish and is_whitespace(raw[cursor]) |cursor: usize = start| -> cursor:
                 cursor <- cursor + 1.usize()
 
         # Locate a closing delimiter in an already validated document.
@@ -56,11 +56,11 @@ module Json:
             first_digit: usize = skip_whitespace(raw, start, finish)
             cursor: mutable usize = first_digit
             value: mutable u64 = 0
-            return false if:
-                not ByteText::scan_unsigned_decimal(raw, first_digit, finish, &cursor, &value)
-                skip_whitespace(raw, cursor, finish) != finish
-            out <- value
-            true
+            if ByteText::scan_unsigned_decimal(raw, first_digit, finish, &cursor, &value) and skip_whitespace(raw, cursor, finish) == finish:
+                out <- value
+                true
+            else:
+                false
 
         # Field readers expect a validated object and a literal, unescaped key.
         def object_has_key(raw: darray[u8]&, start: usize, finish: usize, wanted: cstr) -> bool:
@@ -69,11 +69,12 @@ module Json:
         def object_string_value(raw: darray[u8]&, start: usize, finish: usize, wanted: cstr, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
             out.resize(0)
             content_start: mutable usize = 0
-            region content_end_scope:
-                content_end: mutable usize = 0
-                return false if not object_string_span(raw, start, finish, wanted, &content_start, &content_end)
+            content_end: mutable usize = 0
+            if object_string_span(raw, start, finish, wanted, &content_start, &content_end):
                 ByteText::append_range(out, raw, content_start, content_end)
-            true
+                true
+            else:
+                false
 
         # Return the span of a string that contains no escapes, excluding the surrounding quotes.
         def object_string_span(raw: darray[u8]&, start: usize, finish: usize, wanted: cstr, content_start_out: mutable usize&, content_end_out: mutable usize&) -> bool:
@@ -85,10 +86,12 @@ module Json:
                 while cursor < finish and raw[cursor] != 34 |cursor: usize = content_start| -> cursor:
                     return false if raw[cursor] < 32 or raw[cursor] == 92
                     cursor <- cursor + 1.usize()
-            return false if content_end == finish
-            content_start_out <- content_start
-            content_end_out <- content_end
-            true
+            if content_end != finish:
+                content_start_out <- content_start
+                content_end_out <- content_end
+                true
+            else:
+                false
 
         def object_string_equals(raw: darray[u8]&, start: usize, finish: usize, field: cstr, expected: darray[u8]&) -> bool:
             content_start: mutable usize = 0
@@ -106,10 +109,12 @@ module Json:
             value_start: usize = direct_value_offset(raw, start, finish, wanted)
             return false if value_start >= raw.count or value_start >= finish or raw[value_start] != 123
             value_end: usize = object_end(raw, value_start)
-            return false if value_end >= finish
-            value_start_out <- value_start
-            value_end_out <- value_end
-            true
+            if value_end < finish:
+                value_start_out <- value_start
+                value_end_out <- value_end
+                true
+            else:
+                false
 
         def object_unsigned_value(raw: darray[u8]&, start: usize, finish: usize, wanted: cstr, out: mutable u64&) -> bool:
             out <- 0.u64()
@@ -132,24 +137,23 @@ module Json:
                     continue
                 top: usize = frames.count - 1.usize()
                 frame: GrammarFrame = frames[top]
-                state: GrammarState = frame.state
-                return false if state == GrammarState.Done
-                if closes_container(frame.kind, state, byte):
+                return false if frame.state == GrammarState.Done
+                if closes_container(frame.kind, frame.state, byte):
                     frames <- frames.resize(top)
                     cursor <- cursor + 1.usize()
                     continue
-                if state == GrammarState.Colon:
+                if frame.state == GrammarState.Colon:
                     return false if byte != 58
                     frames[top].state <- GrammarState.Value
                     cursor <- cursor + 1.usize()
                     continue
-                if state == GrammarState.ObjectSeparator or state == GrammarState.ArraySeparator:
+                if frame.state == GrammarState.ObjectSeparator or frame.state == GrammarState.ArraySeparator:
                     return false if byte != 44
-                    frames[top].state <- GrammarState.Key if state == GrammarState.ObjectSeparator else GrammarState.Value
+                    frames[top].state <- GrammarState.Key if frame.state == GrammarState.ObjectSeparator else GrammarState.Value
                     cursor <- cursor + 1.usize()
                     continue
-                object_key: bool = state == GrammarState.FirstKey or state == GrammarState.Key
-                expects_value: bool = state == GrammarState.Value or state == GrammarState.FirstArrayValue
+                object_key: bool = frame.state == GrammarState.FirstKey or frame.state == GrammarState.Key
+                expects_value: bool = frame.state == GrammarState.Value or frame.state == GrammarState.FirstArrayValue
                 return false if:
                     object_key and byte != 34
                     not object_key and not expects_value
@@ -161,16 +165,16 @@ module Json:
                     return false if not expects_value or frames.count > maximum_container_depth
                     # The parent resumes only after this child frame is closed.
                     frames[top].state <- after_value(frame.kind)
+                    cursor <- cursor + 1.usize()
                     child: GrammarFrame = GrammarFrame{kind: ContainerKind.Object, state: GrammarState.FirstKey} if byte == 123 else GrammarFrame{kind: ContainerKind.Array, state: GrammarState.FirstArrayValue}
                     frames <- frames.push(child)
-                    cursor <- cursor + 1.usize()
                 else:
-                    region start_scope:
-                        start: usize = cursor
-                        while cursor < raw.count and not is_whitespace(raw[cursor]) and raw[cursor] != 44 and raw[cursor] != 93 and raw[cursor] != 125:
-                            cursor <- cursor + 1.usize()
-                        return false if not json_scalar(raw, start, cursor)
+                    scalar_end: usize =
+                        while scalar_cursor < raw.count and not is_whitespace(raw[scalar_cursor]) and raw[scalar_cursor] != 44 and raw[scalar_cursor] != 93 and raw[scalar_cursor] != 125 |scalar_cursor: usize = cursor| -> scalar_cursor:
+                            scalar_cursor <- scalar_cursor + 1.usize()
+                    return false if not json_scalar(raw, cursor, scalar_end)
                     frames[top].state <- after_value(frame.kind)
+                    cursor <- scalar_end
             frames.count == 1.usize() and frames[0].state == GrammarState.Done
 
         def valid_utf8(raw: darray[u8]&) -> bool:
@@ -182,43 +186,33 @@ module Json:
             # interleave their keys with a parent's keys in the input, so a
             # flat scan needlessly compares every key against unrelated
             # objects as well.
-            region object_last_keys_scope:
-                object_last_keys: mutable darray[usize] = []
-                keys: mutable darray[ObjectKey] = []
-                candidate_checks: mutable usize = 0.usize()
-                comparison_bytes: mutable usize = 0.usize()
-                in_string: mutable bool = false
-                escaped: mutable bool = false
-                string_start: mutable usize = 0.usize()
-                for index in 0..<raw.count |raw, object_last_keys, keys, candidate_checks, comparison_bytes, in_string, escaped, string_start|:
-                    byte: u8 = raw[index]
-                    if in_string:
-                        if escaped:
-                            escaped <- false
-                        elif byte == 92:
-                            escaped <- true
-                        elif byte == 34:
-                            after: usize = skip_whitespace(raw, index + 1.usize(), raw.count)
-                            if after < raw.count and raw[after] == 58 and object_last_keys.count > 0.usize():
-                                object_index: usize = object_last_keys.count - 1.usize()
-                                key: ObjectKey = ObjectKey{hash: key_hash(raw, string_start, index), start: string_start, length: index - string_start, previous: object_last_keys[object_index]}
-                                return false if:
-                                    duplicate_key(raw, key, keys, &candidate_checks, &comparison_bytes)
-                                    keys.count >= maximum_object_keys
-                                object_last_keys[object_index] <- keys.count
-                                keys <- keys.push(key)
-                            in_string <- false
-                        continue
-                    if byte == 34:
-                        in_string <- true
-                        string_start <- index + 1.usize()
-                    elif byte == 123:
-                        return false if object_last_keys.count >= maximum_container_depth
-                        object_last_keys <- object_last_keys.push(no_key)
-                    elif byte == 125:
-                        return false if object_last_keys.count == 0.usize()
-                        object_last_keys <- object_last_keys.resize(object_last_keys.count - 1.usize())
-                return not in_string and not escaped and object_last_keys.count == 0.usize()
+            final_scan: KeyScan = for index in 0..<raw.count |scan: KeyScan = KeyScan{object_last_keys: [], keys: [], candidate_checks: 0.usize(), comparison_bytes: 0.usize(), in_string: false, escaped: false, string_start: 0.usize()}| -> scan:
+                byte: u8 = raw[index]
+                if scan.in_string:
+                    if scan.escaped:
+                        scan.escaped <- false
+                    elif byte == 92:
+                        scan.escaped <- true
+                    elif byte == 34:
+                        scan.in_string <- false
+                        after: usize = skip_whitespace(raw, index + 1.usize(), raw.count)
+                        if after < raw.count and raw[after] == 58 and scan.object_last_keys.count > 0.usize():
+                            key: ObjectKey = ObjectKey{hash: key_hash(raw, scan.string_start, index), start: scan.string_start, length: index - scan.string_start, previous: scan.object_last_keys[scan.object_last_keys.count - 1.usize()]}
+                            return false if:
+                                duplicate_key(raw, key, scan.keys, &scan.candidate_checks, &scan.comparison_bytes)
+                                scan.keys.count >= maximum_object_keys
+                            scan.object_last_keys[scan.object_last_keys.count - 1.usize()] <- scan.keys.count
+                            scan.keys <- scan.keys.push(key)
+                elif byte == 34:
+                    scan.in_string <- true
+                    scan.string_start <- index + 1.usize()
+                elif byte == 123:
+                    return false if scan.object_last_keys.count >= maximum_container_depth
+                    scan.object_last_keys <- scan.object_last_keys.push(no_key)
+                elif byte == 125:
+                    return false if scan.object_last_keys.count == 0.usize()
+                    scan.object_last_keys <- scan.object_last_keys.resize(scan.object_last_keys.count - 1.usize())
+            not final_scan.in_string and not final_scan.escaped and final_scan.object_last_keys.count == 0.usize()
 
     private:
         const enum ContainerKind of u8:
@@ -252,118 +246,107 @@ module Json:
             return raw.count if:
                 finish >= raw.count or object_start >= finish
                 raw[object_start] != 123 or raw[finish] != 125
-            region scanner_scope:
-                in_string: mutable bool = false
-                escaped: mutable bool = false
-                string_start: mutable usize = 0.usize()
-                braces: mutable i64 = 1
-                brackets: mutable i64 = 0
-                for index in (object_start + 1.usize())..<finish |raw, finish, wanted, in_string, escaped, string_start, braces, brackets|:
-                    byte: u8 = raw[index]
-                    if not in_string:
-                        if byte == 34:
-                            in_string <- true
-                            string_start <- index + 1.usize()
-                        elif byte == 123:
-                            braces <- braces + 1
-                        elif byte == 125:
-                            braces <- braces - 1
-                        elif byte == 91:
-                            brackets <- brackets + 1
-                        elif byte == 93:
-                            brackets <- brackets - 1
-                    elif escaped:
-                        escaped <- false
-                    elif byte == 92:
-                        escaped <- true
-                    elif byte == 34:
-                        if braces == 1 and brackets == 0 and ByteText::range_equals_text(raw, string_start, index, wanted):
-                            after: usize = skip_whitespace(raw, index + 1.usize(), finish)
-                            if after < finish and raw[after] == 58:
-                                return skip_whitespace(raw, after + 1.usize(), finish)
-                        in_string <- false
+            for index in (object_start + 1.usize())..<finish |in_string: bool = false, escaped: bool = false, string_start: usize = 0.usize(), braces: i64 = 1, brackets: i64 = 0|:
+                byte: u8 = raw[index]
+                if not in_string:
+                    if byte == 34:
+                        in_string <- true
+                        string_start <- index + 1.usize()
+                    elif byte == 123:
+                        braces <- braces + 1
+                    elif byte == 125:
+                        braces <- braces - 1
+                    elif byte == 91:
+                        brackets <- brackets + 1
+                    elif byte == 93:
+                        brackets <- brackets - 1
+                elif escaped:
+                    escaped <- false
+                elif byte == 92:
+                    escaped <- true
+                elif byte == 34:
+                    if braces == 1 and brackets == 0 and ByteText::range_equals_text(raw, string_start, index, wanted):
+                        after: usize = skip_whitespace(raw, index + 1.usize(), finish)
+                        if after < finish and raw[after] == 58:
+                            return skip_whitespace(raw, after + 1.usize(), finish)
+                    in_string <- false
             raw.count
 
         def container_end(raw: darray[u8]&, start: usize, opening: u8, closing: u8) -> usize:
             return raw.count if start >= raw.count or raw[start] != opening
-            region depth_scope:
-                depth: mutable i64 = 0
-                in_string: mutable bool = false
-                escaped: mutable bool = false
-                for index in start..<raw.count |raw, depth, in_string, escaped, opening, closing|:
-                    byte: u8 = raw[index]
-                    if in_string:
-                        if escaped:
-                            escaped <- false
-                        elif byte == 92:
-                            escaped <- true
-                        elif byte == 34:
-                            in_string <- false
+            for index in start..<raw.count |depth: i64 = 0, in_string: bool = false, escaped: bool = false|:
+                byte: u8 = raw[index]
+                if in_string:
+                    if escaped:
+                        escaped <- false
+                    elif byte == 92:
+                        escaped <- true
                     elif byte == 34:
-                        in_string <- true
-                    elif byte == opening:
-                        depth <- depth + 1
-                    elif byte == closing:
-                        depth <- depth - 1
-                        return index if depth == 0
-                        return raw.count if depth < 0
+                        in_string <- false
+                elif byte == 34:
+                    in_string <- true
+                elif byte == opening:
+                    depth <- depth + 1
+                elif byte == closing:
+                    depth <- depth - 1
+                    return index if depth == 0
+                    return raw.count if depth < 0
             raw.count
 
         # A 4096-target role can require over eight million candidate comparisons.
         # Keep that work ceiling explicit and shared with callers.
         def json_scalar(raw: darray[u8]&, start: usize, end: usize) -> bool:
             return false if start >= end
-            integer_start: usize =
-                first: u8 = raw[start]
-                return ByteText::range_equals_text(raw, start, end, "true") if first == 116
-                return ByteText::range_equals_text(raw, start, end, "null") if first == 110
-                return ByteText::range_equals_text(raw, start, end, "false") if first == 102
-                start + 1.usize() if first == 45 else start
-            return false if integer_start >= end
-            cursor: mutable usize = integer_start
-            if raw[integer_start] == 48:
-                cursor <- integer_start + 1.usize()
+            fraction_end: usize =
+                integer_end: usize =
+                    integer_start: usize =
+                        first: u8 = raw[start]
+                        return ByteText::range_equals_text(raw, start, end, "true") if first == 116
+                        return ByteText::range_equals_text(raw, start, end, "null") if first == 110
+                        return ByteText::range_equals_text(raw, start, end, "false") if first == 102
+                        start + 1.usize() if first == 45 else start
+                    # The integer part needs a digit, and a leading zero stands alone.
+                    return false if integer_start >= end or raw[integer_start] < 48 or raw[integer_start] > 57
+                    integer_start + 1.usize() if raw[integer_start] == 48 else decimal_digits_end(raw, integer_start, end)
+                if integer_end < end and raw[integer_end] == 46:
+                    digits_end: usize = decimal_digits_end(raw, integer_end + 1.usize(), end)
+                    return false if digits_end == integer_end + 1.usize()
+                    digits_end
+                else:
+                    integer_end
+            if fraction_end < end and (raw[fraction_end] == 101 or raw[fraction_end] == 69):
+                digits_start: usize = fraction_end + 2.usize() if fraction_end + 1.usize() < end and (raw[fraction_end + 1.usize()] == 43 or raw[fraction_end + 1.usize()] == 45) else fraction_end + 1.usize()
+                digits_end: usize = decimal_digits_end(raw, digits_start, end)
+                digits_end != digits_start and digits_end == end
             else:
-                cursor <- decimal_digits_end(raw, integer_start, end)
-                return false if cursor == integer_start
-            if cursor < end and raw[cursor] == 46:
-                fraction_start: usize = cursor + 1.usize()
-                cursor <- decimal_digits_end(raw, fraction_start, end)
-                return false if cursor == fraction_start
-            if cursor < end and (raw[cursor] == 101 or raw[cursor] == 69):
-                cursor <- cursor + 1.usize()
-                if cursor < end and (raw[cursor] == 43 or raw[cursor] == 45):
-                    cursor <- cursor + 1.usize()
-                exponent_start: usize = cursor
-                cursor <- decimal_digits_end(raw, exponent_start, end)
-                return false if cursor == exponent_start
-            cursor == end
+                fraction_end == end
 
         def decimal_digits_end(raw: darray[u8]&, start: usize, end: usize) -> usize:
             requires start <= end and end <= raw.count
             ensure result >= start and result <= end
-            return while cursor < end and raw[cursor] >= 48 and raw[cursor] <= 57 |cursor: usize = start| -> cursor:
+            while cursor < end and raw[cursor] >= 48 and raw[cursor] <= 57 |cursor: usize = start| -> cursor:
                 cursor <- cursor + 1.usize()
 
         # Return the offset after the closing quote, or zero on rejection.
         def string_end(raw: darray[u8]&, start: usize, object_key: bool) -> usize:
             while cursor < raw.count |cursor: usize = start|:
-                region byte_scope:
+                cursor <-
                     byte: u8 = raw[cursor]
-                    cursor <- cursor + 1.usize()
-                    return cursor if byte == 34
+                    return cursor + 1.usize() if byte == 34
                     return 0.usize() if byte < 32
-                    continue if byte != 92
-                # Escaped keys would bypass literal field lookup and duplicate checks.
-                return 0.usize() if object_key or cursor >= raw.count
-                escape: u8 = raw[cursor]
-                if escape == 117:
-                    escape_size: usize = unicode_escape_size(raw, cursor)
-                    return 0.usize() if escape_size == 0.usize()
-                    cursor <- cursor + escape_size
-                else:
-                    return 0.usize() if escape != 34 and escape != 92 and escape != 47 and escape != 98 and escape != 102 and escape != 110 and escape != 114 and escape != 116
-                    cursor <- cursor + 1.usize()
+                    if byte != 92:
+                        cursor + 1.usize()
+                    else:
+                        # Escaped keys would bypass literal field lookup and duplicate checks.
+                        return 0.usize() if object_key or cursor + 1.usize() >= raw.count
+                        escape: u8 = raw[cursor + 1.usize()]
+                        if escape == 117:
+                            escape_size: usize = unicode_escape_size(raw, cursor + 1.usize())
+                            return 0.usize() if escape_size == 0.usize()
+                            cursor + 1.usize() + escape_size
+                        else:
+                            return 0.usize() if escape != 34 and escape != 92 and escape != 47 and escape != 98 and escape != 102 and escape != 110 and escape != 114 and escape != 116
+                            cursor + 2.usize()
             0.usize()
 
         # The cursor points at the 'u'. A high surrogate must be followed by
@@ -374,16 +357,15 @@ module Json:
             return 0.usize() if code_unit < 0 or (code_unit >= 56320 and code_unit <= 57343)
             if code_unit >= 55296 and code_unit <= 56319:
                 return 0.usize() if cursor + 10.usize() >= raw.count or raw[cursor + 5.usize()] != 92 or raw[cursor + 6.usize()] != 117
-                region low_surrogate_scope:
-                    low_surrogate: i64 = hexadecimal_code_unit(raw, cursor + 7.usize())
-                    return 0.usize() if low_surrogate < 56320 or low_surrogate > 57343
-                return 11.usize()
-            5.usize()
+                low_surrogate: i64 = hexadecimal_code_unit(raw, cursor + 7.usize())
+                0.usize() if low_surrogate < 56320 or low_surrogate > 57343 else 11.usize()
+            else:
+                5.usize()
 
         def hexadecimal_code_unit(raw: darray[u8]&, start: usize) -> i64:
             requires start <= raw.count and raw.count - start >= 4.usize()
             ensure result >= -1 and result <= 65535
-            return for index in start..<(start + 4.usize()) |code_unit: i64 = 0| -> code_unit:
+            for index in start..<(start + 4.usize()) |code_unit: i64 = 0| -> code_unit:
                 digit: i64 = json_hex_nibble(raw[index])
                 return -1 if digit < 0
                 code_unit <- code_unit * 16 + digit
@@ -392,7 +374,7 @@ module Json:
             (byte - 48).i64() if byte >= 48 and byte <= 57 else (byte - 55).i64() if byte >= 65 and byte <= 70 else (byte - 87).i64() if byte >= 97 and byte <= 102 else -1
 
         def key_hash(raw: darray[u8]&, start: usize, end: usize) -> u32:
-            return for index in start..<end |hash: u32 = 2166136261.u32()| -> hash:
+            for index in start..<end |hash: u32 = 2166136261.u32()| -> hash:
                 hash <- (hash ^ raw[index].u32()) * 16777619.u32()
 
         # The stack uses an out-of-range key index for an object with no keys.
@@ -419,3 +401,14 @@ module Json:
                     return true if matches
                 item <- prior.previous
             false
+
+        # The duplicate-key scan: open objects' latest keys, every recorded
+        # key, the work charged so far, and the lexical string state.
+        struct KeyScan:
+            object_last_keys: mutable darray[usize]
+            keys: mutable darray[ObjectKey]
+            candidate_checks: mutable usize
+            comparison_bytes: mutable usize
+            in_string: mutable bool
+            escaped: mutable bool
+            string_start: mutable usize
