@@ -73,7 +73,7 @@ def main() -> int:
         "_ = native_execve(openssl, raw_child_argument_vector, raw_child_environment)", child_start
     )
     empty_environment = verifier.find("empty_environment: mutable darray[cstr] = [null]")
-    environment_pointer = verifier.find("raw_child_environment: void& = child_environment.cast[void&]")
+    environment_pointer = verifier.find("raw_child_environment: void& = (&empty_environment[0]).cast[void&]")
     if not (
         0 <= empty_environment < environment_pointer < child_start
         < group_setup < limits_setup < redirects[0] < redirects[1] < redirects[2]

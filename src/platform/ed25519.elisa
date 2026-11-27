@@ -14,12 +14,8 @@ module NativeEd25519:
             # Homebrew's stable `opt` paths are symlinks. Resolve the fixed
             # candidates before the no-follow executable check so the secure
             # filesystem wrapper does not accidentally select LibreSSL.
-            resolved_openssl: mutable darray[u8] = []
-            resolved_openssl <- resolved_openssl.resize(4096)
-            openssl: cstr = get trusted_openssl(&resolved_openssl) else return -38
-            encoded_key: mutable darray[u8] = [48, 42, 48, 5, 6, 3, 43, 101, 112, 3, 33, 0]
-            for index in 0..<public_key.count |encoded_key, public_key|:
-                encoded_key <- encoded_key.push(public_key[index])
+            openssl_path: darray[u8] = trusted_openssl()
+            return -38 if openssl_path.count == 0.usize()
             # OpenSSL reopens the inputs by name. Keep those names inside a
             # private directory while the child is running.
             staging: mutable darray[u8] =
@@ -30,18 +26,24 @@ module NativeEd25519:
             public_path: mutable darray[u8] = crypto_input_path(staging, "/key.XXXXXX")
             message_path: mutable darray[u8] = crypto_input_path(staging, "/message.XXXXXX")
             signature_path: mutable darray[u8] = crypto_input_path(staging, "/signature.XXXXXX")
-            key_status: i64 = write_temporary_blob(encoded_key, &public_path)
+            # Each input is written only after the previous one succeeded.
+            key_status: i64 =
+                encoded_key: mutable darray[u8] = [48, 42, 48, 5, 6, 3, 43, 101, 112, 3, 33, 0]
+                for index in 0..<public_key.count |encoded_key, public_key|:
+                    encoded_key <- encoded_key.push(public_key[index])
+                write_temporary_blob(encoded_key, &public_path)
             message_status: i64 = write_temporary_blob(message, &message_path) if key_status == 0 else -38
             signature_status: i64 = write_temporary_blob(signature, &signature_path) if message_status == 0 else -38
             if signature_status != 0:
+                # Inputs that were never created have no name to remove.
                 if key_status != 0:
                     message_path <- message_path.resize(0)
                 if message_status != 0:
                     signature_path <- signature_path.resize(0)
-                cleanup: i64 = cleanup_crypto_inputs(staging_name, public_path, message_path, signature_path)
-                return -38 if cleanup == 0 else -5
-            result: i64 = run_verifier(openssl, public_path, message_path, signature_path)
-            -5 if cleanup_crypto_inputs(staging_name, public_path, message_path, signature_path) != 0 else result
+                -38 if cleanup_crypto_inputs(staging_name, public_path, message_path, signature_path) == 0 else -5
+            else:
+                result: i64 = run_verifier(((&openssl_path[0]).cast[cstr] can Unsafe.PointerCast), public_path, message_path, signature_path)
+                -5 if cleanup_crypto_inputs(staging_name, public_path, message_path, signature_path) != 0 else result
 
     private:
         # Run `openssl pkeyutl -verify` on the staged key, message, and
@@ -55,23 +57,28 @@ module NativeEd25519:
             arguments <- arguments.push(null)
             raw_child_argument_vector: void& = (&arguments[0]).cast[void&] can Unsafe.PointerCast
             empty_environment: mutable darray[cstr] = [null]
-            child_environment: mutable cstr&& = (&empty_environment[0]).cast[mutable cstr&&] can Unsafe.PointerCast
-            raw_child_environment: void& = child_environment.cast[void&] can Unsafe.PointerCast
+            raw_child_environment: void& = (&empty_environment[0]).cast[void&] can Unsafe.PointerCast
             child_process_identifier: i64 = native_fork()
-            return NativeErrors::negative_errno() if child_process_identifier < 0
-            if child_process_identifier == 0:
+            if child_process_identifier < 0:
+                NativeErrors::negative_errno()
+            elif child_process_identifier == 0:
                 run_verifier_child(openssl, raw_child_argument_vector, raw_child_environment)
-                return -1
-            wait_for_verifier(child_process_identifier)
+                -1
+            else:
+                wait_for_verifier(child_process_identifier)
 
-        # The first fixed OpenSSL candidate that resolves to a trusted
-        # executable, in Homebrew openssl@3, Homebrew openssl, system order.
-        def trusted_openssl(resolved_openssl: mutable darray[u8]&) -> cstr? can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            candidates: darray[cstr] = ["/opt/homebrew/opt/openssl@3/bin/openssl", "/opt/homebrew/opt/openssl/bin/openssl", "/usr/bin/openssl"]
-            for index in 0..<candidates.count:
-                if PlatformNative::realpath(candidates[index], resolved_openssl) is canonical and NativeTrustedPaths::is_trusted_crypto_executable(canonical, native_geteuid().u64()):
-                    return canonical
-            null
+        # The NUL-terminated canonical path of the first fixed OpenSSL
+        # candidate that resolves to a trusted executable, in Homebrew
+        # openssl@3, Homebrew openssl, system order; empty when none does.
+        def trusted_openssl() -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            resolved_openssl: mutable darray[u8] = []
+            resolved_openssl <- resolved_openssl.resize(4096)
+            trusted: bool =
+                candidates: darray[cstr] = ["/opt/homebrew/opt/openssl@3/bin/openssl", "/opt/homebrew/opt/openssl/bin/openssl", "/usr/bin/openssl"]
+                for index in 0..<candidates.count |resolved_openssl, found: bool = false| -> found:
+                    if PlatformNative::realpath(candidates[index], &resolved_openssl) is canonical and NativeTrustedPaths::is_trusted_crypto_executable(canonical, native_geteuid().u64()):
+                        break true
+            resolved_openssl if trusted else []
 
         # In the forked child: isolate the process, discard its output, and
         # execute OpenSSL. OpenSSL writes a success sentence to stdout and
@@ -95,11 +102,13 @@ module NativeEd25519:
         # for a rejected signature, or the negative wait error.
         def wait_for_verifier(child_process_identifier: i64) -> i64 can[Unsafe.PointerCast]:
             status: mutable i32 = 0
-            region waited_scope:
-                waited: i64 = NativeProcess::waitpid_group_timeout(child_process_identifier, &status, 10000)
-                return waited if waited < 0
-                return -1 if waited != 0
-            0 if status == 0 else -38 if status == 126 * 256 or status == 127 * 256 else -1
+            waited: i64 = NativeProcess::waitpid_group_timeout(child_process_identifier, &status, 10000)
+            if waited < 0:
+                waited
+            elif waited != 0:
+                -1
+            else:
+                0 if status == 0 else -38 if status == 126 * 256 or status == 127 * 256 else -1
 
         def crypto_input_path(directory: darray[u8]&, suffix: cstr) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
             path: mutable darray[u8] = []
@@ -116,33 +125,23 @@ module NativeEd25519:
             if file_descriptor < 0:
                 path.resize(0)
                 return file_descriptor
-            written: mutable usize = 0.usize()
-            failed: mutable bool = false
-            while written < value.count |value, written, file_descriptor, failed|:
+            failed: bool = while written < value.count |written: usize = 0.usize(), failed: bool = false| -> failed:
                 amount: i64 =
                     raw: void& = (&value[written]).cast[void&] can Unsafe.PointerCast
                     native_write(file_descriptor, raw, value.count - written)
-                continue if amount < 0 and NativeErrors::current_errno() == 4
-                if amount <= 0:
-                    failed <- true
-                    break
-                if amount > (value.count - written).i64():
-                    failed <- true
-                    break
-                written <- written + amount.usize()
-            region close_status_scope:
-                close_status: i64 = native_close(file_descriptor)
-                return -5 if failed or close_status != 0
-            0
+                # An interrupted write is retried; any other short result fails.
+                interrupted: bool = amount < 0 and NativeErrors::current_errno() == 4
+                break true if not interrupted and (amount <= 0 or amount > (value.count - written).i64())
+                written <- written + amount.usize() if not interrupted
+            # Close first so the descriptor is released even after a failed write.
+            -5 if native_close(file_descriptor) != 0 or failed else 0
 
         def cleanup_crypto_inputs(directory: cstr, key: darray[u8]&, message: darray[u8]&, signature: darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            region directory_status_scope:
-                key_status: i64 = remove_temporary_blob(key)
-                message_status: i64 = remove_temporary_blob(message)
-                signature_status: i64 = remove_temporary_blob(signature)
-                directory_status: i64 = NativeFileMutation::rmdir(directory)
-                return -5 if key_status != 0 or message_status != 0 or signature_status != 0 or directory_status != 0
-            0
+            key_status: i64 = remove_temporary_blob(key)
+            message_status: i64 = remove_temporary_blob(message)
+            signature_status: i64 = remove_temporary_blob(signature)
+            directory_status: i64 = NativeFileMutation::rmdir(directory)
+            -5 if key_status != 0 or message_status != 0 or signature_status != 0 or directory_status != 0 else 0
 
         def remove_temporary_blob(path: darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return 0 if path.count == 0
