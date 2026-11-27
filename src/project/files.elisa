@@ -15,45 +15,13 @@ module ProjectFiles:
             # never be replaced by a rename race. The temporary is removed after the
             # link, leaving one durable directory entry for the caller to own.
             return -22 if path.count > maximum_publication_path_bytes or not valid_path_bytes(path)
-            temporary_snapshot: mutable darray[u8] = []
-            return -5 if not stage_file_for_publication(path, value, &temporary_snapshot)
-            temporary_c: mutable darray[u8] = [temporary_snapshot[item] for item in 0..<temporary_snapshot.count]
-            target_c: mutable darray[u8] = []
-            target_c <- with_null_terminator(path)
-            temporary_name: mutable cstr = (&temporary_c[0]).cast[cstr] can Unsafe.PointerCast
-            target_name: cstr = (&target_c[0]).cast[cstr] can Unsafe.PointerCast
-            region link_status_scope:
-                link_status: i64 = Platform::create_hard_link(temporary_name, target_name)
-                if link_status != 0:
-                    # Keep the exclusive temporary for recovery. Unlinking this
-                    # pathname after the descriptor is closed could remove a
-                    # replacement installed by another actor.
-                    return link_status
-            temporary_c <- temporary_c.resize(0)
-            ByteText::append(&temporary_c, temporary_snapshot)
-            temporary_name <- (&temporary_c[0]).cast[cstr] can Unsafe.PointerCast
-            region unlink_status_scope:
-                unlink_status: i64 = Platform::unlink_path(temporary_name)
-                if unlink_status != 0:
-                    # The destination link is already published. Do not remove it
-                    # by pathname after a cleanup failure: another actor may have
-                    # replaced that name while the temporary link was being
-                    # retired. Leave the evidence for a later recovery pass.
-                    return -5
-            if not sync_parent_directory(path):
-                # The link is visible, but its directory durability is unknown.
-                # Removing the destination by pathname could delete a concurrent
-                # replacement, so report the durability failure and leave the
-                # published evidence for recovery instead.
-                return -5
-            0
+            temporary_path: mutable darray[u8] = []
+            -5 if not stage_file_for_publication(path, value, &temporary_path) else linked_exclusively(path, temporary_path)
 
         def remove_known_file(path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return false if not valid_path_bytes(path)
-            path_c: mutable darray[u8] = []
-            path_c <- with_null_terminator(path)
-            path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
-            remove_c_string_file(path_name)
+            path_c: darray[u8] = with_null_terminator(path)
+            remove_c_string_file((&path_c[0]).cast[cstr] can Unsafe.PointerCast)
 
         def valid_path_bytes(path: darray[u8]&) -> bool:
             return false if path.count == 0.usize() or path.count > 4096.usize()
@@ -81,13 +49,7 @@ module ProjectFiles:
                     Platform::synchronize_parent_directory(prefix) == 0 if created == 0 else Platform::is_directory(prefix) == 1
                 work[index] <- 47
                 return false if not valid
-            final_path: cstr = (&work[0]).cast[cstr] can Unsafe.PointerCast
-            region created_scope:
-                created: i64 = Platform::make_directory(final_path, 493.u16())
-                return false if:
-                    created == 0 and Platform::synchronize_parent_directory(final_path) != 0
-                    created != 0 and Platform::is_directory(final_path) != 1
-            Platform::is_directory(final_path) == 1
+            final_directory_ready(work)
 
         def read_c_string_into(path_name: cstr, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return false if out.count == 0.usize() or out.count > 67108864.usize()
@@ -106,81 +68,56 @@ module ProjectFiles:
             loaded >= 0
 
         def write_file_descriptor_all(file_descriptor: i64, value: darray[u8]&) -> bool can[Unsafe.PointerCast, Console.Write]:
-            region offset_scope:
-                offset: mutable usize = 0.usize()
-                while offset < value.count |value, offset|:
-                    wrote: i64 =
-                        value_raw: void& = (&value[offset]).cast[void&] can Unsafe.PointerCast
-                        Platform::write_file_descriptor(file_descriptor, value_raw, value.count - offset) can Console.Write
-                    # A native write must never report more bytes than requested.
-                    # Treat a malformed FFI result as a failed publication instead
-                    # of allowing the cursor conversion below to overrun the
-                    # caller's buffer or wrap an unsigned offset.
-                    return false if wrote <= 0 or wrote > (value.count - offset).i64()
-                    offset <- offset + wrote.usize()
+            while offset < value.count |value, offset: usize = 0.usize()|:
+                wrote: i64 =
+                    value_raw: void& = (&value[offset]).cast[void&] can Unsafe.PointerCast
+                    Platform::write_file_descriptor(file_descriptor, value_raw, value.count - offset) can Console.Write
+                # A native write must never report more bytes than requested.
+                # Treat a malformed FFI result as a failed publication instead
+                # of allowing the cursor conversion below to overrun the
+                # caller's buffer or wrap an unsigned offset.
+                return false if wrote <= 0 or wrote > (value.count - offset).i64()
+                offset <- offset + wrote.usize()
             true
 
         def write_c_string_file(path_name: cstr, value: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             # mkstemp provides an exclusive 0600 temporary file; fsync and rename make
             # the lockfile transition atomic and prevent readers from seeing a prefix.
-            path_snapshot: mutable darray[u8] = []
-            region path_length_scope:
-                path_length: usize = Platform::c_string_length(path_name)
-                return false if path_length == 0.usize() or path_length > maximum_publication_path_bytes
-            ByteText::append_text(&path_snapshot, path_name)
-            replace_file(path_snapshot, value)
+            path_length: usize = Platform::c_string_length(path_name)
+            path_length > 0.usize() and path_length <= maximum_publication_path_bytes and replace_file(c_string_bytes(path_name), value)
 
         # Atomically replace the destination and sync its parent directory.
         def replace_file(path: darray[u8]&, value: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
-            temporary_snapshot: mutable darray[u8] = []
-            return false if not stage_file_for_publication(path, value, &temporary_snapshot)
-            temporary_c: mutable darray[u8] = [temporary_snapshot[item] for item in 0..<temporary_snapshot.count]
-            target_c: mutable darray[u8] = []
-            target_c <- with_null_terminator(path)
-            temporary_name: cstr = (&temporary_c[0]).cast[cstr] can Unsafe.PointerCast
-            region target_name_scope:
-                target_name: cstr = (&target_c[0]).cast[cstr] can Unsafe.PointerCast
-                # Preserve the staged name if publication fails.
-                return false if Platform::rename_path(temporary_name, target_name) != 0
-            sync_parent_directory(path)
+            temporary_path: mutable darray[u8] = []
+            stage_file_for_publication(path, value, &temporary_path) and renamed_into_place(temporary_path, path) and sync_parent_directory(path)
 
         def sync_parent_directory(path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return false if not valid_path_bytes(path)
-            path_c: mutable darray[u8] = []
-            path_c <- with_null_terminator(path)
-            path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
-            Platform::synchronize_parent_directory(path_name) == 0
+            path_c: darray[u8] = with_null_terminator(path)
+            Platform::synchronize_parent_directory((&path_c[0]).cast[cstr] can Unsafe.PointerCast) == 0
 
         def path_occupied(path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return true if not valid_path_bytes(path)
-            path_c: mutable darray[u8] = []
-            path_c <- with_null_terminator(path)
-            path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
+            path_c: darray[u8] = with_null_terminator(path)
             # Treat anything except definite ENOENT as occupied. In
             # particular, symlinks and special files must not be mistaken for
             # an available destination just because the regular-file opener
             # refuses to read them.
-            Platform::package_file_size(path_name) != -2
+            Platform::package_file_size((&path_c[0]).cast[cstr] can Unsafe.PointerCast) != -2
 
         def c_string_file_exists(path_name: cstr) -> bool:
             Platform::access_path(path_name, 0) == 0
 
+        # A missing directory counts as removed.
         def remove_empty_directory(path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return false if not valid_path_bytes(path)
-            path_c: mutable darray[u8] = []
-            path_c <- with_null_terminator(path)
-            path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
-            region result_scope:
-                result: i64 = Platform::remove_directory(path_name)
-                return true if result == 0 or result == -2
-            false
+            path_c: darray[u8] = with_null_terminator(path)
+            removed_or_missing(Platform::remove_directory((&path_c[0]).cast[cstr] can Unsafe.PointerCast))
 
+        # A missing file counts as removed; any other unreadable state fails.
         def remove_c_string_file(path_name: cstr) -> bool:
-            region state_scope:
-                state: i64 = Platform::package_file_size(path_name)
-                return true if state == -2
-                return false if state < 0
-            Platform::unlink_path(path_name) == 0
+            state: i64 = Platform::package_file_size(path_name)
+            true if state == -2 else false if state < 0 else Platform::unlink_path(path_name) == 0
 
         # `left`, a separating slash when it lacks one, then `right`.
         def path_join(left: darray[u8]&, right: cstr) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
@@ -212,22 +149,14 @@ module ProjectFiles:
         def canonical_existing_path(path: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out.resize(0)
             return false if not valid_path_bytes(path)
-            path_c: mutable darray[u8] = []
-            path_c <- with_null_terminator(path)
-            path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
-            canonical_existing_c_string_path(path_name, out)
+            path_c: darray[u8] = with_null_terminator(path)
+            canonical_existing_c_string_path(((&path_c[0]).cast[cstr] can Unsafe.PointerCast), out)
 
         def canonical_existing_c_string_path(path: cstr, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out.resize(0)
             resolved: mutable darray[u8] = []
             resolved.resize(4096)
-            if Platform::resolve_real_path(path, &resolved) is canonical:
-                length: usize = Platform::c_string_length(canonical)
-                return false if length == 0.usize() or length >= 4096.usize()
-                for index in 0..<length |out, canonical|:
-                    out.push(canonical[index].u8())
-                return true
-            false
+            copied_real_path(path, &resolved, out)
 
         # Compare normalized path bytes at a component boundary.
         def path_is_same_or_beneath(candidate: darray[u8]&, parent: darray[u8]&) -> bool:
@@ -245,51 +174,16 @@ module ProjectFiles:
 
         def resolve_entry_beneath_canonical_root(canonical_root: darray[u8]&, entry: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out.resize(0)
-            region resolved_entry_scope:
-                resolved_entry: mutable darray[u8] = []
-                return false if:
-                    canonical_root.count == 0.usize()
-                    canonical_root[0] != 47
-                    not canonical_existing_path(entry, &resolved_entry)
-                    resolved_entry.count <= canonical_root.count
-                    not path_is_same_or_beneath(resolved_entry, canonical_root)
-                ByteText::append(out, resolved_entry)
-            true
+            resolved_entry: mutable darray[u8] = []
+            canonical_root.count > 0.usize() and canonical_root[0] == 47 and canonical_existing_path(entry, &resolved_entry) and resolved_entry.count > canonical_root.count and path_is_same_or_beneath(resolved_entry, canonical_root) and appended_bytes(out, resolved_entry)
 
+        # Collapse "." and "name/.." segments of a relative path; a leading
+        # ".." stays. False when nothing remains.
         def normalize_relative_path(path: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
             out.resize(0)
-            segment_start: mutable usize = 0.usize()
-            index: mutable usize = 0.usize()
-            while index <= path.count |path, out, segment_start, index|:
-                at_end: bool = index == path.count
-                if at_end or path[index] == 47:
-                    segment_length: usize = index - segment_start
-                    if segment_length > 0.usize() and not (segment_length == 1.usize() and path[segment_start] == 46):
-                        is_parent: bool = segment_length == 2.usize() and path[segment_start] == 46 and path[segment_start + 1.usize()] == 46
-                        if is_parent:
-                            if out.count > 0.usize():
-                                last: mutable usize = out.count
-                                while last > 0.usize() and out[last - 1.usize()] != 47 |out, last|:
-                                    last <- last - 1.usize()
-                                previous_parent: bool = out.count - last == 2.usize() and out[last] == 46 and out[last + 1.usize()] == 46
-                                if previous_parent:
-                                    out.push(47)
-                                    out.push(46)
-                                    out.push(46)
-                                else:
-                                    # `last` points to the component start;
-                                    # remove its preceding separator as well.
-                                    if last > 0.usize() and out[last - 1.usize()] == 47:
-                                        out.resize(last - 1.usize())
-                                    else:
-                                        out.resize(last)
-                            else:
-                                out.push(46)
-                                out.push(46)
-                        else:
-                            if out.count > 0.usize():
-                                out.push(47)
-                            ByteText::append_range(out, path, segment_start, index)
+            while index <= path.count |path, out, index: usize = 0.usize(), segment_start: usize = 0.usize()|:
+                if index == path.count or path[index] == 47:
+                    append_normalized_segment(path, segment_start, index, out)
                     segment_start <- index + 1.usize()
                 index <- index + 1.usize()
             out.count > 0.usize()
@@ -301,17 +195,103 @@ module ProjectFiles:
         def stage_file_for_publication(path: darray[u8]&, value: darray[u8]&, temporary_path: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             temporary_path.resize(0)
             return false if path.count > maximum_publication_path_bytes or not valid_path_bytes(path)
+            template: mutable darray[u8] = temporary_template(path)
+            file_descriptor: i64 = Platform::make_temporary_file(&template)
+            file_descriptor >= 0 and written_and_closed(file_descriptor, value) and appended_bytes(temporary_path, template)
+
+        # `path` with a mkstemp suffix and a NUL terminator.
+        def temporary_template(path: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
             template: mutable darray[u8] = [path[item] for item in 0..<path.count]
             ByteText::append_text(&template, ".tmp.XXXXXX")
             template <- template.push(0)
-            file_descriptor: i64 = Platform::make_temporary_file(&template)
-            return false if file_descriptor < 0
+            template
+
+        # Write and sync `value`; the descriptor is closed either way.
+        def written_and_closed(file_descriptor: i64, value: darray[u8]&) -> bool can[Unsafe.PointerCast, Console.Write]:
             durable: bool = write_file_descriptor_all(file_descriptor, value) and Platform::synchronize_file(file_descriptor) == 0
-            region close_status_scope:
-                close_status: i64 = Platform::close_file_descriptor(file_descriptor)
-                return false if not durable or close_status != 0
-            ByteText::append(temporary_path, template)
+            Platform::close_file_descriptor(file_descriptor) == 0 and durable
+
+        # Keep the exclusive temporary for recovery when the link fails.
+        # Unlinking that pathname after the descriptor is closed could remove
+        # a replacement installed by another actor.
+        def linked_exclusively(path: darray[u8]&, temporary_path: darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            link_status: i64 = hard_linked(temporary_path, path)
+            link_status if link_status != 0 else retired_temporary(path, temporary_path)
+
+        def hard_linked(temporary_path: darray[u8]&, path: darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            path_c: darray[u8] = with_null_terminator(path)
+            Platform::create_hard_link(((&temporary_path[0]).cast[cstr] can Unsafe.PointerCast), ((&path_c[0]).cast[cstr] can Unsafe.PointerCast))
+
+        # The destination link is already published. Do not remove it by
+        # pathname after a cleanup or durability failure: another actor may
+        # have replaced that name meanwhile. Report the failure and leave the
+        # published evidence for a later recovery pass.
+        def retired_temporary(path: darray[u8]&, temporary_path: darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            -5 if Platform::unlink_path((&temporary_path[0]).cast[cstr] can Unsafe.PointerCast) != 0 or not sync_parent_directory(path) else 0
+
+        # Preserve the staged name if publication fails.
+        def renamed_into_place(temporary_path: darray[u8]&, path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            path_c: darray[u8] = with_null_terminator(path)
+            Platform::rename_path(((&temporary_path[0]).cast[cstr] can Unsafe.PointerCast), ((&path_c[0]).cast[cstr] can Unsafe.PointerCast)) == 0
+
+        def final_directory_ready(work: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            final_path: cstr = (&work[0]).cast[cstr] can Unsafe.PointerCast
+            created: i64 = Platform::make_directory(final_path, 493.u16())
+            (Platform::synchronize_parent_directory(final_path) == 0 if created == 0 else Platform::is_directory(final_path) == 1) and Platform::is_directory(final_path) == 1
+
+        def removed_or_missing(status: i64) -> bool:
+            status == 0 or status == -2
+
+        def c_string_bytes(value: cstr) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
+            bytes: mutable darray[u8] = []
+            ByteText::append_text(&bytes, value)
+            bytes
+
+        def appended_bytes(out: mutable darray[u8]&, value: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            ByteText::append(out, value)
             true
+
+        def copied_real_path(path: cstr, resolved: mutable darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            if Platform::resolve_real_path(path, resolved) is canonical:
+                return copied_c_string(canonical, out)
+            false
+
+        def copied_c_string(value: cstr, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            length: usize = Platform::c_string_length(value)
+            length > 0.usize() and length < 4096.usize() and appended_c_string(value, length, out)
+
+        def appended_c_string(value: cstr, length: usize, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            for index in 0..<length |out, value|:
+                out.push(value[index].u8())
+            true
+
+        # Append one segment: skip empty and "." segments, resolve "..".
+        def append_normalized_segment(path: darray[u8]&, start: usize, finish: usize, out: mutable darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
+            segment_length: usize = finish - start
+            return if segment_length == 0.usize() or (segment_length == 1.usize() and path[start] == 46)
+            if segment_length == 2.usize() and path[start] == 46 and path[start + 1.usize()] == 46:
+                append_parent_segment(out)
+            else:
+                out.push(47) if out.count > 0.usize()
+                ByteText::append_range(out, path, start, finish)
+
+        # Remove the last component, or keep stacking ".." past the start.
+        def append_parent_segment(out: mutable darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
+            if out.count == 0.usize():
+                ByteText::append_text(out, "..")
+            else:
+                apply_parent_segment(out, last_component_start(out))
+
+        def apply_parent_segment(out: mutable darray[u8]&, last: usize) -> void can[Memory.Allocate, Abort.Panic]:
+            if out.count - last == 2.usize() and out[last] == 46 and out[last + 1.usize()] == 46:
+                ByteText::append_text(out, "/..")
+            else:
+                # `last` points to the component start; remove its preceding separator as well.
+                out.resize(last - 1.usize() if last > 0.usize() and out[last - 1.usize()] == 47 else last)
+
+        def last_component_start(out: darray[u8]&) -> usize:
+            while last > 0.usize() and out[last - 1.usize()] != 47 |last: usize = out.count| -> last:
+                last <- last - 1.usize()
 
         def append_directory_prefix(directory: darray[u8]&, out: mutable darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
             out.resize(0)
