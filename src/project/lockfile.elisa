@@ -21,13 +21,10 @@ module Lockfile:
         const maximum_body_bytes: usize = Json::maximum_document_bytes - 7.usize()
 
         def append_header(out: mutable darray[u8]&, format: Format, name: darray[u8]&, version: darray[u8]&, manifest_digest: darray[u8]&, source_digest: darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
-            document_version: u64 = local_version if format == Format.Local else registry_version
-            region resolver_scope:
-                resolver: cstr = "elisapkg-v2" if format == Format.Local else registry_resolver
-                ByteText::append_text(out, "{\n  \"lock-version\": ")
-                ByteText::append_decimal(out, document_version)
-                ByteText::append_text(out, ",\n  \"resolver\": \"")
-                ByteText::append_text(out, resolver)
+            ByteText::append_text(out, "{\n  \"lock-version\": ")
+            ByteText::append_decimal(out, local_version if format == Format.Local else registry_version)
+            ByteText::append_text(out, ",\n  \"resolver\": \"")
+            ByteText::append_text(out, "elisapkg-v2" if format == Format.Local else registry_resolver)
             ByteText::append_text(out, "\",\n  \"package\": {\n    \"name\": \"")
             ByteText::append(out, name)
             ByteText::append_text(out, "\",\n    \"version\": \"")
@@ -54,23 +51,17 @@ module Lockfile:
 
         def read_registry_archive(raw: darray[u8]&, record_start: usize, record_end: usize, archive: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
             source_start: mutable usize = 0
-            region source_end_scope:
-                source_end: mutable usize = 0
-                return false if not:
-                    Json::object_value_span(raw, record_start, record_end, "source", &source_start, &source_end)
-                    SchemaFields::valid(raw, source_start, source_end, SchemaFields::Kind.RegistryLockSource)
-                    Json::object_string_equals_text(raw, source_start, source_end, "type", "registry")
-                    Json::object_string_equals_text(raw, source_start, source_end, "registry", "primary")
-                    Json::object_string_value(raw, source_start, source_end, "archive", archive)
-            Archive::is_safe_entry(archive)
+            source_end: mutable usize = 0
+            Json::object_value_span(raw, record_start, record_end, "source", &source_start, &source_end) and SchemaFields::valid(raw, source_start, source_end, SchemaFields::Kind.RegistryLockSource) and Json::object_string_equals_text(raw, source_start, source_end, "type", "registry") and Json::object_string_equals_text(raw, source_start, source_end, "registry", "primary") and Json::object_string_value(raw, source_start, source_end, "archive", archive) and Archive::is_safe_entry(archive)
 
         def read_sha256_field(raw: darray[u8]&, object_start: usize, object_end: usize, field: cstr, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
             out.resize(0)
-            region start_scope:
-                start: usize = sha256_field_start(raw, object_start, object_end, field)
-                return false if start >= raw.count
+            start: usize = sha256_field_start(raw, object_start, object_end, field)
+            if start >= raw.count:
+                false
+            else:
                 ByteText::append_range(out, raw, start, start + 64.usize())
-            true
+                true
 
         def has_sha256_field(raw: darray[u8]&, object_start: usize, object_end: usize, field: cstr) -> bool:
             sha256_field_start(raw, object_start, object_end, field) < raw.count
@@ -84,28 +75,21 @@ module Lockfile:
             requires right_start <= right_end and right_end <= lock.count
             left_length: usize = left_end - left_start
             right_length: usize = right_end - right_start
-            region shared_length_scope:
-                shared_length: usize = left_length if left_length < right_length else right_length
-                for offset in 0..<shared_length |lock, left_start, right_start|:
-                    return true if lock[left_start + offset] < lock[right_start + offset]
-                    return false if lock[left_start + offset] > lock[right_start + offset]
-            left_length < right_length
+            # The first differing byte decides; otherwise the shorter name sorts first.
+            for offset in 0..<(left_length if left_length < right_length else right_length) |precedes: bool = left_length < right_length| -> precedes:
+                break true if lock[left_start + offset] < lock[right_start + offset]
+                break false if lock[left_start + offset] > lock[right_start + offset]
 
         def registry_record_starts(lock: darray[u8]&, packages_start: usize, packages_end: usize, out: mutable darray[usize]&) -> bool can[Memory.Allocate, Abort.Panic]:
             out.resize(0)
             return false if:
                 packages_end >= lock.count or packages_start >= packages_end
                 lock[packages_start] != 91 or lock[packages_end] != 93
-            previous_start: mutable usize = 0
-            previous_end: mutable usize = 0
-            cursor: mutable usize = packages_start + 1.usize()
-            while true |starts: darray[usize] = []|:
+            while true |starts: darray[usize] = [], cursor: usize = packages_start + 1.usize(), record_end: usize = 0.usize(), name_start: usize = 0.usize(), name_end: usize = 0.usize(), previous_start: usize = 0.usize(), previous_end: usize = 0.usize()|:
                 cursor <- Json::skip_whitespace(lock, cursor, packages_end)
                 return false if cursor >= packages_end or lock[cursor] != 123 or starts.count >= maximum_registry_records
-                record_end: usize = Json::object_end(lock, cursor)
+                record_end <- Json::object_end(lock, cursor)
                 return false if record_end <= cursor or record_end >= packages_end
-                name_start: mutable usize = 0
-                name_end: mutable usize = 0
                 return false if not:
                     Json::object_string_span(lock, cursor, record_end, "name", &name_start, &name_end)
                     PackageIdentity::valid_name_segment(lock, name_start, name_end)
@@ -113,8 +97,7 @@ module Lockfile:
                 previous_start <- name_start
                 previous_end <- name_end
                 starts <- starts.push(cursor)
-                cursor <- record_end + 1.usize()
-                cursor <- Json::skip_whitespace(lock, cursor, packages_end)
+                cursor <- Json::skip_whitespace(lock, record_end + 1.usize(), packages_end)
                 if cursor == packages_end:
                     for index in 0..<starts.count |out, starts|:
                         out.push(starts[index])
@@ -133,43 +116,38 @@ module Lockfile:
                         first <- middle + 1.usize()
                     else:
                         last <- middle
-            return false if lower >= starts.count or compare_record_name(lock, starts[lower], wanted) != 0
-            out <- lower
-            true
+            if lower >= starts.count or compare_record_name(lock, starts[lower], wanted) != 0:
+                false
+            else:
+                out <- lower
+                true
 
         def matching_registry_record(lock: darray[u8]&, starts: darray[usize]&, wanted: Solver::Constraint) -> i64:
             record_index: mutable usize = 0.usize()
             return -1 if not registry_record_index(lock, starts, wanted.package, &record_index)
             record_start: usize = starts[record_index]
             record_end: usize = Json::object_end(lock, record_start)
-            return -1 if record_end <= record_start or record_end >= lock.count
             version: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-            return -1 if not read_registry_version(lock, record_start, record_end, &version)
-            region requirement_scope:
-                requirement: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
-                return -1 if not SemVer::parse_requirement(wanted.requirement, &requirement) or not SemVer::matches(requirement, version)
-            record_index.i64()
+            requirement: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
+            record_index.i64() if record_end > record_start and record_end < lock.count and read_registry_version(lock, record_start, record_end, &version) and SemVer::parse_requirement(wanted.requirement, &requirement) and SemVer::matches(requirement, version) else -1
 
         # Match only direct records in the packages array.
         def contains_package(raw: darray[u8]&, wanted: darray[u8]&) -> bool:
             start: usize = Json::root_value_offset(raw, "packages")
-            if start >= raw.count or raw[start] != 91:
-                return false
+            return false if start >= raw.count or raw[start] != 91
             finish: usize = Json::array_end(raw, start)
-            return false if finish <= start or finish >= raw.count
-            region cursor_scope:
-                cursor: mutable usize = start + 1.usize()
-                while cursor < finish |raw, finish, cursor, wanted|:
+            if finish <= start or finish >= raw.count:
+                false
+            else:
+                while cursor < finish |cursor: usize = start + 1.usize(), record_end: usize = 0.usize(), found: bool = false| -> found:
                     cursor <- Json::skip_whitespace(raw, cursor, finish)
-                    return false if cursor >= finish or raw[cursor] != 123
-                    record_end: usize = Json::object_end(raw, cursor)
-                    return false if record_end <= cursor or record_end >= finish
-                    return true if Json::object_string_equals(raw, cursor, record_end, "name", wanted)
-                    cursor <- record_end + 1.usize()
-                    cursor <- Json::skip_whitespace(raw, cursor, finish)
-                    return false if cursor >= finish or raw[cursor] != 44
+                    break false if cursor >= finish or raw[cursor] != 123
+                    record_end <- Json::object_end(raw, cursor)
+                    break false if record_end <= cursor or record_end >= finish
+                    break true if Json::object_string_equals(raw, cursor, record_end, "name", wanted)
+                    cursor <- Json::skip_whitespace(raw, record_end + 1.usize(), finish)
+                    break false if cursor >= finish or raw[cursor] != 44
                     cursor <- cursor + 1.usize()
-            false
 
         # The caller supplies record offsets in strictly increasing package-name order.
         def registry_satisfies_roots(lock: darray[u8]&, starts: darray[usize]&, roots: darray[Solver::Constraint]&) -> bool:
@@ -181,31 +159,23 @@ module Lockfile:
         const invalid_record_name: i64 = 2
 
         def compare_record_name(lock: darray[u8]&, record_start: usize, wanted: darray[u8]&) -> i64:
-            record_end: usize = Json::object_end(lock, record_start)
             start: mutable usize = 0
             length: usize =
+                record_end: usize = Json::object_end(lock, record_start)
                 finish: mutable usize = 0
-                return invalid_record_name if:
-                    record_end <= record_start or record_end >= lock.count
-                    not Json::object_string_span(lock, record_start, record_end, "name", &start, &finish)
-                finish - start
-            region shared_length_scope:
-                shared_length: usize = length if length < wanted.count else wanted.count
-                for offset in 0..<shared_length |lock, start, wanted|:
-                    return -1 if lock[start + offset] < wanted[offset]
-                    return 1 if lock[start + offset] > wanted[offset]
-            -1 if length < wanted.count else 1 if length > wanted.count else 0
+                if record_end <= record_start or record_end >= lock.count or not Json::object_string_span(lock, record_start, record_end, "name", &start, &finish):
+                    return invalid_record_name
+                else:
+                    finish - start
+            # The first differing byte decides; otherwise the shorter name sorts first.
+            for offset in 0..<(length if length < wanted.count else wanted.count) |order: i64 = -1 if length < wanted.count else 1 if length > wanted.count else 0| -> order:
+                break -1 if lock[start + offset] < wanted[offset]
+                break 1 if lock[start + offset] > wanted[offset]
 
         # Return the validated hex span's start, or the input length on failure.
         def sha256_field_start(raw: darray[u8]&, object_start: usize, object_end: usize, field: cstr) -> usize:
             start: mutable usize = 0
-            region finish_scope:
-                finish: mutable usize = 0
-                return raw.count if:
-                    not Json::object_string_span(raw, object_start, object_end, field, &start, &finish)
-                    finish - start != 71.usize()
-                    not ByteText::range_equals_text(raw, start, start + 7.usize(), "sha256:")
-                    not Integrity::valid_sha256_hex_range(raw, start + 7.usize(), finish)
-            start + 7.usize()
+            finish: mutable usize = 0
+            start + 7.usize() if Json::object_string_span(raw, object_start, object_end, field, &start, &finish) and finish - start == 71.usize() and ByteText::range_equals_text(raw, start, start + 7.usize(), "sha256:") and Integrity::valid_sha256_hex_range(raw, start + 7.usize(), finish) else raw.count
 
         const maximum_registry_records: usize = 4096.usize()
