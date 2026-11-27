@@ -20,66 +20,45 @@ module CheckpointRecords:
             Platform::c_string_length(checkpoint_header)
 
         def valid(state: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            cursor: mutable usize =
-                header_bytes: usize = header_length()
-                return false if state.count <= header_bytes or state.count > maximum_state_bytes or not ByteText::starts_with_text(state, checkpoint_header)
-                header_bytes
-            previous_key: mutable darray[u8] = []
-            row_count: mutable usize = 0.usize()
-            while cursor < state.count |state, cursor, row_count|:
-                region row_scope:
-                    row: mutable Row = empty_row()
-                    region ignored_version_scope:
-                        ignored_version: mutable u64 = 0.u64()
-                        return false if:
-                            not read_row(state, cursor, &row)
-                            not valid_scoped_role(row.key) or not Tuf::parse_checkpoint_version(row.version, &ignored_version) or not Integrity::valid_sha256_hex(row.digest)
-                            row_count > 0.usize() and compare_keys(previous_key, row.key) >= 0
-                    ByteText::replace(&previous_key, row.key)
-                    cursor <- row.next
+            return false if state.count <= header_length() or state.count > maximum_state_bytes or not ByteText::starts_with_text(state, checkpoint_header)
+            # Rows must be well formed and strictly increasing by key.
+            while cursor < state.count |cursor: usize = header_length(), previous_key: darray[u8] = [], row_count: usize = 0.usize(), row: Row = empty_row(), ignored_version: u64 = 0.u64()| -> row_count > 0.usize():
+                return false if:
+                    not read_row(state, cursor, &row)
+                    not valid_scoped_role(row.key) or not Tuf::parse_checkpoint_version(row.version, &ignored_version) or not Integrity::valid_sha256_hex(row.digest)
+                    row_count > 0.usize() and compare_keys(previous_key, row.key) >= 0
+                ByteText::replace(&previous_key, row.key)
+                cursor <- row.next
                 row_count <- row_count + 1.usize()
                 return false if row_count > 32768.usize()
-            row_count > 0.usize()
 
         # The registry validates the authenticated batch before scoping its rows.
         def scope_batch(scope_digest: darray[u8]&, batch: darray[u8]&, out: mutable darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic]:
             out.resize(0)
-            cursor: mutable usize =
-                batch_header: cstr = "elisapkg-tuf-batch:1\n"
-                Platform::c_string_length(batch_header)
             ByteText::append_text(out, checkpoint_header)
-            while cursor < batch.count |batch, cursor|:
-                finish: mutable usize = cursor
-                while finish < batch.count and batch[finish] != 10 |batch, finish|:
-                    finish <- finish + 1.usize()
+            # Each batch line becomes `<scope digest>:<line>`.
+            while cursor < batch.count |out, cursor: usize = Platform::c_string_length("elisapkg-tuf-batch:1\n")|:
+                finish: usize = while position < batch.count and batch[position] != 10 |position: usize = cursor| -> position:
+                    position <- position + 1.usize()
                 return Code.MalformedBatch if finish == batch.count
-                first_separator: mutable usize = cursor
-                while first_separator < finish and batch[first_separator] != 32 |batch, first_separator|:
-                    first_separator <- first_separator + 1.usize()
                 ByteText::append(out, scope_digest)
                 out.push(58)
-                ByteText::append_range(out, batch, cursor, first_separator)
-                for index in first_separator..=finish |out, batch|:
-                    out.push(batch[index])
+                ByteText::append_range(out, batch, cursor, finish + 1.usize())
                 return Code.ResourceLimit if out.count > maximum_state_bytes
                 cursor <- finish + 1.usize()
             Code.Ok
 
         def merge(state: darray[u8]&, candidates: darray[u8]&, out: mutable darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic]:
             out.resize(0)
-            header_bytes: usize = header_length()
             ByteText::append_text(out, checkpoint_header)
-            old_cursor: mutable usize = header_bytes if state.count > 0.usize() else 0.usize()
-            candidate_cursor: mutable usize = header_bytes
             # A present input always holds at least one row after its header.
-            old_end: mutable bool = state.count == 0.usize()
-            candidate_end: mutable bool = false
-            while not old_end or not candidate_end |state, candidates, out, old_cursor, candidate_cursor, old_end, candidate_end|:
-                region step_status_scope:
-                    step_status: Code = merge_step(state, &old_cursor, old_end, candidates, &candidate_cursor, candidate_end, out)
-                    return step_status if step_status != Code.Ok
-                old_end <- old_cursor == state.count
-                candidate_end <- candidate_cursor == candidates.count
+            while not old_end or not candidate_end |out, old_cursor: usize = header_length() if state.count > 0.usize() else 0.usize(), candidate_cursor: usize = header_length(), old_end: bool = state.count == 0.usize(), candidate_end: bool = false|:
+                step_status: Code = merge_step(state, &old_cursor, old_end, candidates, &candidate_cursor, candidate_end, out)
+                if step_status != Code.Ok:
+                    return step_status
+                else:
+                    old_end <- old_cursor == state.count
+                    candidate_end <- candidate_cursor == candidates.count
             Code.Ok
 
         # Take the next row from whichever input remains, or merge both.
@@ -89,11 +68,15 @@ module CheckpointRecords:
         # Copy the row at `cursor` to `out` and advance past it.
         def copy_row(source: darray[u8]&, cursor: mutable usize&, out: mutable darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic]:
             row: mutable Row = empty_row()
-            return Code.MalformedState if not read_row(source, cursor, &row)
-            ByteText::append_range(out, source, cursor, row.next)
-            return Code.ResourceLimit if out.count > maximum_state_bytes
-            cursor <- row.next
-            Code.Ok
+            if not read_row(source, cursor, &row):
+                Code.MalformedState
+            else:
+                ByteText::append_range(out, source, cursor, row.next)
+                if out.count > maximum_state_bytes:
+                    Code.ResourceLimit
+                else:
+                    cursor <- row.next
+                    Code.Ok
 
         # Merge the next row of each sorted input. The smaller key is copied
         # alone; equal keys must form an authenticated, non-rolled-back
@@ -102,25 +85,31 @@ module CheckpointRecords:
             old_row: mutable Row = empty_row()
             candidate_row: mutable Row = empty_row()
             return Code.MalformedState if not read_row(state, old_cursor, &old_row) or not read_row(candidates, candidate_cursor, &candidate_row)
-            region key_comparison_scope:
-                key_comparison: i64 = compare_keys(old_row.key, candidate_row.key)
-                return copy_row(state, old_cursor, out) if key_comparison < 0
-                return copy_row(candidates, candidate_cursor, out) if key_comparison > 0
+            key_comparison: i64 = compare_keys(old_row.key, candidate_row.key)
             old_version: mutable u64 = 0.u64()
             candidate_version: mutable u64 = 0.u64()
-            return Code.MalformedState if not Tuf::parse_checkpoint_version(old_row.version, &old_version) or not Tuf::parse_checkpoint_version(candidate_row.version, &candidate_version)
-            region checkpoint_status_scope:
-                checkpoint_status: Tuf::CheckpointCode = Tuf::check_authenticated_checkpoint(old_version, old_row.digest, candidate_version, candidate_row.digest)
-                return Code.Rollback if checkpoint_status == Tuf::CheckpointCode.Rollback
-                return Code.Equivocation if checkpoint_status == Tuf::CheckpointCode.Equivocation
-                return Code.MalformedState if checkpoint_status != Tuf::CheckpointCode.Accepted
-            if candidate_version == old_version:
-                ByteText::append_range(out, state, old_cursor, old_row.next)
+            if key_comparison < 0:
+                copy_row(state, old_cursor, out)
+            elif key_comparison > 0:
+                copy_row(candidates, candidate_cursor, out)
+            elif not Tuf::parse_checkpoint_version(old_row.version, &old_version) or not Tuf::parse_checkpoint_version(candidate_row.version, &candidate_version):
+                Code.MalformedState
             else:
-                ByteText::append_range(out, candidates, candidate_cursor, candidate_row.next)
-            old_cursor <- old_row.next
-            candidate_cursor <- candidate_row.next
-            Code.ResourceLimit if out.count > maximum_state_bytes else Code.Ok
+                checkpoint_status: Tuf::CheckpointCode = Tuf::check_authenticated_checkpoint(old_version, old_row.digest, candidate_version, candidate_row.digest)
+                if checkpoint_status == Tuf::CheckpointCode.Rollback:
+                    Code.Rollback
+                elif checkpoint_status == Tuf::CheckpointCode.Equivocation:
+                    Code.Equivocation
+                elif checkpoint_status != Tuf::CheckpointCode.Accepted:
+                    Code.MalformedState
+                else:
+                    if candidate_version == old_version:
+                        ByteText::append_range(out, state, old_cursor, old_row.next)
+                    else:
+                        ByteText::append_range(out, candidates, candidate_cursor, candidate_row.next)
+                    old_cursor <- old_row.next
+                    candidate_cursor <- candidate_row.next
+                    Code.ResourceLimit if out.count > maximum_state_bytes else Code.Ok
 
         # One parsed "KEY VERSION DIGEST" row and the offset after its newline.
         struct Row:
@@ -141,46 +130,42 @@ module CheckpointRecords:
             digest_out.resize(0)
             next_out <- 0.usize()
             return false if cursor >= raw.count
-            finish: mutable usize = cursor
-            while finish < raw.count and raw[finish] != 10 |raw, finish|:
-                finish <- finish + 1.usize()
-            return false if finish == cursor or finish == raw.count
-            first_separator: mutable usize = cursor
-            while first_separator < finish and raw[first_separator] != 32 |raw, first_separator|:
-                first_separator <- first_separator + 1.usize()
-            region second_separator_scope:
-                second_separator: mutable usize = first_separator + 1.usize()
-                while second_separator < finish and raw[second_separator] != 32 |raw, second_separator|:
-                    second_separator <- second_separator + 1.usize()
-                return false if:
-                    first_separator == cursor or second_separator >= finish or first_separator + 1.usize() == second_separator or second_separator + 1.usize() == finish
-                    contains_byte(raw, second_separator + 1.usize(), finish, 32)
+            finish: usize = while position < raw.count and raw[position] != 10 |position: usize = cursor| -> position:
+                position <- position + 1.usize()
+            first_separator: usize = while position < finish and raw[position] != 32 |position: usize = cursor| -> position:
+                position <- position + 1.usize()
+            second_separator: usize = while position < finish and raw[position] != 32 |position: usize = first_separator + 1.usize()| -> position:
+                position <- position + 1.usize()
+            if finish == cursor or finish == raw.count or first_separator == cursor or second_separator >= finish or first_separator + 1.usize() == second_separator or second_separator + 1.usize() == finish or contains_byte(raw, second_separator + 1.usize(), finish, 32):
+                false
+            else:
                 ByteText::append_range(key_out, raw, cursor, first_separator)
                 ByteText::append_range(version_out, raw, (first_separator + 1.usize()), second_separator)
                 ByteText::append_range(digest_out, raw, (second_separator + 1.usize()), finish)
-            next_out <- finish + 1.usize()
-            true
+                next_out <- finish + 1.usize()
+                true
 
     private:
         const checkpoint_header: cstr = "elisapkg-tuf-checkpoints:1\n"
 
         def valid_scoped_role(key: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
             return false if key.count < 66.usize() or key.count > 193.usize() or key[64] != 58
-            for index in 0..<64.usize() |key|:
+            # The scope is a lowercase hex digest; the role follows the colon.
+            hex_scope: bool = for index in 0..<64.usize() |valid: bool = true| -> valid:
                 byte: u8 = key[index]
-                return false if (byte < 48 or byte > 57) and (byte < 97 or byte > 102)
-            role: mutable darray[u8] = [key[item] for item in 65..<key.count]
-            Tuf::valid_checkpoint_role(role)
+                break false if (byte < 48 or byte > 57) and (byte < 97 or byte > 102)
+            if not hex_scope:
+                false
+            else:
+                role: darray[u8] = [key[item] for item in 65..<key.count]
+                Tuf::valid_checkpoint_role(role)
 
         def compare_keys(left: darray[u8]&, right: darray[u8]&) -> i64:
-            region common_scope:
-                common: usize = left.count if left.count < right.count else right.count
-                for index in 0..<common |left, right|:
-                    return -1 if left[index] < right[index]
-                    return 1 if left[index] > right[index]
-            -1 if left.count < right.count else 1 if left.count > right.count else 0
+            # The first differing byte decides; otherwise the shorter key sorts first.
+            for index in 0..<(left.count if left.count < right.count else right.count) |order: i64 = -1 if left.count < right.count else 1 if left.count > right.count else 0| -> order:
+                break -1 if left[index] < right[index]
+                break 1 if left[index] > right[index]
 
         def contains_byte(raw: darray[u8]&, start: usize, finish: usize, wanted: u8) -> bool:
-            for index in start..<finish |raw|:
-                return true if raw[index] == wanted
-            false
+            for index in start..<finish |found: bool = false| -> found:
+                break true if raw[index] == wanted
