@@ -274,7 +274,10 @@ elevated local install can still read a user's private source tree. `..` stays
 available for local dependencies outside the current package root. Executable
 checks retain the separate toolchain-directory policy, including its narrow
 euid-owned Homebrew `admin`-group exception; package-source reads do not inherit
-that exception.
+that exception. Build receipts hash each toolchain file (compiler, stage1, runtime,
+clang, SDK settings and developer tools) through that same toolchain-directory
+policy, still opening the file without following links and requiring a regular
+file, so a Homebrew clang can be identified and cached builds can be reused.
 
 Linux uses `openat2` with `O_NOFOLLOW` and
 `RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS`. If the syscall or flags are unavailable,
