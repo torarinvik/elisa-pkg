@@ -6,6 +6,7 @@ include "./errors.elisa"
 include "./libc.elisa"
 include "../package/ustar_fields.elisa"
 include "./staging_tree.elisa"
+include "../text/bytes.elisa"
 
 module NativeArchiveExtract:
     public:
@@ -15,38 +16,34 @@ module NativeArchiveExtract:
             return root if root < 0
             seen: mutable darray[u8] = []
             created_directories: mutable darray[u8] = []
-            extracted_nodes: mutable usize = 0.usize()
-            cursor: mutable usize = 0.usize()
-            entries: mutable usize = 0.usize()
-            result: mutable i64 = -22
-            while cursor + 512.usize() <= archive.count |archive, cursor, entries, seen, root, result|:
+            result: i64 = while cursor + 512.usize() <= archive.count |seen, created_directories, cursor: usize = 0.usize(), entries: usize = 0.usize(), extracted_nodes: usize = 0.usize(), next_offset: usize = 0.usize(), entry_status: i64 = 0, outcome: i64 = -22| -> outcome:
                 if UstarFields::archive_block_zero(archive, cursor):
-                    if cursor + 1024.usize() == archive.count and entries > 0.usize() and UstarFields::archive_block_zero(archive, cursor + 512.usize()):
-                        result <- 0
+                    # Two zero blocks that end the archive after at least one entry.
+                    outcome <- 0 if cursor + 1024.usize() == archive.count and entries > 0.usize() and UstarFields::archive_block_zero(archive, cursor + 512.usize())
                     break
                 return extraction_failure(root, seen, created_directories, -22) if entries >= PackagePathPolicy::maximum_package_archive_entries or cursor + 1024.usize() > archive.count
-                name: mutable darray[u8] = []
-                for index in 0..<100 |archive, cursor, name|:
-                    break if archive[cursor + index] == 0
-                    name <- name.push(archive[cursor + index])
-                return extraction_failure(root, seen, created_directories, -22) if name.count >= 100 or not UstarFields::safe_relative_path(name) or UstarFields::archive_name_seen(seen, name)
-                size: usize =
-                    payload_size: i64 = UstarFields::normalized_payload_size(archive, cursor, name.count)
-                    return extraction_failure(root, seen, created_directories, -22) if payload_size < 0
-                    payload_size.usize()
-                next_offset: usize = UstarFields::next_entry_offset(archive, cursor, size)
-                return extraction_failure(root, seen, created_directories, -22) if next_offset == 0.usize()
-                region entry_status_scope:
-                    entry_status: i64 = extract_file(root, archive, cursor + 512.usize(), size, name, &seen, &created_directories, &extracted_nodes)
-                    return extraction_failure(root, seen, created_directories, entry_status) if entry_status != 0
+                rebind next_offset, entry_status: i64 =
+                    name: darray[u8] =
+                        while index < 100 and archive[cursor + index] != 0 |cursor, index: usize = 0.usize(), entry_name: darray[u8] = []| -> entry_name:
+                            entry_name <- entry_name.push(archive[cursor + index])
+                            index <- index + 1.usize()
+                    return extraction_failure(root, seen, created_directories, -22) if name.count >= 100 or not UstarFields::safe_relative_path(name) or UstarFields::archive_name_seen(seen, name)
+                    size: usize =
+                        payload_size: i64 = UstarFields::normalized_payload_size(archive, cursor, name.count)
+                        return extraction_failure(root, seen, created_directories, -22) if payload_size < 0
+                        payload_size.usize()
+                    entry_end: usize = UstarFields::next_entry_offset(archive, cursor, size)
+                    return extraction_failure(root, seen, created_directories, -22) if entry_end == 0.usize()
+                    entry_end, extract_file(root, archive, cursor + 512.usize(), size, name, &seen, &created_directories, &extracted_nodes)
                 entries <- entries + 1.usize()
                 cursor <- next_offset
-            return extraction_failure(root, seen, created_directories, result) if result != 0
-            return extraction_failure(root, seen, created_directories, -5) if native_fsync(root) != 0
-            region close_status_scope:
-                close_status: i64 = native_close(root)
-                return -5 if result == 0 and close_status != 0
-            result
+                return extraction_failure(root, seen, created_directories, entry_status) if entry_status != 0
+            if result != 0:
+                extraction_failure(root, seen, created_directories, result)
+            elif native_fsync(root) != 0:
+                extraction_failure(root, seen, created_directories, -5)
+            else:
+                -5 if native_close(root) != 0 else 0
 
     private:
         # Open the destination as an empty, owner-only staging directory.
@@ -73,56 +70,55 @@ module NativeArchiveExtract:
         # The name joins `seen` once the file exists. Returns 0 or a negative
         # errno; a file whose write fails is unlinked again.
         def extract_file(root: i64, archive: darray[u8]&, data_start: usize, size: usize, name: darray[u8]&, seen: mutable darray[u8]&, created_directories: mutable darray[u8]&, extracted_nodes: mutable usize&) -> i64:
-            parent_copy: mutable darray[u8] = []
-            leaf_offset: mutable usize = 0.usize()
-            parent: i64 = NativeStagingTree::open_archive_parent(root, name, &parent_copy, &leaf_offset, true, created_directories, extracted_nodes)
-            return -22 if parent < 0
-            leaf_snapshot: mutable darray[u8] = [parent_copy[index] for index in leaf_offset..<parent_copy.count]
+            # The parent directory and a private copy of the NUL-terminated leaf name.
+            rebind parent: i64, leaf_snapshot: darray[u8] =
+                parent_copy: mutable darray[u8] = []
+                leaf_offset: mutable usize = 0.usize()
+                opened: i64 = NativeStagingTree::open_archive_parent(root, name, &parent_copy, &leaf_offset, true, created_directories, extracted_nodes)
+                return -22 if opened < 0
+                leaf: darray[u8] = []
+                opened, ByteText::with_range(leaf, parent_copy, leaf_offset, parent_copy.count)
             if extracted_nodes >= NativeStagingTree::maximum_archive_extracted_nodes:
                 return -5 if native_close(parent) != 0
                 return -75
-            file: i64 =
-                leaf: cstr = (&parent_copy[leaf_offset]).cast[cstr] can Unsafe.PointerCast
-                native_openat(parent, leaf, PlatformNative::flags_write_create_exclusive(), 420)
-            if file < 0:
-                file_errno: i64 = NativeErrors::negative_errno()
-                return -5 if native_close(parent) != 0
-                return file_errno
+            file_durable: bool =
+                file: i64 = native_openat(parent, ((&leaf_snapshot[0]).cast[cstr] can Unsafe.PointerCast), PlatformNative::flags_write_create_exclusive(), 420)
+                if file < 0:
+                    file_errno: i64 = NativeErrors::negative_errno()
+                    return -5 if native_close(parent) != 0
+                    return file_errno
+                written: bool = write_payload(file, archive, data_start, size)
+                sync_status: i64 = native_fsync(file)
+                # Close first so the file is closed whatever else failed.
+                native_close(file) == 0 and written and sync_status == 0
+            # The name joins `seen` once the file exists.
             for index in 0..<name.count |seen, name|:
                 seen <- seen.push(name[index])
             seen <- seen.push(0)
             extracted_nodes <- extracted_nodes + 1.usize()
-            write_failed: bool = not write_payload(file, archive, data_start, size)
-            sync_status: i64 = native_fsync(file)
-            close_status: i64 = native_close(file)
-            region directory_sync_scope:
-                directory_sync: i64 = native_fsync(parent) if not write_failed and sync_status == 0 and close_status == 0 else -5
-                if write_failed or sync_status != 0 or close_status != 0 or directory_sync != 0:
-                    _ =
-                        cleanup_name: cstr = (&leaf_snapshot[0]).cast[cstr] can Unsafe.PointerCast
-                        native_unlinkat(parent, cleanup_name, 0)
-                    _ = native_close(parent)
-                    return -5
-            -5 if native_close(parent) != 0 else 0
+            if not file_durable or native_fsync(parent) != 0:
+                _ = native_unlinkat(parent, ((&leaf_snapshot[0]).cast[cstr] can Unsafe.PointerCast), 0)
+                _ = native_close(parent)
+                -5
+            else:
+                -5 if native_close(parent) != 0 else 0
 
         # Write `size` payload bytes starting at `data_start`, retrying on EINTR.
         def write_payload(file: i64, archive: darray[u8]&, data_start: usize, size: usize) -> bool:
             requires data_start <= archive.count and size <= archive.count - data_start
-            region written_scope:
-                written: mutable usize = 0.usize()
-                while written < size |archive, data_start, file, written, size|:
-                    amount: i64 =
-                        data: void& = (&archive[data_start + written]).cast[void&] can Unsafe.PointerCast
-                        native_write(file, data, size - written)
-                    continue if amount < 0 and NativeErrors::current_errno() == 4
-                    return false if amount <= 0 or amount > (size - written).i64()
-                    written <- written + amount.usize()
+            while written < size |written: usize = 0.usize()|:
+                amount: i64 =
+                    data: void& = (&archive[data_start + written]).cast[void&] can Unsafe.PointerCast
+                    native_write(file, data, size - written)
+                continue if amount < 0 and NativeErrors::current_errno() == 4
+                return false if amount <= 0 or amount > (size - written).i64()
+                written <- written + amount.usize()
             true
+
         def extraction_failure(root: i64, seen: darray[u8]&, created_directories: darray[u8]&, errno_value: i64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            cleanup_ok: mutable bool = NativeStagingTree::remove_files(root, seen)
-            cleanup_ok <- NativeStagingTree::remove_directories(root, created_directories) and cleanup_ok
+            cleanup_ok: bool =
+                files_removed: bool = NativeStagingTree::remove_files(root, seen)
+                NativeStagingTree::remove_directories(root, created_directories) and files_removed
             sync_status: i64 = native_fsync(root)
-            region close_status_scope:
-                close_status: i64 = native_close(root)
-                return -5 if not cleanup_ok or sync_status != 0 or close_status != 0
-            errno_value
+            # Close first so the root is closed whatever else failed.
+            -5 if native_close(root) != 0 or not cleanup_ok or sync_status != 0 else errno_value
