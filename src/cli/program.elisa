@@ -13,57 +13,63 @@ module ProgramCommand:
     public:
         def run(argument_count: i64, slots: cstr&&, options: Model::CommandOptions, expected_kind: cstr) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
-                manifest_raw: mutable darray[u8] = []
-                manifest_raw <- manifest_raw.resize(ProjectFiles::project_document_limit)
-                return CliStatus::build_failed if not ProjectFiles::read_c_string_into("elisapkg.json", &manifest_raw)
-                artifact_label: darray[u8] =
-                    target_name: mutable darray[u8] = []
-                    target_kind: mutable darray[u8] = []
-                    region target_entry_scope:
+                child_process_identifier: i64 =
+                    # The selected target's built executable, NUL-terminated.
+                    artifact_path_c: darray[u8] =
+                        manifest_raw: mutable darray[u8] = []
+                        manifest_raw <- manifest_raw.resize(ProjectFiles::project_document_limit)
+                        target_name: mutable darray[u8] = []
+                        target_kind: mutable darray[u8] = []
                         target_entry: mutable darray[u8] = []
-                        return CliStatus::build_failed if not ManifestTargets::select_target(manifest_raw, options.target_name, options.target_kind, &target_name, &target_kind, &target_entry)
-                    if not ByteText::equal_text(target_kind, expected_kind):
-                        CliOutput::write_error("error: selected target does not produce an executable\n")
-                        return CliStatus::build_failed
-                    ManifestTargets::artifact_leaf(target_name, false)
-                build_root: darray[u8] =
-                    current_directory: darray[u8] = []
-                    Build::output_directory(current_directory, Platform::c_string_equal(options.profile, "release"))
-                artifact_path: mutable darray[u8] = []
-                ProjectFiles::path_join_bytes_into(build_root, artifact_label, &artifact_path)
-                artifact_path_c: mutable darray[u8] = []
-                artifact_path_c <- ProjectFiles::with_null_terminator(&artifact_path)
-                artifact_name: cstr = (&artifact_path_c[0]).cast[cstr] can Unsafe.PointerCast
-                arguments: mutable darray[cstr] = []
-                arguments <- arguments.push("/usr/bin/env")
-                arguments <- arguments.push("-i")
-                arguments <- arguments.push(Toolchain::isolated_path_environment)
-                arguments <- arguments.push(artifact_name)
-                index: mutable i64 = 2
-                while index < argument_count and not Platform::c_string_equal(slots[index].cast[cstr], "--") |slots, index|:
-                    index <- index + 1
-                index <- index + 1 if index < argument_count and Platform::c_string_equal(slots[index].cast[cstr], "--")
-                while index < argument_count |arguments, slots, index|:
-                    arguments <- arguments.push(slots[index].cast[cstr])
-                    index <- index + 1
-                arguments <- arguments.push(null)
-                child_argument_vector: mutable cstr&& = (&arguments[0]).cast[mutable cstr&&] can Unsafe.PointerCast
-                child_process_identifier: i64 = Platform::fork_process()
-                if child_process_identifier == 0:
-                    run_program_child(child_argument_vector)
-                return CliStatus::build_failed if child_process_identifier < 0
-                status: mutable i32 = 0
-                region waited_scope:
+                        if not ProjectFiles::read_c_string_into("elisapkg.json", &manifest_raw) or not ManifestTargets::select_target(manifest_raw, options.target_name, options.target_kind, &target_name, &target_kind, &target_entry):
+                            return CliStatus::build_failed
+                        elif not ByteText::equal_text(target_kind, expected_kind):
+                            CliOutput::write_error("error: selected target does not produce an executable\n")
+                            return CliStatus::build_failed
+                        else:
+                            artifact_path: darray[u8] =
+                                artifact_label: darray[u8] = ManifestTargets::artifact_leaf(target_name, false)
+                                build_root: darray[u8] =
+                                    current_directory: darray[u8] = []
+                                    Build::output_directory(current_directory, Platform::c_string_equal(options.profile, "release"))
+                                ProjectFiles::path_join_bytes(build_root, artifact_label)
+                            ProjectFiles::with_null_terminator(&artifact_path)
+                    arguments: mutable darray[cstr] = ["/usr/bin/env", "-i", Toolchain::isolated_path_environment, ((&artifact_path_c[0]).cast[cstr] can Unsafe.PointerCast)]
+                    # Pass the arguments after the first `--` through to the program.
+                    while index < argument_count |arguments, index: i64 = 2, passing: bool = false|:
+                        if passing:
+                            arguments <- arguments.push(slots[index].cast[cstr])
+                        elif Platform::c_string_equal(slots[index].cast[cstr], "--"):
+                            passing <- true
+                        index <- index + 1
+                    arguments <- arguments.push(null)
+                    fork_program(&artifact_path_c, &arguments)
+                if child_process_identifier < 0:
+                    CliStatus::build_failed
+                else:
+                    status: mutable i32 = 0
                     waited: i64 = Platform::wait_for_process_group_with_timeout(child_process_identifier, &status, PROGRAM_TIMEOUT_MS)
-                    return CliStatus::cancelled if waited == Platform::timeout_error()
-                    return CliStatus::build_failed if waited < 0
-                # waitpid returns the platform wait status. Preserve a normal child's exit
-                # code for `run`, and map signal termination to the documented cancellation
-                # status instead of exposing the platform-specific wait encoding.
-                status.i64() / 256.i64() if status % 256 == 0 else CliStatus::cancelled
+                    if waited == Platform::timeout_error():
+                        CliStatus::cancelled
+                    elif waited < 0:
+                        CliStatus::build_failed
+                    else:
+                        # waitpid returns the platform wait status. Preserve a normal child's exit
+                        # code for `run`, and map signal termination to the documented cancellation
+                        # status instead of exposing the platform-specific wait encoding.
+                        status.i64() / 256.i64() if status % 256 == 0 else CliStatus::cancelled
 
     private:
         const PROGRAM_TIMEOUT_MS: i64 = 120000
+
+        # Fork the program child. `artifact_path` backs the argument vector's
+        # program name, so the caller keeps it alive until the fork copies it.
+        def fork_program(artifact_path: darray[u8]&, arguments: mutable darray[cstr]&) -> i64 can[Unsafe.PointerCast]:
+            requires artifact_path.count > 0
+            child_process_identifier: i64 = Platform::fork_process()
+            if child_process_identifier == 0:
+                run_program_child((&arguments[0]).cast[mutable cstr&&] can Unsafe.PointerCast)
+            child_process_identifier
 
         # In the forked child: isolate the process and execute the program
         # with an empty environment. Package code must not inherit file,
