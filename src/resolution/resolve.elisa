@@ -16,43 +16,34 @@ module Resolve:
             selected.resize(0)
             return false if catalog.count == 0.usize() or catalog.count > 1048576.usize()
             parsed_requirement: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
-            return false if not SemVer::parse_requirement(requirement, &parsed_requirement)
-            found: mutable bool = false
-            best_text: mutable darray[u8] = []
-            best: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-            seen_slots: mutable darray[usize] = []
-            seen_slots <- seen_slots.resize(8192.usize())
-            seen_versions: mutable darray[u8] = []
-            seen_offsets: mutable darray[usize] = []
-            seen_hashes: mutable darray[u64] = []
-            candidates: mutable usize = 0.usize()
-            while cursor < catalog.count |cursor: usize = 0.usize()|:
-                finish: mutable usize = cursor
-                while finish < catalog.count and catalog[finish] != 10 |catalog, finish|:
-                    finish <- finish + 1.usize()
-                line_end: mutable usize = finish
-                line_end <- line_end - 1.usize() if line_end > cursor and catalog[line_end - 1.usize()] == 13
-                return false if line_end == cursor or line_end - cursor > 128.usize()
-                candidate_text: mutable darray[u8] = []
-                for index in cursor..<line_end |catalog, candidate_text|:
-                    candidate_text <- candidate_text.push(catalog[index])
-                candidate: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-                return false if not:
-                    SemVer::parse(candidate_text, &candidate)
-                    version_record_unique(&seen_slots, &seen_versions, &seen_offsets, &seen_hashes, candidate_text)
-                candidates <- candidates + 1.usize()
-                return false if candidates > 4096.usize()
-                if SemVer::matches(parsed_requirement, candidate) and (not found or SemVer::compare(candidate, best) > 0):
-                    best <- candidate
-                    best_text <- best_text.resize(0)
-                    for index in 0..<candidate_text.count |best_text, candidate_text|:
-                        best_text <- best_text.push(candidate_text[index])
-                    found <- true
-                cursor <- finish + 1.usize()
-            if found:
-                for index in 0..<best_text.count |selected, best_text|:
-                    selected.push(best_text[index])
-            found
+            if not SemVer::parse_requirement(requirement, &parsed_requirement):
+                false
+            else:
+                found: mutable bool = false
+                best_text: mutable darray[u8] = []
+                # One catalog line per iteration; `finish` is its newline and
+                # `line_end` drops an optional carriage return.
+                while cursor < catalog.count |found, best_text, cursor: usize = 0.usize(), finish: usize = 0.usize(), line_end: usize = 0.usize(), candidate: Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, best: Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, candidates: usize = 0.usize(), seen_slots: darray[usize] = [0.usize() for slot in 0..<version_hash_capacity], seen_versions: darray[u8] = [], seen_offsets: darray[usize] = [], seen_hashes: darray[u64] = []|:
+                    finish <- while position < catalog.count and catalog[position] != 10 |position: usize = cursor| -> position:
+                        position <- position + 1.usize()
+                    line_end <- finish - 1.usize() if finish > cursor and catalog[finish - 1.usize()] == 13 else finish
+                    return false if line_end == cursor or line_end - cursor > 128.usize()
+                    candidate_text: darray[u8] = [catalog[index] for index in cursor..<line_end]
+                    cursor <- finish + 1.usize()
+                    return false if not:
+                        SemVer::parse(candidate_text, &candidate)
+                        version_record_unique(&seen_slots, &seen_versions, &seen_offsets, &seen_hashes, candidate_text)
+                    candidates <- candidates + 1.usize()
+                    return false if candidates > 4096.usize()
+                    if SemVer::matches(parsed_requirement, candidate) and (not found or SemVer::compare(candidate, best) > 0):
+                        best <- candidate
+                        best_text <- [candidate_text[index] for index in 0..<candidate_text.count]
+                        found <- true
+                if found:
+                    ByteText::append(selected, best_text)
+                    true
+                else:
+                    false
 
     private:
         const version_hash_capacity: usize = 8192
@@ -64,23 +55,19 @@ module Resolve:
         # cannot turn this lookup back into an unbounded quadratic scan.
         def version_record_unique(slots: mutable darray[usize]&, versions: mutable darray[u8]&, offsets: mutable darray[usize]&, hashes: mutable darray[u64]&, wanted: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
             return false if slots.count != version_hash_capacity or offsets.count >= 4096.usize() or hashes.count != offsets.count
-            hash: u64 = version_hash(wanted)
-            probes: mutable usize = 0.usize()
-            while probes < version_hash_probe_limit |slot: usize = (hash & (version_hash_capacity - 1.usize()).u64()).usize()|:
+            while probes < version_hash_probe_limit |hash: u64 = version_hash(wanted), slot: usize = (hash & (version_hash_capacity - 1.usize()).u64()).usize(), probes: usize = 0.usize()|:
                 existing_index: usize = slots[slot]
                 if existing_index == 0.usize():
                     offsets.push(versions.count)
                     hashes.push(hash)
-                    for index in 0..<wanted.count |versions, wanted|:
-                        versions.push(wanted[index])
-                    versions.push(0)
+                    ByteText::append_terminated(versions, wanted)
                     slots[slot] <- offsets.count
                     return true
-                region seen_index_scope:
-                    seen_index: usize = existing_index - 1.usize()
-                    return false if hashes[seen_index] == hash and version_text_equal(versions, offsets[seen_index], wanted)
-                slot <- (slot + 1.usize()) & (version_hash_capacity - 1.usize())
-                probes <- probes + 1.usize()
+                elif hashes[existing_index - 1.usize()] == hash and version_text_equal(versions, offsets[existing_index - 1.usize()], wanted):
+                    return false
+                else:
+                    slot <- (slot + 1.usize()) & (version_hash_capacity - 1.usize())
+                    probes <- probes + 1.usize()
             false
 
         def version_text_equal(versions: darray[u8]&, start: usize, wanted: darray[u8]&) -> bool:
