@@ -9,6 +9,7 @@ include "../package/model.elisa"
 include "./semver.elisa"
 include "../package/package_identity.elisa"
 include "../text/bytes.elisa"
+include "./solver_budget.elisa"
 
 module Solver:
     public:
@@ -56,7 +57,7 @@ module Solver:
         # graph unsatisfiable.
         def solve_with_preferences(candidates: darray[Candidate]&, roots: darray[Constraint]&, preferences: darray[Preference]&, selected: mutable darray[usize]&) -> SolveCode can[Memory.Allocate, Abort.Panic]:
             failure_constraints: mutable darray[Constraint] = []
-            work: mutable WorkBudget = WorkBudget{used: 0}
+            work: mutable SolverBudget::WorkBudget = SolverBudget::empty()
             solver_solve_with_preferences(candidates, roots, preferences, selected, &failure_constraints, &work, false)
 
         # The conflict companion records constraints from one actual failed
@@ -67,33 +68,9 @@ module Solver:
             conflict.first_requirement.resize(0)
             conflict.second_requirement.resize(0)
             failure_constraints: mutable darray[Constraint] = []
-            work: mutable WorkBudget = WorkBudget{used: 0}
+            work: mutable SolverBudget::WorkBudget = SolverBudget::empty()
             result: SolveCode = solver_solve_with_preferences(candidates, roots, preferences, selected, &failure_constraints, &work, true)
-            return result if result != SolveCode.Unsatisfiable
-            # Diagnostic work may stop early once unsatisfiability is proven.
-            for first in 0..<failure_constraints.count |failure_constraints, candidates, conflict|:
-                return result if not solver_charge_work(&work, 1)
-                has_candidate: bool = solver_requirement_has_candidate(candidates, failure_constraints[first], preferences, &work)
-                return result if solver_work_exhausted(work)
-                if not has_candidate:
-                    record_conflict(failure_constraints[first], failure_constraints[first], &work, conflict)
-                    return result
-            for first in 0..<failure_constraints.count |failure_constraints, candidates, conflict|:
-                comparisons: mutable usize = 0.usize()
-                for second in first + 1.usize()..<failure_constraints.count |failure_constraints, candidates, first, second, comparisons, conflict|:
-                    return result if not solver_charge_work(&work, 1)
-                    region same_package_scope:
-                        same_package: bool = solver_equal(failure_constraints[first].package, failure_constraints[second].package, &work)
-                        return result if solver_work_exhausted(work)
-                        continue if not same_package
-                    comparisons <- comparisons + 1.usize()
-                    break if comparisons > 128.usize()
-                    pair_has_candidate: bool = solver_requirement_pair_has_candidate(candidates, failure_constraints[first], failure_constraints[second], preferences, &work)
-                    return result if solver_work_exhausted(work)
-                    if not pair_has_candidate:
-                        record_conflict(failure_constraints[first], failure_constraints[second], &work, conflict)
-                        return result
-            result
+            result if result != SolveCode.Unsatisfiable else explained_conflict(candidates, failure_constraints, preferences, &work, conflict)
 
         # Solve while retaining a bounded, deterministic explanation for an
         # unsatisfiable graph. The original `solve` API remains unchanged for
@@ -107,16 +84,72 @@ module Solver:
             solve_with_preferences_and_conflict(candidates, roots, preferences, selected, conflict)
 
     private:
-        def record_conflict(first: Constraint, second: Constraint, work: mutable WorkBudget&, conflict: mutable Conflict&) -> void can[Memory.Allocate, Abort.Panic]:
+        # The mutable state of one search: ordered preferences, the active
+        # constraints, the candidate assigned to each package slot (or -1),
+        # and the number of decisions taken.
+        struct SearchState:
+            preferences: mutable darray[Preference]
+            constraints: mutable darray[Constraint]
+            assigned: mutable darray[i64]
+            decisions: mutable usize
+
+        # The depth-first walk over a selected graph: one color per slot
+        # (0 unvisited, 1 on the stack, 2 finished) and the slot stack with
+        # the next dependency edge of each entry.
+        struct GraphWalk:
+            colors: mutable darray[u8]
+            stack_slots: mutable darray[usize]
+            stack_edges: mutable darray[usize]
+
+        const maximum_decisions: usize = 16384
+        const maximum_packages: usize = 1024
+
+        # Outcomes of checking one candidate against a requirement.
+        const candidate_rejected: i64 = 0
+        const candidate_eligible: i64 = 1
+        const candidate_matches: i64 = 2
+        const budget_exhausted: i64 = 3
+
+        # ---------- conflict explanation ------------------------------------------------------
+
+        # Find the first failed requirement with no candidate at all, or else
+        # the first same-package requirement pair with no common candidate.
+        # Diagnostic work may stop early once unsatisfiability is proven.
+        def explained_conflict(candidates: darray[Candidate]&, failure_constraints: darray[Constraint]&, preferences: darray[Preference]&, work: mutable SolverBudget::WorkBudget&, conflict: mutable Conflict&) -> SolveCode can[Memory.Allocate, Abort.Panic]:
+            for first in 0..<failure_constraints.count |failure_constraints, candidates, conflict|:
+                return SolveCode.Unsatisfiable if not SolverBudget::charge(work, 1)
+                has_candidate: bool = solver_requirement_has_candidate(candidates, failure_constraints[first], preferences, work)
+                return SolveCode.Unsatisfiable if SolverBudget::exhausted(work)
+                if not has_candidate:
+                    record_conflict(failure_constraints[first], failure_constraints[first], work, conflict)
+                    return SolveCode.Unsatisfiable
+            for first in 0..<failure_constraints.count |failure_constraints, candidates, conflict|:
+                comparisons: mutable usize = 0.usize()
+                for second in first + 1.usize()..<failure_constraints.count |failure_constraints, candidates, first, second, comparisons, conflict|:
+                    return SolveCode.Unsatisfiable if not SolverBudget::charge(work, 1)
+                    # An exhausted budget makes the comparison false and the next charge fail.
+                    continue if not SolverBudget::equal(failure_constraints[first].package, failure_constraints[second].package, work)
+                    comparisons <- comparisons + 1.usize()
+                    break if comparisons > 128.usize()
+                    pair_has_candidate: bool = solver_requirement_pair_has_candidate(candidates, failure_constraints[first], failure_constraints[second], preferences, work)
+                    return SolveCode.Unsatisfiable if SolverBudget::exhausted(work)
+                    if not pair_has_candidate:
+                        record_conflict(failure_constraints[first], failure_constraints[second], work, conflict)
+                        return SolveCode.Unsatisfiable
+            SolveCode.Unsatisfiable
+
+        def record_conflict(first: Constraint, second: Constraint, work: mutable SolverBudget::WorkBudget&, conflict: mutable Conflict&) -> void can[Memory.Allocate, Abort.Panic]:
             return if not:
-                solver_charge_work(work, first.package.count)
-                solver_charge_work(work, first.requirement.count)
-                solver_charge_work(work, second.requirement.count)
+                SolverBudget::charge(work, first.package.count)
+                SolverBudget::charge(work, first.requirement.count)
+                SolverBudget::charge(work, second.requirement.count)
             ByteText::append(&conflict.package, first.package)
             ByteText::append(&conflict.first_requirement, first.requirement)
             ByteText::append(&conflict.second_requirement, second.requirement)
 
-        def solver_solve_with_preferences(candidates: darray[Candidate]&, roots: darray[Constraint]&, preferences: darray[Preference]&, selected: mutable darray[usize]&, failure_constraints: mutable darray[Constraint]&, work: mutable WorkBudget&, capture_conflict: bool) -> SolveCode can[Memory.Allocate, Abort.Panic]:
+        # ---------- input validation ----------------------------------------------------------
+
+        def solver_solve_with_preferences(candidates: darray[Candidate]&, roots: darray[Constraint]&, preferences: darray[Preference]&, selected: mutable darray[usize]&, failure_constraints: mutable darray[Constraint]&, work: mutable SolverBudget::WorkBudget&, capture_conflict: bool) -> SolveCode can[Memory.Allocate, Abort.Panic]:
             selected.resize(0)
             failure_constraints.resize(0)
             return SolveCode.ResourceLimit if:
@@ -125,446 +158,443 @@ module Solver:
                 preferences.count > maximum_packages
             return SolveCode.Malformed if candidates.count == 0.usize()
             package_slots: mutable darray[usize] = []
-            region candidate_status_scope:
-                candidate_status: SolveCode = index_candidates(candidates, &package_slots, work)
-                return candidate_status if candidate_status != SolveCode.Solved
+            input_status: SolveCode = validated_inputs(candidates, roots, preferences, &package_slots, work)
+            input_status if input_status != SolveCode.Solved else solve_validated(candidates, roots, preferences, &package_slots, selected, failure_constraints, work, capture_conflict)
+
+        def validated_inputs(candidates: darray[Candidate]&, roots: darray[Constraint]&, preferences: darray[Preference]&, package_slots: mutable darray[usize]&, work: mutable SolverBudget::WorkBudget&) -> SolveCode can[Memory.Allocate, Abort.Panic]:
+            candidate_status: SolveCode = index_candidates(candidates, package_slots, work)
+            candidate_status if candidate_status != SolveCode.Solved else validated_requirements(roots, preferences, work)
+
+        def validated_requirements(roots: darray[Constraint]&, preferences: darray[Preference]&, work: mutable SolverBudget::WorkBudget&) -> SolveCode:
             for root_index in 0..<roots.count |roots|:
-                return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
+                return SolveCode.ResourceLimit if not SolverBudget::charge(work, 1)
                 validation: SolveCode = validate_constraint(roots[root_index], work)
                 return validation if validation != SolveCode.Solved
-            region preference_status_scope:
-                preference_status: SolveCode = validate_preferences(preferences, work)
-                return preference_status if preference_status != SolveCode.Solved
-            ordered_preferences: mutable darray[Preference] = []
-            for preference_index in 0..<preferences.count |preferences, ordered_preferences|:
-                return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
-                ordered_preferences <- ordered_preferences.push(preferences[preference_index])
-            return SolveCode.ResourceLimit if:
-                not solver_sort_preferences(&ordered_preferences, work)
-                not solver_sort_slots(&package_slots, candidates, work)
-            constraints: mutable darray[Constraint] = []
-            for index in 0..<roots.count |constraints, roots|:
-                return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
-                constraints <- constraints.push(roots[index])
-            assigned: mutable darray[i64] = []
-            for _index in 0..<package_slots.count |assigned|:
-                return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
-                assigned <- assigned.push(-1)
-            decisions: mutable usize = 0.usize()
-            region result_scope:
-                result: SolveCode = solver_search(candidates, package_slots, &constraints, ordered_preferences, &assigned, &decisions, failure_constraints, work, capture_conflict)
-                return result if result != SolveCode.Solved
-            # A dependency edge can point at an already selected package, so
-            # satisfiability alone does not rule out A -> B -> A (or A -> A).
-            # Reject cycles after selection before exposing indexes to lockfile
-            # serialization or compiler planning.
-            for slot in 0..<assigned.count |assigned, candidates|:
-                return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
-                return SolveCode.Malformed if assigned[slot] >= candidates.count.i64()
-            region graph_acyclic_scope:
-                graph_acyclic: bool = solver_selected_graph_acyclic(candidates, package_slots, assigned, work)
-                return SolveCode.ResourceLimit if solver_work_exhausted(work)
-                return SolveCode.Malformed if not graph_acyclic
-            return SolveCode.ResourceLimit if not solver_charge_work(work, assigned.count)
-            for slot in 0..<assigned.count |assigned, selected|:
-                selected.push(assigned[slot].usize()) if assigned[slot] >= 0
-            SolveCode.Solved
+            validate_preferences(preferences, work)
 
         # Validate every candidate and record the first candidate index of
         # each distinct package as its slot. Same-package candidates must have
         # distinct versions, and the total dependency count stays bounded.
-        def index_candidates(candidates: darray[Candidate]&, package_slots: mutable darray[usize]&, work: mutable WorkBudget&) -> SolveCode can[Memory.Allocate, Abort.Panic]:
-            total_dependencies: mutable usize = 0.usize()
-            for candidate_index in 0..<candidates.count |candidates, package_slots, total_dependencies|:
-                return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
-                return SolveCode.Malformed if not PackageIdentity::valid_name(candidates[candidate_index].package)
-                return SolveCode.ResourceLimit if not solver_charge_work(work, candidates[candidate_index].package.count)
-                # Version values are normalized by the provider boundary, but
-                # prereleases are outside the v1 graph identity. Reject them at
-                # this API boundary so unchecked callers cannot create an
-                # ambiguous duplicate/version ordering.
-                return SolveCode.Malformed if candidates[candidate_index].version.prerelease
-                existing: mutable bool = false
-                for slot_index in 0..<package_slots.count |candidates, package_slots, candidate_index, existing|:
-                    return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
-                    existing <- true if solver_equal(candidates[package_slots[slot_index]].package, candidates[candidate_index].package, work)
-                    return SolveCode.ResourceLimit if solver_work_exhausted(work)
-                if not existing:
-                    package_slots.push(candidate_index)
-                    return SolveCode.ResourceLimit if package_slots.count > maximum_packages
-                dependency_count: usize = candidates[candidate_index].dependencies.count
-                return SolveCode.ResourceLimit if dependency_count > maximum_constraints or total_dependencies > maximum_constraints - dependency_count
-                total_dependencies <- total_dependencies + dependency_count
-                for dependency_index in 0..<candidates[candidate_index].dependencies.count |candidates, candidate_index|:
-                    return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
-                    validation: SolveCode =
-                        dependency: Constraint = candidates[candidate_index].dependencies[dependency_index]
-                        validate_constraint(dependency, work)
-                    return validation if validation != SolveCode.Solved
-                for previous in 0..<candidate_index |candidates, candidate_index|:
-                    return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
-                    same_package: bool = solver_equal(candidates[previous].package, candidates[candidate_index].package, work)
-                    return SolveCode.ResourceLimit if solver_work_exhausted(work)
-                    return SolveCode.Malformed if same_package and SemVer::compare(candidates[previous].version, candidates[candidate_index].version) == 0
+        def index_candidates(candidates: darray[Candidate]&, package_slots: mutable darray[usize]&, work: mutable SolverBudget::WorkBudget&) -> SolveCode can[Memory.Allocate, Abort.Panic]:
+            for candidate_index in 0..<candidates.count |candidates, package_slots, total_dependencies: usize = 0.usize()|:
+                status: SolveCode = index_candidate(candidates, candidate_index, package_slots, total_dependencies, work)
+                # The running total only matters while every candidate indexes cleanly.
+                total_dependencies <- total_dependencies + candidates[candidate_index].dependencies.count
+                return status if status != SolveCode.Solved
+            SolveCode.Solved
+
+        def index_candidate(candidates: darray[Candidate]&, candidate_index: usize, package_slots: mutable darray[usize]&, total_dependencies: usize, work: mutable SolverBudget::WorkBudget&) -> SolveCode can[Memory.Allocate, Abort.Panic]:
+            return SolveCode.ResourceLimit if not SolverBudget::charge(work, 1)
+            return SolveCode.Malformed if not PackageIdentity::valid_name(candidates[candidate_index].package)
+            return SolveCode.ResourceLimit if not SolverBudget::charge(work, candidates[candidate_index].package.count)
+            # Version values are normalized by the provider boundary, but
+            # prereleases are outside the v1 graph identity. Reject them at
+            # this API boundary so unchecked callers cannot create an
+            # ambiguous duplicate/version ordering.
+            return SolveCode.Malformed if candidates[candidate_index].version.prerelease
+            slot_status: SolveCode = add_package_slot(candidates, candidate_index, package_slots, work)
+            slot_status if slot_status != SolveCode.Solved else SolveCode.ResourceLimit if dependency_total_exceeded(candidates[candidate_index].dependencies.count, total_dependencies) else validate_candidate_dependencies(candidates, candidate_index, work)
+
+        # Give the candidate's package a slot unless an earlier candidate did.
+        def add_package_slot(candidates: darray[Candidate]&, candidate_index: usize, package_slots: mutable darray[usize]&, work: mutable SolverBudget::WorkBudget&) -> SolveCode can[Memory.Allocate, Abort.Panic]:
+            known: bool = for slot_index in 0..<package_slots.count |existing: bool = false| -> existing:
+                return SolveCode.ResourceLimit if not SolverBudget::charge(work, 1)
+                existing <- true if SolverBudget::equal(candidates[package_slots[slot_index]].package, candidates[candidate_index].package, work)
+                return SolveCode.ResourceLimit if SolverBudget::exhausted(work)
+            SolveCode.Solved if known else appended_package_slot(package_slots, candidate_index)
+
+        def appended_package_slot(package_slots: mutable darray[usize]&, candidate_index: usize) -> SolveCode can[Memory.Allocate, Abort.Panic]:
+            package_slots.push(candidate_index)
+            SolveCode.ResourceLimit if package_slots.count > maximum_packages else SolveCode.Solved
+
+        def dependency_total_exceeded(dependency_count: usize, total_dependencies: usize) -> bool:
+            dependency_count > maximum_constraints or total_dependencies > maximum_constraints - dependency_count
+
+        # Every dependency is a valid constraint, and no earlier candidate of
+        # the same package has the same version.
+        def validate_candidate_dependencies(candidates: darray[Candidate]&, candidate_index: usize, work: mutable SolverBudget::WorkBudget&) -> SolveCode:
+            for dependency_index in 0..<candidates[candidate_index].dependencies.count |candidates, candidate_index|:
+                return SolveCode.ResourceLimit if not SolverBudget::charge(work, 1)
+                validation: SolveCode = validate_constraint(candidates[candidate_index].dependencies[dependency_index], work)
+                return validation if validation != SolveCode.Solved
+            for previous in 0..<candidate_index |candidates, candidate_index|:
+                return SolveCode.ResourceLimit if not SolverBudget::charge(work, 1)
+                same_package: bool = SolverBudget::equal(candidates[previous].package, candidates[candidate_index].package, work)
+                return SolveCode.ResourceLimit if SolverBudget::exhausted(work)
+                return SolveCode.Malformed if same_package and SemVer::compare(candidates[previous].version, candidates[candidate_index].version) == 0
             SolveCode.Solved
 
         # Preferences name valid, stable, pairwise distinct packages.
-        def validate_preferences(preferences: darray[Preference]&, work: mutable WorkBudget&) -> SolveCode:
+        def validate_preferences(preferences: darray[Preference]&, work: mutable SolverBudget::WorkBudget&) -> SolveCode:
             for preference_index in 0..<preferences.count |preferences|:
-                return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
+                return SolveCode.ResourceLimit if not SolverBudget::charge(work, 1)
                 return SolveCode.Malformed if not PackageIdentity::valid_name(preferences[preference_index].package) or preferences[preference_index].version.prerelease
-                return SolveCode.ResourceLimit if not solver_charge_work(work, preferences[preference_index].package.count)
+                return SolveCode.ResourceLimit if not SolverBudget::charge(work, preferences[preference_index].package.count)
                 for previous in 0..<preference_index |preferences, preference_index|:
-                    return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
-                    duplicate_package: bool = solver_equal(preferences[previous].package, preferences[preference_index].package, work)
-                    return SolveCode.ResourceLimit if solver_work_exhausted(work)
+                    return SolveCode.ResourceLimit if not SolverBudget::charge(work, 1)
+                    duplicate_package: bool = SolverBudget::equal(preferences[previous].package, preferences[preference_index].package, work)
+                    return SolveCode.ResourceLimit if SolverBudget::exhausted(work)
                     return SolveCode.Malformed if duplicate_package
             SolveCode.Solved
 
-        struct WorkBudget:
-            used: mutable usize
-
-        # This deterministic cap covers nested name comparisons, constraint
-        # checks, and parser work across validation and every search branch.
-        const maximum_solver_work: usize = 20000000
-        const maximum_decisions: usize = 16384
-        const maximum_packages: usize = 1024
-
-        def solver_search(candidates: darray[Candidate]&, package_slots: darray[usize]&, constraints: mutable darray[Constraint]&, preferences: darray[Preference]&, assigned: mutable darray[i64]&, decisions: mutable usize&, failure_constraints: mutable darray[Constraint]&, work: mutable WorkBudget&, capture_conflict: bool) -> SolveCode can[Memory.Allocate, Abort.Panic]:
+        def validate_constraint(constraint: Constraint, work: mutable SolverBudget::WorkBudget&) -> SolveCode:
+            return SolveCode.Malformed if not PackageIdentity::valid_name(constraint.package) or constraint.requirement.count == 0.usize()
             return SolveCode.ResourceLimit if:
-                not solver_charge_work(work, 1)
+                not SolverBudget::charge(work, constraint.package.count)
+                not SolverBudget::charge(work, constraint.requirement.count)
+            requirement: mutable SemVer::Requirement = SemVer::unbounded_requirement()
+            SolveCode.Solved if SemVer::parse_requirement(constraint.requirement, &requirement) else SolveCode.Malformed
+
+        # ---------- search --------------------------------------------------------------------
+
+        # Order the slots and preferences, search, and expose the selection
+        # only for an acyclic graph.
+        def solve_validated(candidates: darray[Candidate]&, roots: darray[Constraint]&, preferences: darray[Preference]&, package_slots: mutable darray[usize]&, selected: mutable darray[usize]&, failure_constraints: mutable darray[Constraint]&, work: mutable SolverBudget::WorkBudget&, capture_conflict: bool) -> SolveCode can[Memory.Allocate, Abort.Panic]:
+            return SolveCode.ResourceLimit if:
+                not SolverBudget::charge(work, preferences.count)
+                not SolverBudget::charge(work, roots.count)
+                not SolverBudget::charge(work, package_slots.count)
+            search: mutable SearchState = initial_search_state(preferences, roots, package_slots.count)
+            return SolveCode.ResourceLimit if not solver_sort_preferences(&search.preferences, work) or not solver_sort_slots(package_slots, candidates, work)
+            result: SolveCode = solver_search(candidates, package_slots, &search.constraints, search.preferences, &search.assigned, &search.decisions, failure_constraints, work, capture_conflict)
+            result if result != SolveCode.Solved else finished_selection(candidates, package_slots, search.assigned, selected, work)
+
+        def initial_search_state(preferences: darray[Preference]&, roots: darray[Constraint]&, slot_count: usize) -> SearchState can[Memory.Allocate, Abort.Panic]:
+            ordered_preferences: darray[Preference] = [preferences[index] for index in 0..<preferences.count]
+            constraints: darray[Constraint] = [roots[index] for index in 0..<roots.count]
+            assigned: darray[i64] = [-1 for index in 0..<slot_count]
+            SearchState{preferences: ordered_preferences, constraints: constraints, assigned: assigned, decisions: 0.usize()}
+
+        # A dependency edge can point at an already selected package, so
+        # satisfiability alone does not rule out A -> B -> A (or A -> A).
+        # Reject cycles after selection before exposing indexes to lockfile
+        # serialization or compiler planning.
+        def finished_selection(candidates: darray[Candidate]&, package_slots: darray[usize]&, assigned: darray[i64]&, selected: mutable darray[usize]&, work: mutable SolverBudget::WorkBudget&) -> SolveCode can[Memory.Allocate, Abort.Panic]:
+            for slot in 0..<assigned.count |assigned, candidates|:
+                return SolveCode.ResourceLimit if not SolverBudget::charge(work, 1)
+                return SolveCode.Malformed if assigned[slot] >= candidates.count.i64()
+            graph_acyclic: bool = solver_selected_graph_acyclic(candidates, package_slots, assigned, work)
+            SolveCode.ResourceLimit if SolverBudget::exhausted(work) else SolveCode.Malformed if not graph_acyclic else SolveCode.ResourceLimit if not SolverBudget::charge(work, assigned.count) else published_selection(assigned, selected)
+
+        def published_selection(assigned: darray[i64]&, selected: mutable darray[usize]&) -> SolveCode can[Memory.Allocate, Abort.Panic]:
+            for slot in 0..<assigned.count |assigned, selected|:
+                selected.push(assigned[slot].usize()) if assigned[slot] >= 0
+            SolveCode.Solved
+
+        def solver_search(candidates: darray[Candidate]&, package_slots: darray[usize]&, constraints: mutable darray[Constraint]&, preferences: darray[Preference]&, assigned: mutable darray[i64]&, decisions: mutable usize&, failure_constraints: mutable darray[Constraint]&, work: mutable SolverBudget::WorkBudget&, capture_conflict: bool) -> SolveCode can[Memory.Allocate, Abort.Panic]:
+            return SolveCode.ResourceLimit if:
+                not SolverBudget::charge(work, 1)
                 decisions >= maximum_decisions or constraints.count > maximum_constraints
-                not solver_charge_work(work, package_slots.count)
-            required_slots: mutable darray[bool] = []
-            required_slots <- required_slots.resize(package_slots.count)
-            for constraint_index in 0..<constraints.count |constraints, package_slots, candidates, required_slots|:
-                return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
+                not SolverBudget::charge(work, package_slots.count)
+            required_slots: darray[bool] = for constraint_index in 0..<constraints.count |required: darray[bool] = [false for index in 0..<package_slots.count]| -> required:
+                return SolveCode.ResourceLimit if not SolverBudget::charge(work, 1)
                 slot: usize = solver_slot_for(constraints[constraint_index].package, package_slots, candidates, work)
-                return SolveCode.ResourceLimit if solver_work_exhausted(work)
-                if slot == package_slots.count:
-                    return solver_record_unsatisfiable(constraints, failure_constraints, work, capture_conflict)
-                required_slots[slot] <- true
+                return SolveCode.ResourceLimit if SolverBudget::exhausted(work)
+                return solver_record_unsatisfiable(constraints, failure_constraints, work, capture_conflict) if slot == package_slots.count
+                required[slot] <- true
+            search_required_slots(candidates, package_slots, constraints, preferences, assigned, decisions, failure_constraints, work, capture_conflict, required_slots)
+
+        # Check the assigned slots, then branch on the required open slot
+        # with the fewest viable candidates.
+        def search_required_slots(candidates: darray[Candidate]&, package_slots: darray[usize]&, constraints: mutable darray[Constraint]&, preferences: darray[Preference]&, assigned: mutable darray[i64]&, decisions: mutable usize&, failure_constraints: mutable darray[Constraint]&, work: mutable SolverBudget::WorkBudget&, capture_conflict: bool, required_slots: darray[bool]&) -> SolveCode can[Memory.Allocate, Abort.Panic]:
             for slot in 0..<assigned.count |assigned, candidates, package_slots, constraints|:
-                return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
+                return SolveCode.ResourceLimit if not SolverBudget::charge(work, 1)
                 continue if assigned[slot] < 0
                 satisfies: bool = solver_candidate_satisfies(candidates[assigned[slot].usize()], package_slots[slot], constraints, package_slots, candidates, work)
-                return SolveCode.ResourceLimit if solver_work_exhausted(work)
-                if not satisfies:
-                    return solver_record_unsatisfiable(constraints, failure_constraints, work, capture_conflict)
-            best_slot: mutable usize = package_slots.count
-            best_count: mutable usize = 18446744073709551615.usize()
-            for slot in 0..<package_slots.count |package_slots, assigned, candidates, constraints, required_slots, best_slot, best_count|:
-                return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
+                return SolveCode.ResourceLimit if SolverBudget::exhausted(work)
+                return solver_record_unsatisfiable(constraints, failure_constraints, work, capture_conflict) if not satisfies
+            chosen_slot: usize = for slot in 0..<package_slots.count |best_slot: usize = package_slots.count, best_count: usize = 18446744073709551615.usize()| -> best_slot:
+                return SolveCode.ResourceLimit if not SolverBudget::charge(work, 1)
                 continue if assigned[slot] >= 0 or not required_slots[slot]
-                possible: mutable usize = 0.usize()
-                for candidate_index in 0..<candidates.count |candidates, package_slots, slot, constraints, possible|:
-                    region viability_scope:
-                        viability: SolveCode = candidate_viability(candidates, candidate_index, slot, package_slots, constraints, preferences, work)
-                        return viability if viability == SolveCode.ResourceLimit
-                        possible <- possible + 1.usize() if viability == SolveCode.Solved
-                    # Later slots only win when they have strictly fewer choices.
-                    break if possible >= best_count
+                # Later slots only win when they have strictly fewer choices.
+                possible: usize = while candidate_index < candidates.count and viable < best_count |candidate_index: usize = 0.usize(), viable: usize = 0.usize()| -> viable:
+                    viability: SolveCode = candidate_viability(candidates, candidate_index, slot, package_slots, constraints, preferences, work)
+                    return viability if viability == SolveCode.ResourceLimit
+                    candidate_index <- candidate_index + 1.usize()
+                    viable <- viable + 1.usize() if viability == SolveCode.Solved
                 return solver_record_unsatisfiable(constraints, failure_constraints, work, capture_conflict) if possible == 0.usize()
                 if possible < best_count:
                     best_count <- possible
                     best_slot <- slot
-            if best_slot == package_slots.count:
-                # A cyclic assignment is a failed branch, not malformed
-                # solver input. Return Unsatisfiable here so search can
-                # backtrack to a version that forms an acyclic graph.
-                region graph_acyclic_scope:
-                    graph_acyclic: bool = solver_selected_graph_acyclic(candidates, package_slots, assigned, work)
-                    return SolveCode.ResourceLimit if solver_work_exhausted(work)
-                    return solver_record_unsatisfiable(constraints, failure_constraints, work, capture_conflict) if not graph_acyclic
-                return SolveCode.Solved
+            complete_assignment(candidates, package_slots, constraints, assigned, failure_constraints, work, capture_conflict) if chosen_slot == package_slots.count else branch_on_slot(candidates, package_slots, constraints, preferences, assigned, decisions, failure_constraints, work, capture_conflict, chosen_slot)
 
+        # Every required slot is assigned. A cyclic assignment is a failed
+        # branch, not malformed solver input: return Unsatisfiable so search
+        # can backtrack to a version that forms an acyclic graph.
+        def complete_assignment(candidates: darray[Candidate]&, package_slots: darray[usize]&, constraints: darray[Constraint]&, assigned: darray[i64]&, failure_constraints: mutable darray[Constraint]&, work: mutable SolverBudget::WorkBudget&, capture_conflict: bool) -> SolveCode can[Memory.Allocate, Abort.Panic]:
+            graph_acyclic: bool = solver_selected_graph_acyclic(candidates, package_slots, assigned, work)
+            SolveCode.ResourceLimit if SolverBudget::exhausted(work) else solver_record_unsatisfiable(constraints, failure_constraints, work, capture_conflict) if not graph_acyclic else SolveCode.Solved
+
+        # Try the viable candidates for `slot` in preference order.
+        def branch_on_slot(candidates: darray[Candidate]&, package_slots: darray[usize]&, constraints: mutable darray[Constraint]&, preferences: darray[Preference]&, assigned: mutable darray[i64]&, decisions: mutable usize&, failure_constraints: mutable darray[Constraint]&, work: mutable SolverBudget::WorkBudget&, capture_conflict: bool, slot: usize) -> SolveCode can[Memory.Allocate, Abort.Panic]:
             order: mutable darray[usize] = []
-            for candidate_index in 0..<candidates.count |candidates, package_slots, best_slot, constraints, order|:
-                viability: SolveCode = candidate_viability(candidates, candidate_index, best_slot, package_slots, constraints, preferences, work)
+            for candidate_index in 0..<candidates.count |candidates, package_slots, slot, constraints, order|:
+                viability: SolveCode = candidate_viability(candidates, candidate_index, slot, package_slots, constraints, preferences, work)
                 return viability if viability == SolveCode.ResourceLimit
                 order <- order.push(candidate_index) if viability == SolveCode.Solved
             return SolveCode.ResourceLimit if not solver_sort_candidates(&order, candidates, preferences, work)
-            try_candidates(candidates, package_slots, constraints, preferences, assigned, decisions, failure_constraints, work, capture_conflict, order, best_slot)
+            try_candidates(candidates, package_slots, constraints, preferences, assigned, decisions, failure_constraints, work, capture_conflict, order, slot)
 
         # Whether one candidate can fill `slot` under the current constraints:
         # Solved when it can, Unsatisfiable when it cannot, or ResourceLimit.
-        def candidate_viability(candidates: darray[Candidate]&, candidate_index: usize, slot: usize, package_slots: darray[usize]&, constraints: darray[Constraint]&, preferences: darray[Preference]&, work: mutable WorkBudget&) -> SolveCode:
-            return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
-            region candidate_slot_scope:
-                candidate_slot: usize = solver_slot_for(candidates[candidate_index].package, package_slots, candidates, work)
-                return SolveCode.ResourceLimit if solver_work_exhausted(work)
-                return SolveCode.Unsatisfiable if candidate_slot != slot
-            region available_scope:
-                available: bool = solver_candidate_available(candidates[candidate_index], preferences, work)
-                return SolveCode.ResourceLimit if solver_work_exhausted(work)
-                return SolveCode.Unsatisfiable if not available
-            satisfies: bool = solver_candidate_satisfies(candidates[candidate_index], package_slots[slot], constraints, package_slots, candidates, work)
-            SolveCode.ResourceLimit if solver_work_exhausted(work) else SolveCode.Solved if satisfies else SolveCode.Unsatisfiable
+        def candidate_viability(candidates: darray[Candidate]&, candidate_index: usize, slot: usize, package_slots: darray[usize]&, constraints: darray[Constraint]&, preferences: darray[Preference]&, work: mutable SolverBudget::WorkBudget&) -> SolveCode:
+            return SolveCode.ResourceLimit if not SolverBudget::charge(work, 1)
+            candidate_slot: usize = solver_slot_for(candidates[candidate_index].package, package_slots, candidates, work)
+            SolveCode.ResourceLimit if SolverBudget::exhausted(work) else SolveCode.Unsatisfiable if candidate_slot != slot else available_viability(candidates, candidate_index, slot, package_slots, constraints, preferences, work)
 
-        # Assign each ordered candidate to `slot` in turn, add its
-        # dependencies, and search on; undo the choice when the branch fails.
-        def try_candidates(candidates: darray[Candidate]&, package_slots: darray[usize]&, constraints: mutable darray[Constraint]&, preferences: darray[Preference]&, assigned: mutable darray[i64]&, decisions: mutable usize&, failure_constraints: mutable darray[Constraint]&, work: mutable WorkBudget&, capture_conflict: bool, order: darray[usize]&, slot: usize) -> SolveCode can[Memory.Allocate, Abort.Panic]:
+        def available_viability(candidates: darray[Candidate]&, candidate_index: usize, slot: usize, package_slots: darray[usize]&, constraints: darray[Constraint]&, preferences: darray[Preference]&, work: mutable SolverBudget::WorkBudget&) -> SolveCode:
+            available: bool = solver_candidate_available(candidates[candidate_index], preferences, work)
+            SolveCode.ResourceLimit if SolverBudget::exhausted(work) else SolveCode.Unsatisfiable if not available else satisfying_viability(candidates, candidate_index, slot, package_slots, constraints, work)
+
+        def satisfying_viability(candidates: darray[Candidate]&, candidate_index: usize, slot: usize, package_slots: darray[usize]&, constraints: darray[Constraint]&, work: mutable SolverBudget::WorkBudget&) -> SolveCode:
+            satisfies: bool = solver_candidate_satisfies(candidates[candidate_index], package_slots[slot], constraints, package_slots, candidates, work)
+            SolveCode.ResourceLimit if SolverBudget::exhausted(work) else SolveCode.Solved if satisfies else SolveCode.Unsatisfiable
+
+        # Assign each ordered candidate to `slot` in turn and search on; stop
+        # at the first branch that does not fail.
+        def try_candidates(candidates: darray[Candidate]&, package_slots: darray[usize]&, constraints: mutable darray[Constraint]&, preferences: darray[Preference]&, assigned: mutable darray[i64]&, decisions: mutable usize&, failure_constraints: mutable darray[Constraint]&, work: mutable SolverBudget::WorkBudget&, capture_conflict: bool, order: darray[usize]&, slot: usize) -> SolveCode can[Memory.Allocate, Abort.Panic]:
             for order_index in 0..<order.count |order, candidates, package_slots, slot, constraints, assigned, decisions|:
-                return SolveCode.ResourceLimit if not solver_charge_work(work, 1)
-                candidate_index: usize = order[order_index]
-                constraint_mark: usize = constraints.count
-                dependency_count: usize = candidates[candidate_index].dependencies.count
-                return SolveCode.ResourceLimit if dependency_count > maximum_constraints - constraint_mark
-                assigned[slot] <- candidate_index.i64()
-                decisions <- decisions + 1.usize()
-                for dependency_index in 0..<dependency_count |candidates, candidate_index, constraints|:
-                    dependency: Constraint = candidates[candidate_index].dependencies[dependency_index]
-                    return SolveCode.ResourceLimit if:
-                        not solver_charge_work(work, 1)
-                        not solver_charge_work(work, dependency.package.count)
-                        not solver_charge_work(work, dependency.requirement.count)
-                    constraints.push(dependency)
-                region result_scope:
-                    result: SolveCode = solver_search(candidates, package_slots, constraints, preferences, assigned, decisions, failure_constraints, work, capture_conflict)
-                    return result if result == SolveCode.Solved or result == SolveCode.ResourceLimit or result == SolveCode.Malformed
-                constraints.resize(constraint_mark)
-                assigned[slot] <- -1
+                result: SolveCode = try_candidate(candidates, package_slots, constraints, preferences, assigned, decisions, failure_constraints, work, capture_conflict, order[order_index], slot)
+                return result if result != SolveCode.Unsatisfiable
             SolveCode.Unsatisfiable
 
-        def solver_record_unsatisfiable(constraints: darray[Constraint]&, failure_constraints: mutable darray[Constraint]&, work: mutable WorkBudget&, capture_conflict: bool) -> SolveCode can[Memory.Allocate, Abort.Panic]:
+        # Assign one candidate, add its dependencies, and search on; undo the
+        # choice when the branch fails.
+        def try_candidate(candidates: darray[Candidate]&, package_slots: darray[usize]&, constraints: mutable darray[Constraint]&, preferences: darray[Preference]&, assigned: mutable darray[i64]&, decisions: mutable usize&, failure_constraints: mutable darray[Constraint]&, work: mutable SolverBudget::WorkBudget&, capture_conflict: bool, candidate_index: usize, slot: usize) -> SolveCode can[Memory.Allocate, Abort.Panic]:
+            return SolveCode.ResourceLimit if not SolverBudget::charge(work, 1)
+            constraint_mark: usize = constraints.count
+            return SolveCode.ResourceLimit if candidates[candidate_index].dependencies.count > maximum_constraints - constraint_mark
+            assigned[slot] <- candidate_index.i64()
+            decisions <- decisions + 1.usize()
+            result: SolveCode = SolveCode.ResourceLimit if not appended_dependencies(candidates[candidate_index].dependencies, constraints, work) else solver_search(candidates, package_slots, constraints, preferences, assigned, decisions, failure_constraints, work, capture_conflict)
+            undone_failed_branch(result, constraints, constraint_mark, assigned, slot)
+
+        def appended_dependencies(dependencies: darray[Constraint]&, constraints: mutable darray[Constraint]&, work: mutable SolverBudget::WorkBudget&) -> bool can[Memory.Allocate, Abort.Panic]:
+            for dependency_index in 0..<dependencies.count |dependencies, constraints|:
+                dependency: Constraint = dependencies[dependency_index]
+                return false if:
+                    not SolverBudget::charge(work, 1)
+                    not SolverBudget::charge(work, dependency.package.count)
+                    not SolverBudget::charge(work, dependency.requirement.count)
+                constraints.push(dependency)
+            true
+
+        def undone_failed_branch(result: SolveCode, constraints: mutable darray[Constraint]&, constraint_mark: usize, assigned: mutable darray[i64]&, slot: usize) -> SolveCode can[Memory.Allocate, Abort.Panic]:
+            if result == SolveCode.Unsatisfiable:
+                constraints.resize(constraint_mark)
+                assigned[slot] <- -1
+            result
+
+        def solver_record_unsatisfiable(constraints: darray[Constraint]&, failure_constraints: mutable darray[Constraint]&, work: mutable SolverBudget::WorkBudget&, capture_conflict: bool) -> SolveCode can[Memory.Allocate, Abort.Panic]:
             # Keep only the first concrete failure witness. Re-copying the
             # whole active graph at every dead search leaf would multiply the
             # solver's bounded branch count by its bounded constraint count.
             if capture_conflict and failure_constraints.count == 0.usize():
                 for index in 0..<constraints.count |constraints, failure_constraints|:
                     return SolveCode.ResourceLimit if:
-                        not solver_charge_work(work, 1)
-                        not solver_charge_work(work, constraints[index].package.count)
-                        not solver_charge_work(work, constraints[index].requirement.count)
+                        not SolverBudget::charge(work, 1)
+                        not SolverBudget::charge(work, constraints[index].package.count)
+                        not SolverBudget::charge(work, constraints[index].requirement.count)
                     failure_constraints.push(constraints[index])
             SolveCode.Unsatisfiable
 
-        def solver_requirement_has_candidate(candidates: darray[Candidate]&, constraint: Constraint, preferences: darray[Preference]&, work: mutable WorkBudget&) -> bool:
+        # ---------- candidate checks ----------------------------------------------------------
+
+        def solver_requirement_has_candidate(candidates: darray[Candidate]&, constraint: Constraint, preferences: darray[Preference]&, work: mutable SolverBudget::WorkBudget&) -> bool:
             for candidate_index in 0..<candidates.count |candidates, constraint, preferences|:
-                return false if not solver_charge_work(work, 1)
-                candidate: Candidate = candidates[candidate_index]
-                region same_package_scope:
-                    same_package: bool = solver_equal(candidate.package, constraint.package, work)
-                    return false if solver_work_exhausted(work)
-                    continue if not same_package
-                region available_scope:
-                    available: bool = solver_candidate_available(candidate, preferences, work)
-                    return false if solver_work_exhausted(work)
-                    continue if not available
-                return false if not solver_charge_work(work, constraint.requirement.count)
-                parsed: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
-                return true if SemVer::parse_requirement(constraint.requirement, &parsed) and SemVer::matches(parsed, candidate.version)
+                outcome: i64 = requirement_outcome(candidates[candidate_index], constraint, preferences, work)
+                return (outcome == candidate_matches) if outcome != candidate_rejected
             false
 
-        def solver_requirement_pair_has_candidate(candidates: darray[Candidate]&, first: Constraint, second: Constraint, preferences: darray[Preference]&, work: mutable WorkBudget&) -> bool:
+        def solver_requirement_pair_has_candidate(candidates: darray[Candidate]&, first: Constraint, second: Constraint, preferences: darray[Preference]&, work: mutable SolverBudget::WorkBudget&) -> bool:
             for candidate_index in 0..<candidates.count |candidates, first, second, preferences|:
-                return false if not solver_charge_work(work, 1)
-                candidate: Candidate = candidates[candidate_index]
-                region same_package_scope:
-                    same_package: bool = solver_equal(candidate.package, first.package, work)
-                    return false if solver_work_exhausted(work)
-                    continue if not same_package
-                region available_scope:
-                    available: bool = solver_candidate_available(candidate, preferences, work)
-                    return false if solver_work_exhausted(work)
-                    continue if not available
-                return false if not:
-                    solver_charge_work(work, first.requirement.count)
-                    solver_charge_work(work, second.requirement.count)
-                first_parsed: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
-                second_parsed: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
-                return true if SemVer::parse_requirement(first.requirement, &first_parsed) and SemVer::parse_requirement(second.requirement, &second_parsed) and SemVer::matches(first_parsed, candidate.version) and SemVer::matches(second_parsed, candidate.version)
+                outcome: i64 = requirement_pair_outcome(candidates[candidate_index], first, second, preferences, work)
+                return (outcome == candidate_matches) if outcome != candidate_rejected
             false
+
+        def requirement_outcome(candidate: Candidate, constraint: Constraint, preferences: darray[Preference]&, work: mutable SolverBudget::WorkBudget&) -> i64:
+            eligibility: i64 = eligibility_outcome(candidate, constraint.package, preferences, work)
+            eligibility if eligibility != candidate_eligible else budget_exhausted if not SolverBudget::charge(work, constraint.requirement.count) else candidate_matches if requirement_allows(constraint.requirement, candidate.version) else candidate_rejected
+
+        def requirement_pair_outcome(candidate: Candidate, first: Constraint, second: Constraint, preferences: darray[Preference]&, work: mutable SolverBudget::WorkBudget&) -> i64:
+            eligibility: i64 = eligibility_outcome(candidate, first.package, preferences, work)
+            eligibility if eligibility != candidate_eligible else budget_exhausted if not SolverBudget::charge(work, first.requirement.count) or not SolverBudget::charge(work, second.requirement.count) else candidate_matches if requirement_allows(first.requirement, candidate.version) and requirement_allows(second.requirement, candidate.version) else candidate_rejected
+
+        # Whether `candidate` belongs to `package` and is available.
+        def eligibility_outcome(candidate: Candidate, package: darray[u8]&, preferences: darray[Preference]&, work: mutable SolverBudget::WorkBudget&) -> i64:
+            return budget_exhausted if not SolverBudget::charge(work, 1)
+            same_package: bool = SolverBudget::equal(candidate.package, package, work)
+            budget_exhausted if SolverBudget::exhausted(work) else candidate_rejected if not same_package else availability_outcome(candidate, preferences, work)
+
+        def availability_outcome(candidate: Candidate, preferences: darray[Preference]&, work: mutable SolverBudget::WorkBudget&) -> i64:
+            available: bool = solver_candidate_available(candidate, preferences, work)
+            budget_exhausted if SolverBudget::exhausted(work) else candidate_eligible if available else candidate_rejected
+
+        def requirement_allows(requirement: darray[u8]&, version: Model::Version) -> bool:
+            parsed: mutable SemVer::Requirement = SemVer::unbounded_requirement()
+            SemVer::parse_requirement(requirement, &parsed) and SemVer::matches(parsed, version)
 
         # A yanked candidate is eligible only when it is the exact version
         # selected by the previous lock. The caller supplies preferences from
         # that validated lock; this preserves existing graphs without allowing
         # a fresh resolution to introduce a yanked release.
-        def solver_candidate_available(candidate: Candidate, preferences: darray[Preference]&, work: mutable WorkBudget&) -> bool:
+        def solver_candidate_available(candidate: Candidate, preferences: darray[Preference]&, work: mutable SolverBudget::WorkBudget&) -> bool:
             return true if not candidate.yanked
             preference_index: usize = solver_preference_index(preferences, candidate.package, work)
-            false if solver_work_exhausted(work) or preference_index >= preferences.count else SemVer::compare(candidate.version, preferences[preference_index].version) == 0
+            false if SolverBudget::exhausted(work) or preference_index >= preferences.count else SemVer::compare(candidate.version, preferences[preference_index].version) == 0
 
-        def solver_candidate_satisfies(candidate: Candidate, slot_candidate: usize, constraints: darray[Constraint]&, package_slots: darray[usize]&, candidates: darray[Candidate]&, work: mutable WorkBudget&) -> bool:
+        def solver_candidate_satisfies(candidate: Candidate, slot_candidate: usize, constraints: darray[Constraint]&, package_slots: darray[usize]&, candidates: darray[Candidate]&, work: mutable SolverBudget::WorkBudget&) -> bool:
             for index in 0..<constraints.count |candidate, slot_candidate, constraints, package_slots, candidates|:
-                return false if not solver_charge_work(work, 1)
-                constraint_slot: usize = solver_slot_for(constraints[index].package, package_slots, candidates, work)
-                return false if solver_work_exhausted(work)
-                region candidate_slot_scope:
-                    candidate_slot: usize = solver_slot_for(candidates[slot_candidate].package, package_slots, candidates, work)
-                    return false if solver_work_exhausted(work)
-                    continue if constraint_slot != candidate_slot
-                requirement: darray[u8] = constraints[index].requirement
-                return false if not solver_charge_work(work, requirement.count)
-                parsed: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
-                return false if not:
-                    SemVer::parse_requirement(requirement, &parsed)
-                    SemVer::matches(parsed, candidate.version)
+                return false if not SolverBudget::charge(work, 1) or not constraint_allows(candidate, slot_candidate, constraints[index], package_slots, candidates, work)
             true
 
-        def solver_selected_graph_acyclic(candidates: darray[Candidate]&, package_slots: darray[usize]&, selected: darray[i64]&, work: mutable WorkBudget&) -> bool can[Memory.Allocate, Abort.Panic]:
+        # A constraint on another package always allows the candidate.
+        def constraint_allows(candidate: Candidate, slot_candidate: usize, constraint: Constraint, package_slots: darray[usize]&, candidates: darray[Candidate]&, work: mutable SolverBudget::WorkBudget&) -> bool:
+            constraint_slot: usize = solver_slot_for(constraint.package, package_slots, candidates, work)
+            return false if SolverBudget::exhausted(work)
+            candidate_slot: usize = solver_slot_for(candidates[slot_candidate].package, package_slots, candidates, work)
+            false if SolverBudget::exhausted(work) else true if constraint_slot != candidate_slot else SolverBudget::charge(work, constraint.requirement.count) and requirement_allows(constraint.requirement, candidate.version)
+
+        # ---------- selected graph ------------------------------------------------------------
+
+        def solver_selected_graph_acyclic(candidates: darray[Candidate]&, package_slots: darray[usize]&, selected: darray[i64]&, work: mutable SolverBudget::WorkBudget&) -> bool can[Memory.Allocate, Abort.Panic]:
             return false if selected.count != package_slots.count
-            colors: mutable darray[u8] = []
-            colors <- colors.resize(package_slots.count)
-            region stack_slots_scope:
-                stack_slots: mutable darray[usize] = []
-                stack_edges: mutable darray[usize] = []
-                for start in 0..<package_slots.count |candidates, package_slots, selected, colors, stack_slots, stack_edges|:
-                    return false if not solver_charge_work(work, 1)
-                    continue if selected[start] < 0 or colors[start] != 0
-                    stack_slots <- stack_slots.push(start)
-                    stack_edges <- stack_edges.push(0)
-                    colors[start] <- 1
-                    while stack_slots.count > 0 |candidates, package_slots, selected, colors, stack_slots, stack_edges|:
-                        return false if not solver_charge_work(work, 1)
-                        current_slot: usize = stack_slots[stack_slots.count - 1.usize()]
-                        return false if selected[current_slot] < 0 or selected[current_slot] >= candidates.count.i64()
-                        candidate: Candidate = candidates[selected[current_slot].usize()]
-                        edge_cursor: usize = stack_edges[stack_edges.count - 1.usize()]
-                        if edge_cursor >= candidate.dependencies.count:
-                            colors[current_slot] <- 2
-                            stack_slots <- stack_slots.resize(stack_slots.count - 1.usize())
-                            stack_edges <- stack_edges.resize(stack_edges.count - 1.usize())
-                            continue
-                        stack_edges[stack_edges.count - 1.usize()] <- edge_cursor + 1.usize()
-                        dependency_slot: usize = solver_slot_for(candidate.dependencies[edge_cursor].package, package_slots, candidates, work)
-                        return false if:
-                            solver_work_exhausted(work)
-                            dependency_slot == package_slots.count or selected[dependency_slot] < 0
-                            colors[dependency_slot] == 1
-                        continue if colors[dependency_slot] == 2
-                        stack_slots <- stack_slots.push(dependency_slot)
-                        stack_edges <- stack_edges.push(0)
-                        colors[dependency_slot] <- 1
+            walk: mutable GraphWalk = new_graph_walk(package_slots.count)
+            walked_all_slots(candidates, package_slots, selected, &walk, work)
+
+        def new_graph_walk(slot_count: usize) -> GraphWalk can[Memory.Allocate, Abort.Panic]:
+            colors: darray[u8] = [0.u8() for index in 0..<slot_count]
+            GraphWalk{colors: colors, stack_slots: [], stack_edges: []}
+
+        def walked_all_slots(candidates: darray[Candidate]&, package_slots: darray[usize]&, selected: darray[i64]&, walk: mutable GraphWalk&, work: mutable SolverBudget::WorkBudget&) -> bool can[Memory.Allocate, Abort.Panic]:
+            for start in 0..<package_slots.count |candidates, package_slots, selected, walk|:
+                return false if not SolverBudget::charge(work, 1)
+                continue if selected[start] < 0 or walk.colors[start] != 0
+                enter_slot(walk, start)
+                return false if not walked_from_stack(candidates, package_slots, selected, walk, work)
             true
 
-        def solver_slot_for(package: darray[u8]&, package_slots: darray[usize]&, candidates: darray[Candidate]&, work: mutable WorkBudget&) -> usize:
+        def walked_from_stack(candidates: darray[Candidate]&, package_slots: darray[usize]&, selected: darray[i64]&, walk: mutable GraphWalk&, work: mutable SolverBudget::WorkBudget&) -> bool can[Memory.Allocate, Abort.Panic]:
+            while walk.stack_slots.count > 0 |candidates, package_slots, selected, walk|:
+                return false if not SolverBudget::charge(work, 1) or not walk_step(candidates, package_slots, selected, walk, work)
+            true
+
+        # Advance the slot on top of the stack by one dependency edge, or
+        # finish it when no edges remain. Returns false on a cycle.
+        def walk_step(candidates: darray[Candidate]&, package_slots: darray[usize]&, selected: darray[i64]&, walk: mutable GraphWalk&, work: mutable SolverBudget::WorkBudget&) -> bool can[Memory.Allocate, Abort.Panic]:
+            current_slot: usize = walk.stack_slots[walk.stack_slots.count - 1.usize()]
+            false if selected[current_slot] < 0 or selected[current_slot] >= candidates.count.i64() else follow_next_edge(candidates[selected[current_slot].usize()], current_slot, candidates, package_slots, selected, walk, work)
+
+        def follow_next_edge(candidate: Candidate&, current_slot: usize, candidates: darray[Candidate]&, package_slots: darray[usize]&, selected: darray[i64]&, walk: mutable GraphWalk&, work: mutable SolverBudget::WorkBudget&) -> bool can[Memory.Allocate, Abort.Panic]:
+            edge_cursor: usize = walk.stack_edges[walk.stack_edges.count - 1.usize()]
+            finished_slot(walk, current_slot) if edge_cursor >= candidate.dependencies.count else followed_edge(candidate, edge_cursor, candidates, package_slots, selected, walk, work)
+
+        def followed_edge(candidate: Candidate&, edge_cursor: usize, candidates: darray[Candidate]&, package_slots: darray[usize]&, selected: darray[i64]&, walk: mutable GraphWalk&, work: mutable SolverBudget::WorkBudget&) -> bool can[Memory.Allocate, Abort.Panic]:
+            walk.stack_edges[walk.stack_edges.count - 1.usize()] <- edge_cursor + 1.usize()
+            dependency_slot: usize = solver_slot_for(candidate.dependencies[edge_cursor].package, package_slots, candidates, work)
+            return false if:
+                SolverBudget::exhausted(work)
+                dependency_slot == package_slots.count or selected[dependency_slot] < 0
+                walk.colors[dependency_slot] == 1
+            true if walk.colors[dependency_slot] == 2 else entered_slot(walk, dependency_slot)
+
+        def enter_slot(walk: mutable GraphWalk&, slot: usize) -> void can[Memory.Allocate, Abort.Panic]:
+            walk.stack_slots.push(slot)
+            walk.stack_edges.push(0)
+            walk.colors[slot] <- 1
+
+        def entered_slot(walk: mutable GraphWalk&, slot: usize) -> bool can[Memory.Allocate, Abort.Panic]:
+            enter_slot(walk, slot)
+            true
+
+        def finished_slot(walk: mutable GraphWalk&, slot: usize) -> bool can[Memory.Allocate, Abort.Panic]:
+            walk.colors[slot] <- 2
+            walk.stack_slots.resize(walk.stack_slots.count - 1.usize())
+            walk.stack_edges.resize(walk.stack_edges.count - 1.usize())
+            true
+
+        def solver_slot_for(package: darray[u8]&, package_slots: darray[usize]&, candidates: darray[Candidate]&, work: mutable SolverBudget::WorkBudget&) -> usize:
             for slot in 0..<package_slots.count |package, package_slots, candidates|:
-                return package_slots.count if not solver_charge_work(work, 1)
-                same_package: bool = solver_equal(package, candidates[package_slots[slot]].package, work)
-                return package_slots.count if solver_work_exhausted(work)
+                return package_slots.count if not SolverBudget::charge(work, 1)
+                same_package: bool = SolverBudget::equal(package, candidates[package_slots[slot]].package, work)
+                return package_slots.count if SolverBudget::exhausted(work)
                 return slot if same_package
             package_slots.count
 
-        def solver_sort_slots(slots: mutable darray[usize]&, candidates: darray[Candidate]&, work: mutable WorkBudget&) -> bool:
+        # ---------- ordering ------------------------------------------------------------------
+
+        # Insertion sorts that charge the budget for every comparison. A
+        # comparison returns false once the budget is exhausted, which ends
+        # the inner scan; the sort then reports the exhausted budget.
+        def solver_sort_slots(slots: mutable darray[usize]&, candidates: darray[Candidate]&, work: mutable SolverBudget::WorkBudget&) -> bool:
             for index in 1..<slots.count |slots, candidates, index|:
-                return false if not solver_charge_work(work, 1)
+                return false if not SolverBudget::charge(work, 1)
                 value: usize = slots[index]
-                cursor: mutable usize = index
-                while cursor > 0.usize():
-                    region should_move_scope:
-                        should_move: bool = solver_less(candidates[value].package, candidates[slots[cursor - 1.usize()]].package, work)
-                        return false if solver_work_exhausted(work)
-                        break if not should_move
+                destination: usize = while cursor > 0.usize() |cursor: usize = index, slots| -> cursor:
+                    break cursor if not SolverBudget::less(candidates[value].package, candidates[slots[cursor - 1.usize()]].package, work)
                     slots[cursor] <- slots[cursor - 1.usize()]
                     cursor <- cursor - 1.usize()
-                slots[cursor] <- value
+                return false if SolverBudget::exhausted(work)
+                slots[destination] <- value
             true
 
-        def solver_sort_candidates(order: mutable darray[usize]&, candidates: darray[Candidate]&, preferences: darray[Preference]&, work: mutable WorkBudget&) -> bool:
+        def solver_sort_candidates(order: mutable darray[usize]&, candidates: darray[Candidate]&, preferences: darray[Preference]&, work: mutable SolverBudget::WorkBudget&) -> bool:
             for index in 1..<order.count |order, candidates, index|:
-                return false if not solver_charge_work(work, 1)
+                return false if not SolverBudget::charge(work, 1)
                 value: usize = order[index]
-                cursor: mutable usize = index
-                while cursor > 0.usize():
-                    region should_move_scope:
-                        should_move: bool = solver_candidate_before(value, order[cursor - 1.usize()], candidates, preferences, work)
-                        return false if solver_work_exhausted(work)
-                        break if not should_move
+                destination: usize = while cursor > 0.usize() |cursor: usize = index, order| -> cursor:
+                    break cursor if not solver_candidate_before(value, order[cursor - 1.usize()], candidates, preferences, work)
                     order[cursor] <- order[cursor - 1.usize()]
                     cursor <- cursor - 1.usize()
-                order[cursor] <- value
+                return false if SolverBudget::exhausted(work)
+                order[destination] <- value
             true
 
-        def solver_sort_preferences(preferences: mutable darray[Preference]&, work: mutable WorkBudget&) -> bool:
+        def solver_sort_preferences(preferences: mutable darray[Preference]&, work: mutable SolverBudget::WorkBudget&) -> bool:
             for index in 1..<preferences.count |preferences, index|:
-                return false if not solver_charge_work(work, 1)
+                return false if not SolverBudget::charge(work, 1)
                 value: Preference = preferences[index]
-                cursor: mutable usize = index
-                while cursor > 0.usize():
-                    region should_move_scope:
-                        should_move: bool = solver_less(value.package, preferences[cursor - 1.usize()].package, work)
-                        return false if solver_work_exhausted(work)
-                        break if not should_move
+                destination: usize = while cursor > 0.usize() |cursor: usize = index, preferences| -> cursor:
+                    break cursor if not SolverBudget::less(value.package, preferences[cursor - 1.usize()].package, work)
                     preferences[cursor] <- preferences[cursor - 1.usize()]
                     cursor <- cursor - 1.usize()
-                preferences[cursor] <- value
+                return false if SolverBudget::exhausted(work)
+                preferences[destination] <- value
             true
 
-        def solver_candidate_before(left: usize, right: usize, candidates: darray[Candidate]&, preferences: darray[Preference]&, work: mutable WorkBudget&) -> bool:
-            return false if not solver_charge_work(work, 1)
-            region preference_index_scope:
-                preference_index: usize = solver_preference_index(preferences, candidates[left].package, work)
-                return false if solver_work_exhausted(work)
-                if preference_index < preferences.count:
-                    left_preferred: bool = SemVer::compare(candidates[left].version, preferences[preference_index].version) == 0
-                    right_preferred: bool = SemVer::compare(candidates[right].version, preferences[preference_index].version) == 0
-                    return true if left_preferred and not right_preferred
-                    return false if right_preferred and not left_preferred
-            region comparison_scope:
-                comparison: i64 = SemVer::compare(candidates[left].version, candidates[right].version)
-                return true if comparison > 0
-                return false if comparison < 0
-            solver_less(candidates[left].package, candidates[right].package, work)
+        # A preferred (previously locked) version first, then the higher
+        # version, then the lower package name.
+        def solver_candidate_before(left: usize, right: usize, candidates: darray[Candidate]&, preferences: darray[Preference]&, work: mutable SolverBudget::WorkBudget&) -> bool:
+            return false if not SolverBudget::charge(work, 1)
+            preference_index: usize = solver_preference_index(preferences, candidates[left].package, work)
+            false if SolverBudget::exhausted(work) else candidate_before_with_preference(left, right, candidates, preferences, preference_index, work)
 
-        def solver_preference_index(preferences: darray[Preference]&, package: darray[u8]&, work: mutable WorkBudget&) -> usize:
-            lower: mutable usize = 0.usize()
-            region upper_scope:
-                upper: mutable usize = preferences.count
-                while lower < upper |preferences, package, lower, upper|:
-                    return preferences.count if not solver_charge_work(work, 1)
-                    middle: usize = lower + (upper - lower) / 2.usize()
-                    less: bool = solver_less(preferences[middle].package, package, work)
-                    return preferences.count if solver_work_exhausted(work)
-                    if less:
-                        lower <- middle + 1.usize()
-                    else:
-                        upper <- middle
-            return preferences.count if lower >= preferences.count
-            region equal_scope:
-                equal: bool = solver_equal(preferences[lower].package, package, work)
-                return preferences.count if solver_work_exhausted(work) or not equal
-            lower
+        def candidate_before_with_preference(left: usize, right: usize, candidates: darray[Candidate]&, preferences: darray[Preference]&, preference_index: usize, work: mutable SolverBudget::WorkBudget&) -> bool:
+            preference_order: i64 = preferred_first(candidates[left].version, candidates[right].version, preferences, preference_index)
+            true if preference_order > 0 else false if preference_order < 0 else candidate_before_by_version(left, right, candidates, work)
 
-        def validate_constraint(constraint: Constraint, work: mutable WorkBudget&) -> SolveCode:
-            return SolveCode.Malformed if not PackageIdentity::valid_name(constraint.package) or constraint.requirement.count == 0.usize()
-            return SolveCode.ResourceLimit if:
-                not solver_charge_work(work, constraint.package.count)
-                not solver_charge_work(work, constraint.requirement.count)
-            region requirement_scope:
-                requirement: mutable SemVer::Requirement = SemVer::Requirement{lower: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, upper: Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, has_lower: false, has_upper: false, include_lower: false, include_upper: false}
-                return SolveCode.Malformed if not SemVer::parse_requirement(constraint.requirement, &requirement)
-            SolveCode.Solved
+        # 1 when only `left` is the preferred version, -1 when only `right`
+        # is, and 0 otherwise.
+        def preferred_first(left: Model::Version, right: Model::Version, preferences: darray[Preference]&, preference_index: usize) -> i64:
+            return 0 if preference_index >= preferences.count
+            left_preferred: bool = SemVer::compare(left, preferences[preference_index].version) == 0
+            right_preferred: bool = SemVer::compare(right, preferences[preference_index].version) == 0
+            1 if left_preferred and not right_preferred else -1 if right_preferred and not left_preferred else 0
 
-        def solver_equal(left: darray[u8]&, right: darray[u8]&, work: mutable WorkBudget&) -> bool:
-            return false if:
-                not solver_charge_work(work, 1)
-                left.count != right.count
-            for index in 0..<left.count |left, right|:
-                return false if:
-                    not solver_charge_work(work, 1)
-                    left[index] != right[index]
-            true
+        def candidate_before_by_version(left: usize, right: usize, candidates: darray[Candidate]&, work: mutable SolverBudget::WorkBudget&) -> bool:
+            comparison: i64 = SemVer::compare(candidates[left].version, candidates[right].version)
+            true if comparison > 0 else false if comparison < 0 else SolverBudget::less(candidates[left].package, candidates[right].package, work)
 
-        def solver_less(left: darray[u8]&, right: darray[u8]&, work: mutable WorkBudget&) -> bool:
-            return false if not solver_charge_work(work, 1)
-            region limit_scope:
-                limit: usize = left.count if left.count < right.count else right.count
-                for index in 0..<limit |left, right|:
-                    return false if not solver_charge_work(work, 1)
-                    return true if left[index] < right[index]
-                    return false if left[index] > right[index]
-            left.count < right.count
-
-        def solver_charge_work(work: mutable WorkBudget&, amount: usize) -> bool:
-            if work.used > maximum_solver_work:
-                work.used <- maximum_solver_work + 1.usize()
-                return false
-            if amount > maximum_solver_work - work.used:
-                work.used <- maximum_solver_work + 1.usize()
-                return false
-            work.used <- work.used + amount
-            true
-
-        def solver_work_exhausted(work: WorkBudget&) -> bool:
-            work.used > maximum_solver_work
+        # Binary search for `package` among the sorted preferences; returns
+        # `preferences.count` when absent or when the budget is exhausted.
+        def solver_preference_index(preferences: darray[Preference]&, package: darray[u8]&, work: mutable SolverBudget::WorkBudget&) -> usize:
+            position: usize = while lower < upper |lower: usize = 0.usize(), upper: usize = preferences.count| -> lower:
+                return preferences.count if not SolverBudget::charge(work, 1)
+                middle: usize = lower + (upper - lower) / 2.usize()
+                less: bool = SolverBudget::less(preferences[middle].package, package, work)
+                return preferences.count if SolverBudget::exhausted(work)
+                if less:
+                    lower <- middle + 1.usize()
+                else:
+                    upper <- middle
+            preferences.count if position >= preferences.count or not SolverBudget::equal(preferences[position].package, package, work) or SolverBudget::exhausted(work) else position

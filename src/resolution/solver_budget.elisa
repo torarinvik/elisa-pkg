@@ -1,0 +1,52 @@
+# The deterministic work budget shared by every dependency-solver step.
+#
+# Each comparison, constraint check, and parser call charges the budget, so a
+# hostile candidate graph cannot make solving run without bound.
+
+module SolverBudget:
+    public:
+        struct WorkBudget:
+            used: mutable usize
+
+        # This deterministic cap covers nested name comparisons, constraint
+        # checks, and parser work across validation and every search branch.
+        const maximum_solver_work: usize = 20000000
+
+        def empty() -> WorkBudget:
+            WorkBudget{used: 0}
+
+        # Charge `amount` units of work. Once the cap is exceeded the budget
+        # stays exhausted and every later charge fails.
+        def charge(work: mutable WorkBudget&, amount: usize) -> bool:
+            exceeded: bool = work.used > maximum_solver_work or amount > maximum_solver_work - work.used
+            work.used <- maximum_solver_work + 1.usize() if exceeded else work.used + amount
+            not exceeded
+
+        def exhausted(work: WorkBudget&) -> bool:
+            work.used > maximum_solver_work
+
+        # Byte equality that charges one unit per compared byte.
+        def equal(left: darray[u8]&, right: darray[u8]&, work: mutable WorkBudget&) -> bool:
+            return false if:
+                not charge(work, 1)
+                left.count != right.count
+            for index in 0..<left.count |left, right|:
+                return false if:
+                    not charge(work, 1)
+                    left[index] != right[index]
+            true
+
+        # Bytewise lexicographic order that charges one unit per compared byte.
+        def less(left: darray[u8]&, right: darray[u8]&, work: mutable WorkBudget&) -> bool:
+            return false if not charge(work, 1)
+            common_prefix_less(left, right, left.count if left.count < right.count else right.count, work)
+
+    private:
+        # Compare the first `limit` bytes; a shorter value with an equal prefix
+        # sorts first.
+        def common_prefix_less(left: darray[u8]&, right: darray[u8]&, limit: usize, work: mutable WorkBudget&) -> bool:
+            for index in 0..<limit |left, right|:
+                return false if not charge(work, 1)
+                return true if left[index] < right[index]
+                return false if left[index] > right[index]
+            left.count < right.count
