@@ -20,49 +20,62 @@ module Integrity:
             # successful digest looking like the result of this call.
             out.resize(0)
             return DigestCode.InputTooLarge if value.count > maximum_input
-            padded: darray[u8] = padded_message(value)
-            state: mutable darray[u32] = [
+            out <-
+                state: darray[u32] =
+                    padded: darray[u8] = padded_message(value)
+                    # Build these once per digest rather than once per compression round.
+                    round_constants: darray[u32] = sha256_round_constants()
+                    # The message schedule is scratch storage for one compression
+                    # block, reused across blocks instead of allocated per 64 bytes.
+                    while block < padded.count |block: usize = 0.usize(), words: darray[u32] = [0.u32() for slot in 0..<64], state: darray[u32] = initial_state()| -> state:
+                        words <- load_schedule(padded, block, words)
+                        state <- compress_block(words, round_constants, state)
+                        block <- block + 64.usize()
+                # Each state word becomes four big-endian digest bytes.
+                [(state[index / 4.usize()] >> ((3.usize() - index % 4.usize()) * 8.usize()).u32()).u8() for index in 0..<32]
+            DigestCode.Ok
+
+        # Canonical SHA-256 text used in receipts, cache paths, and metadata.
+        def valid_sha256_hex(value: darray[u8]&) -> bool:
+            valid_sha256_hex_range(value, 0.usize(), value.count)
+
+        def valid_sha256_hex_range(value: darray[u8]&, start: usize, finish: usize) -> bool:
+            return false if finish > value.count or start > finish or finish - start != 64.usize()
+            for index in start..<finish |valid: bool = true| -> valid:
+                byte: u8 = value[index]
+                break false if (byte < 48 or byte > 57) and (byte < 97 or byte > 102)
+
+        # Encode a bounded SHA-256 digest in the canonical receipt format.
+        def sha256_hex(value: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            out.resize(0)
+            digest: mutable darray[u8] = []
+            false if sha256(value, &digest) != DigestCode.Ok else hex_digest(digest, out)
+
+        def hex_digest(digest: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            # Invalid digest widths must not preserve a stale encoded value.
+            out.resize(0)
+            return false if digest.count != 32.usize()
+            for index in 0..<digest.count |digest, out|:
+                out.push(hex_digit((digest[index].u32() >> 4) & 15.u32()))
+                out.push(hex_digit(digest[index].u32() & 15.u32()))
+            true
+
+    private:
+        def initial_state() -> darray[u32] can[Memory.Allocate, Abort.Panic]:
+            [
                 0x6a09e667.u32(), 0xbb67ae85.u32(), 0x3c6ef372.u32(), 0xa54ff53a.u32(),
                 0x510e527f.u32(), 0x9b05688c.u32(), 0x1f83d9ab.u32(), 0x5be0cd19.u32()
             ]
-            # Build these once per digest rather than once per compression round.
-            round_constants: darray[u32] = sha256_round_constants()
-            # The message schedule is scratch storage for one compression
-            # block. Reuse it across blocks instead of allocating a new array
-            # for every 64 bytes of input.
-            region words_scope:
-                words: mutable darray[u32] = []
-                words <- words.resize(64)
-                while block < padded.count |block: usize = 0.usize()|:
-                    load_schedule(padded, block, &words)
-                    compress_block(words, round_constants, &state)
-                    block <- block + 64.usize()
-            for index in 0..<8 |out, state|:
-                word: u32 = state[index]
-                out.push((word >> 24).u8())
-                out.push((word >> 16).u8())
-                out.push((word >> 8).u8())
-                out.push(word.u8())
-            DigestCode.Ok
 
         # Append the 0x80 marker, zero fill, and the big-endian bit length so
         # the message is a whole number of 64-byte blocks.
         def padded_message(value: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
             padded_size: usize = ((value.count + 9.usize() + 63.usize()) / 64.usize()) * 64.usize()
-            padded: mutable darray[u8] = []
-            padded <- padded.resize(padded_size)
-            for index in 0..<value.count |padded, value|:
-                padded[index] <- value[index]
-            padded[value.count] <- 128
             bit_length: u64 = value.count.u64() * 8.u64()
-            region length_offset_scope:
-                length_offset: usize = padded_size - 8.usize()
-                for index in 0..<8 |padded|:
-                    padded[length_offset + index] <- (bit_length >> ((7 - index) * 8).u64()).u8()
-            padded
+            [value[index] if index < value.count else 128.u8() if index == value.count else (bit_length >> ((padded_size - 1.usize() - index) * 8.usize()).u64()).u8() if index >= padded_size - 8.usize() else 0.u8() for index in 0..<padded_size]
 
         def sha256_round_constants() -> darray[u32] can[Memory.Allocate, Abort.Panic]:
-            return [
+            [
                 0x428a2f98.u32(), 0x71374491.u32(), 0xb5c0fbcf.u32(), 0xe9b5dba5.u32(),
                 0x3956c25b.u32(), 0x59f111f1.u32(), 0x923f82a4.u32(), 0xab1c5ed5.u32(),
                 0xd807aa98.u32(), 0x12835b01.u32(), 0x243185be.u32(), 0x550c7dc3.u32(),
@@ -82,26 +95,19 @@ module Integrity:
             ]
 
         # Expand one 64-byte block into the 64-word message schedule.
-        def load_schedule(padded: darray[u8]&, block: usize, words: mutable darray[u32]&) -> void can[Abort.Panic]:
+        def load_schedule(padded: darray[u8]&, block: usize, words: mutable darray[u32]) -> darray[u32] can[Abort.Panic]:
             requires words.count == 64 and block + 64 <= padded.count
             for index in 0..<16 |words, padded, block|:
                 offset: usize = block + index * 4.usize()
                 words[index] <- (padded[offset].u32() << 24) | (padded[offset + 1.usize()].u32() << 16) | (padded[offset + 2.usize()].u32() << 8) | padded[offset + 3.usize()].u32()
             for index in 16..<64 |words|:
                 words[index] <- small_sigma1(words[index - 2.usize()]) + words[index - 7.usize()] + small_sigma0(words[index - 15.usize()]) + words[index - 16.usize()]
+            words
 
-        # Run the 64 compression rounds and add the result into `state`.
-        def compress_block(words: darray[u32]&, round_constants: darray[u32]&, state: mutable darray[u32]&) -> void can[Abort.Panic]:
+        # Run the 64 compression rounds and return `state` with the result added.
+        def compress_block(words: darray[u32]&, round_constants: darray[u32]&, state: darray[u32]) -> darray[u32] can[Memory.Allocate, Abort.Panic]:
             requires words.count == 64 and round_constants.count == 64 and state.count == 8
-            a: mutable u32 = state[0]
-            b: mutable u32 = state[1]
-            c: mutable u32 = state[2]
-            d: mutable u32 = state[3]
-            e: mutable u32 = state[4]
-            f: mutable u32 = state[5]
-            g: mutable u32 = state[6]
-            h: mutable u32 = state[7]
-            for index in 0..<64 |words, round_constants, a, b, c, d, e, f, g, h|:
+            for index in 0..<64 |a: u32 = state[0], b: u32 = state[1], c: u32 = state[2], d: u32 = state[3], e: u32 = state[4], f: u32 = state[5], g: u32 = state[6], h: u32 = state[7]| -> [state[0] + a, state[1] + b, state[2] + c, state[3] + d, state[4] + e, state[5] + f, state[6] + g, state[7] + h]:
                 first_sum: u32 = h + big_sigma1(e) + choose(e, f, g) + round_constants[index] + words[index]
                 second_sum: u32 = big_sigma0(a) + majority(a, b, c)
                 h <- g
@@ -112,44 +118,7 @@ module Integrity:
                 c <- b
                 b <- a
                 a <- first_sum + second_sum
-            state[0] <- state[0] + a
-            state[1] <- state[1] + b
-            state[2] <- state[2] + c
-            state[3] <- state[3] + d
-            state[4] <- state[4] + e
-            state[5] <- state[5] + f
-            state[6] <- state[6] + g
-            state[7] <- state[7] + h
 
-        # Canonical SHA-256 text used in receipts, cache paths, and metadata.
-        def valid_sha256_hex(value: darray[u8]&) -> bool:
-            valid_sha256_hex_range(value, 0.usize(), value.count)
-
-        def valid_sha256_hex_range(value: darray[u8]&, start: usize, finish: usize) -> bool:
-            return false if finish > value.count or start > finish or finish - start != 64.usize()
-            for index in start..<finish |value|:
-                byte: u8 = value[index]
-                return false if (byte < 48 or byte > 57) and (byte < 97 or byte > 102)
-            true
-
-        # Encode a bounded SHA-256 digest in the canonical receipt format.
-        def sha256_hex(value: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            out.resize(0)
-            digest: mutable darray[u8] = []
-            false if sha256(value, &digest) != DigestCode.Ok else hex_digest(digest, out)
-
-        def hex_digest(digest: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            # Invalid digest widths must not preserve a stale encoded value.
-            out.resize(0)
-            return false if digest.count != 32.usize()
-            for index in 0..<digest.count |digest, out|:
-                high: u32 = (digest[index].u32() >> 4) & 15.u32()
-                low: u32 = digest[index].u32() & 15.u32()
-                out.push(hex_digit(high))
-                out.push(hex_digit(low))
-            true
-
-    private:
         def rotate_right(value: u32, amount: u32) -> u32:
             (value >> amount) | (value << (32.u32() - amount))
 
