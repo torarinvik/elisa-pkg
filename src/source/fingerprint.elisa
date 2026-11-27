@@ -20,29 +20,30 @@ module SourceFingerprint:
             out.resize(0)
             bytes_hashed_out <- 0.usize()
             return false if not ProjectFiles::valid_path_bytes(root)
-            root_c: mutable darray[u8] = []
-            root_c <- ProjectFiles::with_null_terminator(root)
-            root_name: cstr = (&root_c[0]).cast[cstr] can Unsafe.PointerCast
             resolved_root: mutable darray[u8] = []
             resolved_root <- resolved_root.resize(4096)
-            root_real_name: mutable cstr = ""
-            if Platform::resolve_real_path(root_name, &resolved_root) is canonical_root:
-                root_real_name <- canonical_root
-            else:
-                return false
+            root_real_name: cstr =
+                root_c: darray[u8] = ProjectFiles::with_null_terminator(root)
+                if Platform::resolve_real_path(((&root_c[0]).cast[cstr] can Unsafe.PointerCast), &resolved_root) is canonical_root:
+                    canonical_root
+                else:
+                    return false
             root_real_length: usize = Platform::c_string_length(root_real_name)
-            return false if root_real_length == 0.usize() or root_real_length >= 4096.usize()
-            region root_policy_path_scope:
+            if root_real_length == 0.usize() or root_real_length >= 4096.usize():
+                false
+            else:
                 root_policy_path: mutable darray[u8] = []
                 ByteText::append_bounded_text(&root_policy_path, root_real_name)
                 root_policy_path <- root_policy_path.push(0)
-                return false if PackagePathPolicy::credential_root_forbidden(root_policy_path)
-            buffer: mutable darray[u8] = []
-            buffer <- buffer.resize(16777216)
-            collected: i64 =
-                buffer_raw: mutable u8& = (&buffer[0]).cast[mutable u8&] can Unsafe.PointerCast
-                Platform::collect_files(root_real_name, buffer_raw, buffer.count)
-            false if collected < 0 or collected.usize() > buffer.count else fingerprint_collected_paths(buffer, collected.usize(), root_real_name, root_real_length, maximum_bytes, out, bytes_hashed_out)
+                if PackagePathPolicy::credential_root_forbidden(root_policy_path):
+                    false
+                else:
+                    buffer: mutable darray[u8] = []
+                    buffer <- buffer.resize(16777216)
+                    collected: i64 =
+                        buffer_raw: mutable u8& = (&buffer[0]).cast[mutable u8&] can Unsafe.PointerCast
+                        Platform::collect_files(root_real_name, buffer_raw, buffer.count)
+                    false if collected < 0 or collected.usize() > buffer.count else fingerprint_collected_paths(buffer, collected.usize(), root_real_name, root_real_length, maximum_bytes, out, bytes_hashed_out)
 
         def at(root: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             bytes_hashed: mutable usize = 0.usize()
@@ -61,27 +62,26 @@ module SourceFingerprint:
             requires collected <= buffer.count and root_real_length < 4096.usize()
             fingerprint: mutable darray[u8] = []
             bytes_hashed: mutable usize = 0.usize()
-            cursor: mutable usize = 0.usize()
-            while cursor < collected |root_prefix: usize = root_real_length + 1.usize()|:
-                path_start: usize = cursor
+            # Each pass reads the NUL-terminated path starting at `cursor`.
+            while cursor < collected |fingerprint, bytes_hashed, cursor: usize = 0.usize(), root_prefix: usize = root_real_length + 1.usize()|:
                 path_end: usize =
-                    while end < collected and buffer[end] != 0 |end: usize = path_start| -> end:
+                    while end < collected and buffer[end] != 0 |end: usize = cursor| -> end:
                         end <- end + 1.usize()
                 return false if:
-                    path_end == collected or path_end - path_start <= root_prefix
-                    buffer[path_start + root_real_length] != 47
-                    not ByteText::range_equals_text(buffer, path_start, path_start + root_real_length, root_real_name)
-                cursor <- path_end + 1.usize()
+                    path_end == collected or path_end - cursor <= root_prefix
+                    buffer[cursor + root_real_length] != 47
+                    not ByteText::range_equals_text(buffer, cursor, cursor + root_real_length, root_real_name)
                 # The manifest and lock have their own digests. Including the lock
                 # here would make its source fingerprint self-referential.
-                region relative_start_scope:
-                    relative_start: usize = path_start + root_prefix
-                    continue if ByteText::range_equals_text(buffer, relative_start, path_end, "elisapkg.json") or ByteText::range_equals_text(buffer, relative_start, path_end, "elisapkg.lock")
-                path: mutable darray[u8] = [buffer[item] for item in path_start..<path_end]
-                return false if not append_file_fingerprint(path, root_prefix, maximum_bytes, &bytes_hashed, &fingerprint)
-            return false if not Integrity::sha256_hex(fingerprint, out)
-            bytes_hashed_out <- bytes_hashed
-            true
+                if not ByteText::range_equals_text(buffer, cursor + root_prefix, path_end, "elisapkg.json") and not ByteText::range_equals_text(buffer, cursor + root_prefix, path_end, "elisapkg.lock"):
+                    path: darray[u8] = [buffer[item] for item in cursor..<path_end]
+                    return false if not append_file_fingerprint(path, root_prefix, maximum_bytes, &bytes_hashed, &fingerprint)
+                cursor <- path_end + 1.usize()
+            if not Integrity::sha256_hex(fingerprint, out):
+                false
+            else:
+                bytes_hashed_out <- bytes_hashed
+                true
 
         def append_file_fingerprint(path: darray[u8]&, root_prefix: usize, maximum_bytes: usize, bytes_hashed: mutable usize&, fingerprint: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             requires root_prefix < path.count and bytes_hashed <= maximum_bytes
@@ -89,12 +89,17 @@ module SourceFingerprint:
                 remaining_bytes: usize = maximum_bytes - bytes_hashed
                 remaining_bytes if remaining_bytes < Integrity::maximum_input else Integrity::maximum_input
             content: mutable darray[u8] = []
-            return false if not Platform::read_bounded_file(path, file_limit, &content)
-            bytes_hashed <- bytes_hashed + content.count
             digest_bytes: mutable darray[u8] = []
-            return false if Integrity::sha256(content, &digest_bytes) != Integrity::DigestCode.Ok
-            ByteText::append_range(fingerprint, path, root_prefix, path.count)
-            fingerprint.push(0)
-            ByteText::append(fingerprint, digest_bytes)
-            fingerprint.push(0)
-            true
+            if not Platform::read_bounded_file(path, file_limit, &content):
+                false
+            else:
+                bytes_hashed <- bytes_hashed + content.count
+                if Integrity::sha256(content, &digest_bytes) != Integrity::DigestCode.Ok:
+                    false
+                else:
+                    # Each entry is `<relative path> NUL <digest> NUL`.
+                    ByteText::append_range(fingerprint, path, root_prefix, path.count)
+                    fingerprint.push(0)
+                    ByteText::append(fingerprint, digest_bytes)
+                    fingerprint.push(0)
+                    true
