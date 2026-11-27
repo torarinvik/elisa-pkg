@@ -16,29 +16,11 @@ include "./manifest.elisa"
 module LocalLock:
     public:
         def canonical(name: darray[u8]&, version: darray[u8]&, raw: darray[u8]&, root: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            out: mutable darray[u8] = []
             graph_source_bytes: mutable usize = 0.usize()
-            region root_digest_scope:
-                root_digest: mutable darray[u8] = []
-                root_source_digest: mutable darray[u8] = []
-                return [] if:
-                    not Integrity::sha256_hex(raw, &root_digest)
-                    not SourceFingerprint::at_bounded(root, &root_source_digest, SourceFingerprint::maximum_snapshot_bytes, &graph_source_bytes)
-                Lockfile::append_header(&out, Lockfile::Format.Local, name, version, root_digest, root_source_digest)
+            out: darray[u8] = local_lock_header(name, version, raw, root, &graph_source_bytes)
+            return [] if out.count == 0.usize()
             graph: mutable DependencyQueue = DependencyQueue{queue: [], record_starts: [], sorted_records: [], edges: [], edge_count: 0.usize(), total: 0.usize()}
-            return [] if not append_local_dependency_records(raw, root, &graph, 18446744073709551615.usize())
-            if graph.total == 0.usize():
-                ByteText::append_text(&out, "]\n}\n")
-                return out
-            traversed_manifest_digests: mutable darray[u8] = []
-            return [] if not traverse_dependencies(name, &graph, &traversed_manifest_digests)
-            return [] if graph.sorted_records.count != graph.total
-            if append_sorted_records(graph.queue, graph.record_starts, graph.sorted_records, graph.total, traversed_manifest_digests, graph_source_bytes, out) is body:
-                out <- body
-            else:
-                return []
-            Lockfile::append_footer(&out)
-            return out
+            return [] if not append_local_dependency_records(raw, root, &graph, 18446744073709551615.usize()) else finished_lock(name, &graph, graph_source_bytes, out)
 
     private:
         # The breadth-first queue of local packages: NUL-separated
@@ -52,79 +34,131 @@ module LocalLock:
             edge_count: mutable usize
             total: mutable usize
 
+        # The three fields of one queued package record.
+        struct QueuedPackage:
+            path: mutable darray[u8]
+            name: mutable darray[u8]
+            version: mutable darray[u8]
+
+        const manifest_digest_bytes: usize = 32.usize()
+
+        def empty_queued_package() -> QueuedPackage:
+            return QueuedPackage{path: [], name: [], version: []}
+
+        # The lock header binding the root manifest and source digests, or an
+        # empty array when either is unavailable. Adds the root source size to
+        # `graph_source_bytes`.
+        def local_lock_header(name: darray[u8]&, version: darray[u8]&, raw: darray[u8]&, root: darray[u8]&, graph_source_bytes: mutable usize&) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            root_digest: mutable darray[u8] = []
+            root_source_digest: mutable darray[u8] = []
+            return [] if not Integrity::sha256_hex(raw, &root_digest) or not SourceFingerprint::at_bounded(root, &root_source_digest, SourceFingerprint::maximum_snapshot_bytes, graph_source_bytes) else lock_header(name, version, root_digest, root_source_digest)
+
+        def lock_header(name: darray[u8]&, version: darray[u8]&, root_digest: darray[u8]&, root_source_digest: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
+            header: mutable darray[u8] = []
+            Lockfile::append_header(&header, Lockfile::Format.Local, name, version, root_digest, root_source_digest)
+            return header
+
+        # Traverse the queued dependencies and append their records and the footer.
+        def finished_lock(name: darray[u8]&, graph: mutable DependencyQueue&, graph_source_bytes: usize, out: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return ByteText::with_text(out, "]\n}\n") if graph.total == 0.usize()
+            traversed_manifest_digests: mutable darray[u8] = []
+            return [] if not traverse_dependencies(name, graph, &traversed_manifest_digests) or graph.sorted_records.count != graph.total else with_footer(append_sorted_records(graph.queue, graph.record_starts, graph.sorted_records, graph.total, traversed_manifest_digests, graph_source_bytes, out))
+
+        # `body` followed by the lock footer, or an empty array without a body.
+        def with_footer(body: darray[u8]?) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
+            if body is records:
+                footed: mutable darray[u8] = records
+                Lockfile::append_footer(&footed)
+                return footed
+            return []
+
         # Breadth-first traversal of the local dependency graph. Each queued
         # package's manifest must name the queued package and version; its
         # own local dependencies join the queue. The graph must be acyclic.
         def traverse_dependencies(name: darray[u8]&, graph: mutable DependencyQueue&, traversed_manifest_digests: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            edge_offsets: mutable darray[usize] = []
-            edge_offsets <- edge_offsets.push(0.usize())
-            processed: mutable usize = 0.usize()
-            while processed < graph.total |edge_offsets, processed|:
-                package_root: mutable darray[u8] = []
-                child_raw: mutable darray[u8] = []
-                return false if:
-                    not read_queued_manifest(name, graph.queue, graph.record_starts, processed, &package_root, &child_raw)
-                    not append_local_dependency_records(child_raw, &package_root, graph, processed)
-                region digest_scope:
-                    digest: mutable darray[u8] = []
-                    return false if Integrity::sha256(child_raw, &digest) != Integrity::DigestCode.Ok
-                    ByteText::append(traversed_manifest_digests, digest)
+            edge_offsets: mutable darray[usize] = [0.usize()]
+            while processed < graph.total |edge_offsets, processed: usize = 0.usize()|:
+                return false if not traverse_queued_package(name, graph, processed, traversed_manifest_digests)
                 processed <- processed + 1.usize()
                 edge_offsets <- edge_offsets.push(graph.edges.count)
             return DependencyGraph::is_acyclic(graph.total, graph.edges, edge_offsets)
 
+        # Read queued package `processed`, queue its dependencies, and record
+        # the digest of the manifest the traversal used.
+        def traverse_queued_package(name: darray[u8]&, graph: mutable DependencyQueue&, processed: usize, traversed_manifest_digests: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            package_root: mutable darray[u8] = []
+            child_raw: mutable darray[u8] = []
+            return read_queued_manifest(name, graph.queue, graph.record_starts, processed, &package_root, &child_raw) and append_local_dependency_records(child_raw, package_root, graph, processed) and append_manifest_digest(child_raw, traversed_manifest_digests)
+
+        def append_manifest_digest(manifest: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            digest: mutable darray[u8] = []
+            return Integrity::sha256(manifest, &digest) == Integrity::DigestCode.Ok and appended(out, digest)
+
+        def appended(out: mutable darray[u8]&, value: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            ByteText::append(out, value)
+            return true
+
         # Read the manifest of queued package `processed`. It must not be the
         # root package and must name the queued package and version.
         def read_queued_manifest(name: darray[u8]&, queue: darray[u8]&, record_starts: darray[usize]&, processed: usize, package_root: mutable darray[u8]&, child_raw: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            return false if not queue_field_at(queue, record_starts, processed, 0, package_root)
-            region manifest_path_scope:
-                manifest_path: mutable darray[u8] = []
-                ProjectFiles::path_join_into(package_root, "elisapkg.json", &manifest_path)
-                return false if not Platform::read_bounded_file(manifest_path, Json::maximum_document_bytes, child_raw)
+            return false if not queue_field_at(queue, record_starts, processed, 0, package_root) or not Platform::read_bounded_file(ProjectFiles::path_join(package_root, "elisapkg.json"), Json::maximum_document_bytes, child_raw)
             child_name: mutable darray[u8] = []
             child_version: mutable darray[u8] = []
-            return false if not ProjectManifest::validate_at(child_raw, package_root, &child_name, &child_version) or ByteText::equal(child_name, name)
-            queued_name: mutable darray[u8] = []
-            queued_version: mutable darray[u8] = []
-            return queue_field_at(queue, record_starts, processed, 1, &queued_name) and queue_field_at(queue, record_starts, processed, 2, &queued_version) and ByteText::equal(queued_name, child_name) and ByteText::equal(queued_version, child_version)
+            queued: mutable QueuedPackage = empty_queued_package()
+            return ProjectManifest::validate_at(child_raw, package_root, &child_name, &child_version) and not ByteText::equal(child_name, name) and queue_field_at(queue, record_starts, processed, 1, &queued.name) and queue_field_at(queue, record_starts, processed, 2, &queued.version) and ByteText::equal(queued.name, child_name) and ByteText::equal(queued.version, child_version)
 
         # Append one dependency record per package in name order, binding each
         # to its source digest and to the manifest digest seen in traversal.
         def append_sorted_records(queue: darray[u8]&, record_starts: darray[usize]&, sorted_records: darray[usize]&, total: usize, traversed_manifest_digests: darray[u8]&, root_source_bytes: usize, body: mutable darray[u8]) -> darray[u8]? can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            graph_source_bytes: mutable usize = root_source_bytes
-            for sorted_position in 0..<total |body, graph_source_bytes|:
+            while sorted_position < total |body, sorted_position: usize = 0.usize(), graph_source_bytes: usize = root_source_bytes|:
                 record: darray[u8] = sorted_record(queue, record_starts, sorted_records[sorted_position], traversed_manifest_digests, &graph_source_bytes)
-                return null if record.count == 0.usize()
-                body <- body.push(44) if sorted_position > 0.usize()
-                for index in 0..<record.count |body, record|:
-                    body <- body.push(record[index])
-                # Reserve seven bytes for the closing array, object, and line endings.
-                return null if body.count > Lockfile::maximum_body_bytes
+                sorted_position <- sorted_position + 1.usize()
+                if separated_record(body, sorted_position > 1.usize(), record) is grown:
+                    body <- grown
+                else:
+                    return null
             return body
+
+        # `body`, a comma when `separated`, and `record`. Returns null for an
+        # empty record or a body past the limit; seven bytes stay reserved
+        # for the closing array, object, and line endings.
+        def separated_record(body: mutable darray[u8], separated: bool, record: darray[u8]&) -> darray[u8]? can[Memory.Allocate, Abort.Panic]:
+            return null if record.count == 0.usize()
+            body <- body.push(44) if separated
+            body <- ByteText::with_bytes(body, record)
+            return null if body.count > Lockfile::maximum_body_bytes else body
 
         # Render the dependency record of queue record `selected`, adding its
         # source size to the bounded `graph_source_bytes` total. Returns an
         # empty array when the record cannot be verified.
         def sorted_record(queue: darray[u8]&, record_starts: darray[usize]&, selected: usize, traversed_manifest_digests: darray[u8]&, graph_source_bytes: mutable usize&) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            return [] if selected >= record_starts.count
-            selected_name: mutable darray[u8] = []
-            selected_path: mutable darray[u8] = []
-            selected_version: mutable darray[u8] = []
-            return [] if not queue_field_at(queue, record_starts, selected, 0, &selected_path) or not queue_field_at(queue, record_starts, selected, 1, &selected_name) or not queue_field_at(queue, record_starts, selected, 2, &selected_version)
-            selected_source_digest: mutable darray[u8] = []
-            region selected_source_bytes_scope:
-                selected_source_bytes: mutable usize = 0.usize()
-                return [] if graph_source_bytes > SourceFingerprint::maximum_snapshot_bytes or not SourceFingerprint::at_bounded(selected_path, &selected_source_digest, SourceFingerprint::maximum_snapshot_bytes - graph_source_bytes, &selected_source_bytes)
-                graph_source_bytes <- graph_source_bytes + selected_source_bytes
-            record: dstr =
-                selected_digest: mutable darray[u8] = []
-                selected_manifest_path: mutable darray[u8] = []
-                ProjectFiles::path_join_into(&selected_path, "elisapkg.json", &selected_manifest_path)
-                region selected_manifest_scope:
-                    selected_manifest: mutable darray[u8] = []
-                    return [] if not Platform::read_bounded_file(selected_manifest_path, Json::maximum_document_bytes, &selected_manifest)
-                    return [] if not verified_manifest_digest(selected_manifest, traversed_manifest_digests, selected, &selected_digest)
-                dependency_record(selected_name, selected_version, selected_path, selected_digest, selected_source_digest)
+            package: mutable QueuedPackage = empty_queued_package()
+            return [] if selected >= record_starts.count or not read_queued_package(queue, record_starts, selected, &package) else source_verified_record(package, selected, traversed_manifest_digests, graph_source_bytes)
+
+        def read_queued_package(queue: darray[u8]&, record_starts: darray[usize]&, record: usize, out: mutable QueuedPackage&) -> bool can[Memory.Allocate, Abort.Panic]:
+            return queue_field_at(queue, record_starts, record, 0, &out.path) and queue_field_at(queue, record_starts, record, 1, &out.name) and queue_field_at(queue, record_starts, record, 2, &out.version)
+
+        def source_verified_record(package: QueuedPackage&, selected: usize, traversed_manifest_digests: darray[u8]&, graph_source_bytes: mutable usize&) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            source_digest: mutable darray[u8] = []
+            return [] if not add_source_digest(package.path, graph_source_bytes, &source_digest) else manifest_verified_record(package, selected, traversed_manifest_digests, source_digest)
+
+        # Fingerprint the package source within what remains of the snapshot
+        # budget, and add its size to `graph_source_bytes`.
+        def add_source_digest(path: darray[u8]&, graph_source_bytes: mutable usize&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            source_bytes: mutable usize = 0.usize()
+            return graph_source_bytes <= SourceFingerprint::maximum_snapshot_bytes and SourceFingerprint::at_bounded(path, out, SourceFingerprint::maximum_snapshot_bytes - graph_source_bytes, &source_bytes) and added_to(graph_source_bytes, source_bytes)
+
+        def added_to(total: mutable usize&, amount: usize) -> bool:
+            total <- total + amount
+            return true
+
+        def manifest_verified_record(package: QueuedPackage&, selected: usize, traversed_manifest_digests: darray[u8]&, source_digest: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            manifest: mutable darray[u8] = []
+            manifest_digest: mutable darray[u8] = []
+            return [] if not Platform::read_bounded_file(ProjectFiles::path_join(package.path, "elisapkg.json"), Json::maximum_document_bytes, &manifest) or not verified_manifest_digest(manifest, traversed_manifest_digests, selected, &manifest_digest) else rendered_record(package, manifest_digest, source_digest)
+
+        def rendered_record(package: QueuedPackage&, manifest_digest: darray[u8]&, source_digest: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            record: dstr = dependency_record(package.name, package.version, package.path, manifest_digest, source_digest)
             return [record[index].u8() for index in 0..<record.count]
 
         def dependency_record(name: darray[u8]&, version: darray[u8]&, path: darray[u8]&, manifest_digest: darray[u8]&, source_digest: darray[u8]&) -> dstr can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -138,14 +172,8 @@ module LocalLock:
 
         # Bind the emitted digest to the manifest used to traverse dependency edges.
         def verified_manifest_digest(manifest: darray[u8]&, traversed_digests: darray[u8]&, record_index: usize, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            digest_width: usize = 32.usize()
-            return false if record_index >= traversed_digests.count / digest_width
-            digest_start: usize = record_index * digest_width
             digest: mutable darray[u8] = []
-            return false if:
-                Integrity::sha256(manifest, &digest) != Integrity::DigestCode.Ok
-                not ByteText::range_equals(traversed_digests, digest_start, digest_start + digest_width, digest)
-            return Integrity::hex_digest(digest, out)
+            return record_index < traversed_digests.count / manifest_digest_bytes and Integrity::sha256(manifest, &digest) == Integrity::DigestCode.Ok and ByteText::range_equals(traversed_digests, record_index * manifest_digest_bytes, (record_index + 1.usize()) * manifest_digest_bytes, digest) and Integrity::hex_digest(digest, out)
 
         def queue_append_field(queue: mutable darray[u8]&, value: darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
             for index in 0..<value.count |queue, value|:
@@ -161,45 +189,44 @@ module LocalLock:
         def queue_field_at(queue: darray[u8]&, record_starts: darray[usize]&, record: usize, field: usize, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
             out.resize(0)
             return false if record >= record_starts.count or field >= 3.usize()
-            region cursor_scope:
-                cursor: mutable usize = record_starts[record]
-                for current_field in 0..<3 |queue, record_starts, record, field, current_field, cursor, out|:
-                    return false if cursor >= queue.count
-                    end: mutable usize = cursor
-                    while end < queue.count and queue[end] != 0 |queue, end|:
-                        end <- end + 1.usize()
-                    return false if end >= queue.count
-                    if current_field == field:
-                        ByteText::append_range(out, queue, cursor, end)
-                        return true
-                    cursor <- end + 1.usize()
-            return false
+            while true |queue, out, cursor: usize = record_starts[record], current_field: usize = 0.usize()|:
+                return false if cursor >= queue.count
+                end: usize = while end < queue.count and queue[end] != 0 |end: usize = cursor| -> end:
+                    end <- end + 1.usize()
+                return false if end >= queue.count
+                if current_field == field:
+                    ByteText::append_range(out, queue, cursor, end)
+                    return true
+                current_field <- current_field + 1.usize()
+                cursor <- end + 1.usize()
 
+        # The record named `wanted`, or `total` when there is none. Stores
+        # where a new record belongs in name order, or `total + 1` when the
+        # sorted records are inconsistent.
         def queue_name_record(queue: darray[u8]&, record_starts: darray[usize]&, sorted_records: darray[usize]&, total: usize, wanted: darray[u8]&, insertion_out: mutable usize&) -> usize can[Memory.Allocate, Abort.Panic]:
             insertion_out <- total + 1.usize()
             return total if sorted_records.count != total
-            lower: mutable usize = 0.usize()
-            region upper_scope:
-                upper: mutable usize = sorted_records.count
-                while lower < upper |queue, record_starts, sorted_records, wanted, lower, upper|:
-                    middle: usize = lower + (upper - lower) / 2.usize()
-                    record: usize = sorted_records[middle]
-                    return total if record >= record_starts.count
-                    candidate: mutable darray[u8] = []
-                    if not queue_field_at(queue, record_starts, record, 1, &candidate):
-                        return total
-                    if ByteText::less(candidate, wanted):
-                        lower <- middle + 1.usize()
-                    else:
-                        upper <- middle
-            insertion_out <- lower
-            return total if lower >= sorted_records.count
-            record: usize = sorted_records[lower]
-            if record >= record_starts.count:
-                insertion_out <- total + 1.usize()
-                return total
+            if name_lower_bound(queue, record_starts, sorted_records, wanted) is lower:
+                insertion_out <- lower
+                return total if lower >= sorted_records.count else matching_record(queue, record_starts, sorted_records[lower], wanted, total, insertion_out)
+            return total
+
+        # The first sorted position whose name is not less than `wanted`, or
+        # null when a sorted record cannot be read.
+        def name_lower_bound(queue: darray[u8]&, record_starts: darray[usize]&, sorted_records: darray[usize]&, wanted: darray[u8]&) -> usize? can[Memory.Allocate, Abort.Panic]:
+            while true |lower: usize = 0.usize(), upper: usize = sorted_records.count|:
+                return lower if lower >= upper
+                middle: usize = lower + (upper - lower) / 2.usize()
+                candidate: mutable darray[u8] = []
+                return null if sorted_records[middle] >= record_starts.count or not queue_field_at(queue, record_starts, sorted_records[middle], 1, &candidate)
+                if ByteText::less(candidate, wanted):
+                    lower <- middle + 1.usize()
+                else:
+                    upper <- middle
+
+        def matching_record(queue: darray[u8]&, record_starts: darray[usize]&, record: usize, wanted: darray[u8]&, total: usize, insertion_out: mutable usize&) -> usize can[Memory.Allocate, Abort.Panic]:
             candidate: mutable darray[u8] = []
-            if not queue_field_at(queue, record_starts, record, 1, &candidate):
+            if record >= record_starts.count or not queue_field_at(queue, record_starts, record, 1, &candidate):
                 insertion_out <- total + 1.usize()
                 return total
             return record if ByteText::equal(candidate, wanted) else total
@@ -212,62 +239,62 @@ module LocalLock:
 
         def queue_insert_sorted_record(sorted_records: mutable darray[usize]&, insertion: usize, record: usize) -> bool can[Memory.Allocate, Abort.Panic]:
             return false if insertion > sorted_records.count
-            previous_count: usize = sorted_records.count
-            sorted_records.resize(previous_count + 1.usize())
-            region cursor_scope:
-                cursor: mutable usize = previous_count
-                while cursor > insertion |sorted_records, cursor|:
-                    sorted_records[cursor] <- sorted_records[cursor - 1.usize()]
-                    cursor <- cursor - 1.usize()
+            sorted_records.resize(sorted_records.count + 1.usize())
+            while cursor > insertion |sorted_records, cursor: usize = sorted_records.count - 1.usize()|:
+                sorted_records[cursor] <- sorted_records[cursor - 1.usize()]
+                cursor <- cursor - 1.usize()
             sorted_records[insertion] <- record
             return true
 
         def append_local_dependency_records(raw: darray[u8]&, package_root: darray[u8]&, graph: mutable DependencyQueue&, parent: usize) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             dependency_start: usize = Json::root_value_offset(raw, "dependencies")
-            return true if dependency_start >= raw.count
-            dependency_end: usize = Json::object_end(raw, dependency_start)
-            return false if dependency_end <= dependency_start or dependency_end >= raw.count or raw[dependency_start] != 123
-            cursor: mutable usize = Json::skip_whitespace(raw, dependency_start + 1.usize(), dependency_end)
+            return dependency_start >= raw.count or append_dependency_object(raw, dependency_start, Json::object_end(raw, dependency_start), package_root, graph, parent)
+
+        # Queue every entry of the `dependencies` object `start..finish`.
+        def append_dependency_object(raw: darray[u8]&, start: usize, finish: usize, package_root: darray[u8]&, graph: mutable DependencyQueue&, parent: usize) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return false if finish <= start or finish >= raw.count or raw[start] != 123
             # The loop returns once the entries end exactly at the object close.
-            while true:
-                return true if cursor == dependency_end
+            while true |cursor: usize = Json::skip_whitespace(raw, start + 1.usize(), finish)|:
+                return true if cursor == finish
                 entry: mutable DependencyEntry::Span = DependencyEntry::Span{name_start: 0, name_end: 0, object_start: 0, object_end: 0}
-                return false if:
-                    graph.edge_count >= LocalBuildPlan::maximum_edges
-                    not DependencyEntry::read(raw, cursor, dependency_end, &entry)
+                return false if graph.edge_count >= LocalBuildPlan::maximum_edges or not DependencyEntry::read(raw, cursor, finish, &entry)
                 graph.edge_count <- graph.edge_count + 1.usize()
-                cursor <- DependencyEntry::next_start(raw, entry.object_end, dependency_end)
-                return false if cursor > dependency_end
-                child_root: mutable darray[u8] = []
-                return false if not dependency_root(raw, entry, package_root, &child_root)
-                child_name: mutable darray[u8] = []
-                child_version: mutable darray[u8] = []
-                return false if not:
-                    ProjectManifest::load_at(&child_root, &child_name, &child_version)
-                    ByteText::range_equals(raw, entry.name_start, entry.name_end, child_name)
-                insertion: mutable usize = 0.usize()
-                existing: usize = queue_name_record(graph.queue, graph.record_starts, graph.sorted_records, graph.total, child_name, &insertion)
-                return false if insertion > graph.sorted_records.count
-                if existing < graph.total:
-                    return false if not queued_record_matches(graph.queue, graph.record_starts, existing, child_root, child_version)
-                    graph.edges.push(existing) if parent < graph.total
-                    continue
-                return false if graph.total >= 4096.usize()
-                queue_append_record(&graph.queue, &graph.record_starts, &child_root, child_name, child_version)
-                return false if not queue_insert_sorted_record(&graph.sorted_records, insertion, graph.total)
-                graph.edges.push(graph.total) if parent < graph.total
-                graph.total <- graph.total + 1.usize()
+                cursor <- DependencyEntry::next_start(raw, entry.object_end, finish)
+                return false if cursor > finish or not add_dependency_entry(raw, entry, package_root, graph, parent)
+
+        # Load the package one entry names, require it to declare the entry's
+        # name, and queue it or link the record already queued.
+        def add_dependency_entry(raw: darray[u8]&, entry: DependencyEntry::Span&, package_root: darray[u8]&, graph: mutable DependencyQueue&, parent: usize) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            child: mutable QueuedPackage = empty_queued_package()
+            return dependency_root(raw, entry, package_root, &child.path) and ProjectManifest::load_at(child.path, &child.name, &child.version) and ByteText::range_equals(raw, entry.name_start, entry.name_end, child.name) and queue_dependency(child, graph, parent)
+
+        def queue_dependency(child: QueuedPackage&, graph: mutable DependencyQueue&, parent: usize) -> bool can[Memory.Allocate, Abort.Panic]:
+            insertion: mutable usize = 0.usize()
+            existing: usize = queue_name_record(graph.queue, graph.record_starts, graph.sorted_records, graph.total, child.name, &insertion)
+            return insertion <= graph.sorted_records.count and (link_queued(child, graph, parent, existing) if existing < graph.total else enqueue_child(child, graph, parent, insertion))
+
+        # A package already queued must have the same root and version.
+        def link_queued(child: QueuedPackage&, graph: mutable DependencyQueue&, parent: usize, existing: usize) -> bool can[Memory.Allocate, Abort.Panic]:
+            return false if not queued_record_matches(graph.queue, graph.record_starts, existing, child.path, child.version)
+            graph.edges.push(existing) if parent < graph.total
+            return true
+
+        def enqueue_child(child: QueuedPackage&, graph: mutable DependencyQueue&, parent: usize, insertion: usize) -> bool can[Memory.Allocate, Abort.Panic]:
+            return false if graph.total >= 4096.usize()
+            queue_append_record(&graph.queue, &graph.record_starts, child.path, child.name, child.version)
+            return false if not queue_insert_sorted_record(&graph.sorted_records, insertion, graph.total)
+            graph.edges.push(graph.total) if parent < graph.total
+            graph.total <- graph.total + 1.usize()
+            return true
 
         # Resolve the `path` of one dependency entry against `package_root`
         # into a normalized relative package root.
         def dependency_root(raw: darray[u8]&, entry: DependencyEntry::Span&, package_root: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             dependency_path: mutable darray[u8] = []
-            return false if not:
-                Json::object_string_value(raw, entry.object_start, entry.object_end, "path", &dependency_path)
-                Manifest::valid_dependency_path(dependency_path)
+            return Json::object_string_value(raw, entry.object_start, entry.object_end, "path", &dependency_path) and Manifest::valid_dependency_path(dependency_path) and ProjectFiles::normalize_relative_path(joined_dependency_root(package_root, dependency_path), out)
+
+        # `package_root` joined with `dependency_path`; the current directory
+        # contributes no prefix.
+        def joined_dependency_root(package_root: darray[u8]&, dependency_path: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
             parent_root: darray[u8] = [] if package_root.count == 0.usize() or (package_root.count == 1.usize() and package_root[0] == 46) else [package_root[index] for index in 0..<package_root.count]
-            joined_root: mutable darray[u8] = []
-            region terminated_path_scope:
-                terminated_path: darray[u8] = ProjectFiles::with_null_terminator(&dependency_path)
-                ProjectFiles::path_join_into(&parent_root, ((&terminated_path[0]).cast[cstr] can Unsafe.PointerCast), &joined_root)
-            return ProjectFiles::normalize_relative_path(&joined_root, out)
+            return ProjectFiles::path_join_bytes(parent_root, dependency_path)
