@@ -9,6 +9,11 @@ module NativeStagingTree:
     public:
         const maximum_archive_extracted_nodes: usize = 4096.usize()
 
+        # Open the parent directory of the archive entry `name` below `root`,
+        # creating missing components when `create_missing` is set. Fills
+        # `copy_out` with a terminated copy of `name` and `leaf_offset` with
+        # the start of its last component. Returns the parent descriptor or
+        # a negative errno.
         def open_archive_parent(root: i64, name: darray[u8]&, copy_out: mutable darray[u8]&, leaf_offset: mutable usize&, create_missing: bool, created_directories: mutable darray[u8]&, extracted_nodes: mutable usize&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             copy_out.resize(0)
             ByteText::append(copy_out, name)
@@ -17,45 +22,8 @@ module NativeStagingTree:
             leaf_offset <- for index in 0..<name.count |slash: usize = 0.usize()| -> slash:
                 slash <- index + 1.usize() if name[index] == 47
             return -22 if leaf_offset >= name.count
-            directory: mutable i64 = native_dup(root)
-            return NativeErrors::negative_errno() if directory < 0
-            while start < leaf_offset |start: usize = 0.usize()|:
-                finish: mutable usize = start
-                while finish < leaf_offset and copy_out[finish] != 47:
-                    finish <- finish + 1.usize()
-                copy_out[finish] <- 0
-                part: cstr = (&copy_out[start]).cast[cstr] can Unsafe.PointerCast
-                next: mutable i64 = PlatformNative::open_package_directory_component(directory, part)
-                created: mutable bool = false
-                if next == -2 and create_missing:
-                    # Bound the full extracted filesystem tree, including
-                    # implicit directories, before an archive can amplify a
-                    # small set of tar records into thousands of mkdir/fsync
-                    # operations. The extractor rolls back on this error.
-                    return PlatformNative::close_error(directory, -75) if extracted_nodes >= maximum_archive_extracted_nodes
-                    mkdir_status: i64 =
-                        mkdir_part: darray[u8] = component_name(name, start, finish)
-                        mkdir_name: cstr = (&mkdir_part[0]).cast[cstr] can Unsafe.PointerCast
-                        native_mkdirat(directory, mkdir_name, 493)
-                    region mkdir_errno_scope:
-                        mkdir_errno: i64 = NativeErrors::current_errno()
-                        if mkdir_status != 0 and mkdir_errno != 17:
-                            return PlatformNative::close_error(directory, NativeErrors::negative_errno())
-                    created <- mkdir_status == 0
-                    next <- PlatformNative::open_package_directory_component(directory, part)
-                return open_component_failure(directory, next, created, name, start, finish) if next < 0
-                if created:
-                    for index in 0..<finish |created_directories, name|:
-                        created_directories.push(name[index])
-                    created_directories.push(0)
-                    extracted_nodes <- extracted_nodes + 1.usize()
-                if native_fsync(directory) != 0:
-                    errno_value: i64 = NativeErrors::negative_errno()
-                    return PlatformNative::close_two_error(directory, next, errno_value)
-                return PlatformNative::close_error(next, -5) if native_close(directory) != 0
-                directory <- next
-                start <- finish + 1.usize()
-            directory
+            directory: i64 = native_dup(root)
+            NativeErrors::negative_errno() if directory < 0 else walk_components(directory, name, copy_out, leaf_offset, create_missing, created_directories, extracted_nodes)
 
         # If this call created the directory, do not leave an untracked
         # staging entry behind when reopening it fails. AT_REMOVEDIR only
@@ -67,10 +35,8 @@ module NativeStagingTree:
                 cleanup_part: darray[u8] = component_name(name, start, finish)
                 cleanup_name: cstr = (&cleanup_part[0]).cast[cstr] can Unsafe.PointerCast
                 native_unlinkat(directory, cleanup_name, at_remove_directory) if created else 0
-            region close_status_scope:
-                close_status: i64 = native_close(directory)
-                return -5 if cleanup_status != 0 or close_status != 0
-            open_errno
+            close_status: i64 = native_close(directory)
+            -5 if cleanup_status != 0 or close_status != 0 else open_errno
 
         # The path component `name[start..<finish]` as a terminated string.
         def component_name(name: darray[u8]&, start: usize, finish: usize) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
@@ -79,74 +45,120 @@ module NativeStagingTree:
             component <- component.push(0)
             component
 
+        # Remove each NUL-terminated file path in `seen`. A missing file is
+        # not an error; every other failure is reported after all removals.
         def remove_files(root: i64, seen: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            cleanup_ok: mutable bool = true
-            ignored_node_count: mutable usize = 0.usize()
-            while cursor < seen.count |cursor: usize = 0.usize()|:
-                end: mutable usize = cursor
-                while end < seen.count and seen[end] != 0:
-                    end <- end + 1.usize()
-                name: mutable darray[u8] = []
-                for index in cursor..<end |name, seen|:
-                    name <- name.push(seen[index])
-                copy: mutable darray[u8] = []
-                leaf_offset: mutable usize = 0.usize()
-                parent: i64 =
-                    empty_directories: mutable darray[u8] = []
-                    open_archive_parent(root, name, &copy, &leaf_offset, false, &empty_directories, &ignored_node_count)
-                if parent >= 0:
-                    removed: i64 =
-                        leaf: cstr = (&copy[leaf_offset]).cast[cstr] can Unsafe.PointerCast
-                        native_unlinkat(parent, leaf, 0)
-                    region remove_errno_scope:
-                        remove_errno: i64 = NativeErrors::current_errno()
-                        if removed == 0:
-                            cleanup_ok <- false if native_fsync(parent) != 0
-                        elif remove_errno != 2:
-                            cleanup_ok <- false
-                    cleanup_ok <- false if native_close(parent) != 0
-                else:
-                    cleanup_ok <- false
-                cursor <- end + 1.usize()
-            cleanup_ok
+            while cursor < seen.count |cursor: usize = 0.usize(), cleanup_ok: bool = true, ignored_node_count: usize = 0.usize()| -> cleanup_ok:
+                name: darray[u8] = record_at(seen, cursor)
+                cleanup_ok <- removed_leaf(root, name, &ignored_node_count, 0, false) and cleanup_ok
+                cursor <- cursor + name.count + 1.usize()
 
+        # Remove the created directories in reverse creation order, so each
+        # directory is empty of its created children before it is removed.
         def remove_directories(root: i64, created_directories: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             offsets: mutable darray[usize] = []
-            ignored_node_count: mutable usize = 0.usize()
-            while cursor < created_directories.count |cursor: usize = 0.usize()|:
-                offsets <- offsets.push(cursor)
-                finish: mutable usize = cursor
-                while finish < created_directories.count and created_directories[finish] != 0 |created_directories, finish|:
-                    finish <- finish + 1.usize()
-                return false if finish == created_directories.count
-                cursor <- finish + 1.usize()
-            cleanup_ok: mutable bool = true
-            for step in 0..<offsets.count |offsets, created_directories, root, cleanup_ok, step|:
-                record: usize = offsets[offsets.count - 1.usize() - step]
-                finish: mutable usize = record
-                while finish < created_directories.count and created_directories[finish] != 0 |created_directories, finish|:
-                    finish <- finish + 1.usize()
-                name: mutable darray[u8] = []
-                for index in record..<finish |name, created_directories|:
-                    name <- name.push(created_directories[index])
-                copy: mutable darray[u8] = []
-                leaf_offset: mutable usize = 0.usize()
-                parent: i64 =
-                    empty_directories: mutable darray[u8] = []
-                    open_archive_parent(root, name, &copy, &leaf_offset, false, &empty_directories, &ignored_node_count)
-                if parent == -2:
-                    continue
-                if parent < 0:
-                    cleanup_ok <- false
-                    continue
-                removed: i64 =
-                    leaf: cstr = (&copy[leaf_offset]).cast[cstr] can Unsafe.PointerCast
-                    native_unlinkat(parent, leaf, at_remove_directory)
-                region remove_errno_scope:
-                    remove_errno: i64 = NativeErrors::current_errno()
-                    if removed == 0:
-                        cleanup_ok <- false if native_fsync(parent) != 0
-                    elif remove_errno != 2:
-                        cleanup_ok <- false
-                cleanup_ok <- false if native_close(parent) != 0
-            cleanup_ok
+            record_offsets(created_directories, &offsets) and removed_directories(root, created_directories, offsets)
+
+    private:
+        # The descriptor of the directory reached so far and the start of the
+        # next path component.
+        struct ComponentWalk:
+            directory: i64
+            start: usize
+
+        # Enter each directory component before `leaf_offset`, closing every
+        # directory once its child is open.
+        def walk_components(root_directory: i64, name: darray[u8]&, copy_out: mutable darray[u8]&, leaf_offset: usize, create_missing: bool, created_directories: mutable darray[u8]&, extracted_nodes: mutable usize&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            walked: ComponentWalk = while position.start < leaf_offset |copy_out, created_directories, extracted_nodes, position: ComponentWalk = ComponentWalk{directory: root_directory, start: 0.usize()}| -> position:
+                position <- next_component(position, name, copy_out, leaf_offset, create_missing, created_directories, extracted_nodes)
+                return position.directory if position.directory < 0
+            walked.directory
+
+        def next_component(position: ComponentWalk, name: darray[u8]&, copy_out: mutable darray[u8]&, leaf_offset: usize, create_missing: bool, created_directories: mutable darray[u8]&, extracted_nodes: mutable usize&) -> ComponentWalk can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            finish: usize = component_end(copy_out, position.start, leaf_offset)
+            copy_out[finish] <- 0
+            ComponentWalk{directory: entered_component(position.directory, name, copy_out, position.start, finish, create_missing, created_directories, extracted_nodes), start: finish + 1.usize()}
+
+        def component_end(path: darray[u8]&, start: usize, limit: usize) -> usize:
+            while finish < limit and path[finish] != 47 |finish: usize = start| -> finish:
+                finish <- finish + 1.usize()
+
+        # Open the component `copy[start..<finish]` below `directory`,
+        # creating it when it is missing and `create_missing` is set.
+        def entered_component(directory: i64, name: darray[u8]&, copy: darray[u8]&, start: usize, finish: usize, create_missing: bool, created_directories: mutable darray[u8]&, extracted_nodes: mutable usize&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            part: cstr = (&copy[start]).cast[cstr] can Unsafe.PointerCast
+            opened: i64 = PlatformNative::open_package_directory_component(directory, part)
+            created_component(directory, part, name, start, finish, created_directories, extracted_nodes) if opened == -2 and create_missing else opened_component(directory, opened, false, name, start, finish, created_directories, extracted_nodes)
+
+        # Bound the full extracted filesystem tree, including implicit
+        # directories, before an archive can amplify a small set of tar
+        # records into thousands of mkdir/fsync operations. The extractor
+        # rolls back on this error.
+        def created_component(directory: i64, part: cstr, name: darray[u8]&, start: usize, finish: usize, created_directories: mutable darray[u8]&, extracted_nodes: mutable usize&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return PlatformNative::close_error(directory, -75) if extracted_nodes >= maximum_archive_extracted_nodes
+            mkdir_status: i64 =
+                mkdir_part: darray[u8] = component_name(name, start, finish)
+                mkdir_name: cstr = (&mkdir_part[0]).cast[cstr] can Unsafe.PointerCast
+                native_mkdirat(directory, mkdir_name, 493)
+            mkdir_errno: i64 = NativeErrors::current_errno()
+            PlatformNative::close_error(directory, NativeErrors::negative_errno()) if mkdir_status != 0 and mkdir_errno != 17 else opened_component(directory, PlatformNative::open_package_directory_component(directory, part), mkdir_status == 0, name, start, finish, created_directories, extracted_nodes)
+
+        # Record a created directory, make the parent durable, and hand the
+        # child descriptor back after closing the parent.
+        def opened_component(directory: i64, next: i64, created: bool, name: darray[u8]&, start: usize, finish: usize, created_directories: mutable darray[u8]&, extracted_nodes: mutable usize&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return open_component_failure(directory, next, created, name, start, finish) if next < 0
+            record_created_directory(name, finish, created_directories, extracted_nodes) if created
+            synced_and_closed(directory, next)
+
+        def record_created_directory(name: darray[u8]&, finish: usize, created_directories: mutable darray[u8]&, extracted_nodes: mutable usize&) -> void can[Memory.Allocate, Abort.Panic]:
+            ByteText::append_range(created_directories, name, 0.usize(), finish)
+            created_directories.push(0)
+            extracted_nodes <- extracted_nodes + 1.usize()
+
+        def synced_and_closed(directory: i64, next: i64) -> i64:
+            return PlatformNative::close_two_error(directory, next, NativeErrors::negative_errno()) if native_fsync(directory) != 0
+            PlatformNative::close_error(next, -5) if native_close(directory) != 0 else next
+
+        # ---------- cleanup -------------------------------------------------------------------
+
+        # The offset of each NUL-terminated record; false for an unterminated one.
+        def record_offsets(records: darray[u8]&, offsets: mutable darray[usize]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            while cursor < records.count |offsets, cursor: usize = 0.usize()|:
+                offsets.push(cursor)
+                cursor <- record_end(records, cursor) + 1.usize()
+                return false if cursor > records.count
+            true
+
+        def removed_directories(root: i64, created_directories: darray[u8]&, offsets: darray[usize]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            for step in 0..<offsets.count |cleanup_ok: bool = true, ignored_node_count: usize = 0.usize()| -> cleanup_ok:
+                cleanup_ok <- removed_leaf(root, record_at(created_directories, offsets[offsets.count - 1.usize() - step]), &ignored_node_count, at_remove_directory, true) and cleanup_ok
+
+        def record_end(records: darray[u8]&, start: usize) -> usize:
+            while position < records.count and records[position] != 0 |position: usize = start| -> position:
+                position <- position + 1.usize()
+
+        def record_at(records: darray[u8]&, start: usize) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
+            [records[index] for index in start..<record_end(records, start)]
+
+        # Remove the leaf of `name` with `unlink_flags`. A missing parent is
+        # acceptable only when `missing_parent_ok` is set.
+        def removed_leaf(root: i64, name: darray[u8]&, ignored_node_count: mutable usize&, unlink_flags: i64, missing_parent_ok: bool) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            copy: mutable darray[u8] = []
+            leaf_offset: mutable usize = 0.usize()
+            parent: i64 = open_existing_parent(root, name, &copy, &leaf_offset, ignored_node_count)
+            missing_parent_ok if parent == -2 else parent >= 0 and unlinked_leaf(parent, copy, leaf_offset, unlink_flags)
+
+        # Open the parent of `name` without creating any directory.
+        def open_existing_parent(root: i64, name: darray[u8]&, copy: mutable darray[u8]&, leaf_offset: mutable usize&, ignored_node_count: mutable usize&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            no_created_directories: mutable darray[u8] = []
+            open_archive_parent(root, name, copy, leaf_offset, false, &no_created_directories, ignored_node_count)
+
+        def unlinked_leaf(parent: i64, copy: darray[u8]&, leaf_offset: usize, unlink_flags: i64) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            removed: i64 = native_unlinkat(parent, ((&copy[leaf_offset]).cast[cstr] can Unsafe.PointerCast), unlink_flags)
+            closed_after_removal(parent, removed, NativeErrors::current_errno())
+
+        # A removed leaf needs a durable parent; a missing leaf is fine. The
+        # parent is closed either way.
+        def closed_after_removal(parent: i64, removed: i64, remove_errno: i64) -> bool:
+            removal_ok: bool = native_fsync(parent) == 0 if removed == 0 else remove_errno == 2
+            native_close(parent) == 0 and removal_ok
