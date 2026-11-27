@@ -149,32 +149,26 @@ module UstarFields:
 
         def safe_relative_path(name: darray[u8]&) -> bool:
             return false if name.count == 0.usize() or name.count > 4096.usize()
-            segment_start: mutable usize = 0.usize()
-            for index in 0..=name.count |name, segment_start|:
+            # Reject control bytes, backslashes, `:`, and empty, `.` or `..` segments.
+            for index in 0..=name.count |segment_start: usize = 0.usize(), safe: bool = true| -> safe:
                 if index < name.count and name[index] != 47:
-                    return false if name[index] < 32 or name[index] >= 127 or name[index] == 92 or name[index] == 58
-                    continue
-                region segment_length_scope:
-                    segment_length: usize = index - segment_start
-                    return false if segment_length == 0.usize() or segment_length == 1.usize() and name[segment_start] == 46 or segment_length == 2.usize() and name[segment_start] == 46 and name[segment_start + 1.usize()] == 46
-                segment_start <- index + 1.usize()
-            true
+                    break false if name[index] < 32 or name[index] >= 127 or name[index] == 92 or name[index] == 58
+                else:
+                    break false if index == segment_start or (index - segment_start == 1.usize() and name[segment_start] == 46) or (index - segment_start == 2.usize() and name[segment_start] == 46 and name[segment_start + 1.usize()] == 46)
+                    segment_start <- index + 1.usize()
 
         def archive_name_seen(seen: darray[u8]&, wanted: darray[u8]&) -> bool:
-            while cursor < seen.count |cursor: usize = 0.usize()|:
-                end: usize =
-                    while end < seen.count and seen[end] != 0 |end: usize = cursor| -> end:
-                        end <- end + 1.usize()
-                common: usize = end - cursor if end - cursor < wanted.count else wanted.count
-                region matches_scope:
-                    matches: mutable bool = true
-                    for index in 0..<common |seen, wanted, cursor, matches|:
-                        left: mutable u8 = seen[cursor + index]
-                        right: mutable u8 = wanted[index]
-                        left <- left + 32 if left >= 65 and left <= 90
-                        right <- right + 32 if right >= 65 and right <= 90
-                        matches <- false if left != right
-                    if matches:
-                        return true if end - cursor == wanted.count or common < wanted.count and wanted[common] == 47 or common < end - cursor and seen[cursor + common] == 47
+            # `seen` holds NUL-separated names; compare each ASCII case-insensitively.
+            while cursor < seen.count |cursor: usize = 0.usize(), end: usize = 0.usize(), common: usize = 0.usize(), matches: bool = false, found: bool = false| -> found:
+                end <- while position < seen.count and seen[position] != 0 |position: usize = cursor| -> position:
+                    position <- position + 1.usize()
+                common <- end - cursor if end - cursor < wanted.count else wanted.count
+                matches <- for index in 0..<common |equal: bool = true| -> equal:
+                    left: mutable u8 = seen[cursor + index]
+                    right: mutable u8 = wanted[index]
+                    left <- left + 32 if left >= 65 and left <= 90
+                    right <- right + 32 if right >= 65 and right <= 90
+                    break false if left != right
+                # A match is the same name or one is a directory prefix of the other.
+                break true if matches and (end - cursor == wanted.count or common < wanted.count and wanted[common] == 47 or common < end - cursor and seen[cursor + common] == 47)
                 cursor <- end + 1.usize()
-            false
