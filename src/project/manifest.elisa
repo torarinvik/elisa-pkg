@@ -17,34 +17,7 @@ module ProjectManifest:
                 return false if raw[index] == 0
             object_start: usize = Json::root_start(raw)
             object_finish: usize = Json::root_object_end(raw, object_start)
-            region schema_version_scope:
-                schema_version: mutable u64 = 0.u64()
-                return false if not:
-                    Json::object_unsigned_value(raw, object_start, object_finish, "schema-version", &schema_version)
-                    schema_version == 1.u64()
-                    Manifest::valid_optional_package_strings(raw)
-                    Manifest::valid_pattern_array(raw, "include")
-                    Manifest::valid_pattern_array(raw, "exclude")
-                    valid_target_objects(raw, root)
-                    Manifest::valid_dependency_map(raw, "dependencies")
-                    Manifest::valid_dependency_map(raw, "dev-dependencies")
-                    dependency_map_empty(raw, "dev-dependencies")
-            name: mutable darray[u8] = []
-            version: mutable darray[u8] = []
-            package_start: mutable usize = 0.usize()
-            region package_end_scope:
-                package_end: mutable usize = 0.usize()
-                return false if not:
-                    Json::object_value_span(raw, object_start, object_finish, "package", &package_start, &package_end)
-                    Json::object_string_value(raw, package_start, package_end, "name", &name)
-                    Json::object_string_value(raw, package_start, package_end, "version", &version)
-                    PackageIdentity::valid_name(name)
-                    PackageIdentity::valid_version(version)
-            for index in 0..<name.count |name_out, name|:
-                name_out.push(name[index])
-            for index in 0..<version.count |version_out, version|:
-                version_out.push(version[index])
-            true
+            valid_schema(raw, root, object_start, object_finish) and read_package_identity(raw, object_start, object_finish, name_out, version_out)
 
         def validate(raw: darray[u8]&, name_out: mutable darray[u8]&, version_out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             root: mutable darray[u8] = [46]
@@ -53,102 +26,130 @@ module ProjectManifest:
         def load_at(root: darray[u8]&, name_out: mutable darray[u8]&, version_out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             name_out.resize(0)
             version_out.resize(0)
-            manifest_path: mutable darray[u8] = []
-            ProjectFiles::path_join_into(root, "elisapkg.json", &manifest_path)
-            region raw_scope:
-                raw: mutable darray[u8] = []
-                return false if not:
-                    Platform::read_bounded_file(manifest_path, Json::maximum_document_bytes, &raw)
-                    validate_at(raw, root, name_out, version_out)
-            true
+            raw: mutable darray[u8] = []
+            Platform::read_bounded_file(ProjectFiles::path_join(root, "elisapkg.json"), Json::maximum_document_bytes, &raw) and validate_at(raw, root, name_out, version_out)
 
     private:
-        def target_file_is_valid(root: darray[u8]&, canonical_root: darray[u8]&, entry: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            entry_path: mutable darray[u8] = []
-            ProjectFiles::path_join_bytes_into(root, entry, &entry_path)
-            region canonical_entry_scope:
-                canonical_entry: mutable darray[u8] = []
-                return false if not ProjectFiles::resolve_entry_beneath_canonical_root(canonical_root, &entry_path, &canonical_entry)
-            entry_path_c: mutable darray[u8] = []
-            entry_path_c <- ProjectFiles::with_null_terminator(&entry_path)
-            region entry_path_name_scope:
-                entry_path_name: cstr = (&entry_path_c[0]).cast[cstr] can Unsafe.PointerCast
-                return false if Platform::package_file_size(entry_path_name) < 0
+        # The packed target names seen so far and their open-addressing table.
+        struct TargetNames:
+            names: mutable darray[u8]
+            offsets: mutable darray[usize]
+
+        # The cursor returned for a target object that does not verify.
+        const malformed_target: usize = 0.usize()
+
+        # Outcomes of probing one slot of the target-name table.
+        const slot_occupied: i64 = 0
+        const slot_registered: i64 = 1
+        const slot_duplicate: i64 = 2
+
+        def valid_schema(raw: darray[u8]&, root: darray[u8]&, object_start: usize, object_finish: usize) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            schema_version: mutable u64 = 0.u64()
+            Json::object_unsigned_value(raw, object_start, object_finish, "schema-version", &schema_version) and schema_version == 1.u64() and Manifest::valid_optional_package_strings(raw) and Manifest::valid_pattern_array(raw, "include") and Manifest::valid_pattern_array(raw, "exclude") and valid_target_objects(raw, root) and Manifest::valid_dependency_map(raw, "dependencies") and Manifest::valid_dependency_map(raw, "dev-dependencies") and dependency_map_empty(raw, "dev-dependencies")
+
+        def read_package_identity(raw: darray[u8]&, object_start: usize, object_finish: usize, name_out: mutable darray[u8]&, version_out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            name: mutable darray[u8] = []
+            version: mutable darray[u8] = []
+            package_start: mutable usize = 0.usize()
+            package_end: mutable usize = 0.usize()
+            Json::object_value_span(raw, object_start, object_finish, "package", &package_start, &package_end) and Json::object_string_value(raw, package_start, package_end, "name", &name) and Json::object_string_value(raw, package_start, package_end, "version", &version) and PackageIdentity::valid_name(name) and PackageIdentity::valid_version(version) and published_identity(name, version, name_out, version_out)
+
+        def published_identity(name: darray[u8]&, version: darray[u8]&, name_out: mutable darray[u8]&, version_out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            ByteText::append(name_out, name)
+            ByteText::append(version_out, version)
             true
 
+        def target_file_is_valid(root: darray[u8]&, canonical_root: darray[u8]&, entry: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            entry_path: darray[u8] = ProjectFiles::path_join_bytes(root, entry)
+            canonical_entry: mutable darray[u8] = []
+            ProjectFiles::resolve_entry_beneath_canonical_root(canonical_root, entry_path, &canonical_entry) and file_exists(entry_path)
+
+        def file_exists(path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            terminated_path: darray[u8] = ProjectFiles::with_null_terminator(path)
+            Platform::package_file_size((&terminated_path[0]).cast[cstr] can Unsafe.PointerCast) >= 0
+
+        # The targets array holds at least one target, each with a unique
+        # name, a valid kind, and an entry file beneath the project root.
         def valid_target_objects(raw: darray[u8]&, root: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            targets_start: usize = Json::root_value_offset(raw, "targets")
-            return false if targets_start >= raw.count or raw[targets_start] != 91
-            targets_end: usize = Json::array_end(raw, targets_start)
-            return false if targets_end <= targets_start or targets_end >= raw.count
+            targets: ManifestTargets::TargetsArray = ManifestTargets::targets_array(raw)
             canonical_root: mutable darray[u8] = []
-            return false if not ProjectFiles::canonical_existing_path(root, &canonical_root)
-            seen: mutable darray[u8] = []
-            name_offsets: mutable darray[usize] = []
-            name_offsets <- name_offsets.resize(2.usize() * ManifestTargets::maximum_targets + 1.usize())
-            found: mutable usize = 0.usize()
-            cursor: mutable usize = Json::skip_whitespace(raw, targets_start + 1.usize(), targets_end)
-            while cursor < targets_end |raw, root, canonical_root, seen, name_offsets, found, cursor, targets_end|:
+            ManifestTargets::valid_targets_array(raw, targets) and ProjectFiles::canonical_existing_path(root, &canonical_root) and valid_targets_in(raw, root, canonical_root, targets)
+
+        def valid_targets_in(raw: darray[u8]&, root: darray[u8]&, canonical_root: darray[u8]&, targets: ManifestTargets::TargetsArray&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            while cursor < targets.finish |cursor: usize = Json::skip_whitespace(raw, targets.start + 1.usize(), targets.finish), found: usize = 0.usize(), names: TargetNames = new_target_names()|:
                 return false if found >= ManifestTargets::maximum_targets or raw[cursor] != 123
-                object_end: usize = Json::object_end(raw, cursor)
-                return false if:
-                    object_end <= cursor or object_end >= targets_end
-                    not SchemaFields::valid(raw, cursor, object_end, SchemaFields::Kind.ManifestTarget)
-                region target_name_scope:
-                    target_name: mutable darray[u8] = []
-                    return false if not:
-                        Json::object_string_value(raw, cursor, object_end, "name", &target_name)
-                        PackageIdentity::valid_name(target_name)
-                        register_target_name(target_name, &seen, &name_offsets)
-                region target_kind_scope:
-                    target_kind: mutable darray[u8] = []
-                    return false if not:
-                        Json::object_string_value(raw, cursor, object_end, "kind", &target_kind)
-                        ManifestTargets::valid_kind(target_kind)
-                region target_entry_scope:
-                    target_entry: mutable darray[u8] = []
-                    return false if not:
-                        Json::object_string_value(raw, cursor, object_end, "entry", &target_entry)
-                        Manifest::is_safe_relative_entry(target_entry)
-                        target_file_is_valid(root, canonical_root, target_entry)
+                cursor <- validated_target_end(raw, root, canonical_root, cursor, targets.finish, &names)
+                return false if cursor == malformed_target
                 found <- found + 1.usize()
-                cursor <- Json::skip_whitespace(raw, object_end + 1.usize(), targets_end)
-                return true if cursor == targets_end
+                cursor <- Json::skip_whitespace(raw, cursor, targets.finish)
+                return true if cursor == targets.finish
                 return false if raw[cursor] != 44
-                cursor <- Json::skip_whitespace(raw, cursor + 1.usize(), targets_end)
+                cursor <- Json::skip_whitespace(raw, cursor + 1.usize(), targets.finish)
             false
+
+        def new_target_names() -> TargetNames can[Memory.Allocate, Abort.Panic]:
+            offsets: darray[usize] = [0.usize() for index in 0..<(2.usize() * ManifestTargets::maximum_targets + 1.usize())]
+            TargetNames{names: [], offsets: offsets}
+
+        # Check the target object at `object_start`. Returns the position
+        # after it, or `malformed_target`.
+        def validated_target_end(raw: darray[u8]&, root: darray[u8]&, canonical_root: darray[u8]&, object_start: usize, targets_end: usize, names: mutable TargetNames&) -> usize can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            object_end: usize = Json::object_end(raw, object_start)
+            malformed_target if object_end <= object_start or object_end >= targets_end or not valid_target(raw, root, canonical_root, object_start, object_end, names) else object_end + 1.usize()
+
+        def valid_target(raw: darray[u8]&, root: darray[u8]&, canonical_root: darray[u8]&, object_start: usize, object_end: usize, names: mutable TargetNames&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            SchemaFields::valid(raw, object_start, object_end, SchemaFields::Kind.ManifestTarget) and valid_target_name(raw, object_start, object_end, names) and valid_target_kind(raw, object_start, object_end) and valid_target_entry(raw, object_start, object_end, root, canonical_root)
+
+        def valid_target_name(raw: darray[u8]&, object_start: usize, object_end: usize, names: mutable TargetNames&) -> bool can[Memory.Allocate, Abort.Panic]:
+            target_name: mutable darray[u8] = []
+            Json::object_string_value(raw, object_start, object_end, "name", &target_name) and PackageIdentity::valid_name(target_name) and register_target_name(target_name, &names.names, &names.offsets)
+
+        def valid_target_kind(raw: darray[u8]&, object_start: usize, object_end: usize) -> bool can[Memory.Allocate, Abort.Panic]:
+            target_kind: mutable darray[u8] = []
+            Json::object_string_value(raw, object_start, object_end, "kind", &target_kind) and ManifestTargets::valid_kind(target_kind)
+
+        def valid_target_entry(raw: darray[u8]&, object_start: usize, object_end: usize, root: darray[u8]&, canonical_root: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            target_entry: mutable darray[u8] = []
+            Json::object_string_value(raw, object_start, object_end, "entry", &target_entry) and Manifest::is_safe_relative_entry(target_entry) and target_file_is_valid(root, canonical_root, target_entry)
 
         # Each occupied slot stores a one-based offset into the packed names.
         # Compare the full name on collisions before rejecting a duplicate.
         def register_target_name(name: darray[u8]&, names: mutable darray[u8]&, offsets: mutable darray[usize]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            slot: mutable usize =
-                hash: mutable u32 = 2166136261.u32()
-                for index in 0..<name.count |hash, name|:
-                    hash <- (hash ^ name[index].u32()) * 16777619.u32()
-                hash.usize() % offsets.count
-            for attempt in 0..<offsets.count |slot, offsets, names, name|:
-                stored: usize = offsets[slot]
-                if stored == 0.usize():
-                    offsets[slot] <- names.count + 1.usize()
-                    ByteText::append(names, name)
-                    names.push(0)
-                    return true
-                start: usize = stored - 1.usize()
-                region finish_scope:
-                    finish: mutable usize = start
-                    while names[finish] != 0 |names, finish|:
-                        finish <- finish + 1.usize()
-                    return false if ByteText::range_equals(names, start, finish, name)
+            for attempt in 0..<offsets.count |offsets, names, slot: usize = name_hash(name).usize() % offsets.count|:
+                outcome: i64 = probe_slot(name, names, offsets, slot)
                 slot <- (slot + 1.usize()) % offsets.count
+                return (outcome == slot_registered) if outcome != slot_occupied
             false
+
+        # The 32-bit FNV-1a hash of `name`.
+        def name_hash(name: darray[u8]&) -> u32:
+            for index in 0..<name.count |hash: u32 = 2166136261.u32()| -> hash:
+                hash <- (hash ^ name[index].u32()) * 16777619.u32()
+
+        def probe_slot(name: darray[u8]&, names: mutable darray[u8]&, offsets: mutable darray[usize]&, slot: usize) -> i64 can[Memory.Allocate, Abort.Panic]:
+            stored: usize = offsets[slot]
+            registered_at(name, names, offsets, slot) if stored == 0.usize() else slot_duplicate if stored_name_equals(names, stored - 1.usize(), name) else slot_occupied
+
+        def registered_at(name: darray[u8]&, names: mutable darray[u8]&, offsets: mutable darray[usize]&, slot: usize) -> i64 can[Memory.Allocate, Abort.Panic]:
+            offsets[slot] <- names.count + 1.usize()
+            ByteText::append(names, name)
+            names.push(0)
+            slot_registered
+
+        def stored_name_equals(names: darray[u8]&, start: usize, name: darray[u8]&) -> bool:
+            ByteText::range_equals(names, start, stored_name_end(names, start), name)
+
+        def stored_name_end(names: darray[u8]&, start: usize) -> usize:
+            while names[finish] != 0 |finish: usize = start| -> finish:
+                finish <- finish + 1.usize()
 
         def dependency_map_empty(raw: darray[u8]&, wanted: cstr) -> bool:
             start: usize = Json::root_value_offset(raw, wanted)
             return true if start >= raw.count
-            region finish_scope:
-                finish: usize = Json::object_end(raw, start)
-                return false if finish <= start or finish >= raw.count
-                for index in (start + 1.usize())..<finish |raw|:
-                    byte: u8 = raw[index]
-                    return false if byte != 32 and byte != 9 and byte != 10 and byte != 13
+            finish: usize = Json::object_end(raw, start)
+            finish > start and finish < raw.count and only_whitespace(raw, start + 1.usize(), finish)
+
+        def only_whitespace(raw: darray[u8]&, start: usize, finish: usize) -> bool:
+            for index in start..<finish |raw|:
+                return false if not Json::is_whitespace(raw[index])
             true
