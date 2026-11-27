@@ -27,28 +27,16 @@ module RollbackRecords:
             version_out.resize(0)
             digest_out.resize(0)
             metadata_digest_out.resize(0)
-            is_v2: bool = version_2(state)
-            return Code.Malformed if not is_v2 and not version_3(state) and not version_4(state)
-            found: mutable bool = false
-            while cursor < state.count |cursor: usize = 23.usize()|:
-                finish: mutable usize = cursor
-                while finish < state.count and state[finish] != 10 |state, finish|:
-                    finish <- finish + 1.usize()
+            return Code.Malformed if not version_2(state) and not version_3(state) and not version_4(state)
+            while cursor < state.count |cursor: usize = 23.usize(), finish: usize = 0.usize()|:
+                finish <- while position < state.count and state[position] != 10 |position: usize = cursor| -> position:
+                    position <- position + 1.usize()
                 # Every record is newline-terminated. A truncated final line
                 # must not be treated as durable trust history.
                 return Code.Malformed if finish == cursor or finish == state.count
-                line_package: mutable darray[u8] = []
-                line_version: mutable darray[u8] = []
-                line_digest: mutable darray[u8] = []
-                line_metadata_digest: mutable darray[u8] = []
-                parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-                return Code.Malformed if not parse_record(state, cursor, finish, is_v2, &line_package, &line_version, &line_digest, &line_metadata_digest, &parsed)
-                if ByteText::equal(line_package, package):
-                    region merge_status_scope:
-                        merge_status: Code = merge_found_record(found, parsed, line_version, line_digest, line_metadata_digest, version_out, digest_out, metadata_digest_out)
-                        return merge_status if merge_status != Code.Ok
-                    found <- true
+                record_status: Code = merge_matching_record(state, cursor, finish, package, version_out, digest_out, metadata_digest_out)
                 cursor <- finish + 1.usize()
+                return record_status if record_status != Code.Ok
             Code.Ok
 
         # Parse the record `state[cursor..<finish]` as
@@ -58,18 +46,16 @@ module RollbackRecords:
             requires cursor < finish and finish <= state.count
             first_separator: usize = next_space(state, cursor, finish)
             second_separator: usize = next_space(state, first_separator + 1.usize(), finish)
-            region third_separator_scope:
-                third_separator: usize = next_space(state, second_separator + 1.usize(), finish)
-                return false if first_separator == cursor or second_separator >= finish or third_separator >= finish or first_separator + 1.usize() == second_separator or second_separator + 1.usize() == third_separator or third_separator + 1.usize() >= finish
+            third_separator: usize = next_space(state, second_separator + 1.usize(), finish)
+            if first_separator == cursor or second_separator >= finish or third_separator >= finish or first_separator + 1.usize() == second_separator or second_separator + 1.usize() == third_separator or third_separator + 1.usize() >= finish:
+                false
+            else:
                 ByteText::append_range(package, state, cursor, first_separator)
                 ByteText::append_range(version, state, first_separator + 1.usize(), second_separator)
                 ByteText::append_range(digest, state, second_separator + 1.usize(), third_separator)
                 ByteText::append_range(metadata_digest, state, third_separator + 1.usize(), finish)
-            return false if:
-                is_v2 and ByteText::starts_with_text(package, "@package:")
-                not is_v2 and PackageIdentity::valid_name(package)
-                not TrustIdentity::valid(package) or not Integrity::valid_sha256_hex(digest) or not Integrity::valid_sha256_hex(metadata_digest)
-            SemVer::parse(version, parsed) and not parsed.prerelease
+                # Version 2 names bare packages and later versions scoped identities.
+                not (is_v2 and ByteText::starts_with_text(package, "@package:")) and not (not is_v2 and PackageIdentity::valid_name(package)) and TrustIdentity::valid(package) and Integrity::valid_sha256_hex(digest) and Integrity::valid_sha256_hex(metadata_digest) and SemVer::parse(version, parsed) and not parsed.prerelease
 
         # Keep the highest recorded version of a package. Two records of the
         # same version must agree on both digests, and versions never decrease.
@@ -100,7 +86,7 @@ module RollbackRecords:
         # The offset of the first space in `state[start..<finish]`, or `finish`.
         def next_space(state: darray[u8]&, start: usize, finish: usize) -> usize:
             requires finish <= state.count
-            return while position < finish and state[position] != 32 |position: usize = start| -> position:
+            while position < finish and state[position] != 32 |position: usize = start| -> position:
                 position <- position + 1.usize()
 
         def check_root_pin(state: darray[u8]&, root_key_identity: darray[u8]&, key_fingerprint: darray[u8]&, require_existing: bool, compare_key: bool, found_out: mutable bool&) -> Code can[Memory.Allocate, Abort.Panic]:
@@ -108,36 +94,38 @@ module RollbackRecords:
             pinned_version: mutable darray[u8] = []
             pinned_digest: mutable darray[u8] = []
             pinned_metadata_digest: mutable darray[u8] = []
-            region find_status_scope:
-                find_status: Code = find(state, root_key_identity, &pinned_version, &pinned_digest, &pinned_metadata_digest) if state.count > 0 else Code.Ok
-                return find_status if find_status != Code.Ok
-            if pinned_version.count == 0:
-                return Code.Unavailable if require_existing or version_4(state) and has_root_scoped_history(state, root_key_identity)
-                return Code.Ok
-            return Code.Malformed if not ByteText::equal_text(pinned_version, "0.0.0") or not ByteText::equal(pinned_digest, pinned_metadata_digest)
-            return Code.RootChanged if compare_key and not ByteText::equal(pinned_digest, key_fingerprint)
-            found_out <- true
-            Code.Ok
+            find_status: Code = find(state, root_key_identity, &pinned_version, &pinned_digest, &pinned_metadata_digest) if state.count > 0 else Code.Ok
+            if find_status != Code.Ok:
+                find_status
+            elif pinned_version.count == 0:
+                Code.Unavailable if require_existing or version_4(state) and has_root_scoped_history(state, root_key_identity) else Code.Ok
+            elif not ByteText::equal_text(pinned_version, "0.0.0") or not ByteText::equal(pinned_digest, pinned_metadata_digest):
+                Code.Malformed
+            elif compare_key and not ByteText::equal(pinned_digest, key_fingerprint):
+                Code.RootChanged
+            else:
+                found_out <- true
+                Code.Ok
 
         def legacy_override_status(state: darray[u8]&, has_override: bool) -> Code can[Memory.Allocate, Abort.Panic]:
             return Code.Ok if:
                 not version_2(state)
                 not has_override
-            region validation_status_scope:
-                validation_status: Code = validate(state)
-                return validation_status if validation_status != Code.Ok
-            while cursor < state.count |cursor: usize = 23.usize()|:
-                finish: mutable usize = cursor
-                while finish < state.count and state[finish] != 10 |state, finish|:
-                    finish <- finish + 1.usize()
-                return Code.Malformed if finish == state.count
-                separator: usize = next_space(state, cursor, finish)
-                return Code.Malformed if separator == cursor or separator == finish
-                region identity_scope:
-                    identity: darray[u8] = [state[index] for index in cursor..<separator]
-                    return Code.Unavailable if PackageIdentity::valid_name(identity)
-                cursor <- finish + 1.usize()
-            Code.Ok
+            validation_status: Code = validate(state)
+            if validation_status != Code.Ok:
+                validation_status
+            else:
+                while cursor < state.count |cursor: usize = 23.usize(), finish: usize = 0.usize(), separator: usize = 0.usize()|:
+                    finish <- while position < state.count and state[position] != 10 |position: usize = cursor| -> position:
+                        position <- position + 1.usize()
+                    return Code.Malformed if finish == state.count
+                    separator <- next_space(state, cursor, finish)
+                    return Code.Malformed if separator == cursor or separator == finish
+                    region identity_scope:
+                        identity: darray[u8] = [state[index] for index in cursor..<separator]
+                        return Code.Unavailable if PackageIdentity::valid_name(identity)
+                    cursor <- finish + 1.usize()
+                Code.Ok
 
         def upgrade_to_v4(root: darray[u8]&, state: darray[u8]&, has_override: bool, out: mutable darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic]:
             out.resize(0)
@@ -148,48 +136,60 @@ module RollbackRecords:
                 ByteText::append(out, state)
                 return Code.Ok
             return Code.Malformed if not version_2(state) and not version_3(state)
-            region validation_status_scope:
-                validation_status: Code = legacy_override_status(state, true) if has_override and version_2(state) else validate(state)
-                return validation_status if validation_status != Code.Ok
-            ByteText::append_text(out, "elisapkg-trust-state:4\n")
-            while cursor < state.count |cursor: usize = 23.usize()|:
-                finish: mutable usize = cursor
-                while finish < state.count and state[finish] != 10 |state, finish|:
-                    finish <- finish + 1.usize()
-                return Code.Malformed if finish == state.count
-                separator: usize = next_space(state, cursor, finish)
-                return Code.Malformed if separator == cursor or separator == finish
-                region identity_scope:
-                    identity: darray[u8] = [state[index] for index in cursor..<separator]
-                    if PackageIdentity::valid_name(identity):
-                        scoped_identity: mutable darray[u8] = []
-                        return Code.Unavailable if not TrustIdentity::package(root, identity, &scoped_identity)
-                        ByteText::append(out, scoped_identity)
-                    else:
-                        ByteText::append(out, identity)
-                for index in separator..=finish |out, state|:
-                    out.push(state[index])
-                return Code.Unavailable if out.count > 1048576.usize()
-                cursor <- finish + 1.usize()
-            Code.Ok
+            validation_status: Code = legacy_override_status(state, true) if has_override and version_2(state) else validate(state)
+            if validation_status != Code.Ok:
+                validation_status
+            else:
+                ByteText::append_text(out, "elisapkg-trust-state:4\n")
+                while cursor < state.count |cursor: usize = 23.usize(), finish: usize = 0.usize(), separator: usize = 0.usize()|:
+                    finish <- while position < state.count and state[position] != 10 |position: usize = cursor| -> position:
+                        position <- position + 1.usize()
+                    return Code.Malformed if finish == state.count
+                    separator <- next_space(state, cursor, finish)
+                    return Code.Malformed if separator == cursor or separator == finish
+                    region identity_scope:
+                        identity: darray[u8] = [state[index] for index in cursor..<separator]
+                        if PackageIdentity::valid_name(identity):
+                            scoped_identity: mutable darray[u8] = []
+                            return Code.Unavailable if not TrustIdentity::package(root, identity, &scoped_identity)
+                            ByteText::append(out, scoped_identity)
+                        else:
+                            ByteText::append(out, identity)
+                    for index in separator..=finish |out, state|:
+                        out.push(state[index])
+                    return Code.Unavailable if out.count > 1048576.usize()
+                    cursor <- finish + 1.usize()
+                Code.Ok
 
     private:
+        # Parse the record `state[cursor..<finish]` and merge it into the
+        # outputs when it names `package`.
+        def merge_matching_record(state: darray[u8]&, cursor: usize, finish: usize, package: darray[u8]&, version_out: mutable darray[u8]&, digest_out: mutable darray[u8]&, metadata_digest_out: mutable darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic]:
+            line_package: mutable darray[u8] = []
+            line_version: mutable darray[u8] = []
+            line_digest: mutable darray[u8] = []
+            line_metadata_digest: mutable darray[u8] = []
+            parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
+            if not parse_record(state, cursor, finish, version_2(state), &line_package, &line_version, &line_digest, &line_metadata_digest, &parsed):
+                Code.Malformed
+            elif not ByteText::equal(line_package, package):
+                Code.Ok
+            else:
+                # A merged record always leaves a non-empty version behind.
+                merge_found_record(version_out.count > 0.usize(), parsed, line_version, line_digest, line_metadata_digest, version_out, digest_out, metadata_digest_out)
+
         def has_root_scoped_history(state: darray[u8]&, root_key_identity: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
             return false if not version_4(state) or state.count <= 23.usize()
             return true if not ByteText::starts_with_text(root_key_identity, "@root-key:") or root_key_identity.count != 74.usize()
-            package_prefix: darray[u8] = root_scoped_prefix(true, root_key_identity)
-            index_prefix: darray[u8] = root_scoped_prefix(false, root_key_identity)
-            while cursor < state.count |cursor: usize = 23.usize()|:
-                finish: mutable usize = cursor
-                while finish < state.count and state[finish] != 10 |state, finish|:
-                    finish <- finish + 1.usize()
+            while cursor < state.count |cursor: usize = 23.usize(), finish: usize = 0.usize(), identity_end: usize = 0.usize(), package_prefix: darray[u8] = root_scoped_prefix(true, root_key_identity), index_prefix: darray[u8] = root_scoped_prefix(false, root_key_identity)|:
+                finish <- while position < state.count and state[position] != 10 |position: usize = cursor| -> position:
+                    position <- position + 1.usize()
                 return true if finish == state.count
-                region identity_end_scope:
-                    identity_end: usize = next_space(state, cursor, finish)
-                    return true if identity_end == cursor or identity_end == finish
-                    return true if:
-                        identity_end - cursor >= package_prefix.count and ByteText::range_equals(state, cursor, cursor + package_prefix.count, package_prefix)
-                        identity_end - cursor >= index_prefix.count and ByteText::range_equals(state, cursor, cursor + index_prefix.count, index_prefix)
+                identity_end <- next_space(state, cursor, finish)
+                return true if:
+                    identity_end == cursor or identity_end == finish
+                    identity_end - cursor >= package_prefix.count and ByteText::range_equals(state, cursor, cursor + package_prefix.count, package_prefix)
+                    identity_end - cursor >= index_prefix.count and ByteText::range_equals(state, cursor, cursor + index_prefix.count, index_prefix)
                 cursor <- finish + 1.usize()
             false
 
@@ -198,10 +198,7 @@ module RollbackRecords:
         def root_scoped_prefix(package_kind: bool, root_key_identity: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
             requires root_key_identity.count == 74.usize()
             prefix: mutable darray[u8] = []
-            if package_kind:
-                ByteText::append_text(&prefix, "@package:")
-            else:
-                ByteText::append_text(&prefix, "@index:")
+            ByteText::append_text(&prefix, "@package:" if package_kind else "@index:")
             ByteText::append_range(&prefix, root_key_identity, 10.usize(), 74.usize())
             prefix <- prefix.push(58)
             prefix
