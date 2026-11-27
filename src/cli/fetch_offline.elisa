@@ -18,32 +18,55 @@ module FetchOffline:
     public:
         def fetch_registry_lock(manifest: darray[u8]&, lock: darray[u8]&) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
-                packages_start: usize = Json::root_value_offset(lock, "packages")
-                packages_end: usize = Json::array_end(lock, packages_start)
-                return CliStatus::resolution_failed if packages_start >= lock.count or packages_end <= packages_start
-                starts: mutable darray[usize] = []
-                return CliStatus::resolution_failed if not Lockfile::registry_record_starts(lock, packages_start, packages_end, &starts)
-                region closure_status_scope:
-                    closure_status: i64 = verify_graph_closure(manifest, lock, starts)
-                    if closure_status != CliStatus::success:
-                        CliOutput::write_error("error: offline registry lock does not match its signed dependency graph\n") if closure_status == CliStatus::resolution_failed
-                        return closure_status
-                now: i64 = Platform::wall_clock_seconds()
-                return CliStatus::security_failed if now < 0
-                return verify_cached_records(lock, starts, packages_end, now.u64())
+                records: mutable LockRecords =
+                    read: mutable LockRecords = LockRecords{starts: [], packages_end: 0.usize()}
+                    return CliStatus::resolution_failed if not read_lock_records(lock, &read)
+                    read
+                closure_status: i64 = verify_graph_closure(manifest, lock, records.starts)
+                return verify_records_now(lock, records) if closure_status == CliStatus::success else report_closure_failure(closure_status)
 
     private:
+        # The offsets of the registry records in a lock, and where its `packages` array ends.
+        struct LockRecords:
+            starts: mutable darray[usize]
+            packages_end: mutable usize
+
+        # A cached metadata document and the signature it was stored with.
+        struct SignedMetadata:
+            metadata: mutable darray[u8]
+            signature: mutable darray[u8]
+
+        # Find every registry record in the lock's `packages` array.
+        def read_lock_records(lock: darray[u8]&, out: mutable LockRecords&) -> bool can[Memory.Allocate, Abort.Panic]:
+            packages_start: usize = Json::root_value_offset(lock, "packages")
+            out.packages_end <- Json::array_end(lock, packages_start)
+            return packages_start < lock.count and out.packages_end > packages_start and Lockfile::registry_record_starts(lock, packages_start, out.packages_end, &out.starts)
+
+        # Explain a lock that does not match its signed graph, and pass the status on.
+        def report_closure_failure(status: i64) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                CliOutput::write_error("error: offline registry lock does not match its signed dependency graph\n") if status == CliStatus::resolution_failed
+                return status
+
+        # Verify every locked record against the current wall clock.
+        def verify_records_now(lock: darray[u8]&, records: LockRecords&) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                now: i64 = Platform::wall_clock_seconds()
+                return verify_cached_records(lock, records.starts, records.packages_end, now.u64()) if now >= 0 else CliStatus::security_failed
+
         # Verify every locked record, each of which must end before `packages_end`.
         def verify_cached_records(lock: darray[u8]&, starts: darray[usize]&, packages_end: usize, now: u64) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
                 for record_index in 0..<starts.count:
-                    record_start: usize = starts[record_index]
-                    record_end: usize = Json::object_end(lock, record_start)
-                    return CliStatus::resolution_failed if record_end <= record_start or record_end >= packages_end
-                    region status_scope:
-                        status: i64 = verify_cached_record(lock, record_start, record_end, now)
-                        return status if status != CliStatus::success
+                    status: i64 = verify_record_at(lock, starts[record_index], packages_end, now)
+                    return status if status != CliStatus::success
                 return CliStatus::success
+
+        # Verify the record starting at `record_start`, which must end before `packages_end`.
+        def verify_record_at(lock: darray[u8]&, record_start: usize, packages_end: usize, now: u64) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                record_end: usize = Json::object_end(lock, record_start)
+                return verify_cached_record(lock, record_start, record_end, now) if record_end > record_start and record_end < packages_end else CliStatus::resolution_failed
 
         # The breadth-first walk over lock records: the queue position of each
         # record (`starts.count` while unqueued), the queued records in order,
@@ -106,76 +129,114 @@ module FetchOffline:
         # Read the dependencies of one lock record from its cached, signed metadata.
         def read_cached_dependencies(lock: darray[u8]&, record_start: usize, maximum_dependencies: usize, out: mutable darray[Solver::Constraint]&) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
-                record_end: usize = Json::object_end(lock, record_start)
                 locked: mutable FetchRelease::LockedRelease = FetchRelease::empty_locked()
-                return CliStatus::security_failed if not Json::object_string_value(lock, record_start, record_end, "name", &locked.package) or not Json::object_string_value(lock, record_start, record_end, "version", &locked.version)
-                region source_scope:
-                    source_start: mutable usize = 0.usize()
-                    source_end: mutable usize = 0.usize()
-                    return CliStatus::security_failed if not Json::object_value_span(lock, record_start, record_end, "source", &source_start, &source_end)
-                    return CliStatus::resolution_failed if:
-                        not Json::object_string_value(lock, source_start, source_end, "archive", &locked.archive)
-                        not Lockfile::read_sha256_field(lock, record_start, record_end, "archive-digest", &locked.digest)
-                        not Lockfile::read_sha256_field(lock, record_start, record_end, "metadata-digest", &locked.metadata_digest)
-                return CliStatus::security_failed if not Json::object_unsigned_value(lock, record_start, record_end, "archive-size", &locked.archive_size)
-                cached_metadata: mutable darray[u8] = []
-                cached_signature: mutable darray[u8] = []
-                if not RegistryCache::read_metadata(locked.metadata_digest, &cached_metadata, &cached_signature):
-                    FetchRelease::report_cached_release_error("error: could not read cached signed metadata for ", locked.package, locked.version)
-                    return CliStatus::security_failed
+                status: i64 = read_dependency_record(lock, record_start, &locked)
+                return status if status != CliStatus::success else read_locked_dependencies(locked, maximum_dependencies, out)
+
+        def read_locked_dependencies(locked: FetchRelease::LockedRelease&, maximum_dependencies: usize, out: mutable darray[Solver::Constraint]&) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                signed: mutable SignedMetadata =
+                    read: mutable SignedMetadata = SignedMetadata{metadata: [], signature: []}
+                    return CliStatus::security_failed if not read_signed_metadata(locked, &read)
+                    read
+                return CliStatus::success if snapshot_dependencies(locked, signed, maximum_dependencies, out) else CliStatus::security_failed
+
+        # Whether the snapshot matches the lock and lists at most `maximum_dependencies` dependencies.
+        def snapshot_dependencies(locked: FetchRelease::LockedRelease&, signed: SignedMetadata&, maximum_dependencies: usize, out: mutable darray[Solver::Constraint]&) -> bool can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                expires: mutable u64 = 0
+                return snapshot_matches(locked, signed, &expires, out) and out.count <= maximum_dependencies
+
+        # Read the name, version, source, digests, and size of one lock record.
+        def read_dependency_record(lock: darray[u8]&, record_start: usize, out: mutable FetchRelease::LockedRelease&) -> i64 can[Memory.Allocate, Abort.Panic]:
+            record_end: usize = Json::object_end(lock, record_start)
+            return CliStatus::security_failed if not Json::object_string_value(lock, record_start, record_end, "name", &out.package) or not Json::object_string_value(lock, record_start, record_end, "version", &out.version)
+            status: i64 = read_record_artifact(lock, record_start, record_end, out)
+            return status if status != CliStatus::success else CliStatus::success if Json::object_unsigned_value(lock, record_start, record_end, "archive-size", &out.archive_size) else CliStatus::security_failed
+
+        # Read the record's source archive name and its two digests.
+        def read_record_artifact(lock: darray[u8]&, record_start: usize, record_end: usize, out: mutable FetchRelease::LockedRelease&) -> i64 can[Memory.Allocate, Abort.Panic]:
+            source_start: mutable usize = 0.usize()
+            source_end: mutable usize = 0.usize()
+            return CliStatus::security_failed if not Json::object_value_span(lock, record_start, record_end, "source", &source_start, &source_end)
+            return CliStatus::success if Json::object_string_value(lock, source_start, source_end, "archive", &out.archive) and Lockfile::read_sha256_field(lock, record_start, record_end, "archive-digest", &out.digest) and Lockfile::read_sha256_field(lock, record_start, record_end, "metadata-digest", &out.metadata_digest) else CliStatus::resolution_failed
+
+        # Read the cached signed metadata of `locked`, reporting a failure.
+        def read_signed_metadata(locked: FetchRelease::LockedRelease&, out: mutable SignedMetadata&) -> bool can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                return true if RegistryCache::read_metadata(locked.metadata_digest, &out.metadata, &out.signature)
+                FetchRelease::report_cached_release_error("error: could not read cached signed metadata for ", locked.package, locked.version)
+                return false
+
+        # Whether the signed snapshot verifies and names the locked archive,
+        # digest, and size. Stores its expiry and dependencies.
+        def snapshot_matches(locked: FetchRelease::LockedRelease&, signed: SignedMetadata&, expires: mutable u64&, dependencies: mutable darray[Solver::Constraint]&) -> bool can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
                 resolved: mutable FetchRelease::ResolvedRelease = FetchRelease::empty_resolved()
-                region status_scope:
-                    status: Registry::ResultCode =
-                        expires: mutable u64 = 0
-                        Registry::verify_metadata_snapshot(locked.package, locked.version, locked.metadata_digest, cached_metadata, cached_signature, &resolved.archive, &resolved.digest, &resolved.archive_size, &expires, out)
-                    return CliStatus::security_failed if:
-                        status != Registry::ResultCode.Ok or not ByteText::equal(resolved.archive, locked.archive) or not ByteText::equal(resolved.digest, locked.digest) or resolved.archive_size != locked.archive_size
-                        out.count > maximum_dependencies
-                return CliStatus::success
+                status: Registry::ResultCode = Registry::verify_metadata_snapshot(locked.package, locked.version, locked.metadata_digest, signed.metadata, signed.signature, &resolved.archive, &resolved.digest, &resolved.archive_size, expires, dependencies)
+                return status == Registry::ResultCode.Ok and ByteText::equal(resolved.archive, locked.archive) and ByteText::equal(resolved.digest, locked.digest) and resolved.archive_size == locked.archive_size
 
         # Verify one locked release entirely from the cache: its receipt, its
         # signed metadata snapshot, its archive, and the trust state.
         def verify_cached_record(lock: darray[u8]&, record_start: usize, record_end: usize, now: u64) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
-                locked: mutable FetchRelease::LockedRelease = FetchRelease::empty_locked()
-                return CliStatus::resolution_failed if:
-                    not FetchRelease::read_locked(lock, record_start, record_end, &locked)
-                    locked.archive_size > Archive::maximum_archive_bytes.u64()
+                locked: mutable FetchRelease::LockedRelease =
+                    read: mutable FetchRelease::LockedRelease = FetchRelease::empty_locked()
+                    return CliStatus::resolution_failed if:
+                        not FetchRelease::read_locked(lock, record_start, record_end, &read)
+                        read.archive_size > Archive::maximum_archive_bytes.u64()
+                    read
+                # A valid receipt expires after `now`, so zero marks a rejected one.
+                receipt_expires: u64 = receipt_expiry(locked, now)
+                return CliStatus::security_failed if receipt_expires == 0
+                signed: mutable SignedMetadata =
+                    read: mutable SignedMetadata = SignedMetadata{metadata: [], signature: []}
+                    return CliStatus::security_failed if not read_signed_metadata(locked, &read)
+                    read
+                return verify_cached_archive(locked, signed.metadata, receipt_expires) if snapshot_expires_at(locked, signed, receipt_expires) else CliStatus::security_failed
+
+        # The expiry of the locked release's cache receipt, or zero when the
+        # receipt is missing, does not match, or has expired by `now`.
+        def receipt_expiry(locked: FetchRelease::LockedRelease&, now: u64) -> u64 can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
                 expires: mutable u64 = 0
-                region receipt_scope:
+                matched: bool = |expires|
                     receipt: mutable darray[u8] = []
-                    return CliStatus::security_failed if:
-                        not Cache::read_registry_receipt(locked.digest, locked.metadata_digest, &receipt)
-                        not Cache::registry_receipt_matches(receipt, locked.package, locked.version, locked.archive, locked.archive_size, locked.digest, locked.metadata_digest, &expires)
-                        expires <= now
-                cached_metadata: mutable darray[u8] = []
-                cached_signature: mutable darray[u8] = []
-                if not RegistryCache::read_metadata(locked.metadata_digest, &cached_metadata, &cached_signature):
-                    FetchRelease::report_cached_release_error("error: could not read cached signed metadata for ", locked.package, locked.version)
-                    return CliStatus::security_failed
-                metadata_expires: mutable u64 = 0
-                region metadata_status_scope:
-                    resolved: mutable FetchRelease::ResolvedRelease = FetchRelease::empty_resolved()
-                    metadata_status: Registry::ResultCode =
-                        metadata_dependencies: mutable darray[Solver::Constraint] = []
-                        Registry::verify_metadata_snapshot(locked.package, locked.version, locked.metadata_digest, cached_metadata, cached_signature, &resolved.archive, &resolved.digest, &resolved.archive_size, &metadata_expires, &metadata_dependencies)
-                    return CliStatus::security_failed if metadata_status != Registry::ResultCode.Ok or not ByteText::equal(resolved.archive, locked.archive) or not ByteText::equal(resolved.digest, locked.digest) or resolved.archive_size != locked.archive_size or metadata_expires != expires
-                # The digest binds this snapshot to the same dependency
-                # bytes already checked during graph traversal.
-                region archive_verified_scope:
-                    archive_verified: bool =
-                        archive_bytes: mutable darray[u8] = []
-                        Cache::read_verified_blob(locked.digest, locked.archive_size.usize(), &archive_bytes) and archive_bytes.count.u64() == locked.archive_size and Registry::release_archive_matches_metadata(locked.package, locked.version, cached_metadata, archive_bytes)
-                    if not archive_verified:
-                        FetchRelease::report_cached_release_error("error: could not verify cached archive for ", locked.package, locked.version)
-                        return CliStatus::security_failed
-                # Only authenticated cache content may advance the durable
-                # trust clock. Do this after snapshot, dependency, expiry, and
-                # archive validation so rejected cache data cannot update it.
-                region trust_status_scope:
-                    trust_status: Registry::ResultCode = Registry::verify_trusted(locked.package, locked.version, locked.digest, locked.metadata_digest, metadata_expires)
-                    if trust_status != Registry::ResultCode.Ok:
-                        FetchRelease::report_registry_error(trust_status, " while using cached ", locked.package)
-                        return CliStatus::security_failed
-                FetchRelease::report_verified("verified cached registry artifact ", locked.package, locked.version, locked.digest, " (offline)\n")
-                return CliStatus::success
+                    Cache::read_registry_receipt(locked.digest, locked.metadata_digest, &receipt) and Cache::registry_receipt_matches(receipt, locked.package, locked.version, locked.archive, locked.archive_size, locked.digest, locked.metadata_digest, &expires) and expires > now
+                return expires if matched else 0
+
+        # Whether the signed snapshot matches the lock and expires exactly at `expected_expires`.
+        def snapshot_expires_at(locked: FetchRelease::LockedRelease&, signed: SignedMetadata&, expected_expires: u64) -> bool can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                expires: mutable u64 = 0
+                dependencies: mutable darray[Solver::Constraint] = []
+                return snapshot_matches(locked, signed, &expires, &dependencies) and expires == expected_expires
+
+        # The digest binds this snapshot to the same dependency bytes already
+        # checked during graph traversal.
+        def verify_cached_archive(locked: FetchRelease::LockedRelease&, metadata: darray[u8]&, expires: u64) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                return verify_cached_trust(locked, expires) if cached_archive_matches(locked, metadata) else report_unverified_archive(locked)
+
+        def cached_archive_matches(locked: FetchRelease::LockedRelease&, metadata: darray[u8]&) -> bool can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                archive_bytes: mutable darray[u8] = []
+                return Cache::read_verified_blob(locked.digest, locked.archive_size.usize(), &archive_bytes) and archive_bytes.count.u64() == locked.archive_size and Registry::release_archive_matches_metadata(locked.package, locked.version, metadata, archive_bytes)
+
+        def report_unverified_archive(locked: FetchRelease::LockedRelease&) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                FetchRelease::report_cached_release_error("error: could not verify cached archive for ", locked.package, locked.version)
+                return CliStatus::security_failed
+
+        # Only authenticated cache content may advance the durable trust
+        # clock. This runs after snapshot, dependency, expiry, and archive
+        # validation so rejected cache data cannot update it.
+        def verify_cached_trust(locked: FetchRelease::LockedRelease&, expires: u64) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                trust_status: Registry::ResultCode = Registry::verify_trusted(locked.package, locked.version, locked.digest, locked.metadata_digest, expires)
+                return FetchRelease::report_verified("verified cached registry artifact ", locked.package, locked.version, locked.digest, " (offline)\n") if trust_status == Registry::ResultCode.Ok else report_untrusted(trust_status, locked.package)
+
+        def report_untrusted(status: Registry::ResultCode, package: darray[u8]&) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                FetchRelease::report_registry_error(status, " while using cached ", package)
+                return CliStatus::security_failed
