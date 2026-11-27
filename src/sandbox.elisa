@@ -35,22 +35,22 @@ module Sandbox:
                                  executable_paths: darray[cstr]&, output_temporary: cstr) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             static if not ELISA_TARGET_OS_MACOS:
                 return []
-            inputs: mutable ProfileInputs = ProfileInputs{home: [], project: [], build: [], snapshot: [], tool_roots: [],
-                                                         dependency_roots: [dependency_roots[index] for index in 0..<dependency_roots.count], tool_paths: [tool_paths[index] for index in 0..<tool_paths.count],
-                                                         executable_paths: [executable_paths[index] for index in 0..<executable_paths.count], output_temporary: output_temporary}
-            return [] if not resolve_profile_inputs(home, project_root, build_root, source_snapshot_root, &inputs)
             profile: mutable darray[u8] = []
-            return [] if not:
-                append_host_runtime_rules(&profile, inputs)
-                append_input_rules(&profile, inputs)
-                append_private_state_denials(&profile, inputs)
-                append_reallowed_inputs(&profile, inputs)
-                append_execution_rules(&profile, inputs)
-                append_snapshot_rules(&profile, inputs)
-                append_credential_denials(&profile)
-                append_output_rules(&profile, inputs)
-            return [] if profile.count > 65536.usize()
-            return profile
+            region inputs_scope:
+                inputs: mutable ProfileInputs = ProfileInputs{home: [], project: [], build: [], snapshot: [], tool_roots: [],
+                    dependency_roots: [dependency_roots[index] for index in 0..<dependency_roots.count], tool_paths: [tool_paths[index] for index in 0..<tool_paths.count],
+                    executable_paths: [executable_paths[index] for index in 0..<executable_paths.count], output_temporary: output_temporary}
+                return [] if not resolve_profile_inputs(home, project_root, build_root, source_snapshot_root, &inputs)
+                return [] if not:
+                    append_host_runtime_rules(&profile, inputs)
+                    append_input_rules(&profile, inputs)
+                    append_private_state_denials(&profile, inputs)
+                    append_reallowed_inputs(&profile, inputs)
+                    append_execution_rules(&profile, inputs)
+                    append_snapshot_rules(&profile, inputs)
+                    append_credential_denials(&profile)
+                    append_output_rules(&profile, inputs)
+            [] if profile.count > 65536.usize() else profile
 
     private:
         # Canonicalize every root the profile names and collect the toolchain roots.
@@ -72,17 +72,21 @@ module Sandbox:
             true
 
         def append_host_runtime_rules(profile: mutable darray[u8]&, inputs: ProfileInputs&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            system_roots: mutable darray[u8] = []
-            system_roots <- add_existing_root("/System", system_roots)
-            system_roots <- add_existing_root("/usr", system_roots)
-            system_roots <- add_existing_root("/bin", system_roots)
-            system_roots <- add_existing_root("/sbin", system_roots)
-            system_roots <- add_existing_root("/Library/Developer/CommandLineTools", system_roots)
-            system_roots <- add_existing_root("/Applications/Xcode.app", system_roots)
-            region extra_read_roots_scope:
-                extra_read_roots: mutable darray[u8] = []
-                extra_read_roots <- add_existing_root("/private/var/db/dyld", extra_read_roots)
-                extra_read_roots <- add_existing_root("/var/select", extra_read_roots)
+            region read_roots_scope:
+                system_roots: darray[u8] =
+                    roots: mutable darray[u8] = []
+                    roots <- add_existing_root("/System", roots)
+                    roots <- add_existing_root("/usr", roots)
+                    roots <- add_existing_root("/bin", roots)
+                    roots <- add_existing_root("/sbin", roots)
+                    roots <- add_existing_root("/Library/Developer/CommandLineTools", roots)
+                    roots <- add_existing_root("/Applications/Xcode.app", roots)
+                    roots
+                extra_read_roots: darray[u8] =
+                    roots: mutable darray[u8] = []
+                    roots <- add_existing_root("/private/var/db/dyld", roots)
+                    roots <- add_existing_root("/var/select", roots)
+                    roots
                 ByteText::append_text(profile, "(version 1)\n(deny default)\n(deny network*)\n")
                 ByteText::append_text(profile, "(allow process-fork)\n(allow process-info* (target self))\n(allow signal (target self))\n")
                 # Some system utilities query the filesystem root as a directory
@@ -225,20 +229,20 @@ module Sandbox:
             DenySourceState
 
         def append_dependency_rules(profile: mutable darray[u8]&, dependency_roots: darray[u8]&, rule: DependencyRule) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            region cursor_scope:
-                cursor: mutable usize = 0
-                while cursor < dependency_roots.count |dependency_roots, cursor, profile, rule|:
+            while cursor < dependency_roots.count |cursor: usize = 0.usize()|:
+                dependency_real: darray[u8] =
                     dependency_path: mutable darray[u8] = []
-                    dependency_real: mutable darray[u8] = []
-                    return false if not:
-                        next_root(dependency_roots, &cursor, &dependency_path)
-                        ProjectFiles::canonical_existing_path(dependency_path, &dependency_real)
-                    if rule == DependencyRule.AllowRead:
-                        return false if not append_read_root(profile, dependency_real)
-                    elif rule == DependencyRule.DenyRead:
-                        return false if not append_path_rule(profile, "deny", "file-read*", "subpath", dependency_real)
+                    real: mutable darray[u8] = []
+                    if not next_root(dependency_roots, &cursor, &dependency_path) or not ProjectFiles::canonical_existing_path(dependency_path, &real):
+                        return false
                     else:
-                        return false if not append_source_state_denials(profile, dependency_real)
+                        real
+                if rule == DependencyRule.AllowRead:
+                    return false if not append_read_root(profile, dependency_real)
+                elif rule == DependencyRule.DenyRead:
+                    return false if not append_path_rule(profile, "deny", "file-read*", "subpath", dependency_real)
+                else:
+                    return false if not append_source_state_denials(profile, dependency_real)
             true
 
         def append_source_state_denials(out: mutable darray[u8]&, root: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
@@ -278,17 +282,16 @@ module Sandbox:
 
         def add_existing_root(path: cstr, roots: mutable darray[u8]) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             root: mutable darray[u8] = []
-            return roots if not ProjectFiles::canonical_existing_c_string_path(path, &root) or not absolute_path(root) or root_present(roots, root)
-            roots <- ByteText::with_bytes(roots, root)
-            roots <- roots.push(0)
-            roots
+            if not ProjectFiles::canonical_existing_c_string_path(path, &root) or not absolute_path(root) or root_present(roots, root):
+                roots
+            else:
+                with_root: mutable darray[u8] = ByteText::with_bytes(roots, root)
+                with_root <- with_root.push(0)
+                with_root
 
         def path_contains_slash(path: cstr) -> bool can[Memory.Allocate, Abort.Panic]:
-            region length_scope:
-                length: usize = Platform::c_string_length(path)
-                for index in 0..<length |path|:
-                    return true if path[index].u8() == 47
-            false
+            for index in 0..<Platform::c_string_length(path) |found: bool = false| -> found:
+                break true if path[index].u8() == 47
 
         def append_tool_file_read(out: mutable darray[u8]&, path: cstr) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return true if Platform::c_string_length(path) == 0.usize() or not path_contains_slash(path)
@@ -304,24 +307,25 @@ module Sandbox:
         def parent_directory(path: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
             out.resize(0)
             return false if not absolute_path(path)
-            cursor: mutable usize = path.count
-            while cursor > 1.usize() and path[cursor - 1.usize()] != 47 |path, cursor|:
-                cursor <- cursor - 1.usize()
-            return false if cursor <= 1.usize()
-            for index in 0..<(cursor - 1.usize()) |out, path|:
-                out.push(path[index])
-            true
+            # The position just after the last slash.
+            cursor: usize = while position > 1.usize() and path[position - 1.usize()] != 47 |position: usize = path.count| -> position:
+                position <- position - 1.usize()
+            if cursor <= 1.usize():
+                false
+            else:
+                for index in 0..<(cursor - 1.usize()) |out, path|:
+                    out.push(path[index])
+                true
 
         def leaf_is(path: darray[u8]&, wanted: cstr) -> bool can[Memory.Allocate, Abort.Panic]:
-            start: mutable usize = path.count
-            while start > 0.usize() and path[start - 1.usize()] != 47 |path, start|:
-                start <- start - 1.usize()
-            region length_scope:
-                length: usize = Platform::c_string_length(wanted)
-                return false if path.count - start != length
-                for index in 0..<length |path, wanted, start|:
-                    return false if path[start + index] != wanted[index].u8()
-            true
+            start: usize = while position > 0.usize() and path[position - 1.usize()] != 47 |position: usize = path.count| -> position:
+                position <- position - 1.usize()
+            length: usize = Platform::c_string_length(wanted)
+            if path.count - start != length:
+                false
+            else:
+                for index in 0..<length |equal: bool = true| -> equal:
+                    break false if path[start + index] != wanted[index].u8()
 
         def append_root(roots: mutable darray[u8]&, path: darray[u8]&) -> void can[Memory.Allocate, Abort.Panic]:
             return if not absolute_path(path) or root_present(roots, path)
@@ -330,8 +334,7 @@ module Sandbox:
 
         # Whether `roots` already lists `path`, or cannot be read further.
         def root_present(roots: darray[u8]&, path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            cursor: mutable usize = 0.usize()
-            while cursor < roots.count |roots, path, cursor|:
+            while cursor < roots.count |cursor: usize = 0.usize()|:
                 current: mutable darray[u8] = []
                 return true if:
                     not next_root(roots, &cursor, &current)
@@ -341,81 +344,67 @@ module Sandbox:
         def next_root(roots: darray[u8]&, cursor: mutable usize&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
             out.resize(0)
             return false if cursor >= roots.count
-            finish: mutable usize = cursor
-            while finish < roots.count and roots[finish] != 0 |roots, finish|:
-                finish <- finish + 1.usize()
-            return false if finish == cursor or finish >= roots.count
-            while cursor < finish |roots, cursor, out|:
-                out.push(roots[cursor])
+            finish: usize = while position < roots.count and roots[position] != 0 |position: usize = cursor| -> position:
+                position <- position + 1.usize()
+            if finish == cursor or finish >= roots.count:
+                false
+            else:
+                while cursor < finish |roots, cursor, out|:
+                    out.push(roots[cursor])
+                    cursor <- cursor + 1.usize()
                 cursor <- cursor + 1.usize()
-            cursor <- cursor + 1.usize()
-            true
+                true
 
         def add_toolchain_root(path: cstr, home: darray[u8]&, roots: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return true if Platform::c_string_length(path) == 0.usize()
-            canonical: mutable darray[u8] = []
-            if not ProjectFiles::canonical_existing_c_string_path(path, &canonical):
-                return true if not path_contains_slash(path)
-                return false
-            directory: mutable darray[u8] = []
-            return false if not parent_directory(canonical, &directory)
-            # Read the containing directory by default. Expand one level only
-            # for a recognized tool in its standard compiler/LLVM layout, and
-            # never grant HOME itself or one of its ancestors as a tool root.
-            region root_scope:
-                root: mutable darray[u8] = [directory[item] for item in 0..<directory.count]
-                if leaf_is(directory, "bin") and (leaf_is(canonical, "elisac-stage1") or leaf_is_clang_tool(canonical)):
-                    candidate: mutable darray[u8] = []
-                    if parent_directory(directory, &candidate) and not ProjectFiles::path_is_same_or_beneath(home, candidate) and not is_usr_local_root(candidate):
-                        root <- candidate
-                elif leaf_is(directory, "scripts") and leaf_is(canonical, "elisac_stage1.sh"):
-                    candidate: mutable darray[u8] = []
-                    if parent_directory(directory, &candidate) and not ProjectFiles::path_is_same_or_beneath(home, candidate) and not is_usr_local_root(candidate):
-                        root <- candidate
-                return true if:
-                    ProjectFiles::path_is_same_or_beneath(home, root)
-                    is_usr_local_root(root)
+            root: darray[u8] =
+                canonical: mutable darray[u8] = []
+                # A bare command name may resolve later through PATH.
+                return not path_contains_slash(path) if not ProjectFiles::canonical_existing_c_string_path(path, &canonical)
+                directory: mutable darray[u8] = []
+                return false if not parent_directory(canonical, &directory)
+                # Read the containing directory by default. Expand one level only
+                # for a recognized tool in its standard compiler/LLVM layout, and
+                # never grant HOME itself or one of its ancestors as a tool root.
+                expanded: mutable darray[u8] = []
+                if ((leaf_is(directory, "bin") and (leaf_is(canonical, "elisac-stage1") or leaf_is_clang_tool(canonical))) or (leaf_is(directory, "scripts") and leaf_is(canonical, "elisac_stage1.sh"))) and parent_directory(directory, &expanded) and not ProjectFiles::path_is_same_or_beneath(home, expanded) and not is_usr_local_root(expanded):
+                    expanded
+                else:
+                    directory
+            if ProjectFiles::path_is_same_or_beneath(home, root) or is_usr_local_root(root):
+                true
+            else:
                 append_root(roots, root)
-            true
+                true
 
         def is_usr_local_root(path: darray[u8]&) -> bool:
-            return false if path.count != 10.usize()
-            region expected_scope:
-                expected: cstr = "/usr/local"
-                for index in 0..<10.usize() |path, expected|:
-                    return false if path[index] != expected[index].u8()
-            true
+            ByteText::equal_text(path, "/usr/local")
 
         def append_toolchain_library_root(out: mutable darray[u8]&, path: cstr, home: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             canonical: mutable darray[u8] = []
-            return true if not ProjectFiles::canonical_existing_c_string_path(path, &canonical) or not leaf_is_clang_tool(canonical)
             binary_directory: mutable darray[u8] = []
-            return true if not parent_directory(canonical, &binary_directory) or not leaf_is(binary_directory, "bin")
             toolchain_root: mutable darray[u8] = []
-            return true if:
-                not parent_directory(binary_directory, &toolchain_root)
-                ProjectFiles::path_is_same_or_beneath(home, toolchain_root)
-            library_path: mutable darray[u8] = [toolchain_root[item] for item in 0..<toolchain_root.count]
-            ByteText::append_text(&library_path, "/lib")
-            library_path <- library_path.push(0)
-            library_name: cstr = (&library_path[0]).cast[cstr] can Unsafe.PointerCast
-            library_real: mutable darray[u8] = []
-            true if not ProjectFiles::canonical_existing_c_string_path(library_name, &library_real) else append_read_root(out, library_real)
+            # Only a clang in a standard "ROOT/bin" layout outside HOME has a library root.
+            if not ProjectFiles::canonical_existing_c_string_path(path, &canonical) or not leaf_is_clang_tool(canonical) or not parent_directory(canonical, &binary_directory) or not leaf_is(binary_directory, "bin") or not parent_directory(binary_directory, &toolchain_root) or ProjectFiles::path_is_same_or_beneath(home, toolchain_root):
+                true
+            else:
+                library_path: mutable darray[u8] = [toolchain_root[item] for item in 0..<toolchain_root.count]
+                ByteText::append_text(&library_path, "/lib")
+                library_path <- library_path.push(0)
+                library_name: cstr = (&library_path[0]).cast[cstr] can Unsafe.PointerCast
+                library_real: mutable darray[u8] = []
+                true if not ProjectFiles::canonical_existing_c_string_path(library_name, &library_real) else append_read_root(out, library_real)
 
         def leaf_is_clang_tool(path: darray[u8]&) -> bool:
             return true if leaf_is(path, "clang")
-            leaf_start: mutable usize = path.count
-            while leaf_start > 0.usize() and path[leaf_start - 1.usize()] != 47 |path, leaf_start|:
-                leaf_start <- leaf_start - 1.usize()
-            region leaf_length_scope:
-                leaf_length: usize = path.count - leaf_start
-                return false if:
-                    leaf_length <= 6.usize()
-                    path[leaf_start] != 99 or path[leaf_start + 1.usize()] != 108 or path[leaf_start + 2.usize()] != 97 or path[leaf_start + 3.usize()] != 110 or path[leaf_start + 4.usize()] != 103 or path[leaf_start + 5.usize()] != 45
-            for index in (leaf_start + 6.usize())..<path.count |path|:
-                byte: u8 = path[index]
-                return false if (byte < 48 or byte > 57) and byte != 46
-            true
+            leaf_start: usize = while position > 0.usize() and path[position - 1.usize()] != 47 |position: usize = path.count| -> position:
+                position <- position - 1.usize()
+            # "clang-" followed by a version of digits and dots.
+            if path.count - leaf_start <= 6.usize() or path[leaf_start] != 99 or path[leaf_start + 1.usize()] != 108 or path[leaf_start + 2.usize()] != 97 or path[leaf_start + 3.usize()] != 110 or path[leaf_start + 4.usize()] != 103 or path[leaf_start + 5.usize()] != 45:
+                false
+            else:
+                for index in (leaf_start + 6.usize())..<path.count |version_only: bool = true| -> version_only:
+                    break false if (path[index] < 48 or path[index] > 57) and path[index] != 46
 
         def tool_path_is_selected(paths: darray[cstr]&, canonical: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             for index in 0..<paths.count |paths, canonical|:
@@ -429,20 +418,16 @@ module Sandbox:
             path_bytes: mutable darray[u8] = []
             ByteText::append_text(&path_bytes, path)
             if not absolute_path(path_bytes):
-                return true if not path_contains_slash(path)
-                return false
-            return false if not:
-                append_literal_rule(out, "file-read*", path_bytes)
-                append_literal_rule(out, "process-exec", path_bytes)
-                append_literal_rule(out, "file-map-executable", path_bytes)
-            region canonical_scope:
+                # A bare command name may resolve later through PATH.
+                not path_contains_slash(path)
+            elif not append_literal_rule(out, "file-read*", path_bytes) or not append_literal_rule(out, "process-exec", path_bytes) or not append_literal_rule(out, "file-map-executable", path_bytes):
+                false
+            else:
                 canonical: mutable darray[u8] = []
                 if ProjectFiles::canonical_existing_c_string_path(path, &canonical) and not ByteText::equal(path_bytes, canonical):
-                    return false if not:
-                        append_literal_rule(out, "file-read*", canonical)
-                        append_literal_rule(out, "process-exec", canonical)
-                        append_literal_rule(out, "file-map-executable", canonical)
-            true
+                    append_literal_rule(out, "file-read*", canonical) and append_literal_rule(out, "process-exec", canonical) and append_literal_rule(out, "file-map-executable", canonical)
+                else:
+                    true
 
         def append_quoted_path(out: mutable darray[u8]&, path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
             return false if not absolute_path(path)
