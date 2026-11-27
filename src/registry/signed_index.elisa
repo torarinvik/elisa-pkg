@@ -39,15 +39,22 @@ module SignedRegistryIndex:
             identity_out.resize(0)
             key_fingerprint_out.resize(0)
             return Code.InvalidConfiguration if not PackageIdentity::valid_name(package)
-            index_path: mutable darray[u8] = []
-            return Code.InvalidConfiguration if not RegistryFiles::join_path_leaf(root, package, "index", &index_path)
-            snapshot: mutable darray[u8] = []
-            region loaded_scope:
-                loaded: i64 = RegistryFiles::read_trusted_file(index_path, 1048576.usize(), &snapshot)
-                return Code.MissingIndex if loaded == -2
-                return Code.ResourceLimit if loaded == -27
-                return Code.InvalidConfiguration if loaded < 0
-                return Code.MalformedMetadata if loaded == 0 or snapshot.count > 1048576
+            snapshot: darray[u8] =
+                contents: mutable darray[u8] = []
+                loaded: i64 =
+                    index_path: mutable darray[u8] = []
+                    return Code.InvalidConfiguration if not RegistryFiles::join_path_leaf(root, package, "index", &index_path)
+                    RegistryFiles::read_trusted_file(index_path, 1048576.usize(), &contents)
+                if loaded == -2:
+                    return Code.MissingIndex
+                elif loaded == -27:
+                    return Code.ResourceLimit
+                elif loaded < 0:
+                    return Code.InvalidConfiguration
+                elif loaded == 0 or contents.count > 1048576:
+                    return Code.MalformedMetadata
+                else:
+                    contents
 
             key_fingerprint_hex: mutable darray[u8] = []
             region signature_status_scope:
@@ -56,60 +63,66 @@ module SignedRegistryIndex:
 
             versions: mutable darray[u8] = []
             yanked_flags: mutable darray[u8] = []
-            snapshot_root: mutable darray[u8] = []
-            snapshot_package: mutable darray[u8] = []
             generation: mutable u64 = 0
             expires: mutable u64 = 0
-            return Code.MalformedMetadata if not RegistryIndexSnapshot::parse(snapshot, &snapshot_root, &snapshot_package, &generation, &expires, &versions, &yanked_flags)
-            return Code.InvalidSignature if not ByteText::equal(snapshot_root, root) or not ByteText::equal(snapshot_package, package)
-            now: i64 = Platform::wall_clock_seconds()
-            return Code.ClockUnavailable if now < 0
+            region snapshot_fields_scope:
+                snapshot_root: mutable darray[u8] = []
+                snapshot_package: mutable darray[u8] = []
+                return Code.MalformedMetadata if not RegistryIndexSnapshot::parse(snapshot, &snapshot_root, &snapshot_package, &generation, &expires, &versions, &yanked_flags)
+                return Code.InvalidSignature if not ByteText::equal(snapshot_root, root) or not ByteText::equal(snapshot_package, package)
             region expiry_status_scope:
-                expiry_status: Code = rollback_result(RollbackStore::metadata_expiry_status(expires, now.u64()))
+                expiry_status: Code =
+                    now: i64 = Platform::wall_clock_seconds()
+                    return Code.ClockUnavailable if now < 0
+                    rollback_result(RollbackStore::metadata_expiry_status(expires, now.u64()))
                 return expiry_status if expiry_status != Code.Ok
 
             snapshot_digest: mutable darray[u8] = []
-            return Code.TrustStateUnavailable if not Integrity::sha256_hex(snapshot, &snapshot_digest)
             index_identity: mutable darray[u8] = []
-            return Code.TrustStateUnavailable if not TrustIdentity::index(root, package, &index_identity)
-            region state_status_scope:
+            if not Integrity::sha256_hex(snapshot, &snapshot_digest) or not TrustIdentity::index(root, package, &index_identity):
+                Code.TrustStateUnavailable
+            else:
+                # The rollback floor is durable before any output is published.
                 state_status: Code = record_index_generation(index_identity, generation, snapshot_digest, expires, key_fingerprint_hex)
-                return state_status if state_status != Code.Ok
-            ByteText::append(out, versions)
-            ByteText::append(yanked_flags_out, yanked_flags)
-            generation_out <- generation
-            ByteText::append(snapshot_digest_out, snapshot_digest)
-            ByteText::append(identity_out, index_identity)
-            ByteText::append(key_fingerprint_out, key_fingerprint_hex)
-            Code.Ok
+                if state_status == Code.Ok:
+                    ByteText::append(out, versions)
+                    ByteText::append(yanked_flags_out, yanked_flags)
+                    generation_out <- generation
+                    ByteText::append(snapshot_digest_out, snapshot_digest)
+                    ByteText::append(identity_out, index_identity)
+                    ByteText::append(key_fingerprint_out, key_fingerprint_hex)
+                state_status
 
         # Check the detached Ed25519 signature of an index snapshot against
         # the configured key, and report that key's fingerprint.
         def verify_snapshot_signature(root: darray[u8]&, package: darray[u8]&, key_path: darray[u8]&, snapshot: darray[u8]&, key_fingerprint_hex: mutable darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
-            signature_path: mutable darray[u8] = []
-            return Code.InvalidConfiguration if not RegistryFiles::join_path_leaf(root, package, "index.sig", &signature_path)
-            signature: mutable darray[u8] = []
-            region signature_size_scope:
-                signature_size: i64 = RegistryFiles::read_trusted_file(signature_path, Trust::ed25519_signature_bytes, &signature)
-                return Code.MissingSignature if signature_size < 0 or signature_size != Trust::ed25519_signature_bytes.i64()
+            signature: darray[u8] =
+                signature_bytes: mutable darray[u8] = []
+                signature_size: i64 =
+                    signature_path: mutable darray[u8] = []
+                    return Code.InvalidConfiguration if not RegistryFiles::join_path_leaf(root, package, "index.sig", &signature_path)
+                    RegistryFiles::read_trusted_file(signature_path, Trust::ed25519_signature_bytes, &signature_bytes)
+                if signature_size < 0 or signature_size != Trust::ed25519_signature_bytes.i64():
+                    return Code.MissingSignature
+                else:
+                    signature_bytes
             public_key: mutable darray[u8] = []
-            return Code.MissingTrustRoot if RegistryFiles::read_trusted_file(key_path, Trust::ed25519_public_key_bytes, &public_key) != Trust::ed25519_public_key_bytes.i64()
-            return Code.TrustStateUnavailable if not Integrity::sha256_hex(public_key, key_fingerprint_hex)
-            region trust_status_scope:
-                trust_status: Trust::VerificationCode = Trust::verify_detached("ed25519", public_key, snapshot, signature)
-                return Code.InvalidSignature if trust_status != Trust::VerificationCode.Valid
-            Code.Ok
+            if RegistryFiles::read_trusted_file(key_path, Trust::ed25519_public_key_bytes, &public_key) != Trust::ed25519_public_key_bytes.i64():
+                Code.MissingTrustRoot
+            elif not Integrity::sha256_hex(public_key, key_fingerprint_hex):
+                Code.TrustStateUnavailable
+            elif Trust::verify_detached("ed25519", public_key, snapshot, signature) != Trust::VerificationCode.Valid:
+                Code.InvalidSignature
+            else:
+                Code.Ok
 
         def contains_version(versions: darray[u8]&, version: darray[u8]&) -> bool:
-            region cursor_scope:
-                cursor: mutable usize = 0
-                while cursor < versions.count |versions, version, cursor|:
-                    finish: mutable usize = cursor
-                    while finish < versions.count and versions[finish] != 10 |versions, finish|:
-                        finish <- finish + 1
-                    return false if finish == versions.count
-                    return true if ByteText::range_equals(versions, cursor, finish, version)
-                    cursor <- finish + 1
+            while cursor < versions.count |cursor: usize = 0.usize(), finish: usize = 0.usize()|:
+                finish <- while position < versions.count and versions[position] != 10 |position: usize = cursor| -> position:
+                    position <- position + 1.usize()
+                return false if finish == versions.count
+                return true if ByteText::range_equals(versions, cursor, finish, version)
+                cursor <- finish + 1.usize()
             false
 
         def filter_yanked_versions(index: darray[u8]&, yanked_flags: darray[u8]&, eligible_out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
