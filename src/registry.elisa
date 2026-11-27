@@ -58,28 +58,76 @@ module Registry:
             read_index_with_key_fingerprint(package, out, yanked_flags_out, generation_out, snapshot_digest_out, identity_out, &key_fingerprint)
 
     private:
+        # The configured registry root and the path of its trust root.
+        struct RegistryAccess:
+            root: mutable darray[u8]
+            key_path: mutable darray[u8]
+
+        # A selected release and its authenticated metadata, published to the
+        # caller's outputs only after every check passed.
+        struct SelectedRelease:
+            version: mutable darray[u8]
+            archive: mutable darray[u8]
+            digest: mutable darray[u8]
+            archive_size: mutable u64
+            metadata: mutable darray[u8]
+
+        # Fields of a metadata snapshot verified from the offline cache.
+        struct VerifiedSnapshot:
+            archive: mutable darray[u8]
+            digest: mutable darray[u8]
+            archive_size: mutable u64
+            expires: mutable u64
+
+        # The version lines of a signed index and one yanked flag per line.
+        struct SignedIndex:
+            versions: mutable darray[u8]
+            yanked_flags: mutable darray[u8]
+
+        # An authenticated index, its evidence, and the key that signed it.
+        struct CurrentIndex:
+            versions: mutable darray[u8]
+            generation: mutable u64
+            digest: mutable darray[u8]
+            identity: mutable darray[u8]
+            key_fingerprint: mutable darray[u8]
+
+        def empty_access() -> RegistryAccess:
+            RegistryAccess{root: [], key_path: []}
+
+        def empty_selected_release() -> SelectedRelease:
+            SelectedRelease{version: [], archive: [], digest: [], archive_size: 0, metadata: []}
+
+        def zero_version() -> Model::Version:
+            Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
+
+        # Read and validate the configured registry root.
+        def configured_registry_root(root: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            ResultCode.NotConfigured if not RegistryConfiguration::configured_root(root) else ResultCode.InvalidConfiguration if not RegistryRoot::valid(root) else ResultCode.Ok
+
+        # Read the registry root and the path of its trust root.
+        def configured_registry(access: mutable RegistryAccess&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            root_status: ResultCode = configured_registry_root(&access.root)
+            root_status if root_status != ResultCode.Ok else configuration_result(RegistryConfiguration::configured_trust_root(access.root, &access.key_path))
+
         # Authenticate `metadata` with the trust root at `key_path` and check
         # that its signed `expires` time has not passed.
         def verify_signed_metadata(key_path: darray[u8]&, metadata: darray[u8]&, signature: darray[u8]&, expires_out: mutable u64&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
-            region public_key_scope:
-                public_key: mutable darray[u8] = []
-                return ResultCode.MissingTrustRoot if RegistryFiles::read_trusted_file(key_path, Trust::ed25519_public_key_bytes, &public_key) != Trust::ed25519_public_key_bytes.i64()
-                return ResultCode.InvalidSignature if Trust::verify_detached("ed25519", public_key, metadata, signature) != Trust::VerificationCode.Valid
-            ResultCode.MalformedMetadata if not ReleaseMetadata::unsigned_field(metadata, "expires", expires_out) else metadata_expiry_result(expires_out)
+            public_key: mutable darray[u8] = []
+            ResultCode.MissingTrustRoot if RegistryFiles::read_trusted_file(key_path, Trust::ed25519_public_key_bytes, &public_key) != Trust::ed25519_public_key_bytes.i64() else ResultCode.InvalidSignature if Trust::verify_detached("ed25519", public_key, metadata, signature) != Trust::VerificationCode.Valid else ResultCode.MalformedMetadata if not ReleaseMetadata::unsigned_field(metadata, "expires", expires_out) else metadata_expiry_result(expires_out)
 
         # The archive named by authenticated metadata exists with the expected
         # size and its bytes match the metadata.
         def verify_archive_file(root: darray[u8]&, package: darray[u8]&, version: darray[u8]&, metadata: darray[u8]&, archive: darray[u8]&, digest: darray[u8]&, archive_size: u64) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             archive_path: mutable darray[u8] = []
-            return ResultCode.InvalidConfiguration if not RegistryFiles::join_archive_path(root, package, version, archive, &archive_path)
-            region actual_size_scope:
-                actual_size: i64 =
-                    terminated_path: darray[u8] = ProjectFiles::with_null_terminator(archive_path)
-                    Platform::package_file_size((&terminated_path[0]).cast[cstr] can Unsafe.PointerCast)
-                return ResultCode.ArchiveMissing if actual_size < 0
-                return ResultCode.DigestMismatch if actual_size.u64() != archive_size
+            ResultCode.InvalidConfiguration if not RegistryFiles::join_archive_path(root, package, version, archive, &archive_path) else verify_archive_at(archive_path, package, version, metadata, digest, archive_size)
+
+        def verify_archive_at(archive_path: darray[u8]&, package: darray[u8]&, version: darray[u8]&, metadata: darray[u8]&, digest: darray[u8]&, archive_size: u64) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            actual_size: i64 =
+                terminated_path: darray[u8] = ProjectFiles::with_null_terminator(archive_path)
+                Platform::package_file_size((&terminated_path[0]).cast[cstr] can Unsafe.PointerCast)
             archive_bytes: mutable darray[u8] = []
-            ResultCode.ArchiveMissing if not RegistryFiles::read_file(archive_path, Archive::maximum_archive_bytes, &archive_bytes) else verify_archive_payload(package, version, metadata, archive_bytes, digest, archive_size)
+            ResultCode.ArchiveMissing if actual_size < 0 else ResultCode.DigestMismatch if actual_size.u64() != archive_size else ResultCode.ArchiveMissing if not RegistryFiles::read_file(archive_path, Archive::maximum_archive_bytes, &archive_bytes) else verify_archive_payload(package, version, metadata, archive_bytes, digest, archive_size)
 
         # Check `expires` against the current wall clock.
         def metadata_expiry_result(expires: u64) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
@@ -90,17 +138,13 @@ module Registry:
         # A nonzero `expected_generation` also requires that index to be the
         # exact snapshot (generation, digest, identity) that selected it.
         def record_at_current_index(package: darray[u8]&, version: darray[u8]&, digest: darray[u8]&, metadata_digest: darray[u8]&, expires: u64, expected_generation: u64, expected_digest: darray[u8]&, expected_identity: darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
-            versions: mutable darray[u8] = []
-            generation: mutable u64 = 0
-            index_digest: mutable darray[u8] = []
-            index_identity: mutable darray[u8] = []
-            key_fingerprint: mutable darray[u8] = []
-            region index_status_scope:
-                yanked_flags: mutable darray[u8] = []
-                index_status: ResultCode = read_index_with_key_fingerprint(package, &versions, &yanked_flags, &generation, &index_digest, &index_identity, &key_fingerprint)
-                return index_status if index_status != ResultCode.Ok
-            return ResultCode.RollbackDetected if expected_generation != 0 and (generation != expected_generation or not ByteText::equal(index_digest, expected_digest) or not ByteText::equal(index_identity, expected_identity))
-            ResultCode.NoMatchingVersion if not SignedRegistryIndex::contains_version(versions, version) else rollback_store_result(RollbackStore::record_release(package, version, digest, metadata_digest, expires, generation, index_digest, index_identity, key_fingerprint))
+            index: mutable CurrentIndex = CurrentIndex{versions: [], generation: 0, digest: [], identity: [], key_fingerprint: []}
+            index_status: ResultCode = read_current_index(package, &index)
+            index_status if index_status != ResultCode.Ok else ResultCode.RollbackDetected if expected_generation != 0 and (index.generation != expected_generation or not ByteText::equal(index.digest, expected_digest) or not ByteText::equal(index.identity, expected_identity)) else ResultCode.NoMatchingVersion if not SignedRegistryIndex::contains_version(index.versions, version) else rollback_store_result(RollbackStore::record_release(package, version, digest, metadata_digest, expires, index.generation, index.digest, index.identity, index.key_fingerprint))
+
+        def read_current_index(package: darray[u8]&, index: mutable CurrentIndex&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            yanked_flags: mutable darray[u8] = []
+            read_index_with_key_fingerprint(package, &index.versions, &yanked_flags, &index.generation, &index.digest, &index.identity, &index.key_fingerprint)
 
         def read_index_with_key_fingerprint(package: darray[u8]&, out: mutable darray[u8]&, yanked_flags_out: mutable darray[u8]&, generation_out: mutable u64&, snapshot_digest_out: mutable darray[u8]&, identity_out: mutable darray[u8]&, key_fingerprint_out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             out.resize(0)
@@ -110,17 +154,11 @@ module Registry:
             identity_out.resize(0)
             key_fingerprint_out.resize(0)
             return ResultCode.InvalidConfiguration if not PackageIdentity::valid_name(package)
-            root: mutable darray[u8] = []
-            return ResultCode.NotConfigured if not RegistryConfiguration::configured_root(&root)
-            return ResultCode.InvalidConfiguration if not RegistryRoot::valid(root)
-            key_path: mutable darray[u8] = []
-            region trust_root_status_scope:
-                trust_root_status: ResultCode = configuration_result(RegistryConfiguration::configured_trust_root(root, &key_path))
-                return trust_root_status if trust_root_status != ResultCode.Ok
-            index_result(SignedRegistryIndex::read(root, package, key_path, out, yanked_flags_out, generation_out, snapshot_digest_out, identity_out, key_fingerprint_out))
+            access: mutable RegistryAccess = empty_access()
+            access_status: ResultCode = configured_registry(&access)
+            access_status if access_status != ResultCode.Ok else index_result(SignedRegistryIndex::read(access.root, package, access.key_path, out, yanked_flags_out, generation_out, snapshot_digest_out, identity_out, key_fingerprint_out))
 
     public:
-
         # Read one archive selected by authenticated metadata. The caller must
         # supply the exact version, archive leaf, digest, and size returned by
         # `resolve`; this boundary never follows a URL or accepts an arbitrary
@@ -131,32 +169,9 @@ module Registry:
             out.resize(0)
             return ResultCode.InvalidConfiguration if not PackageIdentity::valid_name(package) or not PackageIdentity::valid_version(version) or not Archive::is_safe_entry(archive) or not Integrity::valid_sha256_hex(expected_digest) or expected_size > Archive::maximum_archive_bytes.u64()
             root: mutable darray[u8] = []
-            return ResultCode.NotConfigured if not RegistryConfiguration::configured_root(&root)
-            return ResultCode.InvalidConfiguration if not RegistryRoot::valid(root)
-            return ResultCode.MalformedMetadata if not ReleaseMetadata::valid_document(metadata)
-            region metadata_size_scope:
-                metadata_archive: mutable darray[u8] = []
-                metadata_digest: mutable darray[u8] = []
-                metadata_size: mutable u64 = 0
-                return ResultCode.MalformedMetadata if:
-                    not ReleaseMetadata::match_identity_fields(metadata, root, package, version, &metadata_archive, &metadata_digest, &metadata_size)
-                    not ByteText::equal(metadata_archive, archive)
-                return ResultCode.DigestMismatch if not ByteText::equal(metadata_digest, expected_digest) or metadata_size != expected_size
-            verified_archive: mutable darray[u8] = []
-            region path_scope:
-                path: mutable darray[u8] = []
-                return ResultCode.InvalidConfiguration if not RegistryFiles::join_archive_path(root, package, version, archive, &path)
-                return ResultCode.ArchiveMissing if not RegistryFiles::read_file(path, Archive::maximum_archive_bytes, &verified_archive)
-            region archive_status_scope:
-                archive_status: ResultCode = verify_archive_payload(package, version, metadata, verified_archive, expected_digest, expected_size)
-                return archive_status if archive_status != ResultCode.Ok
-            ByteText::append(out, verified_archive)
-            ResultCode.Ok
+            root_status: ResultCode = configured_registry_root(&root)
+            root_status if root_status != ResultCode.Ok else ResultCode.MalformedMetadata if not ReleaseMetadata::valid_document(metadata) else read_selected_archive(root, package, version, metadata, archive, expected_digest, expected_size, out)
 
-        # Bind the package shipped in an authenticated release archive to the
-        # same identity and dependency graph that the signed registry metadata
-        # authorized. Callers must authenticate metadata before using this
-        # check; the function itself treats both inputs as untrusted bytes.
         def release_archive_matches_metadata(package: darray[u8]&, version: darray[u8]&, metadata: darray[u8]&, archive: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
             RegistryArchive::matches_metadata(package, version, metadata, archive)
 
@@ -165,11 +180,9 @@ module Registry:
         # or restoring a project cannot reset rollback protection.
         def record_trusted(package: darray[u8]&, version: darray[u8]&, digest: darray[u8]&, metadata_digest: darray[u8]&, expires: u64) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             return ResultCode.InvalidConfiguration if not PackageIdentity::valid_name(package)
-            region expiry_status_scope:
-                expiry_status: ResultCode = metadata_expiry_result(expires)
-                return expiry_status if expiry_status != ResultCode.Ok
+            expiry_status: ResultCode = metadata_expiry_result(expires)
             empty_identity: darray[u8] = []
-            record_at_current_index(package, version, digest, metadata_digest, expires, 0, empty_identity, empty_identity)
+            expiry_status if expiry_status != ResultCode.Ok else record_at_current_index(package, version, digest, metadata_digest, expires, 0, empty_identity, empty_identity)
 
         # Commit a selected release only while the exact authenticated index
         # snapshot that authorized it is still the highest snapshot recorded
@@ -180,10 +193,8 @@ module Registry:
             return ResultCode.InvalidConfiguration if:
                 not PackageIdentity::valid_name(package) or generation == 0 or not Integrity::valid_sha256_hex(index_digest)
                 not Integrity::valid_sha256_hex(metadata_digest) or not Integrity::valid_sha256_hex(digest)
-            region expiry_status_scope:
-                expiry_status: ResultCode = metadata_expiry_result(expires)
-                return expiry_status if expiry_status != ResultCode.Ok
-            record_at_current_index(package, version, digest, metadata_digest, expires, generation, index_digest, index_identity)
+            expiry_status: ResultCode = metadata_expiry_result(expires)
+            expiry_status if expiry_status != ResultCode.Ok else record_at_current_index(package, version, digest, metadata_digest, expires, generation, index_digest, index_identity)
 
         # Check an identity against persisted signed metadata evidence and
         # advance the state-bound wall-clock floor while holding the same lock
@@ -247,24 +258,10 @@ module Registry:
             generation_out <- 0
             snapshot_digest_out.resize(0)
             identity_out.resize(0)
-            return ResultCode.InvalidConfiguration if not PackageIdentity::valid_name(package) or not PackageIdentity::valid_version(version)
-            region parsed_scope:
-                parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-                return ResultCode.InvalidConfiguration if not SemVer::parse(version, &parsed) or parsed.prerelease
-            root: mutable darray[u8] = []
-            return ResultCode.NotConfigured if not RegistryConfiguration::configured_root(&root)
-            return ResultCode.InvalidConfiguration if not RegistryRoot::valid(root)
-            key_path: mutable darray[u8] = []
-            region trust_root_status_scope:
-                trust_root_status: ResultCode = configuration_result(RegistryConfiguration::configured_trust_root(root, &key_path))
-                return trust_root_status if trust_root_status != ResultCode.Ok
-            index: mutable darray[u8] = []
-            yanked_flags: mutable darray[u8] = []
-            key_fingerprint: mutable darray[u8] = []
-            region index_status_scope:
-                index_status: ResultCode = index_result(SignedRegistryIndex::read(root, package, key_path, &index, &yanked_flags, generation_out, snapshot_digest_out, identity_out, &key_fingerprint))
-                return index_status if index_status != ResultCode.Ok
-            ResultCode.NoMatchingVersion if not SignedRegistryIndex::contains_version(index, version) else resolve_selected_internal(root, key_path, package, version, Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, version_out, archive_out, digest_out, archive_size_out, metadata_out, true)
+            return ResultCode.InvalidConfiguration if not PackageIdentity::valid_name(package) or not PackageIdentity::valid_version(version) or not stable_version(version)
+            release: mutable SelectedRelease = empty_selected_release()
+            status: ResultCode = resolve_listed(package, version, generation_out, snapshot_digest_out, identity_out, &release)
+            status if status != ResultCode.Ok else published_release(release, version_out, archive_out, digest_out, archive_size_out, metadata_out)
 
         # Candidate enumeration authenticates metadata without reading every
         # archive. This keeps a large signed index from forcing unbounded
@@ -287,14 +284,9 @@ module Registry:
             archive_size_out <- 0
             metadata_out.resize(0)
             return ResultCode.InvalidConfiguration if not PackageIdentity::valid_name(package) or not PackageIdentity::valid_version(version)
-            root: mutable darray[u8] = []
-            return ResultCode.NotConfigured if not RegistryConfiguration::configured_root(&root)
-            return ResultCode.InvalidConfiguration if not RegistryRoot::valid(root)
-            key_path: mutable darray[u8] = []
-            region trust_root_status_scope:
-                trust_root_status: ResultCode = configuration_result(RegistryConfiguration::configured_trust_root(root, &key_path))
-                return trust_root_status if trust_root_status != ResultCode.Ok
-            resolve_selected_internal(root, key_path, package, version, Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}, version_out, archive_out, digest_out, archive_size_out, metadata_out, false)
+            release: mutable SelectedRelease = empty_selected_release()
+            status: ResultCode = resolve_configured_selected(package, version, &release)
+            status if status != ResultCode.Ok else published_release(release, version_out, archive_out, digest_out, archive_size_out, metadata_out)
 
         # Read the detached signature that authenticated one immutable metadata
         # record. This is used only after an online fetch has verified the record,
@@ -303,16 +295,8 @@ module Registry:
             out.resize(0)
             return ResultCode.InvalidConfiguration if not PackageIdentity::valid_name(package) or not PackageIdentity::valid_version(version)
             root: mutable darray[u8] = []
-            return ResultCode.NotConfigured if not RegistryConfiguration::configured_root(&root)
-            return ResultCode.InvalidConfiguration if not RegistryRoot::valid(root)
-            region metadata_path_scope:
-                metadata_path: mutable darray[u8] = []
-                return ResultCode.InvalidConfiguration if not RegistryFiles::join_path_version(root, package, version, &metadata_path)
-                ByteText::append_text(&metadata_path, "/metadata.sig")
-                return ResultCode.MissingSignature if:
-                    not RegistryFiles::read_file(metadata_path, Trust::ed25519_signature_bytes, out)
-                    out.count != Trust::ed25519_signature_bytes
-            ResultCode.Ok
+            root_status: ResultCode = configured_registry_root(&root)
+            root_status if root_status != ResultCode.Ok else read_signature_at(root, package, version, out)
 
         # Verify a metadata snapshot restored from the offline cache. The cache
         # supplies exact bytes and the detached signature; this function repeats
@@ -326,32 +310,37 @@ module Registry:
             dependencies_out.resize(0)
             return ResultCode.InvalidConfiguration if not PackageIdentity::valid_name(package) or not PackageIdentity::valid_version(version) or not Integrity::valid_sha256_hex(expected_metadata_digest)
             return ResultCode.MalformedMetadata if not ReleaseMetadata::valid_document(metadata)
-            root: mutable darray[u8] = []
-            return ResultCode.NotConfigured if not RegistryConfiguration::configured_root(&root)
-            return ResultCode.InvalidConfiguration if not RegistryRoot::valid(root)
-            verified_archive: mutable darray[u8] = []
-            verified_digest: mutable darray[u8] = []
-            verified_archive_size: mutable u64 = 0
-            return ResultCode.MalformedMetadata if not ReleaseMetadata::match_identity_fields(metadata, root, package, version, &verified_archive, &verified_digest, &verified_archive_size)
-            region metadata_digest_scope:
-                metadata_digest: mutable darray[u8] = []
-                return ResultCode.DigestMismatch if not Integrity::sha256_hex(metadata, &metadata_digest) or not ByteText::equal(metadata_digest, expected_metadata_digest)
-            key_path: mutable darray[u8] = []
-            region trust_root_status_scope:
-                trust_root_status: ResultCode = configuration_result(RegistryConfiguration::configured_trust_root(root, &key_path))
-                return trust_root_status if trust_root_status != ResultCode.Ok
-            verified_expires: mutable u64 = 0
-            region signature_status_scope:
-                signature_status: ResultCode = verify_signed_metadata(key_path, metadata, signature, &verified_expires)
-                return signature_status if signature_status != ResultCode.Ok
-            return ResultCode.MalformedMetadata if not ReleaseMetadata::dependencies(metadata, dependencies_out)
-            ByteText::append(archive_out, verified_archive)
-            ByteText::append(digest_out, verified_digest)
-            archive_size_out <- verified_archive_size
-            expires_out <- verified_expires
-            ResultCode.Ok
+            snapshot: mutable VerifiedSnapshot = VerifiedSnapshot{archive: [], digest: [], archive_size: 0, expires: 0}
+            status: ResultCode = verify_snapshot_fields(package, version, expected_metadata_digest, metadata, signature, &snapshot, dependencies_out)
+            status if status != ResultCode.Ok else published_snapshot(snapshot, archive_out, digest_out, archive_size_out, expires_out)
 
     private:
+        # ---------- archives ------------------------------------------------------------------
+
+        # The metadata must name `archive` with the expected digest and size;
+        # then read the archive and check its bytes again.
+        def read_selected_archive(root: darray[u8]&, package: darray[u8]&, version: darray[u8]&, metadata: darray[u8]&, archive: darray[u8]&, expected_digest: darray[u8]&, expected_size: u64, out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            metadata_status: ResultCode = metadata_selects_archive(root, package, version, metadata, archive, expected_digest, expected_size)
+            metadata_status if metadata_status != ResultCode.Ok else read_archive_payload(root, package, version, metadata, archive, expected_digest, expected_size, out)
+
+        def metadata_selects_archive(root: darray[u8]&, package: darray[u8]&, version: darray[u8]&, metadata: darray[u8]&, archive: darray[u8]&, expected_digest: darray[u8]&, expected_size: u64) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            metadata_archive: mutable darray[u8] = []
+            metadata_digest: mutable darray[u8] = []
+            metadata_size: mutable u64 = 0
+            ResultCode.MalformedMetadata if not ReleaseMetadata::match_identity_fields(metadata, root, package, version, &metadata_archive, &metadata_digest, &metadata_size) or not ByteText::equal(metadata_archive, archive) else ResultCode.DigestMismatch if not ByteText::equal(metadata_digest, expected_digest) or metadata_size != expected_size else ResultCode.Ok
+
+        def read_archive_payload(root: darray[u8]&, package: darray[u8]&, version: darray[u8]&, metadata: darray[u8]&, archive: darray[u8]&, expected_digest: darray[u8]&, expected_size: u64, out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            path: mutable darray[u8] = []
+            verified_archive: mutable darray[u8] = []
+            ResultCode.InvalidConfiguration if not RegistryFiles::join_archive_path(root, package, version, archive, &path) else ResultCode.ArchiveMissing if not RegistryFiles::read_file(path, Archive::maximum_archive_bytes, &verified_archive) else published_archive(verify_archive_payload(package, version, metadata, verified_archive, expected_digest, expected_size), verified_archive, out)
+
+        # Hand the verified archive to the caller when `status` is Ok.
+        def published_archive(status: ResultCode, archive: darray[u8]&, out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            ByteText::append(out, archive) if status == ResultCode.Ok
+            status
+
+        # ---------- release selection ---------------------------------------------------------
+
         def resolve_internal(package: darray[u8]&, requirement: darray[u8]&, previous_version: Model::Version, version_out: mutable darray[u8]&, archive_out: mutable darray[u8]&, digest_out: mutable darray[u8]&, archive_size_out: mutable u64&, metadata_out: mutable darray[u8]&, verify_archive: bool, generation_out: mutable u64&, snapshot_digest_out: mutable darray[u8]&, identity_out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             version_out.resize(0)
             archive_out.resize(0)
@@ -362,74 +351,121 @@ module Registry:
             snapshot_digest_out.resize(0)
             identity_out.resize(0)
             return ResultCode.InvalidConfiguration if not PackageIdentity::valid_name(package)
-            root: mutable darray[u8] = []
-            return ResultCode.NotConfigured if not RegistryConfiguration::configured_root(&root)
-            return ResultCode.InvalidConfiguration if not RegistryRoot::valid(root)
-            key_path: mutable darray[u8] = []
-            region trust_root_status_scope:
-                trust_root_status: ResultCode = configuration_result(RegistryConfiguration::configured_trust_root(root, &key_path))
-                return trust_root_status if trust_root_status != ResultCode.Ok
-            index: mutable darray[u8] = []
-            index_key_fingerprint: mutable darray[u8] = []
-            index_yanked_flags: mutable darray[u8] = []
-            region index_status_scope:
-                index_status: ResultCode = index_result(SignedRegistryIndex::read(root, package, key_path, &index, &index_yanked_flags, generation_out, snapshot_digest_out, identity_out, &index_key_fingerprint))
-                return index_status if index_status != ResultCode.Ok
+            release: mutable SelectedRelease = empty_selected_release()
+            status: ResultCode = resolve_highest(package, requirement, previous_version, verify_archive, generation_out, snapshot_digest_out, identity_out, &release)
+            status if status != ResultCode.Ok else published_release(release, version_out, archive_out, digest_out, archive_size_out, metadata_out)
+
+        # Select the highest eligible version satisfying `requirement`.
+        def resolve_highest(package: darray[u8]&, requirement: darray[u8]&, previous_version: Model::Version, verify_archive: bool, generation_out: mutable u64&, snapshot_digest_out: mutable darray[u8]&, identity_out: mutable darray[u8]&, release: mutable SelectedRelease&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            access: mutable RegistryAccess = empty_access()
+            access_status: ResultCode = configured_registry(&access)
+            access_status if access_status != ResultCode.Ok else select_from_index(access, package, requirement, previous_version, verify_archive, generation_out, snapshot_digest_out, identity_out, release)
+
+        def select_from_index(access: RegistryAccess&, package: darray[u8]&, requirement: darray[u8]&, previous_version: Model::Version, verify_archive: bool, generation_out: mutable u64&, snapshot_digest_out: mutable darray[u8]&, identity_out: mutable darray[u8]&, release: mutable SelectedRelease&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             eligible_index: mutable darray[u8] = []
-            return ResultCode.MalformedMetadata if not SignedRegistryIndex::filter_yanked_versions(index, index_yanked_flags, &eligible_index)
+            index_status: ResultCode = eligible_versions(access, package, generation_out, snapshot_digest_out, identity_out, &eligible_index)
             selected: mutable darray[u8] = []
-            ResultCode.NoMatchingVersion if not Resolve::select_highest_version(eligible_index, requirement, &selected) else resolve_selected_internal(root, key_path, package, selected, previous_version, version_out, archive_out, digest_out, archive_size_out, metadata_out, verify_archive)
+            index_status if index_status != ResultCode.Ok else ResultCode.NoMatchingVersion if not Resolve::select_highest_version(eligible_index, requirement, &selected) else resolve_selected_internal(access, package, selected, previous_version, verify_archive, release)
+
+        # Read the signed index and keep only its versions that are not yanked.
+        def eligible_versions(access: RegistryAccess&, package: darray[u8]&, generation_out: mutable u64&, snapshot_digest_out: mutable darray[u8]&, identity_out: mutable darray[u8]&, eligible_out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            index: mutable SignedIndex = SignedIndex{versions: [], yanked_flags: []}
+            index_status: ResultCode = read_signed_index(access, package, generation_out, snapshot_digest_out, identity_out, &index)
+            index_status if index_status != ResultCode.Ok else ResultCode.MalformedMetadata if not SignedRegistryIndex::filter_yanked_versions(index.versions, index.yanked_flags, eligible_out) else ResultCode.Ok
+
+        # Read the signed index of `package` with its snapshot evidence.
+        def read_signed_index(access: RegistryAccess&, package: darray[u8]&, generation_out: mutable u64&, snapshot_digest_out: mutable darray[u8]&, identity_out: mutable darray[u8]&, index: mutable SignedIndex&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            key_fingerprint: mutable darray[u8] = []
+            index_result(SignedRegistryIndex::read(access.root, package, access.key_path, &index.versions, &index.yanked_flags, generation_out, snapshot_digest_out, identity_out, &key_fingerprint))
+
+        # A parsed, stable (non-prerelease) version.
+        def stable_version(version: darray[u8]&) -> bool:
+            parsed: mutable Model::Version = zero_version()
+            SemVer::parse(version, &parsed) and not parsed.prerelease
+
+        # Resolve `version`, which the signed index must list.
+        def resolve_listed(package: darray[u8]&, version: darray[u8]&, generation_out: mutable u64&, snapshot_digest_out: mutable darray[u8]&, identity_out: mutable darray[u8]&, release: mutable SelectedRelease&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            access: mutable RegistryAccess = empty_access()
+            access_status: ResultCode = configured_registry(&access)
+            access_status if access_status != ResultCode.Ok else resolve_listed_in_index(access, package, version, generation_out, snapshot_digest_out, identity_out, release)
+
+        def resolve_listed_in_index(access: RegistryAccess&, package: darray[u8]&, version: darray[u8]&, generation_out: mutable u64&, snapshot_digest_out: mutable darray[u8]&, identity_out: mutable darray[u8]&, release: mutable SelectedRelease&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            index: mutable SignedIndex = SignedIndex{versions: [], yanked_flags: []}
+            index_status: ResultCode = read_signed_index(access, package, generation_out, snapshot_digest_out, identity_out, &index)
+            index_status if index_status != ResultCode.Ok else ResultCode.NoMatchingVersion if not SignedRegistryIndex::contains_version(index.versions, version) else resolve_selected_internal(access, package, version, zero_version(), true, release)
+
+        def resolve_configured_selected(package: darray[u8]&, version: darray[u8]&, release: mutable SelectedRelease&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            access: mutable RegistryAccess = empty_access()
+            access_status: ResultCode = configured_registry(&access)
+            access_status if access_status != ResultCode.Ok else resolve_selected_internal(access, package, version, zero_version(), false, release)
 
         # The signed index parser returns one byte per version line. Keep the
         # direct resolver fail-closed if those authenticated views ever stop
         # matching, and never offer a yanked release as a new unpinned choice.
-        def resolve_selected_internal(root: darray[u8]&, key_path: darray[u8]&, package: darray[u8]&, selected: darray[u8]&, previous_version: Model::Version, version_out: mutable darray[u8]&, archive_out: mutable darray[u8]&, digest_out: mutable darray[u8]&, archive_size_out: mutable u64&, metadata_out: mutable darray[u8]&, verify_archive: bool) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            version_out.resize(0)
-            archive_out.resize(0)
-            digest_out.resize(0)
-            metadata_out.resize(0)
-            archive_size_out <- 0
+        def resolve_selected_internal(access: RegistryAccess&, package: darray[u8]&, selected: darray[u8]&, previous_version: Model::Version, verify_archive: bool, release: mutable SelectedRelease&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return ResultCode.InvalidConfiguration if not PackageIdentity::valid_name(package) or not PackageIdentity::valid_version(selected)
             metadata_path: mutable darray[u8] = []
-            return ResultCode.InvalidConfiguration if not RegistryFiles::join_path_version(root, package, selected, &metadata_path)
+            return ResultCode.InvalidConfiguration if not RegistryFiles::join_path_version(access.root, package, selected, &metadata_path)
             ByteText::append_text(&metadata_path, "/metadata.json")
-            metadata: mutable darray[u8] = []
-            return ResultCode.MalformedMetadata if not:
-                RegistryFiles::read_file(metadata_path, Json::maximum_document_bytes, &metadata)
-                ReleaseMetadata::valid_document(metadata)
-            selected_archive: mutable darray[u8] = []
-            selected_digest: mutable darray[u8] = []
-            selected_archive_size: mutable u64 = 0
-            return ResultCode.MalformedMetadata if not ReleaseMetadata::match_identity_fields(metadata, root, package, selected, &selected_archive, &selected_digest, &selected_archive_size)
+            return ResultCode.MalformedMetadata if not RegistryFiles::read_file(metadata_path, Json::maximum_document_bytes, &release.metadata) or not ReleaseMetadata::valid_document(release.metadata)
+            return ResultCode.MalformedMetadata if not ReleaseMetadata::match_identity_fields(release.metadata, access.root, package, selected, &release.archive, &release.digest, &release.archive_size)
             return ResultCode.RollbackDetected if selected_version_below(selected, previous_version)
+            ByteText::append(&release.version, selected)
+            archive_checked(verify_release_signature(access.key_path, metadata_path, release.metadata), access.root, package, release, verify_archive)
+
+        # Read the detached signature beside the metadata and verify it.
+        def verify_release_signature(key_path: darray[u8]&, metadata_path: darray[u8]&, metadata: darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             signature_path: mutable darray[u8] = []
-            return ResultCode.InvalidConfiguration if not RegistryFiles::sibling_path(metadata_path, "metadata.sig", &signature_path)
             signature: mutable darray[u8] = []
-            return ResultCode.MissingSignature if not RegistryFiles::read_file(signature_path, Trust::ed25519_signature_bytes, &signature)
-            region signature_status_scope:
-                expires: mutable u64 = 0
-                signature_status: ResultCode = verify_signed_metadata(key_path, metadata, signature, &expires)
-                return signature_status if signature_status != ResultCode.Ok
-            if verify_archive:
-                archive_status: ResultCode = verify_archive_file(root, package, selected, metadata, selected_archive, selected_digest, selected_archive_size)
-                return archive_status if archive_status != ResultCode.Ok
-            ByteText::append(version_out, selected)
-            ByteText::append(metadata_out, metadata)
-            ByteText::append(archive_out, selected_archive)
-            ByteText::append(digest_out, selected_digest)
-            archive_size_out <- selected_archive_size
+            expires: mutable u64 = 0
+            ResultCode.InvalidConfiguration if not RegistryFiles::sibling_path(metadata_path, "metadata.sig", &signature_path) else ResultCode.MissingSignature if not RegistryFiles::read_file(signature_path, Trust::ed25519_signature_bytes, &signature) else verify_signed_metadata(key_path, metadata, signature, &expires)
+
+        # After a valid signature, verify the archive file when requested.
+        def archive_checked(signature_status: ResultCode, root: darray[u8]&, package: darray[u8]&, release: SelectedRelease&, verify_archive: bool) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            signature_status if signature_status != ResultCode.Ok else verify_archive_file(root, package, release.version, release.metadata, release.archive, release.digest, release.archive_size) if verify_archive else ResultCode.Ok
+
+        # Hand a fully verified release to the caller's outputs.
+        def published_release(release: SelectedRelease&, version_out: mutable darray[u8]&, archive_out: mutable darray[u8]&, digest_out: mutable darray[u8]&, archive_size_out: mutable u64&, metadata_out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic]:
+            ByteText::append(version_out, release.version)
+            ByteText::append(metadata_out, release.metadata)
+            ByteText::append(archive_out, release.archive)
+            ByteText::append(digest_out, release.digest)
+            archive_size_out <- release.archive_size
             ResultCode.Ok
 
-    private:
+        # ---------- signatures and cached snapshots --------------------------------------------
+
+        def read_signature_at(root: darray[u8]&, package: darray[u8]&, version: darray[u8]&, out: mutable darray[u8]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            metadata_path: mutable darray[u8] = []
+            ResultCode.InvalidConfiguration if not RegistryFiles::join_path_version(root, package, version, &metadata_path) else ResultCode.MissingSignature if not RegistryFiles::read_file(ByteText::with_text(metadata_path, "/metadata.sig"), Trust::ed25519_signature_bytes, out) or out.count != Trust::ed25519_signature_bytes else ResultCode.Ok
+
+        def verify_snapshot_fields(package: darray[u8]&, version: darray[u8]&, expected_metadata_digest: darray[u8]&, metadata: darray[u8]&, signature: darray[u8]&, snapshot: mutable VerifiedSnapshot&, dependencies_out: mutable darray[Solver::Constraint]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            root: mutable darray[u8] = []
+            root_status: ResultCode = configured_registry_root(&root)
+            root_status if root_status != ResultCode.Ok else ResultCode.MalformedMetadata if not ReleaseMetadata::match_identity_fields(metadata, root, package, version, &snapshot.archive, &snapshot.digest, &snapshot.archive_size) else ResultCode.DigestMismatch if not metadata_digest_matches(metadata, expected_metadata_digest) else verify_snapshot_signature(root, metadata, signature, snapshot, dependencies_out)
+
+        def metadata_digest_matches(metadata: darray[u8]&, expected_metadata_digest: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            metadata_digest: mutable darray[u8] = []
+            Integrity::sha256_hex(metadata, &metadata_digest) and ByteText::equal(metadata_digest, expected_metadata_digest)
+
+        def verify_snapshot_signature(root: darray[u8]&, metadata: darray[u8]&, signature: darray[u8]&, snapshot: mutable VerifiedSnapshot&, dependencies_out: mutable darray[Solver::Constraint]&) -> ResultCode can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            key_path: mutable darray[u8] = []
+            key_status: ResultCode = configuration_result(RegistryConfiguration::configured_trust_root(root, &key_path))
+            key_status if key_status != ResultCode.Ok else verified_dependencies(verify_signed_metadata(key_path, metadata, signature, &snapshot.expires), metadata, dependencies_out)
+
+        def verified_dependencies(signature_status: ResultCode, metadata: darray[u8]&, dependencies_out: mutable darray[Solver::Constraint]&) -> ResultCode can[Memory.Allocate, Abort.Panic]:
+            signature_status if signature_status != ResultCode.Ok else ResultCode.MalformedMetadata if not ReleaseMetadata::dependencies(metadata, dependencies_out) else ResultCode.Ok
+
+        def published_snapshot(snapshot: VerifiedSnapshot&, archive_out: mutable darray[u8]&, digest_out: mutable darray[u8]&, archive_size_out: mutable u64&, expires_out: mutable u64&) -> ResultCode can[Memory.Allocate, Abort.Panic]:
+            ByteText::append(archive_out, snapshot.archive)
+            ByteText::append(digest_out, snapshot.digest)
+            archive_size_out <- snapshot.archive_size
+            expires_out <- snapshot.expires
+            ResultCode.Ok
 
         def verify_archive_payload(package: darray[u8]&, version: darray[u8]&, metadata: darray[u8]&, archive: darray[u8]&, expected_digest: darray[u8]&, expected_size: u64) -> ResultCode can[Memory.Allocate, Abort.Panic]:
-            region digest_scope:
-                digest: mutable darray[u8] = []
-                return ResultCode.DigestMismatch if not:
-                    archive.count.u64() == expected_size
-                    Integrity::sha256_hex(archive, &digest)
-                    ByteText::equal(digest, expected_digest)
-            ResultCode.MalformedMetadata if not release_archive_matches_metadata(package, version, metadata, archive) else ResultCode.Ok
+            digest: mutable darray[u8] = []
+            ResultCode.DigestMismatch if archive.count.u64() != expected_size or not Integrity::sha256_hex(archive, &digest) or not ByteText::equal(digest, expected_digest) else ResultCode.MalformedMetadata if not release_archive_matches_metadata(package, version, metadata, archive) else ResultCode.Ok
 
         def selected_version_below(version: darray[u8]&, previous: Model::Version) -> bool:
             parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
