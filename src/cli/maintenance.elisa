@@ -17,37 +17,27 @@ module MaintenanceCommand:
     public:
         def clean() -> CliStatus::ExitStatus can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
-                root: mutable darray[u8] = [46]
-                state: mutable darray[u8] = []
-                ProjectFiles::path_join_into(root, ".elisapkg", &state)
-                return CliStatus::build_failed if not ProjectFiles::make_directory(&state)
-                build_directory: darray[u8] = Build::output_directory(root, false)
-                release_build_directory: darray[u8] = Build::output_directory(root, true)
-                region manifest_raw_scope:
+                cleaned: bool =
+                    rebind state: darray[u8], build_directory: darray[u8], release_build_directory: darray[u8] =
+                        root: darray[u8] = [46]
+                        state_path: mutable darray[u8] = []
+                        ProjectFiles::path_join_into(root, ".elisapkg", &state_path)
+                        state_path, Build::output_directory(root, false), Build::output_directory(root, true)
                     manifest_raw: mutable darray[u8] = []
                     manifest_raw <- manifest_raw.resize(ProjectFiles::project_document_limit)
-                    if ProjectFiles::read_c_string_into("elisapkg.json", &manifest_raw):
-                        output_leaves: mutable darray[darray[u8]] = []
-                        return CliStatus::build_failed if:
-                            not ManifestTargets::cleanup_output_leaves(manifest_raw, &output_leaves)
-                            not remove_target_outputs(output_leaves, build_directory)
-                            not remove_target_outputs(output_leaves, release_build_directory)
-                # Remove legacy single-target names left by older receipts as well as the
-                # manifest-declared target outputs.
-                return CliStatus::build_failed if:
-                    not remove_known_file_in(build_directory, "app")
-                    not remove_known_file_in(build_directory, "app.o")
-                    not remove_known_file_in(build_directory, "receipt")
-                    not remove_known_file_in(state, "package.tar")
-                    not remove_known_file_in(state, "package.receipt")
-                    not remove_directory_if_empty(release_build_directory)
-                    not remove_directory_if_empty(build_directory)
-                # `.elisapkg` is removed only when it is empty; cache/state files are never
-                # traversed or recursively deleted by clean. A retained cache makes this
-                # directory intentionally non-empty, which is a successful clean result.
-                return CliStatus::build_failed if not remove_directory_if_empty(state)
-                CliOutput::write_ok("cleaned known .elisapkg outputs\n")
-                CliStatus::success
+                    output_leaves: mutable darray[darray[u8]] = []
+                    # Remove the manifest-declared target outputs when the manifest
+                    # is readable, then the legacy single-target names left by older
+                    # receipts. `.elisapkg` is removed only when it is empty;
+                    # cache/state files are never traversed or recursively deleted
+                    # by clean. A retained cache makes this directory intentionally
+                    # non-empty, which is a successful clean result.
+                    ProjectFiles::make_directory(&state) and (not ProjectFiles::read_c_string_into("elisapkg.json", &manifest_raw) or (ManifestTargets::cleanup_output_leaves(manifest_raw, &output_leaves) and remove_target_outputs(output_leaves, build_directory) and remove_target_outputs(output_leaves, release_build_directory))) and remove_known_file_in(build_directory, "app") and remove_known_file_in(build_directory, "app.o") and remove_known_file_in(build_directory, "receipt") and remove_known_file_in(state, "package.tar") and remove_known_file_in(state, "package.receipt") and remove_directory_if_empty(release_build_directory) and remove_directory_if_empty(build_directory) and remove_directory_if_empty(state)
+                if cleaned:
+                    CliOutput::write_ok("cleaned known .elisapkg outputs\n")
+                    CliStatus::success
+                else:
+                    CliStatus::build_failed
 
         def verify_cache(start: darray[u8]&) -> CliStatus::ExitStatus can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
@@ -65,24 +55,22 @@ module MaintenanceCommand:
                 # The package archive and its receipt are present together or not at all.
                 archive_present: bool =
                     archive_state: i64 = Platform::package_file_size(".elisapkg/package.tar")
-                    region receipt_state_scope:
-                        receipt_state: i64 = Platform::package_file_size(".elisapkg/package.receipt")
-                        return CliStatus::security_failed if:
-                            archive_state < 0 and archive_state != -2
-                            receipt_state < 0 and receipt_state != -2
-                            (archive_state >= 0) != (receipt_state >= 0)
-                    archive_state >= 0
+                    receipt_state: i64 = Platform::package_file_size(".elisapkg/package.receipt")
+                    if (archive_state < 0 and archive_state != -2) or (receipt_state < 0 and receipt_state != -2) or (archive_state >= 0) != (receipt_state >= 0):
+                        return CliStatus::security_failed
+                    else:
+                        archive_state >= 0
                 archive_bytes: mutable darray[u8] = []
                 receipt: mutable darray[u8] = []
-                region archive_digest_scope:
-                    archive_digest: mutable darray[u8] = []
-                    return CliStatus::security_failed if archive_present and not verify_package_archive(raw, lock, name, version, &archive_bytes, &receipt, &archive_digest)
-                    return CliStatus::security_failed if not inputs_unchanged(raw, lock, archive_present, archive_present, &archive_bytes, archive_digest, receipt)
-                CliOutput::write_ok("cache: local lock and manifest digests verified\n")
-                if archive_present:
-                    CliOutput::write_ok("cache: deterministic package archive and receipt verified\n")
-                CliOutput::write_ok("cache: no shared remote cache configured\n")
-                CliStatus::success
+                archive_digest: mutable darray[u8] = []
+                if (archive_present and not verify_package_archive(raw, lock, name, version, &archive_bytes, &receipt, &archive_digest)) or not inputs_unchanged(raw, lock, archive_present, archive_present, &archive_bytes, archive_digest, receipt):
+                    CliStatus::security_failed
+                else:
+                    CliOutput::write_ok("cache: local lock and manifest digests verified\n")
+                    if archive_present:
+                        CliOutput::write_ok("cache: deterministic package archive and receipt verified\n")
+                    CliOutput::write_ok("cache: no shared remote cache configured\n")
+                    CliStatus::success
 
         # Verify the packaged archive and check that its receipt binds this
         # manifest, lock, and archive digest.
@@ -90,78 +78,65 @@ module MaintenanceCommand:
             can Global.Read:
                 manifest_digest: mutable darray[u8] = []
                 lock_digest: mutable darray[u8] = []
-                return false if:
-                    not Integrity::sha256_hex(raw, &manifest_digest)
-                    not Integrity::sha256_hex(lock, &lock_digest)
-                region archive_path_scope:
-                    archive_path: mutable darray[u8] = []
-                    ByteText::append_text(&archive_path, ".elisapkg/package.tar")
-                    return false if:
-                        not read_package_file(&archive_path, archive_bytes)
-                        not Archive::verify_ustar_archive(archive_bytes)
-                        not Integrity::sha256_hex(archive_bytes, archive_digest)
-                receipt.resize(PackageReceipt::maximum_encode + 1.usize())
-                return false if not ProjectFiles::read_c_string_into(".elisapkg/package.receipt", receipt)
-                region expected_receipt_scope:
+                archive_path: mutable darray[u8] = []
+                ByteText::append_text(&archive_path, ".elisapkg/package.tar")
+                if not Integrity::sha256_hex(raw, &manifest_digest) or not Integrity::sha256_hex(lock, &lock_digest) or not read_package_file(&archive_path, archive_bytes) or not Archive::verify_ustar_archive(archive_bytes) or not Integrity::sha256_hex(archive_bytes, archive_digest):
+                    false
+                else:
+                    receipt.resize(PackageReceipt::maximum_encode + 1.usize())
                     expected_receipt: darray[u8] = PackageReceipt::encode(name, version, manifest_digest, lock_digest, archive_digest)
-                    return false if not ByteText::equal(receipt, expected_receipt)
-                true
+                    ProjectFiles::read_c_string_into(".elisapkg/package.receipt", receipt) and ByteText::equal(receipt, expected_receipt)
 
         # Re-read every input after verification so a concurrent edit cannot
         # pass. The archive re-read reuses the first bounded buffer rather
         # than retaining a second full-size archive copy.
         def inputs_unchanged(raw: darray[u8]&, lock: darray[u8]&, archive_present: bool, receipt_present: bool, archive_bytes: mutable darray[u8]&, archive_digest: darray[u8]&, receipt: darray[u8]&) -> bool can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
-                region lock_after_scope:
-                    manifest_after: mutable darray[u8] = []
-                    manifest_after <- manifest_after.resize(ProjectFiles::project_document_limit)
-                    lock_after: mutable darray[u8] = []
-                    lock_after <- lock_after.resize(ProjectFiles::project_document_limit)
-                    return false if:
-                        not ProjectFiles::read_c_string_into("elisapkg.json", &manifest_after) or not ProjectFiles::read_c_string_into("elisapkg.lock", &lock_after)
-                        not ByteText::equal(manifest_after, raw) or not ByteText::equal(lock_after, lock)
-                region receipt_state_after_scope:
+                manifest_after: mutable darray[u8] = []
+                manifest_after <- manifest_after.resize(ProjectFiles::project_document_limit)
+                lock_after: mutable darray[u8] = []
+                lock_after <- lock_after.resize(ProjectFiles::project_document_limit)
+                if not ProjectFiles::read_c_string_into("elisapkg.json", &manifest_after) or not ProjectFiles::read_c_string_into("elisapkg.lock", &lock_after) or not ByteText::equal(manifest_after, raw) or not ByteText::equal(lock_after, lock):
+                    false
+                else:
                     archive_state_after: i64 = Platform::package_file_size(".elisapkg/package.tar")
                     receipt_state_after: i64 = Platform::package_file_size(".elisapkg/package.receipt")
-                    return false if:
-                        archive_state_after < 0 and archive_state_after != -2
-                        receipt_state_after < 0 and receipt_state_after != -2
-                        archive_present != (archive_state_after >= 0) or receipt_present != (receipt_state_after >= 0)
-                if archive_present:
-                    archive_path_after: mutable darray[u8] = []
-                    ByteText::append_text(&archive_path_after, ".elisapkg/package.tar")
-                    # Reuse the first bounded buffer: verify the bytes still at the
-                    # pathname without retaining a second full-size archive copy.
-                    archive_after_digest: mutable darray[u8] = []
-                    receipt_after: mutable darray[u8] = []
-                    receipt_after <- receipt_after.resize(PackageReceipt::maximum_encode + 1.usize())
-                    return false if:
-                        not read_package_file(&archive_path_after, archive_bytes) or not ProjectFiles::read_c_string_into(".elisapkg/package.receipt", &receipt_after)
-                        not Integrity::sha256_hex(archive_bytes, &archive_after_digest)
-                        not ByteText::equal(archive_after_digest, archive_digest) or not ByteText::equal(receipt_after, receipt)
-                        not Cache::verify_blob(archive_digest)
-                true
+                    if (archive_state_after < 0 and archive_state_after != -2) or (receipt_state_after < 0 and receipt_state_after != -2) or archive_present != (archive_state_after >= 0) or receipt_present != (receipt_state_after >= 0):
+                        false
+                    elif not archive_present:
+                        true
+                    else:
+                        archive_path_after: mutable darray[u8] = []
+                        ByteText::append_text(&archive_path_after, ".elisapkg/package.tar")
+                        # Reuse the first bounded buffer: verify the bytes still at the
+                        # pathname without retaining a second full-size archive copy.
+                        archive_after_digest: mutable darray[u8] = []
+                        receipt_after: mutable darray[u8] = []
+                        receipt_after <- receipt_after.resize(PackageReceipt::maximum_encode + 1.usize())
+                        read_package_file(&archive_path_after, archive_bytes) and ProjectFiles::read_c_string_into(".elisapkg/package.receipt", &receipt_after) and Integrity::sha256_hex(archive_bytes, &archive_after_digest) and ByteText::equal(archive_after_digest, archive_digest) and ByteText::equal(receipt_after, receipt) and Cache::verify_blob(archive_digest)
 
         def run_cache(argument_count: i64, slots: cstr&&, start: darray[u8]&) -> CliStatus::ExitStatus can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
-                return verify_cache(start) if argument_count == 3 and Platform::c_string_equal(slots[2].cast[cstr], "verify")
-                if argument_count == 4 and Platform::c_string_equal(slots[2].cast[cstr], "gc") and Platform::c_string_equal(slots[3].cast[cstr], "--dry-run"):
+                if argument_count == 3 and Platform::c_string_equal(slots[2].cast[cstr], "verify"):
+                    verify_cache(start)
+                elif argument_count == 4 and Platform::c_string_equal(slots[2].cast[cstr], "gc") and Platform::c_string_equal(slots[3].cast[cstr], "--dry-run"):
                     CliOutput::write_ok("cache: no shared cache configured; nothing would be collected\n")
-                    return CliStatus::success
-                if argument_count == 3 and Platform::c_string_equal(slots[2].cast[cstr], "gc"):
+                    CliStatus::success
+                elif argument_count == 3 and Platform::c_string_equal(slots[2].cast[cstr], "gc"):
                     CliOutput::write_error("error: cache garbage collection is disabled until a verified cache store is configured; use `cache gc --dry-run`\n")
-                    return CliStatus::operation_failed
-                CliStatus::usage
+                    CliStatus::operation_failed
+                else:
+                    CliStatus::usage
 
     private:
         # Remove `path` if it is an empty directory. A missing or non-empty
         # directory is kept and counts as success: clean owns only the files it
         # names, and a retained cache keeps the state directory non-empty.
         def remove_directory_if_empty(path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            path_c: darray[u8] = ProjectFiles::with_null_terminator(path)
-            region result_scope:
-                result: i64 = Platform::remove_directory((&path_c[0]).cast[cstr] can Unsafe.PointerCast)
-                return result == 0 or result == -2 or result == -Platform::directory_not_empty_error()
+            result: i64 =
+                path_c: darray[u8] = ProjectFiles::with_null_terminator(path)
+                Platform::remove_directory((&path_c[0]).cast[cstr] can Unsafe.PointerCast)
+            result == 0 or result == -2 or result == -Platform::directory_not_empty_error()
 
         def remove_known_file_in(directory: darray[u8]&, leaf: cstr) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             path: mutable darray[u8] = []
@@ -169,11 +144,10 @@ module MaintenanceCommand:
             ProjectFiles::remove_known_file(&path)
 
         def remove_target_outputs(leaves: darray[darray[u8]]&, build_directory: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            for index in 0..<leaves.count |leaves, build_directory|:
+            for index in 0..<leaves.count |removed: bool = true| -> removed:
                 path: mutable darray[u8] = []
                 ProjectFiles::path_join_bytes_into(build_directory, leaves[index], &path)
-                return false if not ProjectFiles::remove_known_file(path)
-            true
+                break false if not ProjectFiles::remove_known_file(path)
 
         def read_package_file(path: darray[u8]&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             Platform::read_bounded_file(path, Integrity::maximum_input, out)
