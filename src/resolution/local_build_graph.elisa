@@ -30,85 +30,78 @@ module LocalBuildGraph:
         # Packages arrive sorted by name with empty reverse edges and counters.
         # The pass consumes that graph state and emits prerequisites first.
         def write_ordered_includes[@r](packages: mutable darray[Package]& @r, order: mutable darray[usize]& @r, root_entry: cstr, aggregate: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            # Record each dependency edge in reverse and count each package's prerequisites.
             for package_index in 0..<packages.count |packages|:
-                dependency_cursor: mutable usize = 0.usize()
-                while dependency_cursor < packages[package_index].dependency_names.count:
-                    dependency_end: mutable usize = dependency_cursor
-                    while dependency_end < packages[package_index].dependency_names.count and packages[package_index].dependency_names[dependency_end] != 0 |packages, dependency_end|:
-                        dependency_end <- dependency_end + 1.usize()
-                    dependency_name: mutable darray[u8] = []
-                    for byte_index in dependency_cursor..<dependency_end |dependency_name, packages|:
-                        dependency_name <- dependency_name.push(packages[package_index].dependency_names[byte_index])
+                while dependency_cursor < packages[package_index].dependency_names.count |packages, dependency_cursor: usize = 0.usize(), dependency_end: usize = 0.usize(), dependency_name: darray[u8] = []|:
+                    dependency_end <- while end < packages[package_index].dependency_names.count and packages[package_index].dependency_names[end] != 0 |end: usize = dependency_cursor| -> end:
+                        end <- end + 1.usize()
+                    dependency_name <- [packages[package_index].dependency_names[byte_index] for byte_index in dependency_cursor..<dependency_end]
                     dependency_index: usize = package_index_for_name(packages, dependency_name)
                     return false if dependency_end == dependency_cursor or dependency_end == packages[package_index].dependency_names.count or dependency_index >= packages.count
+                    dependency_cursor <- dependency_end + 1.usize()
                     packages[package_index].remaining_dependencies <- packages[package_index].remaining_dependencies + 1.usize()
                     packages[dependency_index].dependents.push(package_index)
-                    dependency_cursor <- dependency_end + 1.usize()
-            ready: mutable darray[usize] = []
-            for package_index in 0..<packages.count |packages, ready|:
-                if packages[package_index].remaining_dependencies == 0.usize():
-                    ready <- enqueue_ready(ready, package_index)
-            while ready.count > 0.usize() |packages, ready, order, aggregate|:
-                selected: usize = remove_first_ready(&ready)
-                return false if:
-                    not Build::append_include_path(packages[selected].entry, aggregate)
-                    aggregate.count > maximum_aggregate_bytes
-                order.push(selected)
-                for dependent_index in 0..<packages[selected].dependents.count |packages, selected, dependent_index, ready|:
-                    dependent: usize = packages[selected].dependents[dependent_index]
-                    outstanding: usize = packages[dependent].remaining_dependencies
-                    return false if outstanding == 0.usize()
-                    packages[dependent].remaining_dependencies <- outstanding - 1.usize()
-                    if outstanding == 1.usize():
-                        ready <- enqueue_ready(ready, dependent)
-            return false if order.count != packages.count
-            root_entry_bytes: mutable darray[u8] = []
+            # Emit ready packages in name order; every package must be emitted once.
+            ordered: bool =
+                ready: mutable darray[usize] = for package_index in 0..<packages.count |queue: darray[usize] = []| -> queue:
+                    queue <- enqueue_ready(queue, package_index) if packages[package_index].remaining_dependencies == 0.usize()
+                while ready.count > 0.usize() |packages, ready, order, aggregate| -> order.count == packages.count:
+                    selected: usize = remove_first_ready(&ready)
+                    return false if:
+                        not Build::append_include_path(packages[selected].entry, aggregate)
+                        aggregate.count > maximum_aggregate_bytes
+                    order.push(selected)
+                    for dependent_index in 0..<packages[selected].dependents.count |packages, ready|:
+                        dependent: usize = packages[selected].dependents[dependent_index]
+                        outstanding: usize = packages[dependent].remaining_dependencies
+                        return false if outstanding == 0.usize()
+                        packages[dependent].remaining_dependencies <- outstanding - 1.usize()
+                        ready <- enqueue_ready(ready, dependent) if outstanding == 1.usize()
             root_entry_length: usize = Platform::c_string_length(root_entry)
-            return false if root_entry_length == 0.usize() or root_entry_length > 4096.usize()
-            for index in 0..<root_entry_length |root_entry_bytes, root_entry|:
-                root_entry_bytes <- root_entry_bytes.push(root_entry[index].u8())
-            false if not Build::append_include_path(root_entry_bytes, aggregate) or aggregate.count > maximum_aggregate_bytes else true
+            if not ordered or root_entry_length == 0.usize() or root_entry_length > 4096.usize():
+                false
+            else:
+                root_entry_bytes: darray[u8] = [root_entry[index].u8() for index in 0..<root_entry_length]
+                Build::append_include_path(root_entry_bytes, aggregate) and aggregate.count <= maximum_aggregate_bytes
 
     private:
         # Use a minimum-heap of indices so the earliest package by name still
         # wins every tie, including packages that just became ready.
         def enqueue_ready(ready: mutable darray[usize], package_index: usize) -> darray[usize] can[Memory.Allocate, Abort.Panic]:
-            cursor: mutable usize = ready.count
             ready <- ready.push(package_index)
-            while cursor > 0.usize() |ready, cursor, package_index|:
+            # Swap the new index toward the root while its parent is larger.
+            while cursor > 0.usize() |ready, cursor: usize = ready.count - 1.usize()|:
                 parent: usize = (cursor - 1.usize()) / 2.usize()
                 break if ready[parent] <= package_index
                 ready[cursor] <- ready[parent]
+                ready[parent] <- package_index
                 cursor <- parent
-            ready[cursor] <- package_index
             ready
 
         def remove_first_ready(ready: mutable darray[usize]&) -> usize can[Memory.Allocate, Abort.Panic]:
             first: usize = ready[0]
-            last_index: usize = ready.count - 1.usize()
-            last: usize = ready[last_index]
-            ready.resize(last_index)
-            return first if last_index == 0.usize()
-            cursor: mutable usize = 0.usize()
-            while cursor < last_index / 2.usize() |ready, cursor, last_index, last|:
-                child: mutable usize = cursor * 2.usize() + 1.usize()
-                if child + 1.usize() < last_index and ready[child + 1.usize()] < ready[child]:
-                    child <- child + 1.usize()
-                break if ready[child] >= last
-                ready[cursor] <- ready[child]
-                cursor <- child
-            ready[cursor] <- last
-            first
+            last: usize = ready[ready.count - 1.usize()]
+            ready.resize(ready.count - 1.usize())
+            if ready.count == 0.usize():
+                first
+            else:
+                # Sift the former last index down from the root into the
+                # hole left by the removed first index.
+                while true |ready, hole: usize = 0.usize(), child: usize = 0.usize()|:
+                    child <- hole * 2.usize() + 2.usize() if hole * 2.usize() + 2.usize() < ready.count and ready[hole * 2.usize() + 2.usize()] < ready[hole * 2.usize() + 1.usize()] else hole * 2.usize() + 1.usize()
+                    if hole >= ready.count / 2.usize() or ready[child] >= last:
+                        ready[hole] <- last
+                        break
+                    ready[hole] <- ready[child]
+                    hole <- child
+                first
 
         def package_index_for_name(packages: darray[Package]&, wanted: darray[u8]&) -> usize:
-            lower: mutable usize = 0.usize()
-            region upper_scope:
-                upper: mutable usize = packages.count
-                while lower < upper |packages, wanted, lower, upper|:
-                    middle: usize = lower + (upper - lower) / 2.usize()
-                    return middle if ByteText::equal(packages[middle].name, wanted)
-                    if ByteText::less(packages[middle].name, wanted):
-                        lower <- middle + 1.usize()
-                    else:
-                        upper <- middle
-            packages.count
+            # Binary search of the name-sorted packages; `packages.count` when absent.
+            while lower < upper |lower: usize = 0.usize(), upper: usize = packages.count, found: usize = packages.count| -> found:
+                middle: usize = lower + (upper - lower) / 2.usize()
+                break middle if ByteText::equal(packages[middle].name, wanted)
+                if ByteText::less(packages[middle].name, wanted):
+                    lower <- middle + 1.usize()
+                else:
+                    upper <- middle
