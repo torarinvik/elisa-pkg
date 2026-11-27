@@ -38,37 +38,65 @@ module PackageAssembly:
             can Global.Read:
                 package_source_digest: mutable darray[u8] = []
                 return Code.SecurityFailure if not SourceFingerprint::current(&package_source_digest)
-                region state_root_scope:
-                    state_root: mutable darray[u8] = []
-                    ByteText::append_text(&state_root, ".elisapkg")
-                    return Code.OutputFailure if not ProjectFiles::make_directory(&state_root)
-                archive: mutable darray[u8] = []
-                region build_status_scope:
-                    build_status: Code = build_verified_archive(raw, lock_raw, entry, package_source_digest, &archive)
-                    return build_status if build_status != Code.Ok
-                archive_path: mutable darray[u8] = []
-                ProjectFiles::path_join_into(start, ".elisapkg/package.tar", &archive_path)
-                receipt_path: mutable darray[u8] = []
-                ProjectFiles::path_join_into(start, ".elisapkg/package.receipt", &receipt_path)
-                return Code.OutputFailure if not ProjectFiles::replace_file(archive_path, &archive)
-                persisted_archive: mutable darray[u8] = []
-                return Code.OutputFailure if not Platform::read_bounded_file(archive_path, Integrity::maximum_input, &persisted_archive)
-                # The receipt and cache identify the bytes that remain at the
-                # published path. Refuse a pathname replacement between the
-                # atomic write and this read unless it still matches the exact tar
-                # that passed the in-memory archive verifier.
-                return Code.OutputFailure if not ByteText::equal(persisted_archive, archive)
-                digest: mutable darray[u8] = []
-                return Code.OutputFailure if not Integrity::sha256_hex(persisted_archive, &digest)
-                return Code.OutputFailure if not publish_to_cache(archive_path, digest)
-                region receipt_scope:
-                    receipt: darray[u8] = PackageReceipt::encode(package_name, package_version, manifest_digest, lock_digest, digest)
-                    return Code.OutputFailure if receipt.count == 0.usize()
-                    return Code.OutputFailure if not ProjectFiles::replace_file(receipt_path, receipt)
-                report_packaged(package_name, package_version, archive_path, digest)
-                Code.Ok
+                return Code.OutputFailure if not make_named_directory(".elisapkg")
+                build_and_publish(start, raw, lock_raw, entry, package_source_digest, package_name, package_version, manifest_digest, lock_digest)
 
     private:
+        # The include and exclude pattern arrays of a manifest.
+        struct PatternRanges:
+            include_start: usize
+            include_end: usize
+            exclude_start: usize
+            exclude_end: usize
+
+        # The shared include/exclude matching budget.
+        struct GlobBudget:
+            work_remaining: mutable usize
+            rows_remaining: mutable usize
+            exhausted: mutable bool
+
+        # The paths selected so far and whether the target entry is among them.
+        struct PathSelection:
+            selected: mutable usize
+            target_found: mutable bool
+
+        # How one collected path fares against the include/exclude patterns.
+        const path_skipped: i64 = 0
+        const path_included: i64 = 1
+        const path_budget_exhausted: i64 = 2
+
+        # ---------- outputs -------------------------------------------------------------------
+
+        def build_and_publish(start: darray[u8]&, raw: darray[u8]&, lock_raw: darray[u8]&, entry: darray[u8]&, package_source_digest: darray[u8]&, package_name: darray[u8]&, package_version: darray[u8]&, manifest_digest: darray[u8]&, lock_digest: darray[u8]&) -> Code can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                archive: mutable darray[u8] = []
+                build_status: Code = build_verified_archive(raw, lock_raw, entry, package_source_digest, &archive)
+                build_status if build_status != Code.Ok else publish_archive(start, archive, package_name, package_version, manifest_digest, lock_digest)
+
+        # The receipt and cache identify the bytes that remain at the
+        # published path. Refuse a pathname replacement between the atomic
+        # write and the read back unless it still matches the exact tar that
+        # passed the in-memory archive verifier.
+        def publish_archive(start: darray[u8]&, archive: darray[u8]&, package_name: darray[u8]&, package_version: darray[u8]&, manifest_digest: darray[u8]&, lock_digest: darray[u8]&) -> Code can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                archive_path: darray[u8] = ProjectFiles::path_join(start, ".elisapkg/package.tar")
+                persisted_archive: mutable darray[u8] = []
+                Code.OutputFailure if not ProjectFiles::replace_file(archive_path, archive) or not Platform::read_bounded_file(archive_path, Integrity::maximum_input, &persisted_archive) or not ByteText::equal(persisted_archive, archive) else publish_persisted_archive(start, archive_path, persisted_archive, package_name, package_version, manifest_digest, lock_digest)
+
+        def publish_persisted_archive(start: darray[u8]&, archive_path: darray[u8]&, persisted_archive: darray[u8]&, package_name: darray[u8]&, package_version: darray[u8]&, manifest_digest: darray[u8]&, lock_digest: darray[u8]&) -> Code can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                digest: mutable darray[u8] = []
+                Code.OutputFailure if not Integrity::sha256_hex(persisted_archive, &digest) or not publish_to_cache(archive_path, digest) or not write_receipt(start, package_name, package_version, manifest_digest, lock_digest, digest) else report_packaged(package_name, package_version, archive_path, digest)
+
+        def write_receipt(start: darray[u8]&, package_name: darray[u8]&, package_version: darray[u8]&, manifest_digest: darray[u8]&, lock_digest: darray[u8]&, digest: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            receipt: darray[u8] = PackageReceipt::encode(package_name, package_version, manifest_digest, lock_digest, digest)
+            receipt.count > 0.usize() and ProjectFiles::replace_file(ProjectFiles::path_join(start, ".elisapkg/package.receipt"), receipt)
+
+        def make_named_directory(name: cstr) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            path: mutable darray[u8] = []
+            ByteText::append_text(&path, name)
+            ProjectFiles::make_directory(path)
+
         # Build the package archive, then confirm the source tree, manifest,
         # and lock did not change while it was built. Manifest and lock bytes
         # are excluded from the source-tree digest because their dedicated
@@ -77,58 +105,48 @@ module PackageAssembly:
         # under the earlier identity.
         def build_verified_archive(raw: darray[u8]&, lock_raw: darray[u8]&, entry: darray[u8]&, package_source_digest: darray[u8]&, archive: mutable darray[u8]&) -> Code can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
-                return Code.OutputFailure if not archive_bytes(raw, entry, archive)
-                region package_source_digest_after_scope:
-                    package_source_digest_after: mutable darray[u8] = []
-                    return Code.OutputFailure if not SourceFingerprint::current(&package_source_digest_after) or not ByteText::equal(package_source_digest_after, package_source_digest)
-                # Manifest and lock bytes are excluded from the source-tree digest
-                # because their dedicated receipt fields would otherwise be
-                # self-referential. Re-read both inputs after archive creation so a
-                # concurrent edit cannot publish a mixed archive under the earlier
-                # identity.
-                manifest_after: mutable darray[u8] = []
-                manifest_after <- manifest_after.resize(ProjectFiles::project_document_limit)
-                region lock_after_scope:
-                    lock_after: mutable darray[u8] = []
-                    lock_after <- lock_after.resize(ProjectFiles::project_document_limit)
-                    return Code.OutputFailure if not ProjectFiles::read_c_string_into("elisapkg.json", &manifest_after) or not ProjectFiles::read_c_string_into("elisapkg.lock", &lock_after)
-                    return Code.SecurityFailure if not ByteText::equal(manifest_after, raw) or not ByteText::equal(lock_after, lock_raw)
-                Code.OutputFailure if not Archive::verify_ustar_archive(archive) else Code.Ok
+                return Code.OutputFailure if not archive_bytes(raw, entry, archive) or not source_unchanged(package_source_digest)
+                inputs_status: Code = inputs_unchanged(raw, lock_raw)
+                inputs_status if inputs_status != Code.Ok else Code.OutputFailure if not Archive::verify_ustar_archive(archive) else Code.Ok
+
+        def source_unchanged(package_source_digest: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            package_source_digest_after: mutable darray[u8] = []
+            SourceFingerprint::current(&package_source_digest_after) and ByteText::equal(package_source_digest_after, package_source_digest)
+
+        def inputs_unchanged(raw: darray[u8]&, lock_raw: darray[u8]&) -> Code can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            manifest_after: mutable darray[u8] = []
+            lock_after: mutable darray[u8] = []
+            Code.OutputFailure if not ProjectFiles::read_project_document("elisapkg.json", &manifest_after) or not ProjectFiles::read_project_document("elisapkg.lock", &lock_after) else Code.SecurityFailure if not ByteText::equal(manifest_after, raw) or not ByteText::equal(lock_after, lock_raw) else Code.Ok
+
+        # ---------- cache publication ---------------------------------------------------------
 
         # Link the published archive into the content-addressed cache,
         # quarantining a corrupt existing blob, and make the link durable.
         def publish_to_cache(archive_path: darray[u8]&, digest: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             blob_path: mutable darray[u8] = []
-            return false if not Cache::blob_path(digest, &blob_path)
-            region cache_parent_scope:
-                cache_parent: mutable darray[u8] = []
-                return false if:
-                    not Cache::shard_path(digest, &cache_parent)
-                    not ProjectFiles::make_directory(&cache_parent)
-            blob_name_c: mutable darray[u8] = []
-            archive_source_c: mutable darray[u8] = []
-            quarantine_parent: mutable darray[u8] = []
-            blob_name_c <- ProjectFiles::with_null_terminator(&blob_path)
-            archive_source_c <- ProjectFiles::with_null_terminator(archive_path)
-            ByteText::append_text(&quarantine_parent, Cache::quarantine_directory)
-            blob_name: cstr = (&blob_name_c[0]).cast[cstr] can Unsafe.PointerCast
-            region archive_source_name_scope:
-                archive_source_name: cstr = (&archive_source_c[0]).cast[cstr] can Unsafe.PointerCast
-                if ProjectFiles::c_string_file_exists(blob_name):
-                    if not Cache::verify_blob(digest):
-                        return false if:
-                            not ProjectFiles::make_directory(&quarantine_parent)
-                            not Cache::quarantine_blob(digest)
-                            Platform::create_hard_link(archive_source_name, blob_name) != 0
-                elif Platform::create_hard_link(archive_source_name, blob_name) != 0:
-                    return false if not ProjectFiles::c_string_file_exists(blob_name) or not Cache::verify_blob(digest)
-            # Revalidate after every publication path. A concurrent rename can change
-            # a pathname after the initial existence check; the receipt is written only
-            # once the final cache bytes still match the in-memory archive digest. The
-            # parent flush makes the hard-link durable before the receipt can claim it.
-            Platform::synchronize_parent_directory(blob_name) == 0 and Cache::verify_blob(digest)
+            Cache::blob_path(digest, &blob_path) and prepared_cache_shard(digest) and linked_into_cache(archive_path, ProjectFiles::with_null_terminator(blob_path), digest)
 
-        def report_packaged(package_name: darray[u8]&, package_version: darray[u8]&, archive_path: darray[u8]&, digest: darray[u8]&) -> void can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+        def prepared_cache_shard(digest: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            cache_parent: mutable darray[u8] = []
+            Cache::shard_path(digest, &cache_parent) and ProjectFiles::make_directory(cache_parent)
+
+        # Revalidate after every publication path. A concurrent rename can change
+        # a pathname after the initial existence check; the receipt is written only
+        # once the final cache bytes still match the in-memory archive digest. The
+        # parent flush makes the hard-link durable before the receipt can claim it.
+        def linked_into_cache(archive_path: darray[u8]&, terminated_blob_path: darray[u8]&, digest: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            blob_name: cstr = (&terminated_blob_path[0]).cast[cstr] can Unsafe.PointerCast
+            terminated_archive_path: darray[u8] = ProjectFiles::with_null_terminator(archive_path)
+            published_blob(blob_name, ((&terminated_archive_path[0]).cast[cstr] can Unsafe.PointerCast), digest) and Platform::synchronize_parent_directory(blob_name) == 0 and Cache::verify_blob(digest)
+
+        # Link the archive as the blob unless a verified blob already exists.
+        def published_blob(blob_name: cstr, archive_source_name: cstr, digest: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            replaced_corrupt_blob(blob_name, archive_source_name, digest) if ProjectFiles::c_string_file_exists(blob_name) else Platform::create_hard_link(archive_source_name, blob_name) == 0 or (ProjectFiles::c_string_file_exists(blob_name) and Cache::verify_blob(digest))
+
+        def replaced_corrupt_blob(blob_name: cstr, archive_source_name: cstr, digest: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            Cache::verify_blob(digest) or (make_named_directory(Cache::quarantine_directory) and Cache::quarantine_blob(digest) and Platform::create_hard_link(archive_source_name, blob_name) == 0)
+
+        def report_packaged(package_name: darray[u8]&, package_version: darray[u8]&, archive_path: darray[u8]&, digest: darray[u8]&) -> Code can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
                 CliOutput::write_ok("packaged ")
                 CliOutput::write_bytes(1, package_name)
@@ -139,62 +157,89 @@ module PackageAssembly:
                 CliOutput::write_ok(" sha256:")
                 CliOutput::write_bytes(1, digest)
                 CliOutput::write_ok("\n")
+                Code.Ok
+
+        # ---------- path selection ------------------------------------------------------------
 
         def select_paths(raw: darray[u8]&, target: darray[u8]&, out: mutable darray[u8]&) -> bool can[Global.Read, Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             can Global.Read:
-                resolved_root: mutable darray[u8] = []
-                resolved_root <- resolved_root.resize(4096)
-                root_real_name: mutable cstr = ""
-                if Platform::resolve_real_path(".", &resolved_root) is canonical_root:
-                    root_real_name <- canonical_root
-                else:
-                    return false
-                region root_policy_path_scope:
-                    root_policy_path: mutable darray[u8] = []
-                    ByteText::append_bounded_text(&root_policy_path, root_real_name)
-                    root_policy_path <- root_policy_path.push(0)
-                    return false if PackagePathPolicy::credential_root_forbidden(root_policy_path)
+                return false if not project_root_allowed()
                 buffer: mutable darray[u8] = []
                 buffer <- buffer.resize(8388608)
                 collected: i64 =
                     buffer_raw: mutable u8& = (&buffer[0]).cast[mutable u8&] can Unsafe.PointerCast
                     Platform::collect_files(".", buffer_raw, buffer.count)
-                return false if collected < 0
-                selected: mutable usize = 0.usize()
-                target_found: mutable bool = false
-                include_start: usize = Json::root_value_offset(raw, "include")
-                include_end: usize = Json::array_end(raw, include_start) if include_start < raw.count else raw.count
-                exclude_start: usize = Json::root_value_offset(raw, "exclude")
-                exclude_end: usize = Json::array_end(raw, exclude_start) if exclude_start < raw.count else raw.count
-                return false if not:
-                    PackageSelection::valid_pattern_range(raw, include_start, include_end)
-                    PackageSelection::valid_pattern_range(raw, exclude_start, exclude_end)
-                glob_work_remaining: mutable usize = PackageSelection::maximum_work
-                glob_rows_remaining: mutable usize = PackageSelection::maximum_rows
-                glob_budget_exhausted: mutable bool = false
-                while cursor < collected.usize() |cursor: usize = 0.usize()|:
-                    path: mutable darray[u8] = []
-                    while cursor < collected.usize() and buffer[cursor] != 0 |buffer, cursor, path|:
-                        path <- path.push(buffer[cursor])
-                        cursor <- cursor + 1.usize()
-                    return false if cursor >= collected.usize()
-                    cursor <- cursor + 1.usize()
-                    return false if path.count == 0.usize() or PackageSelection::publish_path_forbidden(path)
-                    required: bool = ByteText::equal_text(path, "elisapkg.json") or ByteText::equal_text(path, "elisapkg.lock")
-                    include_selected: mutable bool = required or PackageSelection::include_allows_path(raw, include_start, include_end, path, &glob_work_remaining, &glob_rows_remaining, &glob_budget_exhausted)
-                    if glob_budget_exhausted:
-                        CliOutput::write_error("error: package include/exclude patterns exceeded the bounded matching budget\n")
-                        return false
-                    if include_selected and not required and PackageSelection::exclude_allows_path(raw, exclude_start, exclude_end, path, &glob_work_remaining, &glob_rows_remaining, &glob_budget_exhausted):
-                        include_selected <- false
-                    if glob_budget_exhausted:
-                        CliOutput::write_error("error: package include/exclude patterns exceeded the bounded matching budget\n")
-                        return false
-                    if include_selected:
-                        return false if selected >= PackagePathPolicy::maximum_package_archive_entries
-                        for index in 0..<path.count |out, path|:
-                            out.push(path[index])
-                        out.push(0)
-                        selected <- selected + 1.usize()
-                        target_found <- true if ByteText::equal(path, target)
-                selected > 0.usize() and target_found
+                collected >= 0 and select_collected(raw, target, buffer, collected.usize(), out)
+
+        # The project root must resolve and must not be a credential directory.
+        def project_root_allowed() -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            resolved_root: mutable darray[u8] = []
+            resolved_root <- resolved_root.resize(4096)
+            root_allowed_at(&resolved_root)
+
+        def root_allowed_at(resolved_root: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            if Platform::resolve_real_path(".", resolved_root) is canonical_root:
+                return not PackagePathPolicy::credential_root_forbidden(terminated_text(canonical_root))
+            false
+
+        def terminated_text(value: cstr) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
+            text: mutable darray[u8] = []
+            ByteText::append_bounded_text(&text, value)
+            text <- text.push(0)
+            text
+
+        def pattern_ranges(raw: darray[u8]&) -> PatternRanges can[Memory.Allocate, Abort.Panic]:
+            include_start: usize = Json::root_value_offset(raw, "include")
+            exclude_start: usize = Json::root_value_offset(raw, "exclude")
+            PatternRanges{include_start: include_start, include_end: Json::array_end(raw, include_start) if include_start < raw.count else raw.count, exclude_start: exclude_start, exclude_end: Json::array_end(raw, exclude_start) if exclude_start < raw.count else raw.count}
+
+        def select_collected(raw: darray[u8]&, target: darray[u8]&, buffer: darray[u8]&, collected: usize, out: mutable darray[u8]&) -> bool can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                patterns: PatternRanges = pattern_ranges(raw)
+                PackageSelection::valid_pattern_range(raw, patterns.include_start, patterns.include_end) and PackageSelection::valid_pattern_range(raw, patterns.exclude_start, patterns.exclude_end) and select_listed_paths(raw, target, buffer, collected, patterns, out)
+
+        # Walk the NUL-separated collected paths and append each selected one,
+        # NUL-terminated, to `out`. The target entry must be among them.
+        def select_listed_paths(raw: darray[u8]&, target: darray[u8]&, buffer: darray[u8]&, collected: usize, patterns: PatternRanges&, out: mutable darray[u8]&) -> bool can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                selection: PathSelection = while cursor < collected |out, cursor: usize = 0.usize(), glob: GlobBudget = GlobBudget{work_remaining: PackageSelection::maximum_work, rows_remaining: PackageSelection::maximum_rows, exhausted: false}, found: PathSelection = PathSelection{selected: 0.usize(), target_found: false}| -> found:
+                    path: darray[u8] = [buffer[index] for index in cursor..<entry_end(buffer, cursor, collected)]
+                    return false if cursor + path.count >= collected
+                    return false if path.count == 0.usize() or PackageSelection::publish_path_forbidden(path) or not path_selected(raw, target, patterns, path, &glob, &found, out)
+                    cursor <- cursor + path.count + 1.usize()
+                selection.selected > 0.usize() and selection.target_found
+
+        # Record `path` when the patterns include it.
+        def path_selected(raw: darray[u8]&, target: darray[u8]&, patterns: PatternRanges&, path: darray[u8]&, glob: mutable GlobBudget&, found: mutable PathSelection&, out: mutable darray[u8]&) -> bool can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                verdict: i64 = path_verdict(raw, patterns, path, glob)
+                verdict != path_budget_exhausted and (verdict != path_included or recorded_path(path, target, found, out))
+
+        def entry_end(buffer: darray[u8]&, start: usize, limit: usize) -> usize:
+            while position < limit and buffer[position] != 0 |position: usize = start| -> position:
+                position <- position + 1.usize()
+
+        # The manifest and lock are always included and never excluded.
+        def path_verdict(raw: darray[u8]&, patterns: PatternRanges&, path: darray[u8]&, glob: mutable GlobBudget&) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                required: bool = ByteText::equal_text(path, "elisapkg.json") or ByteText::equal_text(path, "elisapkg.lock")
+                include_selected: bool = required or PackageSelection::include_allows_path(raw, patterns.include_start, patterns.include_end, path, &glob.work_remaining, &glob.rows_remaining, &glob.exhausted)
+                budget_failure() if glob.exhausted else exclusion_verdict(raw, patterns, path, glob, include_selected and not required, include_selected)
+
+        def exclusion_verdict(raw: darray[u8]&, patterns: PatternRanges&, path: darray[u8]&, glob: mutable GlobBudget&, check_exclude: bool, include_selected: bool) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                excluded: bool = check_exclude and PackageSelection::exclude_allows_path(raw, patterns.exclude_start, patterns.exclude_end, path, &glob.work_remaining, &glob.rows_remaining, &glob.exhausted)
+                budget_failure() if glob.exhausted else path_included if include_selected and not excluded else path_skipped
+
+        def budget_failure() -> i64 can[Global.Read, Console.Write]:
+            can Global.Read:
+                CliOutput::write_error("error: package include/exclude patterns exceeded the bounded matching budget\n")
+                path_budget_exhausted
+
+        def recorded_path(path: darray[u8]&, target: darray[u8]&, found: mutable PathSelection&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            return false if found.selected >= PackagePathPolicy::maximum_package_archive_entries
+            ByteText::append(out, path)
+            out.push(0)
+            found.selected <- found.selected + 1.usize()
+            found.target_found <- true if ByteText::equal(path, target)
+            true
