@@ -23,74 +23,109 @@ module LocalBuildPlan:
             return false if packages_start >= lock.count or packages_end <= packages_start or lock[packages_start] != 91
             root_path: mutable darray[u8] = []
             return false if not ProjectFiles::canonical_existing_path(start, &root_path)
-            total_dependency_source_bytes: mutable usize = 0.usize()
-            cursor: mutable usize = packages_start + 1.usize()
-            while cursor < packages_end |total_graph_edges: usize = 0.usize()|:
-                cursor <- Json::skip_whitespace(lock, cursor, packages_end)
-                break if cursor >= packages_end or lock[cursor] == 93
-                return false if lock[cursor] != 123 or packages.count >= maximum_packages
-                record_end: usize = Json::object_end(lock, cursor)
-                return false if record_end <= cursor or record_end >= packages_end
-                package_name: mutable darray[u8] @r = []
-                package_version: mutable darray[u8] = []
-                source_start: mutable usize = 0.usize()
-                source_end: mutable usize = 0.usize()
-                return false if not read_path_record(lock, cursor, record_end, &package_name, &package_version, &source_start, &source_end)
-                return false if packages.count > 0.usize() and not ByteText::less(packages[packages.count - 1.usize()].name, package_name)
-                canonical_root: mutable darray[u8] @r = []
-                return false if not BuildPaths::resolve_local_source(lock, source_start, source_end, root_path, &canonical_root)
-                package_manifest: mutable darray[u8] = []
-                return false if not read_locked_manifest(lock, cursor, record_end, canonical_root, package_name, package_version, &package_manifest)
-                source_digest: mutable darray[u8] @r = []
-                package_source_bytes: mutable usize = 0.usize()
-                return false if total_dependency_source_bytes > source_byte_budget or not SourceFingerprint::at_bounded(canonical_root, &source_digest, source_byte_budget - total_dependency_source_bytes, &package_source_bytes)
-                total_dependency_source_bytes <- total_dependency_source_bytes + package_source_bytes
-                return false if not Lockfile::sha256_field_equals(lock, cursor, record_end, "source-digest", source_digest)
-                return false if not has_only_local_dependencies(package_manifest)
-                library_entry: mutable darray[u8] @r = []
-                relative_entry: mutable darray[u8] @r = []
-                return false if not BuildPaths::resolve_library_entry(package_manifest, canonical_root, &library_entry, &relative_entry)
-                dependency_names: mutable darray[u8] @r = []
-                remaining_edges: usize = maximum_edges - total_graph_edges
-                package_edges: i64 =
-                    edge_limit: usize = maximum_packages if maximum_packages < remaining_edges else remaining_edges
-                    Manifest::local_dependency_names(package_manifest, edge_limit, &dependency_names)
-                return false if package_edges < 0
-                total_graph_edges <- total_graph_edges + package_edges.usize()
-                snapshot_entry: mutable darray[u8] @r = []
-                dependents: mutable darray[usize] @r = []
-                packages.push(LocalBuildGraph::Package{name: package_name, root: canonical_root, entry: library_entry, relative_entry: relative_entry, source_digest: source_digest, snapshot_entry: snapshot_entry, dependency_names: dependency_names, dependents: dependents, remaining_dependencies: 0})
-                cursor <- record_end + 1.usize()
-                cursor <- Json::skip_whitespace(lock, cursor, packages_end)
-                if cursor < packages_end:
-                    return false if lock[cursor] != 44
-                    cursor <- cursor + 1.usize()
-            if packages.count == 0.usize():
-                return true
+            read_packages(lock, packages_start + 1.usize(), packages_end, root_path, source_byte_budget, packages) and published_includes(packages, order, root_entry, aggregate, has_dependencies)
+
+    private:
+        # Running totals across the lock's packages.
+        struct PlanTotals:
+            graph_edges: mutable usize
+            source_bytes: mutable usize
+
+        # The version and source span of one path lock record.
+        struct PathSource:
+            version: mutable darray[u8]
+            source_start: mutable usize
+            source_end: mutable usize
+
+        # The cursor returned for a lock record that does not verify.
+        const malformed_record: usize = 0.usize()
+
+        def published_includes[@r](packages: mutable darray[LocalBuildGraph::Package]& @r, order: mutable darray[usize]& @r, root_entry: cstr, aggregate: mutable darray[u8]&, has_dependencies: mutable bool&) -> bool can[Memory.Allocate, Abort.Panic]:
+            return true if packages.count == 0.usize()
             has_dependencies <- true
             LocalBuildGraph::write_ordered_includes(packages, order, root_entry, aggregate)
 
-    private:
+        # Verify each record of the lock's "packages" array, starting just
+        # after its opening bracket.
+        def read_packages[@r](lock: darray[u8]&, start: usize, packages_end: usize, root_path: darray[u8]&, source_byte_budget: usize, packages: mutable darray[LocalBuildGraph::Package]& @r) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            while cursor < packages_end |packages, cursor: usize = start, totals: PlanTotals = PlanTotals{graph_edges: 0.usize(), source_bytes: 0.usize()}|:
+                cursor <- Json::skip_whitespace(lock, cursor, packages_end)
+                break if cursor >= packages_end or lock[cursor] == 93
+                return false if lock[cursor] != 123 or packages.count >= maximum_packages
+                cursor <- read_package_at(lock, cursor, packages_end, root_path, source_byte_budget, &totals, packages)
+                return false if cursor == malformed_record
+            true
+
+        # Verify the record starting at `record_start`. Returns the cursor
+        # after its separator, or `malformed_record`.
+        def read_package_at[@r](lock: darray[u8]&, record_start: usize, packages_end: usize, root_path: darray[u8]&, source_byte_budget: usize, totals: mutable PlanTotals&, packages: mutable darray[LocalBuildGraph::Package]& @r) -> usize can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            record_end: usize = Json::object_end(lock, record_start)
+            malformed_record if record_end <= record_start or record_end >= packages_end or not read_package_record(lock, record_start, record_end, root_path, source_byte_budget, totals, packages) else record_separator_end(lock, record_end, packages_end)
+
+        def record_separator_end(lock: darray[u8]&, record_end: usize, packages_end: usize) -> usize:
+            cursor: usize = Json::skip_whitespace(lock, record_end + 1.usize(), packages_end)
+            cursor if cursor >= packages_end else cursor + 1.usize() if lock[cursor] == 44 else malformed_record
+
+        def read_package_record[@r](lock: darray[u8]&, record_start: usize, record_end: usize, root_path: darray[u8]&, source_byte_budget: usize, totals: mutable PlanTotals&, packages: mutable darray[LocalBuildGraph::Package]& @r) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            package: mutable LocalBuildGraph::Package @r = LocalBuildGraph::Package{name: [], root: [], entry: [], relative_entry: [], source_digest: [], snapshot_entry: [], dependency_names: [], dependents: [], remaining_dependencies: 0}
+            read_package_fields(lock, record_start, record_end, root_path, source_byte_budget, totals, packages, &package) and pushed_package(packages, package)
+
+        def pushed_package[@r](packages: mutable darray[LocalBuildGraph::Package]& @r, package: LocalBuildGraph::Package @r) -> bool can[Memory.Allocate, Abort.Panic]:
+            packages.push(package)
+            true
+
+        # Packages appear in strictly increasing name order.
+        def read_package_fields(lock: darray[u8]&, record_start: usize, record_end: usize, root_path: darray[u8]&, source_byte_budget: usize, totals: mutable PlanTotals&, packages: darray[LocalBuildGraph::Package]&, package: mutable LocalBuildGraph::Package&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            source: mutable PathSource = PathSource{version: [], source_start: 0.usize(), source_end: 0.usize()}
+            read_path_record(lock, record_start, record_end, &package.name, &source.version, &source.source_start, &source.source_end) and follows_previous_package(packages, package.name) and BuildPaths::resolve_local_source(lock, source.source_start, source.source_end, root_path, &package.root) and read_package_contents(lock, record_start, record_end, source.version, source_byte_budget, totals, package)
+
+        def follows_previous_package(packages: darray[LocalBuildGraph::Package]&, package_name: darray[u8]&) -> bool:
+            packages.count == 0.usize() or ByteText::less(packages[packages.count - 1.usize()].name, package_name)
+
+        # Check the package's manifest and source digest, then read its
+        # library entry and local dependency names.
+        def read_package_contents(lock: darray[u8]&, record_start: usize, record_end: usize, package_version: darray[u8]&, source_byte_budget: usize, totals: mutable PlanTotals&, package: mutable LocalBuildGraph::Package&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            package_manifest: mutable darray[u8] = []
+            read_locked_manifest(lock, record_start, record_end, package.root, package.name, package_version, &package_manifest) and fingerprinted_source(lock, record_start, record_end, source_byte_budget, totals, package) and has_only_local_dependencies(package_manifest) and BuildPaths::resolve_library_entry(package_manifest, package.root, &package.entry, &package.relative_entry) and read_dependency_names(package_manifest, totals, package)
+
+        # Fingerprint the package source within the remaining byte budget and
+        # match the locked source digest.
+        def fingerprinted_source(lock: darray[u8]&, record_start: usize, record_end: usize, source_byte_budget: usize, totals: mutable PlanTotals&, package: mutable LocalBuildGraph::Package&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            package_source_bytes: mutable usize = 0.usize()
+            totals.source_bytes <= source_byte_budget and SourceFingerprint::at_bounded(package.root, &package.source_digest, source_byte_budget - totals.source_bytes, &package_source_bytes) and counted_source_bytes(totals, package_source_bytes) and Lockfile::sha256_field_equals(lock, record_start, record_end, "source-digest", package.source_digest)
+
+        def counted_source_bytes(totals: mutable PlanTotals&, package_source_bytes: usize) -> bool:
+            totals.source_bytes <- totals.source_bytes + package_source_bytes
+            true
+
+        def read_dependency_names(package_manifest: darray[u8]&, totals: mutable PlanTotals&, package: mutable LocalBuildGraph::Package&) -> bool can[Memory.Allocate, Abort.Panic]:
+            package_edges: i64 = Manifest::local_dependency_names(package_manifest, edge_limit(totals.graph_edges), &package.dependency_names)
+            package_edges >= 0 and counted_edges(totals, package_edges.usize())
+
+        # Each package may name at most `maximum_packages` dependencies and
+        # never more than the edges left in the graph budget.
+        def edge_limit(graph_edges: usize) -> usize:
+            remaining_edges: usize = maximum_edges - graph_edges
+            maximum_packages if maximum_packages < remaining_edges else remaining_edges
+
+        def counted_edges(totals: mutable PlanTotals&, package_edges: usize) -> bool:
+            totals.graph_edges <- totals.graph_edges + package_edges
+            true
+
         # Read a locked package's manifest and check that it names the locked
         # package and version and matches the locked manifest digest.
         def read_locked_manifest(lock: darray[u8]&, record_start: usize, record_end: usize, canonical_root: darray[u8]&, package_name: darray[u8]&, package_version: darray[u8]&, package_manifest: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            region manifest_path_scope:
-                manifest_path: mutable darray[u8] = []
-                ProjectFiles::path_join_into(canonical_root, "elisapkg.json", &manifest_path)
-                return false if not Platform::read_bounded_file(manifest_path, Json::maximum_document_bytes, package_manifest)
+            manifest_path: darray[u8] = ProjectFiles::path_join(canonical_root, "elisapkg.json")
+            Platform::read_bounded_file(manifest_path, Json::maximum_document_bytes, package_manifest) and manifest_names_package(package_manifest, canonical_root, package_name, package_version) and manifest_digest_matches(lock, record_start, record_end, package_manifest)
+
+        def manifest_names_package(package_manifest: darray[u8]&, canonical_root: darray[u8]&, package_name: darray[u8]&, package_version: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             actual_name: mutable darray[u8] = []
-            region actual_version_scope:
-                actual_version: mutable darray[u8] = []
-                return false if not:
-                    ProjectManifest::validate_at(package_manifest, canonical_root, &actual_name, &actual_version)
-                    ByteText::equal(actual_name, package_name)
-                    ByteText::equal(actual_version, package_version)
-            region manifest_digest_scope:
-                manifest_digest: mutable darray[u8] = []
-                return false if not:
-                    Integrity::sha256_hex(package_manifest, &manifest_digest)
-                    Lockfile::sha256_field_equals(lock, record_start, record_end, "manifest-digest", manifest_digest)
-            true
+            actual_version: mutable darray[u8] = []
+            ProjectManifest::validate_at(package_manifest, canonical_root, &actual_name, &actual_version) and ByteText::equal(actual_name, package_name) and ByteText::equal(actual_version, package_version)
+
+        def manifest_digest_matches(lock: darray[u8]&, record_start: usize, record_end: usize, package_manifest: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
+            manifest_digest: mutable darray[u8] = []
+            Integrity::sha256_hex(package_manifest, &manifest_digest) and Lockfile::sha256_field_equals(lock, record_start, record_end, "manifest-digest", manifest_digest)
 
         # A local-lock package may depend only on other local packages.
         def has_only_local_dependencies(package_manifest: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
@@ -102,9 +137,4 @@ module LocalBuildPlan:
         # source is a local path.
         def read_path_record(lock: darray[u8]&, record_start: usize, record_end: usize, package_name: mutable darray[u8]&, package_version: mutable darray[u8]&, source_start: mutable usize&, source_end: mutable usize&) -> bool can[Memory.Allocate, Abort.Panic]:
             source_type: mutable darray[u8] = []
-            return Json::object_string_value(lock, record_start, record_end, "name", package_name) and
-                   PackageIdentity::valid_name(package_name) and
-                   Json::object_string_value(lock, record_start, record_end, "version", package_version) and
-                   Json::object_value_span(lock, record_start, record_end, "source", source_start, source_end) and
-                   Json::object_string_value(lock, source_start, source_end, "type", &source_type) and
-                   ByteText::equal_text(source_type, "path")
+            Json::object_string_value(lock, record_start, record_end, "name", package_name) and PackageIdentity::valid_name(package_name) and Json::object_string_value(lock, record_start, record_end, "version", package_version) and Json::object_value_span(lock, record_start, record_end, "source", source_start, source_end) and Json::object_string_value(lock, source_start, source_end, "type", &source_type) and ByteText::equal_text(source_type, "path")
