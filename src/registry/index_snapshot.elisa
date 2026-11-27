@@ -36,80 +36,78 @@ module RegistryIndexSnapshot:
             finish: usize
 
         def read_versions(raw: darray[u8]&, start_offset: usize, versions_out: mutable darray[u8]&, versions: mutable darray[VersionEntry]&, yanked_versions: mutable darray[VersionEntry]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            reading_yanked: mutable bool = false
-            while cursor < raw.count |cursor: usize = start_offset|:
-                start: usize = cursor
-                finish: usize =
-                    while end < raw.count and end - start < SemVer::maximum_version_bytes and raw[end] != 10 |end: usize = start| -> end:
-                        end <- end + 1.usize()
-                return false if finish == start or finish == raw.count or raw[finish] != 10
-                if not reading_yanked and versions.count > 0.usize() and ByteText::range_equals_text(raw, start, finish, "yanked:"):
+            # Each pass reads the line starting at `cursor` and ending at `finish`.
+            while cursor < raw.count |reading_yanked: bool = false, cursor: usize = start_offset, finish: usize = 0.usize()|:
+                finish <- while end < raw.count and end - cursor < SemVer::maximum_version_bytes and raw[end] != 10 |end: usize = cursor| -> end:
+                    end <- end + 1.usize()
+                return false if finish == cursor or finish == raw.count or raw[finish] != 10
+                if not reading_yanked and versions.count > 0.usize() and ByteText::range_equals_text(raw, cursor, finish, "yanked:"):
                     reading_yanked <- true
-                    cursor <- finish + 1.usize()
-                    continue
-                parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
-                return false if not SemVer::parse_range(raw, start, finish, &parsed) or parsed.prerelease
-                entry: VersionEntry = VersionEntry{version: parsed, start: start, finish: finish}
-                if reading_yanked:
-                    return false if not follows_versions(yanked_versions, parsed)
-                    yanked_versions.push(entry)
-                    return false if yanked_versions.count > versions.count
                 else:
-                    # Stable versions must have strictly increasing precedence.
-                    # This also rules out duplicate spellings and build variants.
-                    return false if not follows_versions(versions, parsed)
-                    ByteText::append_range(versions_out, raw, start, finish + 1.usize())
-                    versions.push(entry)
-                    return false if versions.count > maximum_versions
-                cursor <- finish + 1
+                    parsed: mutable Model::Version = Model::Version{major: 0, minor: 0, patch: 0, prerelease: false}
+                    return false if not SemVer::parse_range(raw, cursor, finish, &parsed) or parsed.prerelease
+                    entry: VersionEntry = VersionEntry{version: parsed, start: cursor, finish: finish}
+                    if reading_yanked:
+                        return false if not follows_versions(yanked_versions, parsed)
+                        yanked_versions.push(entry)
+                        return false if yanked_versions.count > versions.count
+                    else:
+                        # Stable versions must have strictly increasing precedence.
+                        # This also rules out duplicate spellings and build variants.
+                        return false if not follows_versions(versions, parsed)
+                        ByteText::append_range(versions_out, raw, cursor, finish + 1.usize())
+                        versions.push(entry)
+                        return false if versions.count > maximum_versions
+                cursor <- finish + 1.usize()
             versions.count > 0.usize()
 
         def follows_versions(entries: darray[VersionEntry]&, version: Model::Version) -> bool:
             true if entries.count == 0.usize() else SemVer::compare(version, entries[entries.count - 1.usize()].version) > 0
 
         def mark_yanked_versions(raw: darray[u8]&, versions: darray[VersionEntry]&, yanked_versions: darray[VersionEntry]&, yanked_flags_out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
-            yanked_index: mutable usize = 0
-            for index in 0..<versions.count |raw, versions, yanked_versions, yanked_index, yanked_flags_out|:
-                current: VersionEntry = versions[index]
-                is_yanked: mutable bool = false
-                if yanked_index < yanked_versions.count:
-                    yanked: VersionEntry = yanked_versions[yanked_index]
-                    comparison: i64 = SemVer::compare(yanked.version, current.version)
-                    return false if comparison < 0
-                    if comparison == 0:
-                        return false if not same_version_spelling(raw, current, yanked)
-                        is_yanked <- true
-                        yanked_index <- yanked_index + 1.usize()
+            # Walk both sorted lists together; every yanked entry must match a version.
+            for index in 0..<versions.count |yanked_flags_out, yanked_index: usize = 0.usize()| -> yanked_index == yanked_versions.count:
+                is_yanked: bool =
+                    if yanked_index >= yanked_versions.count:
+                        false
+                    else:
+                        comparison: i64 = SemVer::compare(yanked_versions[yanked_index].version, versions[index].version)
+                        if comparison < 0 or (comparison == 0 and not same_version_spelling(raw, versions[index], yanked_versions[yanked_index])):
+                            return false
+                        else:
+                            comparison == 0
                 yanked_flags_out.push(1 if is_yanked else 0)
-            yanked_index == yanked_versions.count
+                yanked_index <- yanked_index + 1.usize() if is_yanked
 
         def same_version_spelling(raw: darray[u8]&, left: VersionEntry, right: VersionEntry) -> bool:
-            region length_scope:
-                length: usize = left.finish - left.start
-                return false if length != right.finish - right.start
-                for offset in 0..<length |raw, left, right|:
-                    return false if raw[left.start + offset] != raw[right.start + offset]
-            true
+            length: usize = left.finish - left.start
+            if length != right.finish - right.start:
+                false
+            else:
+                for offset in 0..<length |same: bool = true| -> same:
+                    break false if raw[left.start + offset] != raw[right.start + offset]
 
         def consume_label(raw: darray[u8]&, label: cstr, cursor: mutable usize&) -> bool:
             finish: i64 = ByteText::match_text_end(raw, cursor, label)
-            return false if finish < 0
-            cursor <- finish.usize()
-            true
+            if finish < 0:
+                false
+            else:
+                cursor <- finish.usize()
+                true
 
         def consume_identity_line(raw: darray[u8]&, label: cstr, maximum_bytes: usize, cursor: mutable usize&, out: mutable darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic]:
             return false if not consume_label(raw, label, cursor)
             start: usize = cursor
             finish: usize =
                 while end < raw.count and end - start < maximum_bytes and raw[end] != 10 |end: usize = start| -> end:
-                    region byte_scope:
-                        byte: u8 = raw[end]
-                        return false if byte < 32 or byte == 127 or byte == 92
+                    return false if raw[end] < 32 or raw[end] == 127 or raw[end] == 92
                     end <- end + 1.usize()
-            return false if finish == start or finish == raw.count or raw[finish] != 10
-            ByteText::append_range(out, raw, start, finish)
-            cursor <- finish + 1.usize()
-            true
+            if finish == start or finish == raw.count or raw[finish] != 10:
+                false
+            else:
+                ByteText::append_range(out, raw, start, finish)
+                cursor <- finish + 1.usize()
+                true
 
         def consume_positive_decimal_line(raw: darray[u8]&, label: cstr, cursor: mutable usize&, out: mutable u64&) -> bool:
             start: usize =
@@ -118,10 +116,9 @@ module RegistryIndexSnapshot:
                 finish.usize()
             end: mutable usize = start
             value: mutable u64 = 0
-            return false if:
-                not ByteText::scan_canonical_unsigned_decimal(raw, start, raw.count, &end, &value)
-                end >= raw.count or raw[end] != 10
-                value == 0
-            cursor <- end + 1.usize()
-            out <- value
-            true
+            if not ByteText::scan_canonical_unsigned_decimal(raw, start, raw.count, &end, &value) or end >= raw.count or raw[end] != 10 or value == 0:
+                false
+            else:
+                cursor <- end + 1.usize()
+                out <- value
+                true
