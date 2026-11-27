@@ -142,35 +142,41 @@ module NativeFileMutation:
         # A missing leaf passes only when `allow_missing`. Returns 0 or a negative errno.
         def check_trusted_regular_leaf(directory: i64, leaf: darray[u8]&, allow_missing: bool) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             file_descriptor: i64 = PlatformNative::open_regular_file_at(directory, ((&leaf[0]).cast[cstr] can Unsafe.PointerCast))
-            return -21 if file_descriptor == -unsupported_file_type_error
-            return 0 if file_descriptor == -2 and allow_missing
-            return file_descriptor if file_descriptor < 0
-            region regular_scope:
+            if file_descriptor == -unsupported_file_type_error:
+                -21
+            elif file_descriptor == -2 and allow_missing:
+                0
+            elif file_descriptor < 0:
+                file_descriptor
+            else:
                 regular: bool = NativeTrustedPaths::trusted_regular_file_descriptor(file_descriptor, native_geteuid().u64())
-                return -5 if native_close(file_descriptor) != 0
-                return -21 if not regular
-            0
+                -5 if native_close(file_descriptor) != 0 else -21 if not regular else 0
 
         def unlink_verified_identity(path: cstr, expected_device: u64, expected_inode: u64) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             leaf: mutable darray[u8] = []
             directory: i64 =
                 parent: mutable darray[u8] = []
                 -22 if not PlatformNative::split_parent_leaf(path, &parent, &leaf) else NativeTrustedPaths::open_trusted_directory(((&parent[0]).cast[cstr] can Unsafe.PointerCast), native_geteuid().u64())
-            return directory if directory < 0
-            file_descriptor: i64 = PlatformNative::open_regular_file_at(directory, ((&leaf[0]).cast[cstr] can Unsafe.PointerCast))
-            return PlatformNative::close_error(directory, file_descriptor) if file_descriptor < 0
-            region identity_status_scope:
-                identity_status: i64 = verify_leaf_identity(directory, file_descriptor, leaf, expected_device, expected_inode)
-                return PlatformNative::close_two_error(directory, file_descriptor, identity_status) if identity_status != 0
-            # POSIX has no unlink-if-inode primitive: this is the narrowest
-            # descriptor-relative check available, but a same-UID actor can
-            # still replace the leaf between fstatat and unlinkat.
-            return PlatformNative::close_two_error(directory, file_descriptor, NativeErrors::negative_errno()) if native_unlinkat(directory, ((&leaf[0]).cast[cstr] can Unsafe.PointerCast), 0) != 0
-            return PlatformNative::close_two_error(directory, file_descriptor, NativeErrors::negative_errno()) if native_fsync(directory) != 0
-            region directory_close_scope:
-                directory_close: i64 = native_close(directory)
-                return -5 if native_close(file_descriptor) != 0 or directory_close != 0
-            0
+            if directory < 0:
+                directory
+            else:
+                file_descriptor: i64 = PlatformNative::open_regular_file_at(directory, ((&leaf[0]).cast[cstr] can Unsafe.PointerCast))
+                if file_descriptor < 0:
+                    PlatformNative::close_error(directory, file_descriptor)
+                else:
+                    identity_status: i64 = verify_leaf_identity(directory, file_descriptor, leaf, expected_device, expected_inode)
+                    if identity_status != 0:
+                        PlatformNative::close_two_error(directory, file_descriptor, identity_status)
+                    elif native_unlinkat(directory, ((&leaf[0]).cast[cstr] can Unsafe.PointerCast), 0) != 0:
+                        # POSIX has no unlink-if-inode primitive: this is the narrowest
+                        # descriptor-relative check available, but a same-UID actor can
+                        # still replace the leaf between fstatat and unlinkat.
+                        PlatformNative::close_two_error(directory, file_descriptor, NativeErrors::negative_errno())
+                    elif native_fsync(directory) != 0:
+                        PlatformNative::close_two_error(directory, file_descriptor, NativeErrors::negative_errno())
+                    else:
+                        directory_close: i64 = native_close(directory)
+                        -5 if native_close(file_descriptor) != 0 or directory_close != 0 else 0
 
         # The open descriptor is a trusted regular file with the expected
         # identity, and the leaf name still refers to that same file. Returns
