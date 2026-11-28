@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
-"""Run one Elisa compiler rebuild with a strict 30-second wall-clock limit."""
+"""Run one Elisa compiler rebuild under a strict wall-clock limit.
+
+The limit defaults to 30 seconds. `--limit-seconds N` changes it, and
+`--resume-status S` reruns the command while it exits with status S (a build
+that saved a checkpoint and asks to be rerun) until it finishes or the single
+overall deadline passes.
+"""
 
 from __future__ import annotations
 
+import math
 import os
 import signal
 import subprocess
@@ -11,6 +18,7 @@ import time
 
 
 TIMEOUT_SECONDS = 30
+USAGE = "usage: compiler_rebuild_timeout.py [--limit-seconds N] [--resume-status S] -- COMMAND [ARG ...]"
 
 
 def process_group_exists(process_group: int) -> bool:
@@ -28,6 +36,11 @@ def terminate_process_group(process_group: int) -> None:
         os.killpg(process_group, signal.SIGKILL)
     except ProcessLookupError:
         pass
+    except PermissionError:
+        # macOS reports EPERM when the group holds only an exited, unreaped
+        # leader. Every live member is this process's own child, which it may
+        # always signal, so nothing in the group is left running.
+        pass
 
 
 def is_stage1_seed_command(command: list[str]) -> bool:
@@ -40,18 +53,44 @@ def is_stage1_seed_command(command: list[str]) -> bool:
     return False
 
 
+def parse_arguments(arguments: list[str]) -> tuple[float, int | None, list[str]] | None:
+    """Return (limit seconds, resume status, command), or None for bad usage."""
+    limit_seconds: float = TIMEOUT_SECONDS
+    resume_status: int | None = None
+    index = 0
+    while index < len(arguments) and arguments[index] != "--":
+        if index + 1 >= len(arguments):
+            return None
+        option, value = arguments[index], arguments[index + 1]
+        try:
+            if option == "--limit-seconds":
+                limit_seconds = float(value)
+            elif option == "--resume-status":
+                resume_status = int(value)
+            else:
+                return None
+        except ValueError:
+            return None
+        index += 2
+    command = arguments[index + 1:]
+    if index >= len(arguments) or not command or not math.isfinite(limit_seconds) or limit_seconds <= 0:
+        return None
+    return limit_seconds, resume_status, command
+
+
 def main() -> int:
-    if len(sys.argv) < 3 or sys.argv[1] != "--":
-        print(
-            "usage: compiler_rebuild_timeout.py -- COMMAND [ARG ...]",
-            file=sys.stderr,
-        )
+    parsed = parse_arguments(sys.argv[1:])
+    if parsed is None:
+        print(USAGE, file=sys.stderr)
         return 2
 
-    command = sys.argv[2:]
+    limit_seconds, resume_status, command = parsed
     started = time.monotonic()
-    deadline = started + TIMEOUT_SECONDS
+    deadline = started + limit_seconds
     environment = os.environ.copy()
+    # stage0_rebuild_hook.py checks this before it drops Elisa-core's own
+    # Stage0 limit, because only this deadline then bounds the build.
+    environment["ELISA_REBUILD_SUPERVISOR"] = "1"
     if is_stage1_seed_command(command):
         # The Stage1 wrapper normally starts its own timeout session. Here this
         # process owns the timeout and group, so keep the seed build inside it
@@ -67,43 +106,56 @@ def main() -> int:
 
     signal.signal(signal.SIGINT, request_cancel)
     signal.signal(signal.SIGTERM, request_cancel)
-    try:
-        process = subprocess.Popen(
-            command,
-            env=environment,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-    except OSError as error:
-        print(f"error: unable to start compiler rebuild: {error}", file=sys.stderr)
-        return 127
-
-    # Reap the leader and confirm the complete rebuild group has exited.
-    # Polling also lets cancellation interrupt the wait without interrupting
-    # Popen or leaving its newly detached child behind.
+    attempt = 1
+    # The attempt whose process group may still be running, if any.
+    process: subprocess.Popen | None = None
     while not cancellation_signal and time.monotonic() < deadline:
-        return_code = process.poll()
-        if return_code is not None and not process_group_exists(process.pid):
-            completed_at = time.monotonic()
-            if not cancellation_signal and completed_at < deadline:
-                elapsed = completed_at - started
-                print(
-                    f"compiler rebuild completed in {elapsed:.3f}s "
-                    f"(limit {TIMEOUT_SECONDS}s)",
-                    file=sys.stderr,
-                )
-                return return_code if return_code >= 0 else 128 - return_code
-            break
-        time.sleep(max(0.0, min(0.01, deadline - time.monotonic())))
+        try:
+            process = subprocess.Popen(
+                command,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError as error:
+            print(f"error: unable to start compiler rebuild: {error}", file=sys.stderr)
+            return 127
 
-    terminate_process_group(process.pid)
-    # An uninterruptible child must not extend the wall-clock limit.
-    process.poll()
+        # Reap the leader and confirm the complete rebuild group has exited.
+        # Polling also lets cancellation interrupt the wait without interrupting
+        # Popen or leaving its newly detached child behind.
+        return_code: int | None = None
+        while not cancellation_signal and time.monotonic() < deadline:
+            polled = process.poll()
+            if polled is not None and not process_group_exists(process.pid):
+                return_code = polled if time.monotonic() < deadline else None
+                process = None
+                break
+            time.sleep(max(0.0, min(0.01, deadline - time.monotonic())))
+
+        if return_code is None or cancellation_signal:
+            break
+        if resume_status is not None and return_code == resume_status:
+            print(f"compiler rebuild attempt {attempt} saved a checkpoint; resuming", file=sys.stderr)
+            attempt += 1
+            continue
+        elapsed = time.monotonic() - started
+        print(
+            f"compiler rebuild completed in {elapsed:.3f}s "
+            f"after {attempt} attempt(s) (limit {limit_seconds:g}s)",
+            file=sys.stderr,
+        )
+        return return_code if return_code >= 0 else 128 - return_code
+
+    if process is not None:
+        terminate_process_group(process.pid)
+        # An uninterruptible child must not extend the wall-clock limit.
+        process.poll()
     if cancellation_signal:
         print("error: compiler rebuild cancelled; terminated its process group", file=sys.stderr)
         return 128 + cancellation_signal
     print(
-        f"error: compiler rebuild exceeded its {TIMEOUT_SECONDS}-second "
+        f"error: compiler rebuild exceeded its {limit_seconds:g}-second "
         "wall-clock limit; sent SIGKILL to its process group",
         file=sys.stderr,
     )

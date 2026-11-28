@@ -107,26 +107,15 @@ jobs:
           PY
           printf 'ELISAPKG_FRESH_COMPILER_CACHE_ROOT=%s\n' "$cache_root" >> "$GITHUB_ENV"
 
-      # The pinned core's `make build` clears the environment and gives Go
-      # five seconds, which only an incremental rebuild meets. Compile every
-      # Stage0 package once, untimed, in the same cleared environment so the
-      # timed build below reuses this job's Go cache and measures the rebuild.
-      - name: Compile stage0 packages into the job's Go cache
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$ELISA_CORE/compiler"
-          warm_directory="$RUNNER_TEMP/elisapkg-stage0-warm"
-          mkdir -p "$warm_directory"
-          env -i HOME="$HOME" PATH="$PATH" TMPDIR="${TMPDIR:-/tmp}" LANG=en_US.UTF-8 GOGC=500 \
-            go build -buildvcs=false -o "$warm_directory/elisac" ./src
-          rm -rf "$warm_directory"
-
+      # The pinned core's `make build` limits the Go build to five seconds,
+      # which a cold build on a hosted runner cannot meet. Its overridable
+      # timeout hook hands that limit to the rebuild supervisor instead.
       - name: Build stage0 compiler
         shell: bash
         run: |
           set -euo pipefail
-          python3 scripts/compiler_rebuild_timeout.py -- make -C "$ELISA_CORE/compiler" build
+          python3 scripts/compiler_rebuild_timeout.py --limit-seconds 600 -- \
+            make -C "$ELISA_CORE/compiler" build ELISA_STAGE0_TIMEOUT_SCRIPT="$PWD/scripts/stage0_rebuild_hook.py"
 
       - name: Seed stage1 compiler
         shell: bash
@@ -134,7 +123,10 @@ jobs:
           set -euo pipefail
           export ELISACORE_SMT_CACHE_DIR="$ELISAPKG_FRESH_COMPILER_CACHE_ROOT/smt"
           export ELISACORE_RETAINED_SERVER=
-          python3 scripts/compiler_rebuild_timeout.py -- "$ELISA_COMPILER_ROOT/scripts/elisac_stage1.sh" --seed
+          # A cold seed saves an analysis checkpoint and exits 75 to ask for a
+          # rerun; the supervisor resumes it under one overall deadline.
+          python3 scripts/compiler_rebuild_timeout.py --limit-seconds 1800 --resume-status 75 -- \
+            "$ELISA_COMPILER_ROOT/scripts/elisac_stage1.sh" --seed
 
       - name: Check strict never-leak lint
         env:
