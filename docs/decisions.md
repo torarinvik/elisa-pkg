@@ -391,7 +391,11 @@ versions), the entry-point names it `contributes`, and `blobs`, each with a
 index exists, `git` may be a local path. Weights may ride inside a
 distribution when each file is at most 16 MiB and all together at most
 32 MiB; larger files are blobs, kept by digest in `agent/blobs/sha256/` and
-named in the expert's stored object so that its reference pins them. The index is the trust root and will be
+named in the expert's stored object so that its reference pins them. Data
+sets never ride in a distribution, whatever their size: a package names the
+digest of the published data and reads it as a blob. A blob source is either
+`huggingface` with `revision` and `file`, or a plain `url` with an optional
+`doi`. The index is the trust root and will be
 signed under the TUF profile; it can start as a git repository where adding a
 package is a reviewed change. Installing an expert runs its code, so shared
 weights must use formats that cannot execute code on load, and running
