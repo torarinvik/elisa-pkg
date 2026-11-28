@@ -361,3 +361,26 @@ fails closed when that is unsafe, because silently starting empty would reset
 rollback protection. Fixtures: `scripts/smoke/toolchain_store.sh`,
 `scripts/smoke/registry_trust_state.sh`, and
 `scripts/security/trust_state_registry_isolation_regression.py`.
+
+## D-017: agents and expert packages
+
+The Elisa agent is a Python system whose expert packages are ordinary Python
+distributions, so elisapkg does not resolve or build them. The agent's own
+`elisa-agent` command owns `agent/` in the elisapkg home (D-016): a shared
+content-addressed object store and, per named agent, a lock of package
+versions and object references plus one state directory per spawned
+instance. elisapkg's part is to install a pinned agent runtime and launch
+that command; this is not implemented yet.
+
+Expert packages will be distributed through an index that hosts metadata
+only. A package version is an immutable record naming a git location with an
+exact commit for code and, for learned weights, a model location such as a
+Hugging Face repository with an exact revision and a SHA-256 per file.
+Commits and digests are the identity; locations only say where to fetch, so
+bytes can move to a mirror and a download that does not match is refused.
+Branches and tags are never recorded. The index is the trust root and will be
+signed under the TUF profile; it can start as a git repository where adding a
+package is a reviewed change. Installing an expert runs its code, so shared
+weights must use formats that cannot execute code on load, and running
+third-party agents inside the build sandbox is a prerequisite for a public
+index.

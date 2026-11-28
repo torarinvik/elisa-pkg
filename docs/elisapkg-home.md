@@ -13,7 +13,7 @@ part of the home.
 | `lang/elisac/NAME/` | One registered Elisa toolchain. A linked checkout has a single `toolchain` record file. |
 | `lang/settings.json` | Language settings. `default-toolchain` names the toolchain builds use. |
 | `lang/packages/` | Reserved for Elisa libraries. |
-| `agent/` | Reserved for the Elisa agent. |
+| `agent/` | The Elisa agent's home, managed by its own `elisa-agent` command: `store/` holds shared content-addressed objects and `agents/NAME/` holds each agent's lock and its spawned instances. |
 | `trust/` | Registry rollback state, one `<sha256-of-registry-root>.state` file per registry. |
 
 ```sh
