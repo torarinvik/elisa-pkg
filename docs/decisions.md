@@ -397,7 +397,16 @@ digest of the published data and reads it as a blob. A blob source is either
 `huggingface` with `revision` and `file`, or a plain `url` with an optional
 `doi`. The index is the trust root and will be
 signed under the TUF profile; it can start as a git repository where adding a
-package is a reviewed change. Installing an expert runs its code, so shared
+package is a reviewed change. The index is a git repository with one file per published version,
+`packages/NAME/VERSION.json`. A package keeps its record, without the commit,
+at the root of its own repository; publishing adds the commit and is refused
+when the code has no licence, a required blob has no source, or a published
+blob lacks a licence or attribution. Published versions are never changed.
+The agent's `elisa-agent add` keeps a copy of the index in `agent/index` that
+only fast-forwards, installs the code at the recorded commit, and admits each
+required blob only when its size and SHA-256 match. elisapkg itself still
+downloads nothing; it forwards `agent add` to the agent's command.
+Installing an expert runs its code, so shared
 weights must use formats that cannot execute code on load, and running
 third-party agents inside the build sandbox is a prerequisite for a public
 index.

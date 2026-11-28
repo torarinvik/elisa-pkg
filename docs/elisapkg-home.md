@@ -14,7 +14,7 @@ part of the home.
 | `lang/settings.json` | Language settings. `default-toolchain` names the toolchain builds use. |
 | `lang/packages/` | Reserved for Elisa libraries. |
 | `agent/runtime` | The Elisa agent checkout linked with `elisapkg agent link PATH`. |
-| `agent/` (the rest) | The Elisa agent's own files, managed by its `elisa-agent` command: `store/` holds shared content-addressed objects, `blobs/` holds large weight files by digest, and `agents/NAME/` holds each agent's lock and its spawned instances. |
+| `agent/` (the rest) | The Elisa agent's own files, managed by its `elisa-agent` command: `store/` holds shared content-addressed objects, `blobs/` holds large weight and data files by digest, `index/` is its copy of the package index, and `agents/NAME/` holds each agent's lock and its spawned instances. |
 | `trust/` | Registry rollback state, one `<sha256-of-registry-root>.state` file per registry. |
 
 ```sh
@@ -28,13 +28,15 @@ command. elisapkg links one local checkout of it and forwards commands:
 
 ```sh
 elisapkg agent link /absolute/path/to/elisa-agent
+elisapkg agent add nca-example
 elisapkg agent create demo
 elisapkg agent list
 elisapkg agent spawn demo -- python host.py
 elisapkg agent unlink
 ```
 
-`link` needs a Python environment in the checkout's `.venv` and its
+`agent add` is the agent's own command: it downloads a package's code and
+files as its index record pins them, into the linked environment. `link` needs a Python environment in the checkout's `.venv` and its
 `src/nca/agents.py`, and downloads or installs nothing. Every other command
 line after `agent` is passed unchanged, with the caller's environment, to the
 linked environment's interpreter, and its exit status becomes elisapkg's.
