@@ -181,7 +181,11 @@ def git_identity(root: Path, expected: str, label: str, env: Mapping[str, str]) 
         clean_env,
     )
     if status:
-        raise ProvenanceError(f"{label} checkout has tracked or untracked changes")
+        # Name a few changed paths so a CI failure says what left them behind.
+        changed_lines = status.splitlines()
+        listed = "; ".join(line.strip() for line in changed_lines[:5])
+        more = f" and {len(changed_lines) - 5} more" if len(changed_lines) > 5 else ""
+        raise ProvenanceError(f"{label} checkout has tracked or untracked changes: {listed}{more}")
     return revision
 
 
