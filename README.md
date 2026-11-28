@@ -101,6 +101,7 @@ Run project commands from the project directory. Where supported, `--manifest-pa
 | Run a test target | `test --test app-tests` | Builds and runs a test target you have declared in the manifest. |
 | Install a local binary | `install --local --bin app` | Installs under `$HOME/.elisapkg/bin` by default. The destination uses the package name. |
 | Remove that installation | `uninstall --local app` | Removes the binary only if it matches its installation receipt. |
+| Use the Elisa agent | `agent link PATH`, then `agent ARGS` | Links a local Elisa agent checkout and runs its `elisa-agent` command. See [the elisapkg home](docs/elisapkg-home.md#the-elisa-agent). |
 | Remove generated build outputs | `clean` | Removes known local build and package outputs. |
 | Check release inputs | `publish --dry-run` | Validates release inputs and deterministic archive contents without uploading. |
 

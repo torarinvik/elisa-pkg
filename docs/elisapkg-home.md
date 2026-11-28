@@ -13,12 +13,33 @@ part of the home.
 | `lang/elisac/NAME/` | One registered Elisa toolchain. A linked checkout has a single `toolchain` record file. |
 | `lang/settings.json` | Language settings. `default-toolchain` names the toolchain builds use. |
 | `lang/packages/` | Reserved for Elisa libraries. |
-| `agent/` | The Elisa agent's home, managed by its own `elisa-agent` command: `store/` holds shared content-addressed objects and `agents/NAME/` holds each agent's lock and its spawned instances. |
+| `agent/runtime` | The Elisa agent checkout linked with `elisapkg agent link PATH`. |
+| `agent/` (the rest) | The Elisa agent's own files, managed by its `elisa-agent` command: `store/` holds shared content-addressed objects, `blobs/` holds large weight files by digest, and `agents/NAME/` holds each agent's lock and its spawned instances. |
 | `trust/` | Registry rollback state, one `<sha256-of-registry-root>.state` file per registry. |
 
 ```sh
 export PATH="$HOME/.elisapkg/bin:$PATH"
 ```
+
+## The Elisa agent
+
+The Elisa agent is a separate Python system with its own `elisa-agent`
+command. elisapkg links one local checkout of it and forwards commands:
+
+```sh
+elisapkg agent link /absolute/path/to/elisa-agent
+elisapkg agent create demo
+elisapkg agent list
+elisapkg agent spawn demo -- python host.py
+elisapkg agent unlink
+```
+
+`link` needs a Python environment in the checkout's `.venv` and its
+`src/nca/agents.py`, and downloads or installs nothing. Every other command
+line after `agent` is passed unchanged, with the caller's environment, to the
+linked environment's interpreter, and its exit status becomes elisapkg's.
+Agents and their state are run with your account's permissions; elisapkg does
+not sandbox them. `unlink` removes only the record and keeps the agents.
 
 ## Trust
 

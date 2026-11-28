@@ -1,0 +1,129 @@
+# `elisapkg agent`: link the Elisa agent runtime and forward commands to it.
+#
+# `agent link PATH` records a local agent checkout and `agent unlink` forgets
+# it. Every other `agent` command line is handed unchanged to the linked
+# runtime's `elisa-agent` command, which keeps its agents in `agent/` of the
+# elisapkg home. Linking never downloads or installs anything.
+include "../../agent/runtime.elisa"
+include "../../platform.elisa"
+include "../../project/files.elisa"
+include "../../state/user_data.elisa"
+include "../../toolchain.elisa"
+include "../output.elisa"
+include "../status.elisa"
+
+module AgentCommand:
+    public:
+        def run(argument_count: i64, slots: cstr&&) -> CliStatus::ExitStatus can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                action: cstr = slots[2].cast[cstr] if argument_count >= 3 else "--help"
+                if Platform::c_string_equal(action, "link"):
+                    link(slots[3].cast[cstr]) if argument_count == 4 else usage_error()
+                elif Platform::c_string_equal(action, "unlink"):
+                    unlink() if argument_count == 3 else usage_error()
+                elif Platform::c_string_equal(action, "--help"):
+                    CliOutput::write_ok("Usage: elisapkg agent <command>\n\n")
+                    CliOutput::write_ok("  link PATH     use the Elisa agent checkout at PATH as the agent runtime\n")
+                    CliOutput::write_ok("  unlink        forget the linked agent runtime\n")
+                    CliOutput::write_ok("  ARGS...       run the linked runtime's elisa-agent command with ARGS,\n")
+                    CliOutput::write_ok("                for example `elisapkg agent list` or `elisapkg agent -h`\n")
+                    CliStatus::success
+                else:
+                    forward(argument_count, slots)
+
+    private:
+        # The Python program that runs the agent's command. `-P` keeps the
+        # current directory off the import path.
+        const launcher: cstr = "import sys; from nca.agents import main; sys.exit(main())"
+
+        def usage_error() -> CliStatus::ExitStatus can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                CliOutput::write_error("error: usage: elisapkg agent link PATH | unlink | ARGS...\n")
+                CliStatus::usage
+
+        def untrusted_home() -> CliStatus::ExitStatus can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                CliOutput::write_error("error: the agent directory under the elisapkg home ($ELISAPKG_HOME or $HOME/.elisapkg) is unsafe or writable by another user\n")
+                CliStatus::security_failed
+
+        def link(checkout_argument: cstr) -> CliStatus::ExitStatus can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                root: mutable darray[u8] = []
+                if not Toolchain::canonical_path_bytes(checkout_argument, &root):
+                    CliOutput::write_error("error: the agent checkout path does not exist\n")
+                    CliStatus::usage
+                elif not checkout_complete(root):
+                    CliOutput::write_error("error: the checkout needs a Python environment in .venv and src/nca/agents.py; run `uv sync` in it first\n")
+                    CliStatus::usage
+                else:
+                    directory: darray[u8] = AgentRuntime::prepared_directory()
+                    if directory.count == 0.usize():
+                        untrusted_home()
+                    elif not AgentRuntime::write(directory, AgentRuntime::checkout_python(root)):
+                        CliOutput::write_error("error: could not write the agent runtime record\n")
+                        CliStatus::operation_failed
+                    else:
+                        CliOutput::write_ok("linked agent runtime: ")
+                        CliOutput::write_bytes(1, root)
+                        CliOutput::write_ok("\n")
+                        CliStatus::success
+
+        # The checkout has a Python environment and the agent command's
+        # source. The environment's interpreter is a link to the base
+        # interpreter, so its marker file is checked, not the link.
+        def checkout_complete(root: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            environment_c: darray[u8] = ProjectFiles::with_null_terminator(ProjectFiles::path_join(root, ".venv/pyvenv.cfg"))
+            source_c: darray[u8] = ProjectFiles::with_null_terminator(ProjectFiles::path_join(root, "src/nca/agents.py"))
+            Platform::access_path(((&environment_c[0]).cast[cstr] can Unsafe.PointerCast), 0) == 0 and
+                Platform::access_path(((&source_c[0]).cast[cstr] can Unsafe.PointerCast), 0) == 0
+
+        def unlink() -> CliStatus::ExitStatus can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                directory: mutable darray[u8] = []
+                python: mutable darray[u8] = []
+                state: UserData::DirectoryState = AgentRuntime::existing_directory(&directory)
+                if state == UserData::DirectoryState.Untrusted:
+                    untrusted_home()
+                elif state == UserData::DirectoryState.Missing or AgentRuntime::read(directory, &python) == -2:
+                    CliOutput::write_error("error: no agent runtime is linked\n")
+                    CliStatus::operation_failed
+                elif not AgentRuntime::remove(directory):
+                    CliOutput::write_error("error: could not remove the agent runtime record\n")
+                    CliStatus::operation_failed
+                else:
+                    CliOutput::write_ok("unlinked the agent runtime; agents under agent/ are kept\n")
+                    CliStatus::success
+
+        # Replace this process with the linked runtime's `elisa-agent`,
+        # passing every argument after `agent` and the caller's environment.
+        def forward(argument_count: i64, slots: cstr&&) -> CliStatus::ExitStatus can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                python: mutable darray[u8] = []
+                state, linked =
+                    directory: mutable darray[u8] = []
+                    located: UserData::DirectoryState = AgentRuntime::existing_directory(&directory)
+                    (located, -2 if located != UserData::DirectoryState.Trusted else AgentRuntime::read(directory, &python))
+                if state == UserData::DirectoryState.Untrusted:
+                    untrusted_home()
+                elif linked == -2:
+                    CliOutput::write_error("error: no agent runtime is linked; run `elisapkg agent link PATH` with an Elisa agent checkout\n")
+                    CliStatus::operation_failed
+                elif linked != 0:
+                    CliOutput::write_error("error: the agent runtime record is unreadable; run `elisapkg agent link PATH` again\n")
+                    CliStatus::operation_failed
+                else:
+                    execute(python, argument_count, slots)
+                    CliOutput::write_error("error: could not run the linked agent runtime; link it again after `uv sync`\n")
+                    CliStatus::operation_failed
+
+        # Execute the interpreter at `python` in place of this process. It
+        # returns only when the interpreter could not be executed.
+        def execute(python: darray[u8]&, argument_count: i64, slots: cstr&&) -> void can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            requires python.count > 0
+            python_c: darray[u8] = ProjectFiles::with_null_terminator(python)
+            arguments: mutable darray[cstr] = [((&python_c[0]).cast[cstr] can Unsafe.PointerCast), "-P", "-c", launcher]
+            while index < argument_count |arguments, index: i64 = 2|:
+                arguments <- arguments.push(slots[index].cast[cstr])
+                index <- index + 1
+            arguments <- arguments.push(null)
+            _ = Platform::execute_program(((&python_c[0]).cast[cstr] can Unsafe.PointerCast), ((&arguments[0]).cast[mutable cstr&&] can Unsafe.PointerCast))

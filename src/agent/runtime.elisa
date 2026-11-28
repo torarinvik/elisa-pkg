@@ -1,0 +1,64 @@
+# The linked Elisa agent runtime, recorded in `agent/runtime` of the elisapkg home.
+#
+# The Elisa agent is a Python system with its own `elisa-agent` command. A
+# linked runtime is a local agent checkout whose environment has the agent
+# installed; the record names that environment's Python interpreter. The
+# record is replaced atomically and read only through a trusted, no-follow
+# walk. The rest of `agent/` belongs to the agent itself.
+include "../platform.elisa"
+include "../project/files.elisa"
+include "../registry/files.elisa"
+include "../state/user_data.elisa"
+include "../text/bytes.elisa"
+
+module AgentRuntime:
+    public:
+        const maximum_record_bytes: usize = 8192.usize()
+
+        # The agent directory when it exists and is trusted.
+        def existing_directory(out: mutable darray[u8]&) -> UserData::DirectoryState can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            UserData::existing("agent", out)
+
+        # The agent directory, created when missing, or empty when it or a
+        # parent is untrusted.
+        def prepared_directory() -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            UserData::prepare("agent")
+
+        # The interpreter of the environment inside the checkout at `root`.
+        # It is deliberately not canonicalized: Python finds its environment
+        # from this path, which is a link to the base interpreter.
+        def checkout_python(root: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
+            requires root.count > 0
+            ProjectFiles::path_join(root, ".venv/bin/python")
+
+        # Read the linked interpreter path. Returns 0, -2 when no runtime is
+        # linked, or another negative status for an unreadable record.
+        def read(directory: darray[u8]&, out: mutable darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            requires directory.count > 0
+            out.resize(0)
+            raw: mutable darray[u8] = []
+            loaded: i64 = RegistryFiles::read_trusted_file(ProjectFiles::path_join(directory, "runtime"), maximum_record_bytes, &raw)
+            if loaded < 0:
+                loaded
+            elif raw.count <= header_bytes + 1.usize() or raw[raw.count - 1.usize()] != 10 or not ByteText::range_equals_text(raw, 0.usize(), header_bytes, "elisapkg-agent-runtime=1\npython="):
+                -74
+            else:
+                ByteText::append_range(out, raw, header_bytes, raw.count - 1.usize())
+                0 if valid_path(out) else -74
+
+        def write(directory: darray[u8]&, python: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            requires directory.count > 0
+            valid_path(python) and ProjectFiles::replace_file(ProjectFiles::path_join(directory, "runtime"), ByteText::with_text(ByteText::with_bytes(ByteText::with_text([], "elisapkg-agent-runtime=1\npython="), python), "\n"))
+
+        def remove(directory: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            requires directory.count > 0
+            ProjectFiles::remove_known_file(ProjectFiles::path_join(directory, "runtime"))
+
+    private:
+        const header_bytes: usize = 32.usize()
+
+        # An absolute path free of control bytes, short enough to execute.
+        def valid_path(path: darray[u8]&) -> bool:
+            return false if path.count < 2.usize() or path.count > 4000.usize() or path[0] != 47
+            for index in 0..<path.count |valid: bool = true| -> valid:
+                break false if path[index] < 32 or path[index] == 127
