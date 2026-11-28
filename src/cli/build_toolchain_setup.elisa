@@ -3,7 +3,9 @@
 include "../platform.elisa"
 include "../project/build_toolchain.elisa"
 include "../project/files.elisa"
+include "../state/user_data.elisa"
 include "../toolchain.elisa"
+include "../toolchain/store.elisa"
 include "./output.elisa"
 include "./status.elisa"
 
@@ -22,6 +24,9 @@ module BuildToolchainSetup:
         # derived from it stay valid for as long as the caller keeps the record.
         struct Setup:
             compiler_storage: mutable darray[u8]
+            # Back the Stage1 and runtime paths of a selected toolchain record.
+            stage1_storage: mutable darray[u8]
+            runtime_storage: mutable darray[u8]
             compiler: mutable cstr
             compiler_executable: mutable cstr
             environment: mutable BuildToolchain::Environment
@@ -40,16 +45,15 @@ module BuildToolchainSetup:
             unidentified: BuildToolchain::FileIdentity = BuildToolchain::FileIdentity{path: "", optional: true, executable: false, available: false, bytes: []}
             identities: Identities = Identities{compiler: unidentified, stage1: unidentified, runtime: unidentified, clang: unidentified,
                                                 sdk_settings: unidentified, developer_linker: unidentified, developer_assembler: unidentified}
-            return Setup{compiler_storage: [], compiler: "", compiler_executable: "",
+            return Setup{compiler_storage: [], stage1_storage: [], runtime_storage: [], compiler: "", compiler_executable: "",
                          environment: BuildToolchain::Environment{stage1_binary: "", runtime_object: "", allow_stale: "", clang: ""},
                          clang: "", is_stage1_wrapper: false, tool_paths: [], executable_paths: [], sdk_root: [], developer_directory: [],
                          sdk_settings_path: [], developer_linker_path: [], developer_assembler_path: [], identities: identities}
 
         def prepare(setup: mutable Setup&) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
-                if CliStatus::failure(select_compiler(setup)) is failed:
+                if CliStatus::failure(select_toolchain(setup)) is failed:
                     return failed
-                return CliStatus::build_failed if not BuildToolchain::read_environment(&setup.environment)
                 setup.clang <- BuildToolchain::select_clang(setup.environment.clang)
                 setup.is_stage1_wrapper <- Toolchain::stage1_wrapper_pair_matches(setup.compiler, setup.environment.stage1_binary)
                 setup.compiler_executable <- setup.compiler
@@ -84,13 +88,49 @@ module BuildToolchainSetup:
                    BuildToolchain::file_unchanged(&identities.developer_assembler)
 
     private:
-        # `ELISAPKG_COMPILER` may name the compiler; it must resolve to an
-        # executable on the isolated build PATH.
-        def select_compiler(setup: mutable Setup&) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+        # `ELISAPKG_COMPILER` selects the compiler and its Stage1 and runtime
+        # through the environment. Without it, the default toolchain supplies
+        # all three; with neither, `elisac-stage1` comes from the isolated PATH.
+        def select_toolchain(setup: mutable Setup&) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
-                setup.compiler <- "elisac-stage1"
-                if Platform::environment_variable("ELISAPKG_COMPILER") is configured:
-                    setup.compiler <- configured.cast[cstr]
+                if not BuildToolchain::read_environment(&setup.environment):
+                    CliStatus::build_failed
+                elif Platform::environment_variable("ELISAPKG_COMPILER") is configured:
+                    select_compiler(setup, configured.cast[cstr])
+                else:
+                    select_default_toolchain(setup)
+
+        def select_default_toolchain(setup: mutable Setup&) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                directory: mutable darray[u8] = []
+                state: UserData::DirectoryState = UserData::existing("toolchains", &directory)
+                default_name: mutable darray[u8] = []
+                default_status: i64 = -2 if state != UserData::DirectoryState.Trusted else ToolchainStore::read_default(directory, &default_name)
+                record: mutable ToolchainStore::Record = ToolchainStore::Record{kind: [], compiler: [], stage1: [], runtime: []}
+                if state == UserData::DirectoryState.Untrusted:
+                    CliOutput::write_error("error: the toolchain directory under $HOME/.local/share/elisapkg is unsafe or writable by another user\n")
+                    CliStatus::security_failed
+                elif default_status == -2:
+                    select_compiler(setup, "elisac-stage1")
+                elif default_status != 0 or ToolchainStore::read(directory, default_name, &record) != 0:
+                    CliOutput::write_error("error: the default toolchain record is missing or unreadable; see `elisapkg toolchain list`\n")
+                    CliStatus::build_failed
+                elif setup.environment.stage1_binary[0].u8() != 0 or setup.environment.runtime_object[0].u8() != 0:
+                    CliOutput::write_error("error: ELISA_STAGE1_BIN and ELISA_RUNTIME_OBJ apply only with ELISAPKG_COMPILER; unset them to use the default toolchain\n")
+                    CliStatus::build_failed
+                else:
+                    setup.stage1_storage <- ProjectFiles::with_null_terminator(record.stage1)
+                    setup.runtime_storage <- ProjectFiles::with_null_terminator(record.runtime)
+                    setup.environment.stage1_binary <- (&setup.stage1_storage[0]).cast[cstr] can Unsafe.PointerCast
+                    setup.environment.runtime_object <- (&setup.runtime_storage[0]).cast[cstr] can Unsafe.PointerCast
+                    compiler_c: darray[u8] = ProjectFiles::with_null_terminator(record.compiler)
+                    select_compiler(setup, (&compiler_c[0]).cast[cstr] can Unsafe.PointerCast)
+
+        # The requested compiler must resolve to an executable on the
+        # isolated build PATH, or be an executable absolute path.
+        def select_compiler(setup: mutable Setup&, requested: cstr) -> i64 can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                setup.compiler <- requested
                 return CliStatus::build_failed if not Toolchain::valid_compiler_argument(setup.compiler)
                 # The storage must outlive this function: a region here would
                 # free it and leave `setup.compiler` dangling.

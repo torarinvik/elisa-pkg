@@ -2,6 +2,7 @@
 include "../integrity.elisa"
 include "../platform.elisa"
 include "../project/files.elisa"
+include "../state/user_data.elisa"
 include "../text/bytes.elisa"
 
 module TrustPaths:
@@ -13,20 +14,8 @@ module TrustPaths:
             resolve(root, false)
 
     private:
-        def trust_state_directory(path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            path_c: darray[u8] = ProjectFiles::with_null_terminator(path)
-            path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
-            created: i64 = Platform::make_directory(path_name, 448.u16())
-            if created == 0:
-                Platform::synchronize_parent_directory(path_name) == 0 and Platform::is_trusted_directory(path_name) == 1
-            elif created == -17:
-                Platform::is_trusted_directory(path_name) == 1
-            else:
-                false
-
         def resolve(root: darray[u8]&, create_directories: bool) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             override: u8&? = Platform::environment_variable("ELISAPKG_TRUST_STATE")
-            home_reference: u8&? = Platform::environment_variable("HOME")
             if override is configured:
                 final_path: darray[u8] =
                     value: cstr = configured.cast[cstr]
@@ -47,11 +36,9 @@ module TrustPaths:
                     return [] if not trusted_state_parent(resolved)
                     [value[index].u8() for index in 0..<length]
                 final_path
-            elif home_reference is home_value:
-                home: cstr = home_value.cast[cstr]
-                prepare_under_home(root, home) if create_directories else lookup_under_home(root, home)
             else:
-                []
+                directory: darray[u8] = UserData::prepare("trust") if create_directories else UserData::directory("trust")
+                trust_state_path(root, directory)
 
         def trusted_state_parent(path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return false if path.count == 0.usize() or path[0] != 47
@@ -71,59 +58,12 @@ module TrustPaths:
                 parent_name: cstr = (&parent[0]).cast[cstr] can Unsafe.PointerCast
                 Platform::is_trusted_directory(parent_name) == 1
 
-        def prepare_under_home(root: darray[u8]&, home: cstr) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            home_length: usize = safe_home_length(home)
-            return [] if home_length == 0
-            # Build the final path in a local buffer before calling filesystem
-            # helpers. The stage1 ABI can invalidate a caller-owned darray after
-            # nested FFI calls; returning this completed value lets the caller's
-            # arena own the path and keeps its cursor and allocation metadata valid.
-            resolved_path: darray[u8] = trust_state_path(root, home, home_length)
-            # Create and check each directory from the outside in.
-            if resolved_path.count == 0.usize() or not trust_state_directory(home_path(home, home_length, ".local")) or not trust_state_directory(home_path(home, home_length, ".local/share")) or not trust_state_directory(home_path(home, home_length, ".local/share/elisapkg")) or not trust_state_directory(home_path(home, home_length, ".local/share/elisapkg/trust")) or resolved_path.count > 4096:
-                []
-            else:
-                resolved_path
-
-        def lookup_under_home(root: darray[u8]&, home: cstr) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            home_length: usize = safe_home_length(home)
-            if home_length == 0:
-                []
-            else:
-                resolved: darray[u8] = trust_state_path(root, home, home_length)
-                [] if resolved.count > 4096 else resolved
-
-        # "HOME/.local/share/elisapkg/trust/DIGEST.state" for `root`, or
-        # empty when `root` cannot be digested.
-        def trust_state_path(root: darray[u8]&, home: cstr, home_length: usize) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
+        # "DIRECTORY/DIGEST.state" for `root`, or empty when the directory is
+        # unavailable or `root` cannot be digested.
+        def trust_state_path(root: darray[u8]&, directory: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
             digest: mutable darray[u8] = []
-            if not Integrity::sha256_hex(root, &digest):
+            if directory.count == 0.usize() or not Integrity::sha256_hex(root, &digest):
                 []
             else:
-                trust_directory: mutable darray[u8] = home_path(home, home_length, ".local/share/elisapkg/trust")
-                trust_directory <- trust_directory.push(47)
-                ByteText::with_text(ByteText::with_bytes(trust_directory, digest), ".state")
-
-        # The first `home_length` bytes of `home` joined with `relative`.
-        def home_path(home: cstr, home_length: usize, relative: cstr) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
-            path: mutable darray[u8] = [home[index].u8() for index in 0..<home_length]
-            path <- path.push(47) if home_length > 1.usize()
-            ByteText::with_text(path, relative)
-
-        def safe_home_length(home: cstr) -> usize:
-            # The length without trailing slashes, keeping a lone "/".
-            normalized: usize =
-                length: usize = Platform::c_string_length(home)
-                return 0 if length == 0 or length > 3800 or home[0].u8() != 47
-                while position > 1 and home[position - 1].u8() == 47 |position: usize = length| -> position:
-                    position <- position - 1.usize()
-            for index in 0..<normalized |home, normalized|:
-                byte: u8 = home[index].u8()
-                return 0 if byte < 32 or byte == 127 or byte == 92
-            for index in 1..<(normalized + 1.usize()) |segment_start: usize = 1.usize()|:
-                if index == normalized or home[index].u8() == 47:
-                    region segment_length_scope:
-                        segment_length: usize = index - segment_start
-                        return 0 if segment_length == 0.usize() or segment_length == 1.usize() and home[segment_start].u8() == 46 or segment_length == 2.usize() and home[segment_start].u8() == 46 and home[segment_start + 1.usize()].u8() == 46
-                    segment_start <- index + 1.usize()
-            normalized
+                state_path: darray[u8] = ByteText::with_text(ByteText::with_bytes(ProjectFiles::path_join(directory, ""), digest), ".state")
+                [] if state_path.count > 4096.usize() else state_path

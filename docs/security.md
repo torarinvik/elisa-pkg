@@ -154,6 +154,15 @@ malformed and is not migrated automatically. Restoring both user-owned files
 together remains outside this local check's protection because they are not
 anchored in hardware-backed monotonic storage.
 
+Toolchain records share that per-user data root:
+`$HOME/.local/share/elisapkg/toolchains` holds one `NAME.toolchain` record per
+linked compiler and a `default` file. Every directory from `$HOME/.local` down
+is created with mode `0700` and must pass the trusted-directory policy; records
+are read through no-follow trusted walks, and a malformed record, a symlink in
+the store, or another user's write access fails closed. A record only names
+files that the user already chose to trust; linking never downloads or builds
+a compiler.
+
 The TUF checkpoint store has a separate `.tuf` state file, `.tuf.lock`, and
 `.tuf.clock` sidecar. It accepts only a bounded, canonical sorted batch of
 role, positive 64-bit version, and lowercase SHA-256 digest records. Each

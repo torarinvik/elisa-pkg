@@ -318,3 +318,28 @@ compared byte-for-byte after the compiler exits and before publication.
 Registry build support remains disabled
 until authenticated source acquisition, cache extraction, and graph-wide
 compilation are integrated. Fixture: `scripts/local_dependency_build_regression.py`.
+
+## D-015: toolchain management
+
+`elisapkg toolchain` manages compilers the way rustup manages Rust toolchains.
+The first phase links local compiler checkouts: a per-user record names the
+canonical wrapper, Stage1, and runtime paths, and builds use the default record
+when `ELISAPKG_COMPILER` is unset. Environment selection stays all-or-nothing,
+so `ELISA_STAGE1_BIN` or `ELISA_RUNTIME_OBJ` without `ELISAPKG_COMPILER` is an
+error rather than a mix of two compilers. Records live under the same trusted
+per-user data root as registry trust state (`UserData`), are read through
+no-follow trusted walks, and fail closed when malformed. Linking never
+downloads or builds anything.
+
+Later phases install prebuilt toolchain archives, one per target triple
+(macOS arm64, Linux x64 and arm64, Windows x64 and arm64). Each archive pins
+the compiler together with the LLVM tools it was built against, z3, and their
+libraries, and `toolchain update` replaces the whole set. LLVM comes from the
+official llvm-project release builds, which are self-contained and
+relocatable. Those builds ship static LLVM libraries but no shared `libLLVM`,
+so Stage1 and Stage0 must link LLVM statically, and only LLVM versions with a
+release build for every target are eligible (23.1.6 has no macOS build, for
+example). The macOS SDK and the MSVC SDK cannot be redistributed and remain
+host requirements checked by `doctor`. Toolchain archives will be distributed
+through the TUF registry under a delegated role separate from package
+publishers. Fixture: `scripts/smoke/toolchain_store.sh`.

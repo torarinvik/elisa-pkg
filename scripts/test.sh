@@ -69,6 +69,7 @@ mkdir -p "$CASE"
 )
 
 source "$ROOT/scripts/smoke/targets_and_invalid_projects.sh"
+source "$ROOT/scripts/smoke/toolchain_store.sh"
 python3 "$ROOT/scripts/regression_test.py"
 python3 "$ROOT/scripts/cli_regression.py"
 echo "elisapkg smoke tests passed"

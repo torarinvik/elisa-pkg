@@ -1,0 +1,110 @@
+# The per-user elisapkg data directories under `$HOME/.local/share/elisapkg`.
+#
+# Every directory from `$HOME/.local` down to the named data directory must be
+# owned by root or the current user and must not be writable by anyone else,
+# so another account cannot replace trust state or toolchain records.
+include "../platform.elisa"
+include "../project/files.elisa"
+include "../text/bytes.elisa"
+
+module UserData:
+    public:
+        # The longest data directory path, leaving room for a file name below PATH_MAX.
+        const maximum_directory_bytes: usize = 3900.usize()
+
+        # Where a data directory lookup found it.
+        const enum DirectoryState of u8:
+            Trusted
+            Missing
+            Untrusted
+
+        # "$HOME/.local/share/elisapkg/NAME", or empty when HOME is unusable.
+        def directory(name: cstr) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            requires Platform::c_string_length(name) > 0.usize()
+            if Platform::environment_variable("HOME") is home_value:
+                home: cstr = home_value.cast[cstr]
+                home_length: usize = safe_home_length(home)
+                [] if home_length == 0.usize() else data_path(home, home_length, name)
+            else:
+                []
+
+        # Create each missing directory from `$HOME/.local` down to NAME and
+        # check every one. Returns the directory, or empty when any step fails.
+        def prepare(name: cstr) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            requires Platform::c_string_length(name) > 0.usize()
+            if Platform::environment_variable("HOME") is home_value:
+                home: cstr = home_value.cast[cstr]
+                home_length: usize = safe_home_length(home)
+                return [] if home_length == 0.usize()
+                # Build the final path before calling filesystem helpers: the
+                # stage1 ABI can invalidate a caller-owned darray after nested
+                # FFI calls, and a completed value is owned by the caller's arena.
+                final_path: darray[u8] = data_path(home, home_length, name)
+                final_path if final_path.count > 0.usize() and
+                              created_trusted(home_path(home, home_length, ".local")) and
+                              created_trusted(home_path(home, home_length, ".local/share")) and
+                              created_trusted(home_path(home, home_length, ".local/share/elisapkg")) and
+                              created_trusted(final_path) else []
+            else:
+                []
+
+        # Look up an existing data directory without creating anything.
+        def existing(name: cstr, out: mutable darray[u8]&) -> DirectoryState can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            requires Platform::c_string_length(name) > 0.usize()
+            out.resize(0)
+            located: darray[u8] = directory(name)
+            return DirectoryState.Untrusted if located.count == 0.usize()
+            # The no-follow walk reports ENOENT only after the existing prefix
+            # of the path passed the trust policy.
+            status: i64 =
+                located_c: darray[u8] = ProjectFiles::with_null_terminator(located)
+                Platform::trusted_directory_status((&located_c[0]).cast[cstr] can Unsafe.PointerCast)
+            if status == 0:
+                ByteText::append(out, located)
+                DirectoryState.Trusted
+            elif status == -2:
+                DirectoryState.Missing
+            else:
+                DirectoryState.Untrusted
+
+    private:
+        def data_path(home: cstr, home_length: usize, name: cstr) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
+            path: darray[u8] = ByteText::with_text(home_path(home, home_length, ".local/share/elisapkg/"), name)
+            [] if path.count > maximum_directory_bytes else path
+
+        # Create `path` with mode 0700 unless it exists, then check its trust.
+        def created_trusted(path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            path_c: darray[u8] = ProjectFiles::with_null_terminator(path)
+            path_name: cstr = (&path_c[0]).cast[cstr] can Unsafe.PointerCast
+            created: i64 = Platform::make_directory(path_name, 448.u16())
+            if created == 0:
+                Platform::synchronize_parent_directory(path_name) == 0 and Platform::is_trusted_directory(path_name) == 1
+            elif created == -17:
+                Platform::is_trusted_directory(path_name) == 1
+            else:
+                false
+
+        # The first `home_length` bytes of `home` joined with `relative`.
+        def home_path(home: cstr, home_length: usize, relative: cstr) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
+            path: mutable darray[u8] = [home[index].u8() for index in 0..<home_length]
+            path <- path.push(47) if home_length > 1.usize()
+            ByteText::with_text(path, relative)
+
+        # The length of an absolute HOME without trailing slashes, keeping a
+        # lone "/", or zero for a relative, oversized, or unsafe HOME.
+        def safe_home_length(home: cstr) -> usize:
+            normalized: usize =
+                length: usize = Platform::c_string_length(home)
+                return 0 if length == 0 or length > 3800 or home[0].u8() != 47
+                while position > 1 and home[position - 1].u8() == 47 |position: usize = length| -> position:
+                    position <- position - 1.usize()
+            for index in 0..<normalized |home, normalized|:
+                byte: u8 = home[index].u8()
+                return 0 if byte < 32 or byte == 127 or byte == 92
+            for index in 1..<(normalized + 1.usize()) |segment_start: usize = 1.usize()|:
+                if index == normalized or home[index].u8() == 47:
+                    region segment_length_scope:
+                        segment_length: usize = index - segment_start
+                        return 0 if segment_length == 0.usize() or segment_length == 1.usize() and home[segment_start].u8() == 46 or segment_length == 2.usize() and home[segment_start].u8() == 46 and home[segment_start + 1.usize()].u8() == 46
+                    segment_start <- index + 1.usize()
+            normalized

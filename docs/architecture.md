@@ -19,6 +19,8 @@ The current source units are:
 | `PackageReceipt`, `InstallRecords` | Local archive receipts and installation record codecs | Record format and field validation | An invalid install journal yields no parsed fields. |
 | `InstallPrefix` | Installation prefix configuration and directory trust | Prefix validation and native path conversion | Missing directory components are created relative to trusted parent descriptors. |
 | `Build`, `Toolchain` | Build output locations, include emission, and executable lookup | Include path validation and compiler path helpers | Compiler lookup and child environment share the same search path. |
+| `UserData` | The per-user data directories under `$HOME/.local/share/elisapkg` | HOME validation and per-directory creation | Every directory from `$HOME/.local` down is created with mode `0700` and must pass the trusted-directory policy. Registry trust state and toolchain records share it. |
+| `ToolchainStore` | Toolchain names, record encoding, and the default toolchain | Record field parsing and listing | Records are published exclusively or replaced atomically, and read only through trusted no-follow walks; a malformed record is never used. |
 | `SourceFingerprint`, `BuildSnapshots` | Source tree identity and verified sandbox inputs | Byte budgets, staging names, and snapshot cleanup | Fingerprints bind logical paths to file digests. The build uses a copied tree only after its fingerprint matches and the selected entry resolves to a regular file. The caller cleans every registered staging directory on success or failure. |
 | `Json` | Bounded JSON syntax validation, duplicate-key rejection, and direct field lookup | Lexical cursors and seen-key tables | It bounds document size, nesting, object-key count, and duplicate-key comparison work; callers still own schema and type validation. |
 | `SemVer` | Version precedence and initial range matching | Requirement parser helpers and grammar constants | Resolver code receives parsed bounds instead of interpreting range text itself. |
@@ -42,14 +44,14 @@ orchestration short and delegates each phase to a focused module:
 | `BuildCommand` | Orders a build: read the project, prepare inputs, reuse a cached artifact, or compile |
 | `BuildTarget` | Reads the manifest and selects the compiled target |
 | `BuildInputs`, `BuildSources` | Fingerprints the inputs bound to a build receipt and prepares the private source tree |
-| `BuildToolchainSetup` | Resolves the compiler toolchain and fingerprints every component |
+| `BuildToolchainSetup` | Selects the compiler from `ELISAPKG_COMPILER` or the default toolchain, and fingerprints every component |
 | `BuildWorkspace` | Owns the private scratch files of one build and removes them on every path |
 | `BuildExecution`, `CompilerProcess` | Runs the sandboxed compiler and verifies and publishes its output |
 | `FetchCommand`, `FetchRelease`, `FetchOffline` | Fetches registry releases online, or verifies a registry lock against the authenticated offline cache |
 | `ResolutionCommand` | Resolves, edits, and presents dependency locks |
 | `LocalInstallCommand` | Publishes and removes verified local installations under a per-prefix lock |
 | `MaintenanceCommand`, `ProgramCommand` | Cleans outputs, verifies the package cache, and runs built programs |
-| `InitCommand`, `PackageCommand`, `InstallCommand` (`src/cli/commands/`) | Creates a package scaffold, lists or writes the package archive and validates a publish dry run, and installs the built binary target locally |
+| `InitCommand`, `PackageCommand`, `InstallCommand`, `ToolchainCommand` (`src/cli/commands/`) | Creates a package scaffold, lists or writes the package archive and validates a publish dry run, installs the built binary target locally, and links, lists, selects, and unlinks toolchains |
 
 Command modules read the argument vector as an immutable `cstr&&`. Only the
 child-process argument vectors handed to `execvp` are writable.

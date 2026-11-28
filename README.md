@@ -45,13 +45,16 @@ The generated package and binary target are named `app`, even though the example
 
 ### 3. Build and run on Apple Silicon macOS
 
-Use a trusted compiler and keep the toolchain settings from step 1 in the same shell. macOS also needs the Xcode Command Line Tools or a supported Xcode installation.
+Register your trusted compiler checkout once as the default toolchain. Builds then find its wrapper, Stage1, and runtime without environment variables. macOS also needs the Xcode Command Line Tools or a supported Xcode installation.
 
 ```sh
-export ELISAPKG_COMPILER="${ELISA_COMPILER_WRAPPER:-$ELISA_COMPILER_ROOT/scripts/elisac_stage1.sh}"
+unset ELISA_STAGE1_BIN ELISA_RUNTIME_OBJ
+"$ELISAPKG" toolchain link dev "$ELISA_COMPILER_ROOT"
 "$ELISAPKG" build --bin app
 "$ELISAPKG" run --bin app --
 ```
+
+To select the compiler through the environment instead, set `ELISAPKG_COMPILER` to the wrapper and keep `ELISA_STAGE1_BIN` and `ELISA_RUNTIME_OBJ` from step 1. See [toolchains](docs/toolchains.md) for the selection rules.
 
 The default build produces `.elisapkg/build/app`. Put program arguments after `--`. On Linux, you can still validate, resolve, and package this project, but `build`, `run`, and `test` require the macOS build sandbox.
 
@@ -110,7 +113,7 @@ normal exit returns the program's status.
 ## Troubleshooting
 
 - **Missing compiler, wrapper, or runtime:** Check the three paths in step 1 against your Elisa compiler checkout. Bootstrap the compiler in that checkout first if its Stage1 or runtime artifacts are missing.
-- **Cannot find the build compiler:** Set `ELISAPKG_COMPILER` to the absolute path of the trusted compiler wrapper, then run `doctor`.
+- **Cannot find the build compiler:** Run `doctor` to see which compiler builds select. Link a checkout with `elisapkg toolchain link NAME PATH`, or set `ELISAPKG_COMPILER` to the absolute path of the trusted compiler wrapper.
 - **Manifest or target not found:** Check your working directory and the target's `name` and `kind` in `elisapkg.json`. Use [the manifest reference](docs/manifest.md) when defining a new target.
 - **Frozen lock is stale:** Review the source or dependency changes. If they're intentional, run `resolve` and review the updated `elisapkg.lock`.
 - **Project transaction recovery failed:** Let any active package edit finish, then retry. If recovery still fails, preserve `elisapkg.json`, `elisapkg.lock` if present, and the files named `.elisapkg/transaction.*` together for inspection. Run `elisapkg doctor` for toolchain diagnostics while recovery is blocked.
@@ -132,6 +135,7 @@ The local registry fixture verifies detached Ed25519 signatures, expiry, cached 
 | [Manifest](docs/manifest.md) and [lockfile](docs/lockfile.md) | JSON schemas, targets, dependencies, and lockfile formats |
 | [Architecture](docs/architecture.md) and [decisions](docs/decisions.md) | Elisa modules, public interfaces, and the private POSIX FFI boundary |
 | [Compiler compatibility](docs/compatibility.md) | Bootstrap paths, host support, and toolchain constraints |
+| [Toolchains](docs/toolchains.md) | Linking compiler checkouts, how builds select a compiler, and planned toolchain installs |
 | [CI and regression checks](docs/ci.md) | Development checks and host requirements |
 | [TUF profile](docs/tuf-profile.md) | Requirements for future production registry support |
 

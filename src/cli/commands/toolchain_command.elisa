@@ -1,0 +1,248 @@
+# `elisapkg toolchain`: link, list, select, and unlink compiler toolchains.
+#
+# A linked toolchain is a local Elisa compiler checkout. Linking records the
+# canonical paths of its compiler wrapper, Stage1 executable, and runtime
+# object; builds use the default toolchain unless `ELISAPKG_COMPILER` selects a
+# compiler through the environment.
+include "../../platform.elisa"
+include "../../state/user_data.elisa"
+include "../../text/bytes.elisa"
+include "../../toolchain.elisa"
+include "../../toolchain/store.elisa"
+include "../output.elisa"
+include "../status.elisa"
+
+module ToolchainCommand:
+    public:
+        # Run `toolchain link NAME PATH`, `toolchain list`,
+        # `toolchain default [NAME]`, or `toolchain unlink NAME`.
+        def run(argument_count: i64, slots: cstr&&) -> CliStatus::ExitStatus can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                return usage_error() if argument_count < 3
+                action: cstr = slots[2].cast[cstr]
+                if Platform::c_string_equal(action, "link") and argument_count == 5:
+                    link(slots[3].cast[cstr], slots[4].cast[cstr])
+                elif Platform::c_string_equal(action, "list") and argument_count == 3:
+                    list()
+                elif Platform::c_string_equal(action, "default") and argument_count == 3:
+                    show_default()
+                elif Platform::c_string_equal(action, "default") and argument_count == 4:
+                    select_default(slots[3].cast[cstr])
+                elif Platform::c_string_equal(action, "unlink") and argument_count == 4:
+                    unlink(slots[3].cast[cstr])
+                elif Platform::c_string_equal(action, "--help"):
+                    write_help()
+                    CliStatus::success
+                else:
+                    usage_error()
+
+        # The `doctor` line that says which compiler builds use.
+        def write_doctor_line() -> void can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                directory: mutable darray[u8] = []
+                state: UserData::DirectoryState = UserData::existing("toolchains", &directory)
+                default_name: mutable darray[u8] = []
+                record: mutable ToolchainStore::Record = empty_record()
+                if Platform::environment_variable("ELISAPKG_COMPILER") is configured:
+                    CliOutput::write_ok("compiler: ELISAPKG_COMPILER selects the compiler, Stage1, and runtime; toolchains are not used\n")
+                elif state == UserData::DirectoryState.Untrusted:
+                    CliOutput::write_ok("compiler: the toolchain directory is unsafe or writable by another user; builds fail closed\n")
+                elif state == UserData::DirectoryState.Missing or ToolchainStore::read_default(directory, &default_name) != 0:
+                    CliOutput::write_ok("compiler: no default toolchain; run `elisapkg toolchain link NAME PATH` or set ELISAPKG_COMPILER\n")
+                elif ToolchainStore::read(directory, default_name, &record) != 0:
+                    CliOutput::write_ok("compiler: the default toolchain record is unreadable; builds fail closed\n")
+                else:
+                    CliOutput::write_ok("compiler: default toolchain ")
+                    CliOutput::write_bytes(1, default_name)
+                    CliOutput::write_ok(", linked compiler ")
+                    CliOutput::write_bytes(1, record.compiler)
+                    CliOutput::write_ok("\n")
+
+    private:
+        def write_help() -> void can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                CliOutput::write_ok("Usage: elisapkg toolchain <command>\n\n")
+                CliOutput::write_ok("  link NAME PATH    register the Elisa compiler checkout at PATH as NAME\n")
+                CliOutput::write_ok("  list              show registered toolchains and the default\n")
+                CliOutput::write_ok("  default [NAME]    show the default toolchain, or make NAME the default\n")
+                CliOutput::write_ok("  unlink NAME       remove a linked toolchain\n")
+
+        def usage_error() -> CliStatus::ExitStatus can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                CliOutput::write_error("error: usage: elisapkg toolchain link NAME PATH | list | default [NAME] | unlink NAME\n")
+                CliStatus::usage
+
+        def invalid_name() -> CliStatus::ExitStatus can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                CliOutput::write_error("error: a toolchain name has 1 to 64 lowercase letters, digits, `.`, `_`, or `-`, and starts with a letter or digit\n")
+                CliStatus::usage
+
+        def untrusted_store() -> CliStatus::ExitStatus can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                CliOutput::write_error("error: the toolchain directory under $HOME/.local/share/elisapkg is missing, unsafe, or writable by another user\n")
+                CliStatus::security_failed
+
+        # ---------- link -----------------------------------------------------------------
+
+        def link(name_argument: cstr, checkout_argument: cstr) -> CliStatus::ExitStatus can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                name: darray[u8] = ByteText::with_bounded_text([], name_argument)
+                return invalid_name() if not ToolchainStore::valid_name(name)
+                root: mutable darray[u8] = []
+                if not Toolchain::canonical_path_bytes(checkout_argument, &root):
+                    CliOutput::write_error("error: the toolchain checkout path does not exist\n")
+                    CliStatus::usage
+                elif not checkout_complete(ToolchainStore::linked_checkout(root)):
+                    CliOutput::write_error("error: the checkout needs an executable scripts/elisac_stage1.sh, an executable bin/elisac-stage1, and build/runtime/elisacore_runtime.o\n")
+                    CliStatus::usage
+                else:
+                    publish_link(name, root)
+
+        # Record the checkout at the canonical `root` as `name`.
+        def publish_link(name: darray[u8]&, root: darray[u8]&) -> CliStatus::ExitStatus can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                directory: darray[u8] = UserData::prepare("toolchains")
+                return untrusted_store() if directory.count == 0.usize()
+                # Check first: an exclusive publication that loses to an existing
+                # record keeps its staged temporary file for recovery.
+                published: i64 = -17 if ToolchainStore::exists(directory, name) else ToolchainStore::publish_new(directory, name, ToolchainStore::linked_checkout(root))
+                if published == -17:
+                    CliOutput::write_error("error: a toolchain with that name already exists; unlink it first\n")
+                    CliStatus::operation_failed
+                elif published != 0:
+                    CliOutput::write_error("error: could not write the toolchain record\n")
+                    CliStatus::operation_failed
+                else:
+                    CliOutput::write_ok("linked toolchain ")
+                    CliOutput::write_bytes(1, name)
+                    CliOutput::write_ok(": ")
+                    CliOutput::write_bytes(1, root)
+                    # The first linked toolchain becomes the default.
+                    made_default: bool =
+                        current_default: mutable darray[u8] = []
+                        ToolchainStore::read_default(directory, &current_default) == -2 and ToolchainStore::write_default(directory, name)
+                    if made_default:
+                        CliOutput::write_ok(" (default)\n")
+                        CliStatus::success
+                    else:
+                        CliOutput::write_ok("\n")
+                        CliStatus::success
+
+        # Every file a build runs or reads exists, and the executables can run.
+        def checkout_complete(record: ToolchainStore::Record) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            compiler_c: darray[u8] = ProjectFiles::with_null_terminator(record.compiler)
+            stage1_c: darray[u8] = ProjectFiles::with_null_terminator(record.stage1)
+            runtime_c: darray[u8] = ProjectFiles::with_null_terminator(record.runtime)
+            compiler_name: cstr = (&compiler_c[0]).cast[cstr] can Unsafe.PointerCast
+            Toolchain::valid_compiler_argument(compiler_name) and
+                Platform::access_path(compiler_name, 1) == 0 and
+                Platform::access_path(((&stage1_c[0]).cast[cstr] can Unsafe.PointerCast), 1) == 0 and
+                Platform::access_path(((&runtime_c[0]).cast[cstr] can Unsafe.PointerCast), 0) == 0
+
+        # ---------- list and default -----------------------------------------------------
+
+        def list() -> CliStatus::ExitStatus can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                directory: mutable darray[u8] = []
+                state: UserData::DirectoryState = UserData::existing("toolchains", &directory)
+                if state == UserData::DirectoryState.Untrusted:
+                    untrusted_store()
+                elif state == UserData::DirectoryState.Missing:
+                    CliOutput::write_ok("no toolchains; link a compiler checkout with `elisapkg toolchain link NAME PATH`\n")
+                    CliStatus::success
+                else:
+                    list_records(directory)
+
+        def list_records(directory: darray[u8]&) -> CliStatus::ExitStatus can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                readable: mutable bool = false
+                names: darray[darray[u8]] = ToolchainStore::names(directory, &readable)
+                default_name: mutable darray[u8] = []
+                if not readable:
+                    CliOutput::write_error("error: could not read the toolchain directory\n")
+                    CliStatus::operation_failed
+                else:
+                    ToolchainStore::read_default(directory, &default_name)
+                    if names.count == 0.usize():
+                        CliOutput::write_ok("no toolchains; link a compiler checkout with `elisapkg toolchain link NAME PATH`\n")
+                    for index in 0..<names.count |names, default_name|:
+                        write_entry(directory, names[index], ByteText::equal(names[index], default_name))
+                    CliStatus::success
+
+        def write_entry(directory: darray[u8]&, name: darray[u8]&, is_default: bool) -> void can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                record: mutable ToolchainStore::Record = empty_record()
+                CliOutput::write_bytes(1, name)
+                CliOutput::write_ok(" (default)" if is_default else "")
+                if ToolchainStore::read(directory, name, &record) == 0:
+                    CliOutput::write_ok(": linked, compiler ")
+                    CliOutput::write_bytes(1, record.compiler)
+                    CliOutput::write_ok("\n")
+                else:
+                    CliOutput::write_ok(": unreadable record\n")
+
+        def show_default() -> CliStatus::ExitStatus can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                directory: mutable darray[u8] = []
+                state: UserData::DirectoryState = UserData::existing("toolchains", &directory)
+                default_name: mutable darray[u8] = []
+                if state == UserData::DirectoryState.Untrusted:
+                    untrusted_store()
+                elif state == UserData::DirectoryState.Missing or ToolchainStore::read_default(directory, &default_name) != 0:
+                    CliOutput::write_ok("no default toolchain\n")
+                    CliStatus::success
+                else:
+                    CliOutput::write_bytes(1, default_name)
+                    CliOutput::write_ok("\n")
+                    CliStatus::success
+
+        def select_default(name_argument: cstr) -> CliStatus::ExitStatus can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                name: darray[u8] = ByteText::with_bounded_text([], name_argument)
+                directory: mutable darray[u8] = []
+                record: mutable ToolchainStore::Record = empty_record()
+                if not ToolchainStore::valid_name(name):
+                    invalid_name()
+                elif UserData::existing("toolchains", &directory) == UserData::DirectoryState.Untrusted:
+                    untrusted_store()
+                elif directory.count == 0.usize() or ToolchainStore::read(directory, name, &record) != 0:
+                    CliOutput::write_error("error: no readable toolchain has that name; see `elisapkg toolchain list`\n")
+                    CliStatus::operation_failed
+                elif not ToolchainStore::write_default(directory, name):
+                    CliOutput::write_error("error: could not write the default toolchain\n")
+                    CliStatus::operation_failed
+                else:
+                    CliOutput::write_ok("default toolchain: ")
+                    CliOutput::write_bytes(1, name)
+                    CliOutput::write_ok("\n")
+                    CliStatus::success
+
+        # ---------- unlink ---------------------------------------------------------------
+
+        def unlink(name_argument: cstr) -> CliStatus::ExitStatus can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            can Global.Read:
+                name: darray[u8] = ByteText::with_bounded_text([], name_argument)
+                directory: mutable darray[u8] = []
+                record: mutable ToolchainStore::Record = empty_record()
+                default_name: mutable darray[u8] = []
+                if not ToolchainStore::valid_name(name):
+                    invalid_name()
+                elif UserData::existing("toolchains", &directory) == UserData::DirectoryState.Untrusted:
+                    untrusted_store()
+                elif directory.count == 0.usize() or ToolchainStore::read(directory, name, &record) == -2:
+                    # A malformed record may still be removed; only a missing one is an error.
+                    CliOutput::write_error("error: no toolchain has that name; see `elisapkg toolchain list`\n")
+                    CliStatus::operation_failed
+                else:
+                    was_default: bool = ToolchainStore::read_default(directory, &default_name) == 0 and ByteText::equal(default_name, name)
+                    if not ToolchainStore::remove(directory, name) or was_default and not ToolchainStore::clear_default(directory):
+                        CliOutput::write_error("error: could not remove the toolchain record\n")
+                        CliStatus::operation_failed
+                    else:
+                        CliOutput::write_ok("unlinked toolchain ")
+                        CliOutput::write_bytes(1, name)
+                        CliOutput::write_ok("; no default toolchain is set\n" if was_default else "\n")
+                        CliStatus::success
+
+        def empty_record() -> ToolchainStore::Record:
+            ToolchainStore::Record{kind: [], compiler: [], stage1: [], runtime: []}

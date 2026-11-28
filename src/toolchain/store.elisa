@@ -1,0 +1,163 @@
+# The per-user toolchain store under `$HOME/.local/share/elisapkg/toolchains`.
+#
+# Each toolchain has one record file, `NAME.toolchain`, naming the compiler
+# wrapper, Stage1 executable, and runtime object a build uses. The file
+# `default` holds the name of the toolchain builds select when no compiler is
+# configured through the environment. Records are replaced atomically and are
+# read only through trusted, no-follow directory walks.
+include "../platform.elisa"
+include "../project/files.elisa"
+include "../registry/files.elisa"
+include "../state/user_data.elisa"
+include "../text/bytes.elisa"
+
+module ToolchainStore:
+    public:
+        # The files one toolchain provides to a build, as absolute paths.
+        struct Record:
+            kind: darray[u8]
+            compiler: darray[u8]
+            stage1: darray[u8]
+            runtime: darray[u8]
+
+        const maximum_record_bytes: usize = 16384.usize()
+        const maximum_path_bytes: usize = 4000.usize()
+        const maximum_toolchains: usize = 256.usize()
+
+        # A toolchain name: 1 to 64 bytes of lowercase ASCII letters, digits,
+        # `.`, `_`, and `-`, starting with a letter or digit.
+        def valid_name(name: darray[u8]&) -> bool:
+            return false if name.count == 0.usize() or name.count > 64.usize()
+            for index in 0..<name.count |valid: bool = true| -> valid:
+                byte: u8 = name[index]
+                letter_or_digit: bool = byte >= 97 and byte <= 122 or byte >= 48 and byte <= 57
+                break false if not letter_or_digit and (index == 0.usize() or byte != 46 and byte != 95 and byte != 45)
+
+        # The record of a linked compiler checkout at the canonical `root`.
+        def linked_checkout(root: darray[u8]&) -> Record can[Memory.Allocate, Abort.Panic]:
+            requires root.count > 0
+            Record{kind: ByteText::with_text([], "link"),
+                   compiler: ProjectFiles::path_join(root, "scripts/elisac_stage1.sh"),
+                   stage1: ProjectFiles::path_join(root, "bin/elisac-stage1"),
+                   runtime: ProjectFiles::path_join(root, "build/runtime/elisacore_runtime.o")}
+
+        def encode(record: Record&) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
+            ByteText::with_text(ByteText::with_bytes(ByteText::with_text(ByteText::with_bytes(ByteText::with_text(ByteText::with_bytes(ByteText::with_text(
+                ByteText::with_bytes(ByteText::with_text([], "elisapkg-toolchain=1\nkind="), record.kind),
+                "\ncompiler="), record.compiler), "\nstage1="), record.stage1), "\nruntime="), record.runtime), "\n")
+
+        # Parse a record written by `encode`. Every field must be present in
+        # order, and every path must be absolute and free of control bytes.
+        def decode(raw: darray[u8]&, out: mutable Record&) -> bool can[Memory.Allocate, Abort.Panic]:
+            return false if raw.count <= header_bytes or raw.count > maximum_record_bytes or not ByteText::range_equals_text(raw, 0.usize(), header_bytes, "elisapkg-toolchain=1\n")
+            runtime_end: usize = read_field(raw, read_field(raw, read_field(raw, read_field(raw, header_bytes, "kind=", &out.kind) + 1.usize(), "compiler=", &out.compiler) + 1.usize(), "stage1=", &out.stage1) + 1.usize(), "runtime=", &out.runtime)
+            runtime_end + 1.usize() == raw.count and ByteText::equal_text(out.kind, "link") and valid_path(out.compiler) and valid_path(out.stage1) and valid_path(out.runtime)
+
+        # Read the record of `name`. Returns 0, -2 when it does not exist, or
+        # another negative status for an unreadable or malformed record.
+        def read(directory: darray[u8]&, name: darray[u8]&, out: mutable Record&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            requires directory.count > 0
+            return -22 if not valid_name(name)
+            raw: mutable darray[u8] = []
+            loaded: i64 = RegistryFiles::read_trusted_file(record_path(directory, name), maximum_record_bytes, &raw)
+            loaded if loaded < 0 else 0 if decode(raw, out) else -74
+
+        # Publish a new record. Returns 0, -17 when `name` already exists, or
+        # another negative status.
+        def publish_new(directory: darray[u8]&, name: darray[u8]&, record: Record&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            requires directory.count > 0
+            return -22 if not valid_name(name)
+            ProjectFiles::publish_file_exclusively(record_path(directory, name), encode(record))
+
+        # Whether any directory entry, readable or not, has the record name of `name`.
+        def exists(directory: darray[u8]&, name: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            requires directory.count > 0
+            valid_name(name) and ProjectFiles::path_occupied(record_path(directory, name))
+
+        def remove(directory: darray[u8]&, name: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            requires directory.count > 0
+            valid_name(name) and ProjectFiles::remove_known_file(record_path(directory, name))
+
+        # Read the default toolchain name. Returns 0, -2 when no default is
+        # set, or another negative status.
+        def read_default(directory: darray[u8]&, out: mutable darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            requires directory.count > 0
+            out.resize(0)
+            raw: mutable darray[u8] = []
+            loaded: i64 = RegistryFiles::read_trusted_file(ProjectFiles::path_join(directory, "default"), 66.usize(), &raw)
+            if loaded < 0:
+                loaded
+            elif raw.count < 2.usize() or raw[raw.count - 1.usize()] != 10:
+                -74
+            else:
+                ByteText::append_range(out, raw, 0.usize(), raw.count - 1.usize())
+                0 if valid_name(out) else -74
+
+        def write_default(directory: darray[u8]&, name: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
+            requires directory.count > 0
+            valid_name(name) and ProjectFiles::replace_file(ProjectFiles::path_join(directory, "default"), ByteText::with_text(ByteText::with_bytes([], name), "\n"))
+
+        def clear_default(directory: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            requires directory.count > 0
+            ProjectFiles::remove_known_file(ProjectFiles::path_join(directory, "default"))
+
+        # The toolchain names in `directory`, in byte order. Clears `readable`
+        # for an unreadable directory or more than `maximum_toolchains` records.
+        def names(directory: darray[u8]&, readable: mutable bool&) -> darray[darray[u8]] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            requires directory.count > 0
+            listing: mutable darray[u8] = []
+            listing <- listing.resize(1048576)
+            collected: i64 =
+                directory_c: darray[u8] = ProjectFiles::with_null_terminator(directory)
+                listing_raw: mutable u8& = (&listing[0]).cast[mutable u8&] can Unsafe.PointerCast
+                Platform::collect_files(((&directory_c[0]).cast[cstr] can Unsafe.PointerCast), listing_raw, listing.count)
+            if collected < 0:
+                readable <- false
+                []
+            else:
+                listed: darray[darray[u8]] = while cursor < collected.usize() |listing, cursor: usize = 0.usize(), entry_start: usize = 0.usize(), found: darray[darray[u8]] = []| -> found:
+                    entry_start <- cursor
+                    while cursor < collected.usize() and listing[cursor] != 0 |listing, cursor|:
+                        cursor <- cursor + 1.usize()
+                    cursor <- cursor + 1.usize()
+                    name: darray[u8] = record_name(listing, entry_start, cursor - 1.usize())
+                    found <- found.push(name) if name.count > 0.usize()
+                readable <- listed.count <= maximum_toolchains
+                listed
+
+    private:
+        def record_path(directory: darray[u8]&, name: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
+            ByteText::with_text(ProjectFiles::path_join_bytes(directory, name), ".toolchain")
+
+        # The toolchain name of a listed entry `listing[start..<finish]`, or
+        # empty when the entry is not a top-level `NAME.toolchain` file.
+        def record_name(listing: darray[u8]&, start: usize, finish: usize) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
+            leaf_start: usize = for index in start..<finish |leaf_start: usize = start| -> leaf_start:
+                leaf_start <- index + 1.usize() if listing[index] == 47
+            suffix_length: usize = 10.usize()
+            if finish - leaf_start <= suffix_length or not ByteText::range_equals_text(listing, finish - suffix_length, finish, ".toolchain"):
+                []
+            else:
+                name: darray[u8] = ByteText::with_range([], listing, leaf_start, finish - suffix_length)
+                name if valid_name(name) else []
+
+        const header_bytes: usize = 21.usize()
+
+        # Read the value of the `key=value` line starting at `start` into
+        # `value`. Returns the offset of the line's newline, or the record
+        # length when the line is missing, has another key, or is unterminated.
+        def read_field(raw: darray[u8]&, start: usize, key: cstr, value: mutable darray[u8]&) -> usize can[Memory.Allocate, Abort.Panic]:
+            value.resize(0)
+            value_start: usize = start + Platform::c_string_length(key)
+            if value_start > raw.count or not ByteText::range_equals_text(raw, start, value_start, key):
+                raw.count
+            else:
+                line_end: usize = for index in value_start..<raw.count |found: usize = raw.count| -> found:
+                    break index if raw[index] == 10
+                ByteText::append_range(value, raw, value_start, line_end)
+                line_end
+
+        def valid_path(path: darray[u8]&) -> bool:
+            return false if path.count < 2.usize() or path.count > maximum_path_bytes or path[0] != 47
+            for index in 0..<path.count |valid: bool = true| -> valid:
+                break false if path[index] < 32 or path[index] == 127

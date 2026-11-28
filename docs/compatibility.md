@@ -2,7 +2,9 @@
 
 The package manager is bootstrapped by an explicitly selected Elisa compiler.
 It never guesses a sibling checkout, downloads a compiler, or treats object
-emission as semantic validation.
+emission as semantic validation. Builds use the compiler that
+`ELISAPKG_COMPILER` selects, or else a checkout registered with
+`elisapkg toolchain link` (see [toolchains](toolchains.md)).
 
 ## Current seed contract
 
