@@ -40,15 +40,18 @@ module ToolchainCommand:
         def write_doctor_line() -> void can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
                 directory: mutable darray[u8] = []
-                state: UserData::DirectoryState = UserData::existing("toolchains", &directory)
+                state: UserData::DirectoryState = ToolchainStore::existing_directory(&directory)
                 default_name: mutable darray[u8] = []
+                default_status: i64 = -2 if state != UserData::DirectoryState.Trusted else ToolchainStore::read_default(directory, &default_name)
                 record: mutable ToolchainStore::Record = empty_record()
                 if Platform::environment_variable("ELISAPKG_COMPILER") is configured:
                     CliOutput::write_ok("compiler: ELISAPKG_COMPILER selects the compiler, Stage1, and runtime; toolchains are not used\n")
                 elif state == UserData::DirectoryState.Untrusted:
                     CliOutput::write_ok("compiler: the toolchain directory is unsafe or writable by another user; builds fail closed\n")
-                elif state == UserData::DirectoryState.Missing or ToolchainStore::read_default(directory, &default_name) != 0:
+                elif default_status == -2:
                     CliOutput::write_ok("compiler: no default toolchain; run `elisapkg toolchain link NAME PATH` or set ELISAPKG_COMPILER\n")
+                elif default_status != 0:
+                    CliOutput::write_ok("compiler: lang/settings.json in the elisapkg home is unreadable or malformed; builds fail closed\n")
                 elif ToolchainStore::read(directory, default_name, &record) != 0:
                     CliOutput::write_ok("compiler: the default toolchain record is unreadable; builds fail closed\n")
                 else:
@@ -79,7 +82,7 @@ module ToolchainCommand:
 
         def untrusted_store() -> CliStatus::ExitStatus can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
-                CliOutput::write_error("error: the toolchain directory under $HOME/.local/share/elisapkg is missing, unsafe, or writable by another user\n")
+                CliOutput::write_error("error: the toolchain directory lang/elisac under the elisapkg home ($ELISAPKG_HOME or $HOME/.elisapkg) is missing, unsafe, or writable by another user\n")
                 CliStatus::security_failed
 
         # ---------- link -----------------------------------------------------------------
@@ -101,7 +104,7 @@ module ToolchainCommand:
         # Record the checkout at the canonical `root` as `name`.
         def publish_link(name: darray[u8]&, root: darray[u8]&) -> CliStatus::ExitStatus can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
-                directory: darray[u8] = UserData::prepare("toolchains")
+                directory: darray[u8] = ToolchainStore::prepared_directory()
                 return untrusted_store() if directory.count == 0.usize()
                 # Check first: an exclusive publication that loses to an existing
                 # record keeps its staged temporary file for recovery.
@@ -144,7 +147,7 @@ module ToolchainCommand:
         def list() -> CliStatus::ExitStatus can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
                 directory: mutable darray[u8] = []
-                state: UserData::DirectoryState = UserData::existing("toolchains", &directory)
+                state: UserData::DirectoryState = ToolchainStore::existing_directory(&directory)
                 if state == UserData::DirectoryState.Untrusted:
                     untrusted_store()
                 elif state == UserData::DirectoryState.Missing:
@@ -183,14 +186,19 @@ module ToolchainCommand:
 
         def show_default() -> CliStatus::ExitStatus can[Global.Read, Console.Write, Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             can Global.Read:
-                directory: mutable darray[u8] = []
-                state: UserData::DirectoryState = UserData::existing("toolchains", &directory)
                 default_name: mutable darray[u8] = []
+                state, default_status =
+                    directory: mutable darray[u8] = []
+                    located: UserData::DirectoryState = ToolchainStore::existing_directory(&directory)
+                    (located, -2 if located != UserData::DirectoryState.Trusted else ToolchainStore::read_default(directory, &default_name))
                 if state == UserData::DirectoryState.Untrusted:
                     untrusted_store()
-                elif state == UserData::DirectoryState.Missing or ToolchainStore::read_default(directory, &default_name) != 0:
+                elif default_status == -2:
                     CliOutput::write_ok("no default toolchain\n")
                     CliStatus::success
+                elif default_status != 0:
+                    CliOutput::write_error("error: lang/settings.json in the elisapkg home is unreadable or malformed; set a default with `elisapkg toolchain default NAME`\n")
+                    CliStatus::operation_failed
                 else:
                     CliOutput::write_bytes(1, default_name)
                     CliOutput::write_ok("\n")
@@ -203,7 +211,7 @@ module ToolchainCommand:
                 record: mutable ToolchainStore::Record = empty_record()
                 if not ToolchainStore::valid_name(name):
                     invalid_name()
-                elif UserData::existing("toolchains", &directory) == UserData::DirectoryState.Untrusted:
+                elif ToolchainStore::existing_directory(&directory) == UserData::DirectoryState.Untrusted:
                     untrusted_store()
                 elif directory.count == 0.usize() or ToolchainStore::read(directory, name, &record) != 0:
                     CliOutput::write_error("error: no readable toolchain has that name; see `elisapkg toolchain list`\n")
@@ -227,7 +235,7 @@ module ToolchainCommand:
                 default_name: mutable darray[u8] = []
                 if not ToolchainStore::valid_name(name):
                     invalid_name()
-                elif UserData::existing("toolchains", &directory) == UserData::DirectoryState.Untrusted:
+                elif ToolchainStore::existing_directory(&directory) == UserData::DirectoryState.Untrusted:
                     untrusted_store()
                 elif directory.count == 0.usize() or ToolchainStore::read(directory, name, &record) == -2:
                     # A malformed record may still be removed; only a missing one is an error.

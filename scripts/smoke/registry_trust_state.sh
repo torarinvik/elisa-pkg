@@ -267,11 +267,32 @@ fi
 # ELISAPKG_TRUST_STATE override is configured.
 DEFAULT_TRUST_HOME="$TEST_TMP/default-trust-home-$$"
 mkdir -p "$DEFAULT_TRUST_HOME"
-env -u ELISAPKG_TRUST_STATE HOME="$DEFAULT_TRUST_HOME/" ELISAPKG_REGISTRY_DIR="$REGISTRY_EXPIRY_ROOT" ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_EXPIRY_KEY" "$TRUST_STATE_BIN"
-test -n "$(find "$DEFAULT_TRUST_HOME/.local/share/elisapkg/trust" -name '*.state' -type f -print -quit)"
+env -u ELISAPKG_TRUST_STATE -u ELISAPKG_HOME HOME="$DEFAULT_TRUST_HOME/" ELISAPKG_REGISTRY_DIR="$REGISTRY_EXPIRY_ROOT" ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_EXPIRY_KEY" "$TRUST_STATE_BIN"
+test -n "$(find "$DEFAULT_TRUST_HOME/.elisapkg/trust" -name '*.state' -type f -print -quit)"
+
+# Trust state that older releases kept under .local/share moves into the
+# elisapkg home only when that is safe. An untrusted legacy directory fails
+# closed rather than silently resetting rollback protection, and once the new
+# directory exists it wins and the legacy one is left alone.
+LEGACY_TRUST_HOME="$TEST_TMP/legacy-trust-home-$$"
+mkdir -m 700 "$LEGACY_TRUST_HOME"
+mkdir -p "$LEGACY_TRUST_HOME/.local/share/elisapkg/trust"
+chmod 700 "$LEGACY_TRUST_HOME/.local" "$LEGACY_TRUST_HOME/.local/share" "$LEGACY_TRUST_HOME/.local/share/elisapkg"
+chmod 777 "$LEGACY_TRUST_HOME/.local/share/elisapkg/trust"
+if env -u ELISAPKG_TRUST_STATE -u ELISAPKG_HOME HOME="$LEGACY_TRUST_HOME" ELISAPKG_REGISTRY_DIR="$REGISTRY_EXPIRY_ROOT" ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_EXPIRY_KEY" "$TRUST_STATE_BIN" >/dev/null 2>&1; then
+  echo "an untrusted legacy trust directory was accepted" >&2
+  exit 1
+fi
+test ! -e "$LEGACY_TRUST_HOME/.elisapkg/trust"
+chmod 700 "$LEGACY_TRUST_HOME/.local/share/elisapkg/trust"
+mkdir -m 700 "$LEGACY_TRUST_HOME/.elisapkg" "$LEGACY_TRUST_HOME/.elisapkg/trust"
+env -u ELISAPKG_TRUST_STATE -u ELISAPKG_HOME HOME="$LEGACY_TRUST_HOME" ELISAPKG_REGISTRY_DIR="$REGISTRY_EXPIRY_ROOT" ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_EXPIRY_KEY" "$TRUST_STATE_BIN"
+test -n "$(find "$LEGACY_TRUST_HOME/.elisapkg/trust" -name '*.state' -type f -print -quit)"
+test -d "$LEGACY_TRUST_HOME/.local/share/elisapkg/trust"
+test -z "$(find "$LEGACY_TRUST_HOME/.local/share/elisapkg/trust" -type f -print -quit)"
 BAD_TRUST_HOME="$TEST_TMP/bad-trust-home-$$"
 BAD_TRUST_HOME="$BAD_TRUST_HOME"$'\n'x
-if env -u ELISAPKG_TRUST_STATE HOME="$BAD_TRUST_HOME" ELISAPKG_REGISTRY_DIR="$REGISTRY_EXPIRY_ROOT" ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_EXPIRY_KEY" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
+if env -u ELISAPKG_TRUST_STATE -u ELISAPKG_HOME HOME="$BAD_TRUST_HOME" ELISAPKG_REGISTRY_DIR="$REGISTRY_EXPIRY_ROOT" ELISAPKG_REGISTRY_TRUST_ROOT="$REGISTRY_EXPIRY_KEY" "$TRUST_STATE_REPEAT_BIN" >/dev/null 2>&1; then
   echo "control-byte HOME was accepted for trust state" >&2
   exit 1
 fi

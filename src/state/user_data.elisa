@@ -1,8 +1,16 @@
-# The per-user elisapkg data directories under `$HOME/.local/share/elisapkg`.
+# The per-user elisapkg home: `ELISAPKG_HOME`, else `$HOME/.elisapkg`.
 #
-# Every directory from `$HOME/.local` down to the named data directory must be
-# owned by root or the current user and must not be writable by anyone else,
-# so another account cannot replace trust state or toolchain records.
+# Everything elisapkg keeps for a user lives below this one directory:
+#   bin/            binaries installed by `install --local`
+#   receipts/       the install receipts for those binaries
+#   lang/elisac/    registered Elisa toolchains
+#   lang/packages/  reserved for Elisa libraries
+#   agent/          reserved for the Elisa agent
+#   trust/          registry rollback state
+#
+# Every directory from the home down to a data directory must be owned by
+# root or the current user and must not be writable by anyone else, so
+# another account cannot replace trust state or toolchain records.
 include "../platform.elisa"
 include "../project/files.elisa"
 include "../text/bytes.elisa"
@@ -18,47 +26,57 @@ module UserData:
             Missing
             Untrusted
 
-        # "$HOME/.local/share/elisapkg/NAME", or empty when HOME is unusable.
-        def directory(name: cstr) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            requires Platform::c_string_length(name) > 0.usize()
-            if Platform::environment_variable("HOME") is home_value:
+        # `ELISAPKG_HOME`, else "$HOME/.elisapkg", or empty when neither names
+        # a safe absolute directory. A lone "/" is never a home.
+        def root() -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            if Platform::environment_variable("ELISAPKG_HOME") is configured_value:
+                configured: cstr = configured_value.cast[cstr]
+                configured_length: usize = safe_absolute_length(configured)
+                [] if configured_length <= 1.usize() else [configured[index].u8() for index in 0..<configured_length]
+            elif Platform::environment_variable("HOME") is home_value:
                 home: cstr = home_value.cast[cstr]
-                home_length: usize = safe_home_length(home)
-                [] if home_length == 0.usize() else data_path(home, home_length, name)
+                home_length: usize = safe_absolute_length(home)
+                [] if home_length == 0.usize() else home_path(home, home_length, ".elisapkg")
             else:
                 []
 
-        # Create each missing directory from `$HOME/.local` down to NAME and
-        # check every one. Returns the directory, or empty when any step fails.
-        def prepare(name: cstr) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            requires Platform::c_string_length(name) > 0.usize()
-            if Platform::environment_variable("HOME") is home_value:
-                home: cstr = home_value.cast[cstr]
-                home_length: usize = safe_home_length(home)
-                return [] if home_length == 0.usize()
-                # Build the final path before calling filesystem helpers: the
-                # stage1 ABI can invalidate a caller-owned darray after nested
-                # FFI calls, and a completed value is owned by the caller's arena.
-                final_path: darray[u8] = data_path(home, home_length, name)
-                final_path if final_path.count > 0.usize() and
-                              created_trusted(home_path(home, home_length, ".local")) and
-                              created_trusted(home_path(home, home_length, ".local/share")) and
-                              created_trusted(home_path(home, home_length, ".local/share/elisapkg")) and
-                              created_trusted(final_path) else []
-            else:
-                []
+        # "ROOT/RELATIVE", or empty when the root is unusable or the path is too long.
+        def directory(relative: cstr) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            requires Platform::c_string_length(relative) > 0.usize()
+            located_root: darray[u8] = root()
+            located: darray[u8] = ProjectFiles::path_join(located_root, relative)
+            [] if located_root.count == 0.usize() or located.count > maximum_directory_bytes else located
+
+        # Create each missing directory from the root down to RELATIVE, which
+        # may name nested directories such as "lang/elisac", and check every
+        # one. Returns the directory, or empty when any step fails.
+        def prepare(relative: cstr) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            requires Platform::c_string_length(relative) > 0.usize()
+            # Build the paths before calling filesystem helpers: the stage1
+            # ABI can invalidate a caller-owned darray after nested FFI calls,
+            # and a completed value is owned by the caller's arena.
+            final_path: darray[u8] = directory(relative)
+            return [] if final_path.count == 0.usize()
+            parents_ready: bool =
+                located_root: darray[u8] = root()
+                relative_length: usize = Platform::c_string_length(relative)
+                for index in 1..<relative_length |ready: bool = created_trusted(located_root)| -> ready:
+                    if ready and relative[index].u8() == 47:
+                        parent: darray[u8] =
+                            parent_relative: darray[u8] = [relative[offset].u8() for offset in 0..<index]
+                            ProjectFiles::path_join_bytes(located_root, parent_relative)
+                        ready <- created_trusted(parent)
+            final_path if parents_ready and created_trusted(final_path) else []
 
         # Look up an existing data directory without creating anything.
-        def existing(name: cstr, out: mutable darray[u8]&) -> DirectoryState can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            requires Platform::c_string_length(name) > 0.usize()
+        def existing(relative: cstr, out: mutable darray[u8]&) -> DirectoryState can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            requires Platform::c_string_length(relative) > 0.usize()
             out.resize(0)
-            located: darray[u8] = directory(name)
+            located: darray[u8] = directory(relative)
             return DirectoryState.Untrusted if located.count == 0.usize()
             # The no-follow walk reports ENOENT only after the existing prefix
             # of the path passed the trust policy.
-            status: i64 =
-                located_c: darray[u8] = ProjectFiles::with_null_terminator(located)
-                Platform::trusted_directory_status((&located_c[0]).cast[cstr] can Unsafe.PointerCast)
+            status: i64 = directory_status(located)
             if status == 0:
                 ByteText::append(out, located)
                 DirectoryState.Trusted
@@ -67,10 +85,53 @@ module UserData:
             else:
                 DirectoryState.Untrusted
 
+        # Move a directory that older releases kept at "$HOME/LEGACY" to
+        # "ROOT/NAME" with one rename, so its files keep their modes and no
+        # partial copy is ever visible. Nothing moves when `ELISAPKG_HOME` is
+        # set, the legacy directory is missing, or "ROOT/NAME" already exists.
+        # Returns false when legacy state exists but cannot be moved safely,
+        # so callers fail closed instead of silently starting from nothing.
+        def adopt_legacy_directory(legacy: cstr, name: cstr) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            requires Platform::c_string_length(legacy) > 0.usize()
+            requires Platform::c_string_length(name) > 0.usize()
+            if Platform::environment_variable("ELISAPKG_HOME") is configured_home:
+                true
+            elif Platform::environment_variable("HOME") is home_value:
+                legacy_path: darray[u8] =
+                    home: cstr = home_value.cast[cstr]
+                    home_length: usize = safe_absolute_length(home)
+                    [] if home_length == 0.usize() else home_path(home, home_length, legacy)
+                target: darray[u8] = directory(name)
+                legacy_status: i64 = -2 if legacy_path.count == 0.usize() else directory_status(legacy_path)
+                target_status: i64 = directory_status(target)
+                if legacy_status == -2 or target_status == 0:
+                    true
+                elif legacy_status != 0 or target_status != -2 or not created_trusted(root()):
+                    false
+                else:
+                    _ = moved(legacy_path, target)
+                    # A concurrent elisapkg may have moved it first; either
+                    # way the state is usable once the target is trusted.
+                    directory_status(target) == 0
+            else:
+                true
+
     private:
-        def data_path(home: cstr, home_length: usize, name: cstr) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
-            path: darray[u8] = ByteText::with_text(home_path(home, home_length, ".local/share/elisapkg/"), name)
-            [] if path.count > maximum_directory_bytes else path
+        # The trusted no-follow walk status of `path`: 0 trusted, -2 missing
+        # below a trusted prefix, any other negative value untrusted.
+        def directory_status(path: darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return -1 if path.count == 0.usize()
+            path_c: darray[u8] = ProjectFiles::with_null_terminator(path)
+            Platform::trusted_directory_status((&path_c[0]).cast[cstr] can Unsafe.PointerCast)
+
+        # Rename `source` to `destination` and make the rename durable.
+        def moved(source: darray[u8]&, destination: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            destination_c: darray[u8] = ProjectFiles::with_null_terminator(destination)
+            destination_name: cstr = (&destination_c[0]).cast[cstr] can Unsafe.PointerCast
+            renamed: i64 =
+                source_c: darray[u8] = ProjectFiles::with_null_terminator(source)
+                Platform::rename_directory(((&source_c[0]).cast[cstr] can Unsafe.PointerCast), destination_name)
+            renamed == 0 and Platform::synchronize_parent_directory(destination_name) == 0
 
         # Create `path` with mode 0700 unless it exists, then check its trust.
         def created_trusted(path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
@@ -90,21 +151,23 @@ module UserData:
             path <- path.push(47) if home_length > 1.usize()
             ByteText::with_text(path, relative)
 
-        # The length of an absolute HOME without trailing slashes, keeping a
-        # lone "/", or zero for a relative, oversized, or unsafe HOME.
-        def safe_home_length(home: cstr) -> usize:
+        # The length of an absolute path without trailing slashes, keeping a
+        # lone "/", or zero for a relative, oversized, or unsafe path.
+        def safe_absolute_length(path: cstr) -> usize:
             normalized: usize =
-                length: usize = Platform::c_string_length(home)
-                return 0 if length == 0 or length > 3800 or home[0].u8() != 47
-                while position > 1 and home[position - 1].u8() == 47 |position: usize = length| -> position:
+                length: usize = Platform::c_string_length(path)
+                return 0 if length == 0 or length > 3800 or path[0].u8() != 47
+                while position > 1 and path[position - 1].u8() == 47 |position: usize = length| -> position:
                     position <- position - 1.usize()
-            for index in 0..<normalized |home, normalized|:
-                byte: u8 = home[index].u8()
+            for index in 0..<normalized |path, normalized|:
+                byte: u8 = path[index].u8()
                 return 0 if byte < 32 or byte == 127 or byte == 92
             for index in 1..<(normalized + 1.usize()) |segment_start: usize = 1.usize()|:
-                if index == normalized or home[index].u8() == 47:
-                    region segment_length_scope:
+                if index == normalized or path[index].u8() == 47:
+                    # An empty, ".", or ".." component.
+                    unsafe_segment: bool =
                         segment_length: usize = index - segment_start
-                        return 0 if segment_length == 0.usize() or segment_length == 1.usize() and home[segment_start].u8() == 46 or segment_length == 2.usize() and home[segment_start].u8() == 46 and home[segment_start + 1.usize()].u8() == 46
+                        segment_length == 0.usize() or segment_length == 1.usize() and path[segment_start].u8() == 46 or segment_length == 2.usize() and path[segment_start].u8() == 46 and path[segment_start + 1.usize()].u8() == 46
                     segment_start <- index + 1.usize()
+                    return 0 if unsafe_segment
             normalized

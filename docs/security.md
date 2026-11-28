@@ -138,8 +138,12 @@ legacy lock directory fails closed and is never removed automatically while an
 older process might still be using it. Lower versions and same-version
 archive- or metadata-digest changes fail closed; malformed or unavailable
 state is a security error. The default path is
-`$HOME/.local/share/elisapkg/trust/<sha256-of-registry-root>.state`, with
-`ELISAPKG_TRUST_STATE` available for an explicit absolute path. Override paths
+`trust/<sha256-of-registry-root>.state` in the [elisapkg home](elisapkg-home.md)
+(`$ELISAPKG_HOME`, else `$HOME/.elisapkg`), with `ELISAPKG_TRUST_STATE`
+available for an explicit absolute path. State that older releases kept in
+`$HOME/.local/share/elisapkg/trust` moves into the home with one rename; an
+untrusted legacy directory or a failed rename fails closed instead of
+resetting rollback protection. Override paths
 must use canonical non-empty components; `.` and `..` are rejected before any
 state directory is opened. Network operations remain disabled until transport
 and publisher delegation are reviewed. The sibling `.clock` file stores both
@@ -154,12 +158,13 @@ malformed and is not migrated automatically. Restoring both user-owned files
 together remains outside this local check's protection because they are not
 anchored in hardware-backed monotonic storage.
 
-Toolchain records share that per-user data root:
-`$HOME/.local/share/elisapkg/toolchains` holds one `NAME.toolchain` record per
-linked compiler and a `default` file. Every directory from `$HOME/.local` down
-is created with mode `0700` and must pass the trusted-directory policy; records
-are read through no-follow trusted walks, and a malformed record, a symlink in
-the store, or another user's write access fails closed. A record only names
+Toolchain records share that home: `lang/elisac/NAME/toolchain` holds the
+record of each linked compiler and `lang/settings.json` names the default.
+Every directory from the home down is created with mode `0700` and must pass
+the trusted-directory policy; records are read through no-follow trusted
+walks, and a malformed record or settings file, a symlinked toolchain, or
+another user's write access fails closed. Unlinking a symlinked toolchain
+removes the link itself and never the record it points at. A record only names
 files that the user already chose to trust; linking never downloads or builds
 a compiler.
 

@@ -164,7 +164,8 @@ Network/TLS transport and publisher authorization are still disabled until
 the TUF verifier and independent security review gates are complete. Signed selections are
 also recorded in a user-owned trust-state file after archive verification. By
 default the file is
-`$HOME/.local/share/elisapkg/trust/<sha256-of-registry-root>.state`; set
+`trust/<sha256-of-registry-root>.state` in the
+[elisapkg home](elisapkg-home.md); set
 `ELISAPKG_TRUST_STATE` to an absolute path when an isolated state location is
 needed. Trust-state operations hold an exclusive, nonblocking kernel `flock`
 on a persistent protected regular file at `<state>.lock`; the inode is never

@@ -326,9 +326,9 @@ The first phase links local compiler checkouts: a per-user record names the
 canonical wrapper, Stage1, and runtime paths, and builds use the default record
 when `ELISAPKG_COMPILER` is unset. Environment selection stays all-or-nothing,
 so `ELISA_STAGE1_BIN` or `ELISA_RUNTIME_OBJ` without `ELISAPKG_COMPILER` is an
-error rather than a mix of two compilers. Records live under the same trusted
-per-user data root as registry trust state (`UserData`), are read through
-no-follow trusted walks, and fail closed when malformed. Linking never
+error rather than a mix of two compilers. Records live in `lang/elisac` of the
+elisapkg home (D-016), are read through no-follow trusted walks, and fail
+closed when malformed. Linking never
 downloads or builds anything.
 
 Later phases install prebuilt toolchain archives, one per target triple
@@ -343,3 +343,21 @@ example). The macOS SDK and the MSVC SDK cannot be redistributed and remain
 host requirements checked by `doctor`. Toolchain archives will be distributed
 through the TUF registry under a delegated role separate from package
 publishers. Fixture: `scripts/smoke/toolchain_store.sh`.
+
+## D-016: one per-user elisapkg home
+
+Everything elisapkg keeps for a user lives in one directory, `$ELISAPKG_HOME`
+or else `$HOME/.elisapkg`, the way `~/.cargo` and `~/.rustup` hold Rust's
+per-user files. One root is easy to find, back up, and remove, and one trust
+check covers everything below it. `bin/` and `receipts/` hold local installs
+and the home is the default install prefix; `lang/elisac/NAME/` holds one
+toolchain each, so an installed toolchain can later keep its files beside its
+record; `lang/settings.json` holds the default toolchain; `trust/` holds
+registry rollback state; `lang/packages/` and `agent/` are reserved. A custom
+`ELISAPKG_INSTALL_PREFIX` keeps receipts under `share/elisapkg/receipts`, so a
+shared prefix gains no top-level elisapkg directory. Trust state from older
+releases moves from `$HOME/.local/share/elisapkg/trust` with one rename and
+fails closed when that is unsafe, because silently starting empty would reset
+rollback protection. Fixtures: `scripts/smoke/toolchain_store.sh`,
+`scripts/smoke/registry_trust_state.sh`, and
+`scripts/security/trust_state_registry_isolation_regression.py`.

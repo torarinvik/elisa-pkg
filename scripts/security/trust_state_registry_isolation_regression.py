@@ -212,6 +212,7 @@ def main() -> None:
             environment["ELISAPKG_REGISTRY_DIR"] = str(registry)
             environment["ELISAPKG_REGISTRY_TRUST_ROOT"] = str(public_key)
             environment["HOME"] = str(home)
+            environment.pop("ELISAPKG_HOME", None)
             if state is None:
                 environment.pop("ELISAPKG_TRUST_STATE", None)
             else:
@@ -219,7 +220,9 @@ def main() -> None:
             return environment
 
         # Older v2 package rows are safe to migrate only in the default file,
-        # whose pathname is already hashed from its sole registry root.
+        # whose pathname is already hashed from its sole registry root. The
+        # state starts where older releases kept it, under .local/share, so
+        # this also covers moving that directory into the elisapkg home.
         migration_home = work / "migration-home"
         migration_home.mkdir(mode=0o700)
         migration_directories = (
@@ -250,7 +253,12 @@ def main() -> None:
         )
         if migrated.returncode != 0:
             raise SystemExit(f"error: default v2 state could not migrate safely: {migrated.stderr!r}")
-        migrated_bytes = migration_state.read_bytes()
+        if migration_directories[-1].exists():
+            raise SystemExit("error: the legacy trust directory stayed behind after moving to the elisapkg home")
+        moved_trust = migration_home / ".elisapkg/trust"
+        if (moved_trust.stat().st_mode & 0o777) != 0o700 or ((migration_home / ".elisapkg").stat().st_mode & 0o777) != 0o700:
+            raise SystemExit("error: the moved trust directory or the elisapkg home is not private")
+        migrated_bytes = (moved_trust / migration_state.name).read_bytes()
         migrated_identity = f"@package:{hashlib.sha256(os.fsencode(str(registry_a))).hexdigest()}:foo".encode("ascii")
         if not migrated_bytes.startswith(b"elisapkg-trust-state:4\n") or migrated_identity + b" 1.0.0 " not in migrated_bytes or migrated_identity + b" 2.0.0 " not in migrated_bytes:
             raise SystemExit("error: higher-release update did not migrate and retain default v2 package history as scoped v4 records")

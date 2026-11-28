@@ -73,14 +73,14 @@ The preview shows which source files will ship. Packaging writes `.elisapkg/pack
 From the example project directory, use a dedicated prefix under your home directory.
 
 ```sh
-export ELISAPKG_INSTALL_PREFIX="$HOME/.local/elisapkg-example"
+export ELISAPKG_INSTALL_PREFIX="$HOME/.elisapkg-example"
 "$ELISAPKG" install --local --bin app
 "$ELISAPKG_INSTALL_PREFIX/bin/app"
 "$ELISAPKG" uninstall --local app
 unset ELISAPKG_INSTALL_PREFIX
 ```
 
-The install destination uses the manifest's package name. Without a custom prefix, the binary goes under `$HOME/.local/bin`. Use the full path to run it if that directory is missing from your `PATH`. Keep the same prefix for uninstall so it can find the receipt and check that the installed file still matches.
+The install destination uses the manifest's package name. Without a custom prefix, the binary goes under `$HOME/.elisapkg/bin` in the [elisapkg home](docs/elisapkg-home.md). Use the full path to run it if that directory is missing from your `PATH`. Keep the same prefix for uninstall so it can find the receipt and check that the installed file still matches.
 
 ## Verifying a CI build candidate
 
@@ -99,7 +99,7 @@ Run project commands from the project directory. Where supported, `--manifest-pa
 | Inspect normalized metadata | `metadata --json` | Prints machine-readable package metadata. |
 | Build a release binary | `build --bin app --profile release` | Places the binary under `.elisapkg/build/release/`. |
 | Run a test target | `test --test app-tests` | Builds and runs a test target you have declared in the manifest. |
-| Install a local binary | `install --local --bin app` | Installs under `$HOME/.local/bin` by default. The destination uses the package name. |
+| Install a local binary | `install --local --bin app` | Installs under `$HOME/.elisapkg/bin` by default. The destination uses the package name. |
 | Remove that installation | `uninstall --local app` | Removes the binary only if it matches its installation receipt. |
 | Remove generated build outputs | `clean` | Removes known local build and package outputs. |
 | Check release inputs | `publish --dry-run` | Validates release inputs and deterministic archive contents without uploading. |
@@ -136,6 +136,7 @@ The local registry fixture verifies detached Ed25519 signatures, expiry, cached 
 | [Architecture](docs/architecture.md) and [decisions](docs/decisions.md) | Elisa modules, public interfaces, and the private POSIX FFI boundary |
 | [Compiler compatibility](docs/compatibility.md) | Bootstrap paths, host support, and toolchain constraints |
 | [Toolchains](docs/toolchains.md) | Linking compiler checkouts, how builds select a compiler, and planned toolchain installs |
+| [The elisapkg home](docs/elisapkg-home.md) | What elisapkg keeps in `~/.elisapkg`, its overrides, and moving from older releases |
 | [CI and regression checks](docs/ci.md) | Development checks and host requirements |
 | [TUF profile](docs/tuf-profile.md) | Requirements for future production registry support |
 

@@ -1,6 +1,9 @@
 # Resolve and validate the configured local installation prefix.
 
 include "../platform.elisa"
+include "../project/files.elisa"
+include "../state/user_data.elisa"
+include "../text/bytes.elisa"
 
 module InstallPrefix:
     private:
@@ -49,17 +52,31 @@ module InstallPrefix:
                 ByteText::append(out, prefix)
             true
 
-        # `ELISAPKG_INSTALL_PREFIX`, else `$HOME/.local`, else empty.
+        # `ELISAPKG_INSTALL_PREFIX`, else the elisapkg home, else empty.
         def environment_install_prefix() -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             if Platform::environment_variable("ELISAPKG_INSTALL_PREFIX") is prefix_value:
-                return copy_environment_path(prefix_value.cast[cstr])
-            if Platform::environment_variable("HOME") is home_value:
-                prefix: mutable darray[u8] = copy_environment_path(home_value.cast[cstr])
-                return [] if prefix.count == 0.usize()
-                if prefix[prefix.count - 1.usize()] != 47:
-                    prefix <- prefix.push(47)
-                return ByteText::with_text(prefix, ".local")
-            []
+                copy_environment_path(prefix_value.cast[cstr])
+            else:
+                UserData::root()
+
+        # "PREFIX/receipts" for the elisapkg home, which owns its whole
+        # layout, else "PREFIX/share/elisapkg/receipts", so a shared prefix
+        # such as /usr/local keeps elisapkg's files below share/.
+        def receipt_directory(prefix: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            elisapkg_home: darray[u8] = UserData::root()
+            if elisapkg_home.count > 0.usize() and ByteText::equal(prefix, elisapkg_home):
+                ProjectFiles::path_join(prefix, "receipts")
+            else:
+                ProjectFiles::path_join(prefix, "share/elisapkg/receipts")
+
+        # Create the binary and receipt directories of `prefix`. In the
+        # elisapkg home they are created like its other data directories,
+        # with mode 0700 from the home down.
+        def ensure_install_directories(prefix: darray[u8]&, binary_directory: darray[u8]&, receipt_directory: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            home_directories_ready: bool =
+                elisapkg_home: darray[u8] = UserData::root()
+                elisapkg_home.count == 0.usize() or not ByteText::equal(prefix, elisapkg_home) or UserData::prepare("bin").count > 0.usize() and UserData::prepare("receipts").count > 0.usize()
+            home_directories_ready and ensure_trusted_directory(binary_directory) and ensure_trusted_directory(receipt_directory)
 
         def trusted_existing_ancestor(path: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             return false if not valid_install_prefix(path)

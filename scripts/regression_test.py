@@ -457,6 +457,7 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
         ELISAPKG_REGISTRY_TRUST_ROOT=str(trust_key),
         HOME=str(empty_home),
     )
+    probe_environment.pop('ELISAPKG_HOME', None)
     if probe_built:
         # Exercise the package-file FFI inside a private source root. The
         # platform boundary intentionally rejects group-writable roots such
@@ -467,7 +468,7 @@ with tempfile.TemporaryDirectory(prefix='review-', dir=ROOT / 'build') as direct
         probe_source.mkdir(mode=0o700)
         (probe_source / 'main.elisa').write_text('def main() -> i64:\n    return 0\n')
         run([work / 'probe'], cwd=probe_root, env=probe_environment)
-        assert not (empty_home / '.local').exists(), 'read-only trust verification created user state directories'
+        assert not (empty_home / '.elisapkg').exists() and not (empty_home / '.local').exists(), 'read-only trust verification created user state directories'
 
 
 print('Elisa module regressions passed')

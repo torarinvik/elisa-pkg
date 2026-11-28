@@ -43,6 +43,17 @@ module NativeFileMutation:
         def rename(old_path: cstr, new_path: cstr) -> i64:
             link_or_rename(old_path, new_path, true)
 
+        # Rename the trusted directory `old_path` to the absent `new_path`.
+        # Both parents must exclude writes by other users, and the source is
+        # opened without following a symlink and must itself be trusted.
+        def rename_directory(old_path: cstr, new_path: cstr) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            old_leaf: mutable darray[u8] = []
+            new_leaf: mutable darray[u8] = []
+            old_directory: i64 = open_parent_directory(old_path, false, &old_leaf)
+            return old_directory if old_directory < 0
+            new_directory: i64 = open_parent_directory(new_path, false, &new_leaf)
+            PlatformNative::close_error(old_directory, new_directory) if new_directory < 0 else rename_directory_at(old_directory, new_directory, old_leaf, new_leaf)
+
         def mkstemp(template_path: mutable darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             create_temporary(template_path, false)
 
@@ -224,6 +235,27 @@ module NativeFileMutation:
                 result: i64 = native_renameat(old_directory, ((&old_leaf[0]).cast[cstr] can Unsafe.PointerCast), new_directory, ((&new_leaf[0]).cast[cstr] can Unsafe.PointerCast)) if is_move else native_linkat(old_directory, ((&old_leaf[0]).cast[cstr] can Unsafe.PointerCast), new_directory, ((&new_leaf[0]).cast[cstr] can Unsafe.PointerCast), 0)
                 return PlatformNative::close_two_result(old_directory, new_directory, 0) if result == 0
             PlatformNative::close_two_error(old_directory, new_directory, NativeErrors::negative_errno())
+
+        def rename_directory_at(old_directory: i64, new_directory: i64, old_leaf: darray[u8]&, new_leaf: darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            requires old_directory >= 0 and new_directory >= 0
+            # 0, or the negative errno that refuses the rename before it runs.
+            destination_status: i64 =
+                source_status: i64 =
+                    source: i64 = native_openat(old_directory, ((&old_leaf[0]).cast[cstr] can Unsafe.PointerCast), flag_read_only + flag_directory + flag_no_follow + flag_close_on_exec)
+                    if source < 0:
+                        NativeErrors::negative_errno()
+                    elif not NativeTrustedPaths::trusted_directory_file_descriptor(old_directory, native_geteuid().u64()) or not NativeTrustedPaths::trusted_directory_file_descriptor(new_directory, native_geteuid().u64()):
+                        PlatformNative::close_error(source, -13)
+                    else:
+                        trusted: bool = NativeTrustedPaths::trusted_directory_file_descriptor(source, native_geteuid().u64())
+                        -5 if native_close(source) != 0 else 0 if trusted else -13
+                check_destination(new_directory, new_leaf, false) if source_status == 0 else source_status
+            if destination_status != 0:
+                PlatformNative::close_two_error(old_directory, new_directory, destination_status)
+            elif native_renameat(old_directory, ((&old_leaf[0]).cast[cstr] can Unsafe.PointerCast), new_directory, ((&new_leaf[0]).cast[cstr] can Unsafe.PointerCast)) == 0:
+                PlatformNative::close_two_result(old_directory, new_directory, 0)
+            else:
+                PlatformNative::close_two_error(old_directory, new_directory, NativeErrors::negative_errno())
 
         def byte_copy(bytes: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
             bytes.clone()

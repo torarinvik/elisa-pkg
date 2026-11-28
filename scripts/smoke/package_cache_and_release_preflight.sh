@@ -293,10 +293,16 @@ PY
   test ! -e "$PREFIX/bin/app"
   TRAILING_HOME="$CASE/trailing-home"
   mkdir -p "$TRAILING_HOME"
-  env -u ELISAPKG_INSTALL_PREFIX HOME="$TRAILING_HOME/" "$BIN" install --local >/dev/null
-  test -x "$TRAILING_HOME/.local/bin/app"
-  env -u ELISAPKG_INSTALL_PREFIX HOME="$TRAILING_HOME/" "$BIN" uninstall --local app >/dev/null
-  test ! -e "$TRAILING_HOME/.local/bin/app"
+  # Without a prefix, binaries go to the elisapkg home and its receipts/
+  # directory holds their receipts.
+  env -u ELISAPKG_INSTALL_PREFIX -u ELISAPKG_HOME HOME="$TRAILING_HOME/" "$BIN" install --local >/dev/null
+  test -x "$TRAILING_HOME/.elisapkg/bin/app"
+  test -f "$TRAILING_HOME/.elisapkg/receipts/app"
+  test ! -e "$TRAILING_HOME/.elisapkg/share"
+  test "$(stat -f '%Lp' "$TRAILING_HOME/.elisapkg" 2>/dev/null || stat -c '%a' "$TRAILING_HOME/.elisapkg")" = 700
+  env -u ELISAPKG_INSTALL_PREFIX -u ELISAPKG_HOME HOME="$TRAILING_HOME/" "$BIN" uninstall --local app >/dev/null
+  test ! -e "$TRAILING_HOME/.elisapkg/bin/app"
+  test ! -e "$TRAILING_HOME/.elisapkg/receipts/app"
   PROBE="$CASE/compiler-env-probe.sh"
   PROBE_OUTPUT="$CASE/compiler-env.output"
   printf '%s\n' '#!/bin/sh' 'exec /usr/bin/env' > "$PROBE"

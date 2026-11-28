@@ -40,6 +40,41 @@ module NativeFileCollection:
                     used <- used + rows[row_index].count + 1.usize()
             used.i64()
 
+        # The names directly inside the directory `path`, except "." and
+        # "..", as NUL-terminated rows in directory order, with no package
+        # path policy applied. The directory is opened through the no-follow
+        # walker. Returns the bytes written or a negative status.
+        def list_entry_names(path: cstr, output: mutable u8&, capacity: usize) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            return -22 if native_strlen(path) == 0.usize() or native_strlen(path) > 4096.usize() or capacity == 0.usize()
+            directory_file_descriptor: i64 = PlatformNative::open_package_directory_path(path)
+            return directory_file_descriptor if directory_file_descriptor < 0
+            directory: mutable heap void&? = native_fdopendir(directory_file_descriptor)
+            if directory is stream:
+                used: mutable usize = 0.usize()
+                failed: mutable bool = false
+                while true |stream, output, used, failed|:
+                    native_errno()[0] <- 0
+                    entry: mutable heap void&? = native_readdir(stream)
+                    if entry is record:
+                        raw: mutable u8& = record.cast[mutable u8&] can Unsafe.PointerCast
+                        name_length: usize = dirent_name_length(raw)
+                        if name_length == 0 or name_length > 255.usize() or used + name_length + 1.usize() > capacity:
+                            failed <- true
+                            break
+                        elif not PlatformNative::name_is_dot(raw, dirent_name_offset, name_length):
+                            for index in 0..<name_length |output, used|:
+                                output[used + index] <- raw[dirent_name_offset + index]
+                            output[used + name_length] <- 0
+                            used <- used + name_length + 1.usize()
+                    else:
+                        failed <- NativeErrors::current_errno() != 0
+                        break
+                closed: bool = native_closedir(stream) == 0
+                -5 if failed or not closed else used.i64()
+            else:
+                _ = native_close(directory_file_descriptor)
+                -5
+
     private:
         const maximum_collect_traversal_nodes: usize = 16384.usize()
 

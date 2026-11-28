@@ -1,11 +1,13 @@
-# The per-user toolchain store under `$HOME/.local/share/elisapkg/toolchains`.
+# The per-user toolchain store in `lang/elisac` of the elisapkg home.
 #
-# Each toolchain has one record file, `NAME.toolchain`, naming the compiler
-# wrapper, Stage1 executable, and runtime object a build uses. The file
-# `default` holds the name of the toolchain builds select when no compiler is
-# configured through the environment. Records are replaced atomically and are
-# read only through trusted, no-follow directory walks.
+# Each toolchain has its own directory, `lang/elisac/NAME`, holding a record
+# file `toolchain` that names the compiler wrapper, Stage1 executable, and
+# runtime object a build uses. `lang/settings.json` names the toolchain builds
+# select when no compiler is configured through the environment. Files are
+# published atomically and read only through trusted, no-follow walks.
+include "../json.elisa"
 include "../platform.elisa"
+include "../platform/path_order.elisa"
 include "../project/files.elisa"
 include "../registry/files.elisa"
 include "../state/user_data.elisa"
@@ -23,6 +25,15 @@ module ToolchainStore:
         const maximum_record_bytes: usize = 16384.usize()
         const maximum_path_bytes: usize = 4000.usize()
         const maximum_toolchains: usize = 256.usize()
+
+        # The store directory when it exists and is trusted.
+        def existing_directory(out: mutable darray[u8]&) -> UserData::DirectoryState can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            UserData::existing("lang/elisac", out)
+
+        # The store directory, created with every missing parent, or empty
+        # when any directory on the way is missing or untrusted.
+        def prepared_directory() -> darray[u8] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+            UserData::prepare("lang/elisac")
 
         # A toolchain name: 1 to 64 bytes of lowercase ASCII letters, digits,
         # `.`, `_`, and `-`, starting with a letter or digit.
@@ -62,55 +73,84 @@ module ToolchainStore:
             loaded: i64 = RegistryFiles::read_trusted_file(record_path(directory, name), maximum_record_bytes, &raw)
             loaded if loaded < 0 else 0 if decode(raw, out) else -74
 
-        # Publish a new record. Returns 0, -17 when `name` already exists, or
-        # another negative status.
+        # Create the directory of `name` and publish its record. Returns 0,
+        # -17 when `name` already exists, or another negative status.
         def publish_new(directory: darray[u8]&, name: darray[u8]&, record: Record&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             requires directory.count > 0
             return -22 if not valid_name(name)
-            ProjectFiles::publish_file_exclusively(record_path(directory, name), encode(record))
+            toolchain_path: darray[u8] = ProjectFiles::path_join_bytes(directory, name)
+            created: i64 =
+                toolchain_c: darray[u8] = ProjectFiles::with_null_terminator(toolchain_path)
+                toolchain_name: cstr = (&toolchain_c[0]).cast[cstr] can Unsafe.PointerCast
+                made: i64 = Platform::make_directory(toolchain_name, 448.u16())
+                made if made != 0 else Platform::synchronize_parent_directory(toolchain_name)
+            if created != 0:
+                created
+            else:
+                published: i64 = ProjectFiles::publish_file_exclusively(record_path(directory, name), encode(record))
+                # Never leave an empty toolchain directory behind a failed publish.
+                _ = ProjectFiles::remove_empty_directory(toolchain_path) if published != 0 else true
+                published
 
-        # Whether any directory entry, readable or not, has the record name of `name`.
+        # Whether any directory entry, readable or not, has the name `name`.
         def exists(directory: darray[u8]&, name: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             requires directory.count > 0
-            valid_name(name) and ProjectFiles::path_occupied(record_path(directory, name))
+            valid_name(name) and ProjectFiles::path_occupied(ProjectFiles::path_join_bytes(directory, name))
 
+        # Remove the record of `name` and then its directory, which must be
+        # empty. Any other entry with that name, such as a symlink, is
+        # removed itself and never followed.
         def remove(directory: darray[u8]&, name: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             requires directory.count > 0
-            valid_name(name) and ProjectFiles::remove_known_file(record_path(directory, name))
+            return false if not valid_name(name)
+            toolchain_path: darray[u8] = ProjectFiles::path_join_bytes(directory, name)
+            toolchain_c: darray[u8] = ProjectFiles::with_null_terminator(toolchain_path)
+            toolchain_name: cstr = (&toolchain_c[0]).cast[cstr] can Unsafe.PointerCast
+            if Platform::trusted_directory_status(toolchain_name) == 0:
+                ProjectFiles::remove_known_file(record_path(directory, name)) and ProjectFiles::remove_empty_directory(toolchain_path)
+            else:
+                Platform::unlink_path(toolchain_name) == 0
 
-        # Read the default toolchain name. Returns 0, -2 when no default is
-        # set, or another negative status.
+        # Read the `default-toolchain` setting. Returns 0, -2 when no default
+        # is set, or another negative status for unreadable settings.
         def read_default(directory: darray[u8]&, out: mutable darray[u8]&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             requires directory.count > 0
             out.resize(0)
             raw: mutable darray[u8] = []
-            loaded: i64 = RegistryFiles::read_trusted_file(ProjectFiles::path_join(directory, "default"), 66.usize(), &raw)
+            loaded: i64 = RegistryFiles::read_trusted_file(settings_path(directory), maximum_settings_bytes, &raw)
+            valid: bool = loaded >= 0 and Json::valid_document(raw) and Json::unique_object_keys(raw)
+            object_start: usize = Json::root_start(raw)
+            object_finish: usize = Json::root_object_end(raw, object_start) if valid else raw.count
             if loaded < 0:
                 loaded
-            elif raw.count < 2.usize() or raw[raw.count - 1.usize()] != 10:
+            elif not valid or object_finish == raw.count or raw[object_start] != 123:
                 -74
+            elif not Json::object_has_key(raw, object_start, object_finish, "default-toolchain"):
+                -2
             else:
-                ByteText::append_range(out, raw, 0.usize(), raw.count - 1.usize())
-                0 if valid_name(out) else -74
+                0 if Json::object_string_value(raw, object_start, object_finish, "default-toolchain", out) and valid_name(out) else -74
 
+        # Make `name` the `default-toolchain` setting. The settings file holds
+        # no other setting yet, so it is rewritten whole.
         def write_default(directory: darray[u8]&, name: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast, Console.Write]:
             requires directory.count > 0
-            valid_name(name) and ProjectFiles::replace_file(ProjectFiles::path_join(directory, "default"), ByteText::with_text(ByteText::with_bytes([], name), "\n"))
+            valid_name(name) and ProjectFiles::replace_file(settings_path(directory), ByteText::with_text(ByteText::with_bytes(ByteText::with_text([], "{\n  \"default-toolchain\": \""), name), "\"\n}\n"))
 
         def clear_default(directory: darray[u8]&) -> bool can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             requires directory.count > 0
-            ProjectFiles::remove_known_file(ProjectFiles::path_join(directory, "default"))
+            ProjectFiles::remove_known_file(settings_path(directory))
 
-        # The toolchain names in `directory`, in byte order. Clears `readable`
-        # for an unreadable directory or more than `maximum_toolchains` records.
+        # The toolchain names in `directory`, in byte order. Entries
+        # that are not valid names are skipped. Clears `readable` for an
+        # unreadable directory or more than `maximum_toolchains` entries.
         def names(directory: darray[u8]&, readable: mutable bool&) -> darray[darray[u8]] can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
             requires directory.count > 0
             listing: mutable darray[u8] = []
-            listing <- listing.resize(1048576)
+            listing <- listing.resize(262144)
             collected: i64 =
                 directory_c: darray[u8] = ProjectFiles::with_null_terminator(directory)
                 listing_raw: mutable u8& = (&listing[0]).cast[mutable u8&] can Unsafe.PointerCast
-                Platform::collect_files(((&directory_c[0]).cast[cstr] can Unsafe.PointerCast), listing_raw, listing.count)
+                Platform::list_entry_names(((&directory_c[0]).cast[cstr] can Unsafe.PointerCast), listing_raw, listing.count)
             if collected < 0:
                 readable <- false
                 []
@@ -120,26 +160,25 @@ module ToolchainStore:
                     while cursor < collected.usize() and listing[cursor] != 0 |listing, cursor|:
                         cursor <- cursor + 1.usize()
                     cursor <- cursor + 1.usize()
-                    name: darray[u8] = record_name(listing, entry_start, cursor - 1.usize())
-                    found <- found.push(name) if name.count > 0.usize()
+                    name: darray[u8] = ByteText::with_range([], listing, entry_start, cursor - 1.usize())
+                    found <- found.push(name) if valid_name(name)
                 readable <- listed.count <= maximum_toolchains
-                listed
+                ordered: mutable darray[usize] = [index for index in 0..<listed.count]
+                CollectedPathOrder::sort_indices(&ordered, listed)
+                [listed[ordered[index]].clone() for index in 0..<ordered.count]
 
     private:
-        def record_path(directory: darray[u8]&, name: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
-            ByteText::with_text(ProjectFiles::path_join_bytes(directory, name), ".toolchain")
+        const maximum_settings_bytes: usize = 65536.usize()
 
-        # The toolchain name of a listed entry `listing[start..<finish]`, or
-        # empty when the entry is not a top-level `NAME.toolchain` file.
-        def record_name(listing: darray[u8]&, start: usize, finish: usize) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
-            leaf_start: usize = for index in start..<finish |leaf_start: usize = start| -> leaf_start:
-                leaf_start <- index + 1.usize() if listing[index] == 47
-            suffix_length: usize = 10.usize()
-            if finish - leaf_start <= suffix_length or not ByteText::range_equals_text(listing, finish - suffix_length, finish, ".toolchain"):
-                []
-            else:
-                name: darray[u8] = ByteText::with_range([], listing, leaf_start, finish - suffix_length)
-                name if valid_name(name) else []
+        # "DIRECTORY/NAME/toolchain".
+        def record_path(directory: darray[u8]&, name: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
+            ProjectFiles::path_join(ProjectFiles::path_join_bytes(directory, name), "toolchain")
+
+        # "settings.json" beside the store directory, in `lang`.
+        def settings_path(directory: darray[u8]&) -> darray[u8] can[Memory.Allocate, Abort.Panic]:
+            parent_end: usize = for index in 0..<directory.count |parent_end: usize = 0.usize()| -> parent_end:
+                parent_end <- index if directory[index] == 47
+            ProjectFiles::path_join(ByteText::with_range([], directory, 0.usize(), parent_end), "settings.json")
 
         const header_bytes: usize = 21.usize()
 

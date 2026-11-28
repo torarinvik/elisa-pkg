@@ -42,15 +42,25 @@ reports which of these selects the compiler.
 
 ## Storage and trust
 
-Records live in `$HOME/.local/share/elisapkg/toolchains`: one
-`NAME.toolchain` file per toolchain and a `default` file naming the default.
-elisapkg creates each directory from `$HOME/.local` down with mode `0700` and
-refuses the store if any of them, or any parent directory, is a symlink or is
-writable by another user. Records are written atomically with mode `0600` and
-read through the same no-follow trusted walk as registry trust state. A
-malformed record is never used; `toolchain list` shows it as unreadable and
-`toolchain unlink` removes it. A symlink inside the store makes listing fail
-closed.
+Toolchains live in the [elisapkg home](elisapkg-home.md), `$HOME/.elisapkg`
+unless `ELISAPKG_HOME` is set. Each toolchain has its own directory,
+`lang/elisac/NAME`, and a linked checkout's directory holds one `toolchain`
+record file. `lang/settings.json` names the default:
+
+```json
+{
+  "default-toolchain": "dev"
+}
+```
+
+elisapkg creates each directory with mode `0700` and refuses the store if any
+of them, or any parent directory, is a symlink or is writable by another user.
+Records are published atomically with mode `0600` and read through the same
+no-follow trusted walk as registry trust state. A malformed record or a
+symlinked toolchain directory is never used; `toolchain list` shows it as
+unreadable, and `toolchain unlink` removes it without following the link.
+Malformed settings are an error for `toolchain default` and for builds, never
+an implicit "no default".
 
 ## Planned
 
