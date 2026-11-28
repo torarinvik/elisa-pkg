@@ -72,7 +72,7 @@ using whatever compiler happens to be installed on the runner:
 | --- | --- |
 | Elisa compiler | `a0fe756c11064d88d1f7f402ef9b1e38866d9f09` |
 | Elisa core / stage0 | `ffb9ba3661e4aa734cd780089b8d5cc036379522` |
-| Go | `1.25.0`, required by the pinned core `go.mod`; checked to select itself without a toolchain switch |
+| Go | Newest stable release at run time (not pinned); the exact version is recorded in the build manifest |
 | LLVM | `23.1.6`, checked after Homebrew installation |
 | `actions/checkout` | `9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0` |
 | `actions/setup-go` | `b7ad1dad31e06c5925ef5d2fc7ad053ef454303e` (v7.0.0) |
@@ -104,12 +104,16 @@ where the compilers' own limits still apply.
 To update a pin, review the upstream source and compatibility notes, update the
 workflow and this table together, then run the clean seed/build/test sequence
 on the supported host. An LLVM formula change intentionally fails the version
-check until the new compiler/runtime combination has been validated. Go module
-dependency changes are constrained by the pinned core `go.sum` and
-`GOFLAGS=-mod=readonly`. The job leaves `GOTOOLCHAIN` at Go's default: core's
-`make build` clears the environment, so the Stage0 receipt records that
-default, and the Stage1 seed rejects a Stage0 whose recorded build context
-differs from its own.
+check until the new compiler/runtime combination has been validated. Go is
+deliberately not pinned: each run installs the newest stable Go release, so a
+new Go release can fail CI before a developer meets it. The job records the
+selected version, checks that the core module builds with it rather than
+switching toolchains, and the attestation job checks the manifest against that
+recorded version. Go module dependency changes are constrained by the pinned
+core `go.sum` and `GOFLAGS=-mod=readonly`. The job sets `GOTOOLCHAIN=auto`, Go's default, after
+`actions/setup-go` exports `local`: core's `make build` clears the environment,
+so the Stage0 receipt records the default, and the Stage1 seed rejects a Stage0
+whose recorded build context differs from its own.
 
 This is an initial attested CI candidate, not a production client release. A
 release still needs consumer-side verification, a supported distribution and

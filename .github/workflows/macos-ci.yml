@@ -12,7 +12,6 @@ permissions:
 env:
   ELISA_COMPILER_SHA: a0fe756c11064d88d1f7f402ef9b1e38866d9f09
   ELISA_CORE_SHA: ffb9ba3661e4aa734cd780089b8d5cc036379522
-  ELISA_GO_VERSION: 1.25.0
   ELISA_LLVM_VERSION: 23.1.6
 
 concurrency:
@@ -24,6 +23,8 @@ jobs:
     name: Seeded toolchain and required sandbox tests
     runs-on: macos-15
     timeout-minutes: 90
+    outputs:
+      go_version: ${{ steps.go_toolchain.outputs.version }}
     env:
       ELISAPKG_REQUIRE_SANDBOX_TESTS: "1"
       GOFLAGS: -mod=readonly
@@ -40,10 +41,13 @@ jobs:
           python3 scripts/ffi_boundary_test.py
           python3 scripts/compiler_rebuild_timeout_regression.py
 
-      - name: Select pinned Go toolchain
+      # CI always builds with the newest stable Go release. The exact version
+      # it selects is recorded below for the build provenance manifest.
+      - name: Select newest stable Go toolchain
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: ${{ env.ELISA_GO_VERSION }}
+          go-version: stable
+          check-latest: true
           cache: false
 
       - name: Fetch pinned Elisa compiler and core sources
@@ -71,16 +75,23 @@ jobs:
           git -C "$toolchain_root/Elisa-core" checkout --quiet --detach FETCH_HEAD
           test "$(git -C "$toolchain_root/Elisa-core" rev-parse HEAD)" = "$ELISA_CORE_SHA"
 
-      # The Stage0 receipt records GOTOOLCHAIN as Go's default, because core's
-      # `make build` clears the environment, and the Stage1 seed rejects a
-      # receipt whose context differs. So the job keeps that default and
-      # checks instead that it selects the pinned toolchain without switching.
-      - name: Verify pinned Go toolchain
+      # The Stage0 receipt records GOTOOLCHAIN as Go's default, `auto`, because
+      # core's `make build` clears the environment, and the Stage1 seed rejects
+      # a receipt whose context differs. setup-go exports GOTOOLCHAIN=local, so
+      # later steps get `auto` back. Under `auto`, check that the core module
+      # builds with the selected Go rather than switching to another toolchain.
+      - name: Record selected Go toolchain
+        id: go_toolchain
         shell: bash
         run: |
           set -euo pipefail
-          test "$(go env GOVERSION)" = "go$ELISA_GO_VERSION"
-          test "$(cd "$ELISA_CORE/compiler" && go env GOVERSION)" = "go$ELISA_GO_VERSION"
+          export GOTOOLCHAIN=auto
+          printf 'GOTOOLCHAIN=auto\n' >> "$GITHUB_ENV"
+          go_version="$(go env GOVERSION)"
+          [[ "$go_version" =~ ^go[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$(cd "$ELISA_CORE/compiler" && go env GOVERSION)" = "$go_version"
+          printf 'ELISA_GO_VERSION=%s\n' "${go_version#go}" >> "$GITHUB_ENV"
+          printf 'version=%s\n' "${go_version#go}" >> "$GITHUB_OUTPUT"
 
       - name: Install and verify LLVM
         shell: bash
@@ -195,7 +206,7 @@ jobs:
           EXPECTED_RUN_ATTEMPT: ${{ github.run_attempt }}
           EXPECTED_COMPILER_REVISION: ${{ env.ELISA_COMPILER_SHA }}
           EXPECTED_CORE_REVISION: ${{ env.ELISA_CORE_SHA }}
-          EXPECTED_GO_VERSION: ${{ env.ELISA_GO_VERSION }}
+          EXPECTED_GO_VERSION: ${{ needs.test.outputs.go_version }}
           EXPECTED_LLVM_VERSION: ${{ env.ELISA_LLVM_VERSION }}
         run: |
           python3 - <<'PY'
